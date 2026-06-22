@@ -1492,11 +1492,116 @@ fn hvf_rehydrate_real_cloud_snapshot_emits_console() {
         !console.is_empty() || shutdown,
         "rehydrated guest produced no console output after {steps} entries"
     );
+    // Every byte must be a legitimate part of a terminal stream: printable
+    // ASCII, ordinary whitespace, or ESC (the guest now resumes far enough to
+    // emit systemd's ANSI-coloured boot output, e.g. "\x1b[0;1;39m"). A
+    // mis-restored CPU/UART would instead spray arbitrary non-terminal bytes.
     assert!(
-        console
-            .iter()
-            .all(|&b| b == b'\n' || b == b'\r' || b == b'\t' || (0x20..0x7f).contains(&b)),
-        "console output contained non-printable bytes — UART servicing or state restore is wrong: {console:?}"
+        console.iter().all(|&b| {
+            b == b'\n' || b == b'\r' || b == b'\t' || b == 0x1b || (0x20..0x7f).contains(&b)
+        }),
+        "console output contained non-terminal bytes — UART servicing or state restore is wrong: {console:?}"
+    );
+}
+
+/// Proves the rehydrated cloud guest **resumes real timed userspace** on HVF —
+/// the payoff of restoring virtual-counter continuity.
+///
+/// A snapshot captures the guest's `CNTVCT_EL0` (the EL0 virtual counter) and an
+/// armed `CNTV_CVAL_EL0` comparator. On a brand-new HVF VM the virtual counter
+/// restarts near zero, so without intervention the restored comparator sits
+/// ~2^32 ticks in the future: the guest's scheduler tick never fires, it idles
+/// in WFI for minutes, and its soft-lockup watchdog trips on the apparent stall
+/// (the only console output is a `watchdog: BUG: soft lockup` line). The HVF
+/// backend now restores the vtimer offset from the captured `CNTVCT` during
+/// `set_state`, so the virtual counter resumes where it left off and the armed
+/// timer fires promptly.
+///
+/// With that fix the resumed guest drives `systemd` forward through its timed
+/// unit startup — sequencing `.service` units with `[ OK ]`, starting D-Bus,
+/// running cloud-init. None of that timed progress is possible unless the
+/// virtual timer is delivering ticks, so this asserts genuine, time-driven
+/// forward execution of the rehydrated cloud snapshot, not just a single
+/// instruction burst.
+///
+/// Gated on `CH_SNAPSHOT_DIR`; skipped (passes trivially) when unset.
+#[cfg(feature = "kvm-snapshot")]
+#[test]
+fn hvf_rehydrate_real_cloud_snapshot_resumes_userspace() {
+    use std::path::PathBuf;
+
+    use hypervisor::hvf::devices::{MmioBus, Pl011};
+    use hypervisor::hvf::rehydrate::{rehydrate, Snapshot};
+
+    const PL011_BASE: u64 = 0x0900_0000;
+    const PL011_SIZE: u64 = 0x1000;
+
+    let Ok(dir) = env::var("CH_SNAPSHOT_DIR") else {
+        eprintln!("CH_SNAPSHOT_DIR unset; skipping real-snapshot userspace test");
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let state_json = fs::read_to_string(dir.join("state.json")).expect("read state.json");
+    let mem_ranges = dir.join("snapshot").join("memory-ranges");
+
+    let snap = Snapshot::from_state_json(&state_json).expect("parse snapshot");
+
+    let uart = Arc::new(Pl011::new());
+    let mut bus = MmioBus::new();
+    bus.add(PL011_BASE, PL011_SIZE, uart.clone());
+    let vm_ops: Arc<dyn VmOps> = Arc::new(bus);
+
+    let hv = hypervisor::new().expect("hypervisor::new() — is the test binary codesigned?");
+    let mut rvm = rehydrate(hv.as_ref(), &snap, &mem_ranges, &vm_ops).expect("rehydrate VM");
+
+    // Resume vCPU0 and drain the console under a wall-clock budget. The guest
+    // spends most of its time parked in WFI between scheduler ticks, so progress
+    // is gated by the virtual timer, not by raw loop iterations.
+    let vcpu = rvm.vcpus[0].as_mut();
+    let mut console = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        match vcpu.run().expect("rehydrated vCPU run") {
+            VmExit::Ignore => {}
+            VmExit::Shutdown | VmExit::Reset => break,
+            other => panic!("unexpected exit from rehydrated guest: {other:?}"),
+        }
+        console.extend(uart.take_output());
+        // Stop as soon as we have unambiguous evidence of timed userspace.
+        let so_far: String = console.iter().map(|&b| b as char).collect();
+        if so_far.matches(".service").count() >= 2 {
+            break;
+        }
+    }
+    console.extend(uart.take_output());
+
+    let text: String = console
+        .iter()
+        .map(|&b| {
+            if (0x20..0x7f).contains(&b) || b == b'\n' {
+                b as char
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    eprintln!("--- resumed guest serial ---\n{text}\n----------------------------");
+
+    // systemd only advances through these timed units when the virtual timer is
+    // delivering ticks — i.e. the restored vtimer offset is working. A guest
+    // stuck on the clock discontinuity would instead emit only a soft-lockup
+    // watchdog line and never reach userspace service startup.
+    let service_lines = text.matches(".service").count();
+    assert!(
+        service_lines >= 2,
+        "resumed guest did not reach timed systemd userspace (only saw \
+         {service_lines} `.service` line(s)); vtimer continuity may be broken. \
+         Console:\n{text}"
+    );
+    assert!(
+        !text.contains("soft lockup"),
+        "resumed guest tripped the soft-lockup watchdog — the virtual timer is \
+         not advancing. Console:\n{text}"
     );
 }
 

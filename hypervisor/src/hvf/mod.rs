@@ -522,6 +522,29 @@ impl HvfVcpu {
     }
 
     /// Write a managed-GIC CPU-interface (ICC) register for this vCPU.
+    /// Restore virtual-counter continuity from a snapshot's captured
+    /// `CNTVCT_EL0`. HVF defines `CNTVCT_EL0 = mach_absolute_time() - offset`,
+    /// so seeding the offset with `mach_absolute_time() - snapshot_cntvct` makes
+    /// the guest's virtual counter resume at the value it held when snapshotted.
+    /// Without this the fresh VM's counter restarts near zero while the guest's
+    /// armed `CNTV_CVAL_EL0` comparator sits ~2^32 ticks ahead, so its scheduler
+    /// tick never fires and a resumed guest idles in WFI for minutes (and its
+    /// soft-lockup watchdog trips on the apparent stall).
+    pub fn restore_vtimer_offset(&self, snapshot_cntvct: u64) -> CpuResult<()> {
+        // SAFETY: FFI; reads the host monotonic tick.
+        let now = unsafe { mach_absolute_time() };
+        let offset = now.wrapping_sub(snapshot_cntvct);
+        // SAFETY: FFI on the owning thread.
+        let ret = unsafe { hv_vcpu_set_vtimer_offset(self.id, offset) };
+        if ret != HV_SUCCESS {
+            return Err(HypervisorCpuError::SetSysRegister(anyhow!(
+                "hv_vcpu_set_vtimer_offset failed: {:#010x}",
+                ret as u32
+            )));
+        }
+        Ok(())
+    }
+
     fn set_icc_reg(&self, reg: u16, val: u64) -> CpuResult<()> {
         // SAFETY: FFI on the owning thread.
         let ret = unsafe { hv_gic_set_icc_reg(self.id, reg, val) };
@@ -758,12 +781,17 @@ impl Vcpu for HvfVcpu {
         // them is best-effort and must not abort the whole restore.
         let _ = self.set_sysreg(SYSREG_SP_EL1, s.sp_el1);
         let mut restored_mpidr = false;
+        let mut snapshot_cntvct = None;
         for &(id, v) in &s.sysregs {
             if id == SYSREG_MPIDR_EL1 {
                 // MPIDR affinity is load-bearing for GIC interrupt delivery, so
                 // it is restored with a hard failure rather than best-effort.
                 self.set_sysreg(SYSREG_MPIDR_EL1, v)?;
                 restored_mpidr = true;
+            } else if id == SYSREG_CNTVCT_EL0 {
+                // Read-only: not written as a sysreg. Its value seeds the vtimer
+                // offset below so the virtual counter resumes continuously.
+                snapshot_cntvct = Some(v);
             } else {
                 let _ = self.set_sysreg(id, v);
             }
@@ -772,6 +800,11 @@ impl Vcpu for HvfVcpu {
             // Older snapshots predate capturing MPIDR; synthesize it from this
             // vCPU's index so a restored guest can still take interrupts.
             self.set_mpidr_affinity(self.index)?;
+        }
+        // Restore virtual-counter continuity if the snapshot carried CNTVCT, so
+        // the guest's armed timer fires promptly and time advances on resume.
+        if let Some(cntvct) = snapshot_cntvct {
+            self.restore_vtimer_offset(cntvct)?;
         }
         // Restore the managed-GIC CPU-interface registers (priority mask, group
         // enables, active priorities, ...). These are load-bearing for delivery

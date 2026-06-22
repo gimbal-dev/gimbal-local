@@ -57,6 +57,10 @@ pub const SYSREG_TPIDR_EL0: u16 = 0xde82;
 pub const SYSREG_TPIDRRO_EL0: u16 = 0xde83;
 pub const SYSREG_SP_EL1: u16 = 0xe208;
 pub const SYSREG_MPIDR_EL1: u16 = 0xc005;
+/// EL0 virtual counter (read-only). Carried in a KVM snapshot's register file;
+/// its captured value seeds the HVF vtimer offset on restore so the guest's
+/// CNTVCT_EL0 resumes continuously instead of restarting near zero.
+pub const SYSREG_CNTVCT_EL0: u16 = 0xdf02;
 /// MPIDR_EL1 bit[31] is RES1 on AArch64; affinity fields occupy Aff0..Aff3.
 pub const MPIDR_RES1: u64 = 1 << 31;
 
@@ -134,6 +138,14 @@ unsafe extern "C" {
     #[allow(dead_code)]
     pub fn hv_vcpu_set_pending_interrupt(vcpu: u64, ty: u32, pending: bool) -> i32;
     pub fn hv_vcpu_set_vtimer_mask(vcpu: u64, masked: bool) -> i32;
+    // VTimer offset: CNTVCT_EL0 = mach_absolute_time() - offset. Restoring the
+    // offset from a snapshot's captured CNTVCT makes the guest's virtual counter
+    // resume where it left off, so an armed CNTV comparator fires promptly
+    // instead of the guest sleeping ~2^32 ticks waiting for a counter that
+    // restarted near zero.
+    #[allow(dead_code)]
+    pub fn hv_vcpu_get_vtimer_offset(vcpu: u64, offset: *mut u64) -> i32;
+    pub fn hv_vcpu_set_vtimer_offset(vcpu: u64, offset: u64) -> i32;
 
     // GIC configuration object (os_object, released with os_release).
     pub fn hv_gic_config_create() -> *mut c_void;
@@ -181,4 +193,10 @@ unsafe extern "C" {
 unsafe extern "C" {
     /// Release an `os_object` (e.g. an `hv_gic_config_t`/`hv_gic_state_t`).
     pub fn os_release(object: *mut c_void);
+}
+
+unsafe extern "C" {
+    /// Mach monotonic tick count. The HVF vtimer offset is defined relative to
+    /// it: `CNTVCT_EL0 = mach_absolute_time() - offset`.
+    pub fn mach_absolute_time() -> u64;
 }
