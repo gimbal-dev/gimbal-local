@@ -43,6 +43,8 @@ pub mod gic;
 use gic::HvfGicV3;
 pub mod translate;
 #[cfg(feature = "kvm-snapshot")]
+pub mod devices;
+#[cfg(feature = "kvm-snapshot")]
 pub mod rehydrate;
 
 type CpuResult<T> = std::result::Result<T, HypervisorCpuError>;

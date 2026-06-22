@@ -1401,6 +1401,103 @@ fn hvf_rehydrate_real_cloud_snapshot_executes() {
     }
 }
 
+/// Rehydrate the same real cloud snapshot, but this time give the resumed guest
+/// a working serial port and capture what it actually prints.
+///
+/// The previous test proves the guest *executes* by observing it trap on device
+/// MMIO. This one closes the loop end-to-end: it stands up the first real piece
+/// of the macOS device model — an [`MmioBus`] with a faithful [`Pl011`] UART at
+/// cloud-hypervisor's serial base — services the guest's transmit path, and
+/// asserts the bytes it emits are real, printable console output. A guest whose
+/// CPU/memory/GIC state was reconstructed incorrectly could not drive a
+/// coherent character stream out of its UART.
+///
+/// Gated on `CH_SNAPSHOT_DIR`; skipped (passes trivially) when unset.
+#[cfg(feature = "kvm-snapshot")]
+#[test]
+fn hvf_rehydrate_real_cloud_snapshot_emits_console() {
+    use std::path::PathBuf;
+
+    use hypervisor::hvf::devices::{MmioBus, Pl011};
+    use hypervisor::hvf::rehydrate::{rehydrate, Snapshot};
+
+    // cloud-hypervisor's arm64 PL011 lives at the base of the mapped-IO window.
+    const PL011_BASE: u64 = 0x0900_0000;
+    const PL011_SIZE: u64 = 0x1000;
+
+    let Ok(dir) = std::env::var("CH_SNAPSHOT_DIR") else {
+        eprintln!("CH_SNAPSHOT_DIR unset; skipping real-snapshot console test");
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let state_json = std::fs::read_to_string(dir.join("state.json")).expect("read state.json");
+    let mem_ranges = dir.join("snapshot").join("memory-ranges");
+
+    let snap = Snapshot::from_state_json(&state_json).expect("parse snapshot");
+
+    // Build the device model: a bus with a real PL011 at the guest's serial base.
+    let uart = Arc::new(Pl011::new());
+    let mut bus = MmioBus::new();
+    bus.add(PL011_BASE, PL011_SIZE, uart.clone());
+    let vm_ops: Arc<dyn VmOps> = Arc::new(bus);
+
+    let hv = hypervisor::new().expect("hypervisor::new() — is the test binary codesigned?");
+    let mut rvm = rehydrate(hv.as_ref(), &snap, &mem_ranges, &vm_ops).expect("rehydrate VM");
+
+    // Resume vCPU0 and drain the serial console as it runs.
+    let vcpu = rvm.vcpus[0].as_mut();
+    let mut console = Vec::new();
+    let mut steps = 0u64;
+    let mut shutdown = false;
+    for _ in 0..2_000_000 {
+        steps += 1;
+        match vcpu.run().expect("rehydrated vCPU run") {
+            VmExit::Ignore => {}
+            VmExit::Shutdown | VmExit::Reset => {
+                shutdown = true;
+                break;
+            }
+            other => panic!("unexpected exit from rehydrated guest: {other:?}"),
+        }
+        console.extend(uart.take_output());
+        // Stop once we have a solid line or two of real console output.
+        if console.iter().filter(|&&b| b == b'\n').count() >= 2 || console.len() >= 80 {
+            break;
+        }
+    }
+    console.extend(uart.take_output());
+
+    let text: String = console
+        .iter()
+        .map(|&b| {
+            if (0x20..0x7f).contains(&b) || b == b'\n' {
+                b as char
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    eprintln!(
+        "guest ran {steps} entries; {} console byte(s){}:\n--- serial ---\n{text}\n--------------",
+        console.len(),
+        if shutdown { " (then powered off)" } else { "" }
+    );
+
+    // The resumed guest must have produced real serial output (or halted). Empty
+    // output after millions of entries would mean the transmit path — and thus
+    // the restored CPU/UART interaction — is not actually live.
+    assert!(
+        !console.is_empty() || shutdown,
+        "rehydrated guest produced no console output after {steps} entries"
+    );
+    assert!(
+        console
+            .iter()
+            .all(|&b| b == b'\n' || b == b'\r' || b == b'\t' || (0x20..0x7f).contains(&b)),
+        "console output contained non-printable bytes — UART servicing or state restore is wrong: {console:?}"
+    );
+}
+
 /// Documents the Apple managed-GIC base-address ordering constraint that drives
 /// the GIC relocation in [`hypervisor::hvf::rehydrate`].
 ///
