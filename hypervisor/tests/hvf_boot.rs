@@ -14,11 +14,16 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+#[cfg(feature = "kvm-snapshot")]
+use std::{env, fs};
 
+use hypervisor::arch::aarch64::gic::{GicState, Vgic, VgicConfig};
+use hypervisor::hvf::gic::{GICD_TYPER, HvfGicV3};
+use hypervisor::hvf::HvfVcpu;
 use hypervisor::{CpuState, HypervisorVmConfig, HypervisorVmError, Vcpu, Vm, VmExit, VmOps};
 
-type VmOpsResult<T> = std::result::Result<T, HypervisorVmError>;
+type VmOpsResult<T> = Result<T, HypervisorVmError>;
 
 const RAM_BASE: u64 = 0x4000_0000;
 const RAM_SIZE: usize = 0x20_0000; // 2 MiB, multiple of the 16 KiB page size
@@ -240,8 +245,6 @@ fn hvf_snapshot_restore_midflight() {
 /// `state()`/`set_state()` — the same mechanism guest-interrupt snapshots use.
 #[test]
 fn hvf_vgic_create_and_state_roundtrip() {
-    use hypervisor::arch::aarch64::gic::VgicConfig;
-    use hypervisor::hvf::gic::HvfGicV3;
 
     // GICv3 layout in guest-physical space, clear of the RAM window and
     // 16 KiB-page aligned.
@@ -277,7 +280,7 @@ fn hvf_vgic_create_and_state_roundtrip() {
             .downcast_mut::<HvfGicV3>()
             .expect("HVF GIC concrete type");
         let typer = concrete
-            .distributor_reg(hypervisor::hvf::gic::GICD_TYPER)
+            .distributor_reg(GICD_TYPER)
             .expect("read GICD_TYPER from live GIC");
         // SPI assertion is also driven through the public set_spi path.
         concrete.set_spi(32, true).expect("assert SPI 32");
@@ -290,7 +293,7 @@ fn hvf_vgic_create_and_state_roundtrip() {
     let snap = gic.lock().unwrap().state().expect("GIC state()");
     let snap_clone = snap.clone();
     assert!(
-        matches!(&snap, hypervisor::arch::aarch64::gic::GicState::Hvf(s) if !s.data.is_empty()),
+        matches!(&snap, GicState::Hvf(s) if !s.data.is_empty()),
         "expected non-empty HVF GIC state blob"
     );
     gic.lock()
@@ -444,7 +447,7 @@ const VT_IRQ_HANDLER: [u8; 32] = [
 /// never reaches the interface.
 struct MarkerVmOps {
     marker: Mutex<Vec<u32>>,
-    gic: Mutex<Option<Arc<Mutex<dyn hypervisor::arch::aarch64::gic::Vgic>>>>,
+    gic: Mutex<Option<Arc<Mutex<dyn Vgic>>>>,
     injected: Mutex<bool>,
 }
 
@@ -467,7 +470,7 @@ impl VmOps for MarkerVmOps {
                 let mut guard = gic.lock().unwrap();
                 let concrete = guard
                     .as_any_concrete_mut()
-                    .downcast_mut::<hypervisor::hvf::gic::HvfGicV3>()
+                    .downcast_mut::<HvfGicV3>()
                     .expect("HVF GIC concrete type");
                 concrete.set_spi(IRQ_SPI_INTID, true).expect("assert SPI 32");
                 *self.injected.lock().unwrap() = true;
@@ -591,7 +594,7 @@ fn hvf_guest_takes_cross_thread_spi() {
         let mut guard = injector_gic.lock().unwrap();
         let concrete = guard
             .as_any_concrete_mut()
-            .downcast_mut::<hypervisor::hvf::gic::HvfGicV3>()
+            .downcast_mut::<HvfGicV3>()
             .expect("HVF GIC concrete type");
         concrete
             .set_spi(IRQ_SPI_INTID, true)
@@ -659,8 +662,8 @@ fn load_wfi_guest(ram: &HostRam) {
     ram.load(0x1800, &IRQ_HANDLER);
 }
 
-fn irq_vgic_config() -> hypervisor::arch::aarch64::gic::VgicConfig {
-    hypervisor::arch::aarch64::gic::VgicConfig {
+fn irq_vgic_config() -> VgicConfig {
+    VgicConfig {
         vcpu_count: 1,
         dist_addr: IRQ_GICD_BASE,
         dist_size: 0x1_0000,
@@ -695,7 +698,7 @@ fn hvf_gic_pending_irq_survives_snapshot() {
 
     // Phase A: capture a vCPU + GIC snapshot with SPI 32 pending but untaken.
     let vcpu_snap: CpuState;
-    let gic_snap: hypervisor::arch::aarch64::gic::GicState;
+    let gic_snap: GicState;
     {
         let ram = HostRam::new(RAM_SIZE);
         load_irq_guest(&ram);
@@ -826,7 +829,7 @@ fn hvf_kvm_register_translation_roundtrip() {
 
     // Phase A: capture a vCPU + GIC snapshot with SPI 32 pending but untaken.
     let vcpu_snap: CpuState;
-    let gic_snap: hypervisor::arch::aarch64::gic::GicState;
+    let gic_snap: GicState;
     {
         let ram = HostRam::new(RAM_SIZE);
         load_irq_guest(&ram);
@@ -1005,7 +1008,7 @@ fn hvf_guest_takes_virtual_timer() {
 /// vCPU parked in the WFI idle path cannot turn a failure into a multi-minute
 /// hang: each `run()` may block up to the backend's WFI poll interval.
 fn run_to_shutdown_deadline(vcpu: &mut dyn Vcpu, deadline: Duration) -> VmExit {
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     loop {
         match vcpu.run().expect("vcpu run") {
             VmExit::Ignore => {
@@ -1066,7 +1069,7 @@ fn hvf_guest_wfi_woken_by_cross_thread_irq() {
     // alongside the GIC and signals it right after asserting an interrupt.
     let wake = vcpu
         .as_any_concrete_mut()
-        .downcast_mut::<hypervisor::hvf::HvfVcpu>()
+        .downcast_mut::<HvfVcpu>()
         .expect("HVF vCPU concrete type")
         .wake_handle();
 
@@ -1078,7 +1081,7 @@ fn hvf_guest_wfi_woken_by_cross_thread_irq() {
             let mut guard = injector_gic.lock().unwrap();
             let concrete = guard
                 .as_any_concrete_mut()
-                .downcast_mut::<hypervisor::hvf::gic::HvfGicV3>()
+                .downcast_mut::<HvfGicV3>()
                 .expect("HVF GIC concrete type");
             concrete
                 .set_spi(IRQ_SPI_INTID, true)
@@ -1123,7 +1126,6 @@ fn hvf_guest_wfi_woken_by_cross_thread_irq() {
 #[cfg(feature = "kvm-snapshot")]
 #[test]
 fn hvf_gic_dist_redist_per_register_rehydration() {
-    use hypervisor::hvf::gic::HvfGicV3;
     use hypervisor::hvf::translate::gic_ingest::{dist_to_hvf, redist_to_hvf};
 
     // Parse the REAL captured GIC node (same fixture the unit tests use).
@@ -1221,7 +1223,7 @@ fn hvf_gic_dist_redist_per_register_rehydration() {
     {
         let concrete = vcpu
             .as_any_concrete_mut()
-            .downcast_mut::<hypervisor::hvf::HvfVcpu>()
+            .downcast_mut::<HvfVcpu>()
             .expect("HVF vCPU concrete type");
 
         let mut write_failures = Vec::new();
@@ -1316,12 +1318,12 @@ fn hvf_rehydrate_real_cloud_snapshot_executes() {
 
     use hypervisor::hvf::rehydrate::{rehydrate, Snapshot};
 
-    let Ok(dir) = std::env::var("CH_SNAPSHOT_DIR") else {
+    let Ok(dir) = env::var("CH_SNAPSHOT_DIR") else {
         eprintln!("CH_SNAPSHOT_DIR unset; skipping real-snapshot rehydration test");
         return;
     };
     let dir = PathBuf::from(dir);
-    let state_json = std::fs::read_to_string(dir.join("state.json")).expect("read state.json");
+    let state_json = fs::read_to_string(dir.join("state.json")).expect("read state.json");
     let mem_ranges = dir.join("snapshot").join("memory-ranges");
 
     // --- Parse + translate the whole snapshot (CPU + GIC + memory layout). ---
@@ -1425,12 +1427,12 @@ fn hvf_rehydrate_real_cloud_snapshot_emits_console() {
     const PL011_BASE: u64 = 0x0900_0000;
     const PL011_SIZE: u64 = 0x1000;
 
-    let Ok(dir) = std::env::var("CH_SNAPSHOT_DIR") else {
+    let Ok(dir) = env::var("CH_SNAPSHOT_DIR") else {
         eprintln!("CH_SNAPSHOT_DIR unset; skipping real-snapshot console test");
         return;
     };
     let dir = PathBuf::from(dir);
-    let state_json = std::fs::read_to_string(dir.join("state.json")).expect("read state.json");
+    let state_json = fs::read_to_string(dir.join("state.json")).expect("read state.json");
     let mem_ranges = dir.join("snapshot").join("memory-ranges");
 
     let snap = Snapshot::from_state_json(&state_json).expect("parse snapshot");
@@ -1511,7 +1513,6 @@ fn hvf_rehydrate_real_cloud_snapshot_emits_console() {
 #[cfg(feature = "kvm-snapshot")]
 #[test]
 fn hvf_gic_requires_redist_above_dist() {
-    use hypervisor::arch::aarch64::gic::VgicConfig;
 
     let mk = |dist: u64, redist: u64, rsize: u64| VgicConfig {
         vcpu_count: 1,

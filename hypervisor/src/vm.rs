@@ -425,7 +425,8 @@ pub trait Vm: Send + Sync + Any {
     ) -> Result<()> {
         Ok(())
     }
-    /// Create a device that is used for passthrough
+    /// Create a device that is used for passthrough (Linux/VFIO only)
+    #[cfg(target_os = "linux")]
     fn create_passthrough_device(&self) -> Result<vfio_ioctls::VfioDeviceFd>;
     /// Start logging dirty pages
     fn start_dirty_log(&self) -> Result<()>;
