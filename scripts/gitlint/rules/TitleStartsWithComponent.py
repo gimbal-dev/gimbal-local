@@ -35,6 +35,7 @@ class TitleStartsWithComponent(LineRule):
             'block',
             'build',
             'ch-remote',
+            'chm',
             'ci',
             'devices',
             'docs',

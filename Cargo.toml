@@ -18,6 +18,7 @@ members = [
   "api_client",
   "arch",
   "block",
+  "chm",
   "cloud-hypervisor",
   "devices",
   "event_monitor",

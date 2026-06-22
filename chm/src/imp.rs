@@ -1,0 +1,285 @@
+// Copyright © 2024 Cloud Hypervisor contributors
+//
+// SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
+
+//! macOS / Apple-Silicon implementation of the `chm` CLI.
+
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::ExitCode;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use std::{env, fs, io};
+
+use hypervisor::hvf::devices::{MmioBus, Pl011};
+use hypervisor::hvf::rehydrate::{rehydrate, Snapshot};
+use hypervisor::{Vcpu, VmExit, VmOps};
+
+/// cloud-hypervisor's arm64 PL011 lives at the base of the mapped-IO window.
+const PL011_BASE: u64 = 0x0900_0000;
+const PL011_SIZE: u64 = 0x1000;
+
+/// Default seconds of total console silence after which `chm` stops on its own.
+/// The resumed guest currently runs until it needs a device this build does not
+/// yet model (virtio-block/net/console over PCI), at which point it goes quiet;
+/// without this it would otherwise sit parked in WFI forever. `--idle-exit 0`
+/// disables it for an open-ended session.
+const DEFAULT_IDLE_EXIT_SECS: u64 = 10;
+
+struct Args {
+    snapshot_dir: PathBuf,
+    max_seconds: u64,
+    idle_exit_secs: u64,
+    quiet: bool,
+}
+
+pub fn main() -> ExitCode {
+    let raw: Vec<String> = env::args().skip(1).collect();
+    match parse(&raw) {
+        Parsed::Run(args) => match run(&args) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("chm: error: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Parsed::Help => {
+            print!("{}", usage());
+            ExitCode::SUCCESS
+        }
+        Parsed::Version => {
+            println!("chm {}", env!("CARGO_PKG_VERSION"));
+            ExitCode::SUCCESS
+        }
+        Parsed::Error(msg) => {
+            eprintln!("chm: {msg}\n");
+            eprint!("{}", usage());
+            ExitCode::FAILURE
+        }
+    }
+}
+
+enum Parsed {
+    Run(Args),
+    Help,
+    Version,
+    Error(String),
+}
+
+fn usage() -> String {
+    "chm — Cloud Hypervisor for macOS (Apple Silicon)\n\
+     \n\
+     Rehydrate a Cloud Hypervisor arm64 snapshot onto Hypervisor.framework and\n\
+     resume it locally, streaming the guest serial console to stdout.\n\
+     \n\
+     USAGE:\n    \
+         chm run <SNAPSHOT_DIR> [OPTIONS]\n    \
+         chm restore <SNAPSHOT_DIR> [OPTIONS]   (alias for run)\n\
+     \n\
+     ARGS:\n    \
+         <SNAPSHOT_DIR>    Directory holding `state.json` and\n                      \
+         `snapshot/memory-ranges` (a `ch-snapshot` directory).\n\
+     \n\
+     OPTIONS:\n    \
+         --max-seconds <N>   Stop after N seconds of wall-clock run time\n                        \
+         (0 = unlimited; default 0).\n    \
+         --idle-exit <N>     Stop after N seconds with no console output\n                        \
+         (0 = disabled; default 10).\n    \
+         --quiet             Suppress the informational banner on stderr.\n    \
+         -h, --help          Print this help.\n    \
+         -V, --version       Print the version.\n\
+     \n\
+     NOTE: the binary must be code-signed with the\n      \
+     `com.apple.security.hypervisor` entitlement (see scripts/build-chm.sh).\n"
+        .to_string()
+}
+
+fn parse(raw: &[String]) -> Parsed {
+    let mut snapshot_dir: Option<PathBuf> = None;
+    let mut max_seconds = 0u64;
+    let mut idle_exit_secs = DEFAULT_IDLE_EXIT_SECS;
+    let mut quiet = false;
+
+    let mut i = 0;
+    // A leading `run`/`restore` subcommand is accepted but optional.
+    if i < raw.len() && (raw[i] == "run" || raw[i] == "restore") {
+        i += 1;
+    }
+
+    while i < raw.len() {
+        let a = &raw[i];
+        match a.as_str() {
+            "-h" | "--help" => return Parsed::Help,
+            "-V" | "--version" => return Parsed::Version,
+            "--quiet" => quiet = true,
+            "--max-seconds" | "--idle-exit" => {
+                i += 1;
+                let Some(v) = raw.get(i) else {
+                    return Parsed::Error(format!("{a} requires a value"));
+                };
+                let Ok(n) = v.parse::<u64>() else {
+                    return Parsed::Error(format!("{a}: `{v}` is not a number"));
+                };
+                if a == "--max-seconds" {
+                    max_seconds = n;
+                } else {
+                    idle_exit_secs = n;
+                }
+            }
+            other if other.starts_with('-') => {
+                return Parsed::Error(format!("unknown option `{other}`"));
+            }
+            _ => {
+                if snapshot_dir.is_some() {
+                    return Parsed::Error(format!("unexpected extra argument `{a}`"));
+                }
+                snapshot_dir = Some(PathBuf::from(a));
+            }
+        }
+        i += 1;
+    }
+
+    match snapshot_dir {
+        Some(snapshot_dir) => Parsed::Run(Args {
+            snapshot_dir,
+            max_seconds,
+            idle_exit_secs,
+            quiet,
+        }),
+        None => Parsed::Error("missing <SNAPSHOT_DIR>".to_string()),
+    }
+}
+
+fn run(args: &Args) -> Result<ExitCode, String> {
+    let dir = &args.snapshot_dir;
+    let state_path = dir.join("state.json");
+    let mem_ranges = dir.join("snapshot").join("memory-ranges");
+
+    if !state_path.exists() {
+        return Err(format!(
+            "{} not found — is `{}` a Cloud Hypervisor snapshot directory?",
+            state_path.display(),
+            dir.display()
+        ));
+    }
+    if !mem_ranges.exists() {
+        return Err(format!("{} not found", mem_ranges.display()));
+    }
+
+    let state_json =
+        fs::read_to_string(&state_path).map_err(|e| format!("read state.json: {e}"))?;
+    let snap = Snapshot::from_state_json(&state_json).map_err(|e| format!("parse snapshot: {e}"))?;
+
+    let num_vcpus = snap.num_vcpus();
+    let total_ram: u64 = snap.mem_mappings.iter().map(|m| m.size).sum();
+
+    if !args.quiet {
+        banner(dir, &mem_ranges, num_vcpus, total_ram);
+    }
+
+    // Device model: a bus with a real PL011 at the guest's serial base.
+    let uart = Arc::new(Pl011::new());
+    let mut bus = MmioBus::new();
+    bus.add(PL011_BASE, PL011_SIZE, uart.clone());
+    let vm_ops: Arc<dyn VmOps> = Arc::new(bus);
+
+    let hv = hypervisor::new().map_err(|e| {
+        format!(
+            "hypervisor::new() failed: {e}\n\
+             (is the binary code-signed with the hypervisor entitlement? \
+             see scripts/build-chm.sh)"
+        )
+    })?;
+
+    let mut rvm =
+        rehydrate(hv.as_ref(), &snap, &mem_ranges, &vm_ops).map_err(|e| format!("rehydrate: {e}"))?;
+
+    if num_vcpus > 1 && !args.quiet {
+        eprintln!(
+            "chm: note: snapshot has {num_vcpus} vCPUs; resuming vCPU0 only \
+             (SMP secondary-core bring-up via PSCI CPU_ON is not yet wired)."
+        );
+    }
+
+    if !args.quiet {
+        eprintln!("chm: guest resumed — serial console follows.\n");
+    }
+
+    let vcpu = rvm.vcpus[0].as_mut();
+    let outcome = run_loop(vcpu, &uart, args)?;
+
+    if !args.quiet {
+        eprintln!();
+        match outcome {
+            Outcome::PoweredOff => eprintln!("chm: guest powered off."),
+            Outcome::MaxSeconds => {
+                eprintln!("chm: reached --max-seconds limit; stopping.");
+            }
+            Outcome::Idle(secs) => eprintln!(
+                "chm: guest produced no console output for {secs}s — stopping \
+                 (it is likely waiting on a device this build does not yet \
+                 model). Use --idle-exit 0 to keep running."
+            ),
+            Outcome::ConsoleClosed => eprintln!("chm: console closed; stopping."),
+        }
+    }
+
+    Ok(ExitCode::SUCCESS)
+}
+
+enum Outcome {
+    PoweredOff,
+    MaxSeconds,
+    Idle(u64),
+    ConsoleClosed,
+}
+
+fn run_loop(vcpu: &mut dyn Vcpu, uart: &Pl011, args: &Args) -> Result<Outcome, String> {
+    let start = Instant::now();
+    let mut last_output = Instant::now();
+    let mut stdout = io::stdout();
+
+    let max = (args.max_seconds > 0).then(|| Duration::from_secs(args.max_seconds));
+    let idle = (args.idle_exit_secs > 0).then(|| Duration::from_secs(args.idle_exit_secs));
+
+    loop {
+        match vcpu.run().map_err(|e| format!("vCPU run: {e}"))? {
+            VmExit::Ignore => {}
+            VmExit::Shutdown | VmExit::Reset => return Ok(Outcome::PoweredOff),
+            other => return Err(format!("unexpected guest exit: {other:?}")),
+        }
+
+        let bytes = uart.take_output();
+        if !bytes.is_empty() {
+            match stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
+                Ok(()) => last_output = Instant::now(),
+                // The console consumer went away (e.g. piped into `head`): stop
+                // cleanly rather than treating a closed pipe as a failure.
+                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
+                    return Ok(Outcome::ConsoleClosed);
+                }
+                Err(e) => return Err(format!("write console: {e}")),
+            }
+        }
+
+        if let Some(max) = max
+            && start.elapsed() >= max
+        {
+            return Ok(Outcome::MaxSeconds);
+        }
+        if let Some(idle) = idle
+            && last_output.elapsed() >= idle
+        {
+            return Ok(Outcome::Idle(args.idle_exit_secs));
+        }
+    }
+}
+
+fn banner(dir: &Path, mem_ranges: &Path, num_vcpus: u32, total_ram: u64) {
+    let mib = total_ram / (1024 * 1024);
+    eprintln!("chm — Cloud Hypervisor for macOS (Apple Silicon)");
+    eprintln!("  snapshot:  {}", dir.display());
+    eprintln!("  memory:    {} ({mib} MiB)", mem_ranges.display());
+    eprintln!("  vCPUs:     {num_vcpus}");
+    eprintln!("  backend:   Apple Hypervisor.framework (managed GICv3)");
+}

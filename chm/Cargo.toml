@@ -1,0 +1,31 @@
+# cloud-hypervisor-mac (`chm`)
+#
+# A standalone macOS / Apple Silicon executable that rehydrates a cloud
+# Cloud Hypervisor arm64 KVM snapshot onto Apple's Hypervisor.framework and
+# resumes it locally — the user-facing front door of the HVF port.
+#
+# The real engine lives in the in-tree `hypervisor` crate's `hvf` backend; this
+# crate is a thin CLI over `hypervisor::hvf::rehydrate`. The dependency on the
+# `hvf`/`kvm-snapshot` feature set is target-gated to macOS+aarch64 so that a
+# `cargo build --workspace` on Linux (CI) does not try to compile the
+# Hypervisor.framework FFI. On other targets the binary builds to a small stub
+# that explains it only runs on Apple Silicon.
+[package]
+authors = ["The Cloud Hypervisor Authors"]
+edition.workspace = true
+name = "cloud-hypervisor-mac"
+rust-version.workspace = true
+version = "0.1.0"
+
+[[bin]]
+name = "chm"
+path = "src/main.rs"
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+hypervisor = { path = "../hypervisor", default-features = false, features = [
+  "hvf",
+  "kvm-snapshot",
+] }
+
+[lints]
+workspace = true
