@@ -11,13 +11,63 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{env, fs, io};
 
+use crate::serve;
+
 use hypervisor::hvf::devices::{MmioBus, Pl011};
 use hypervisor::hvf::rehydrate::{rehydrate, Snapshot};
 use hypervisor::{Vcpu, VmExit, VmOps};
 
 /// cloud-hypervisor's arm64 PL011 lives at the base of the mapped-IO window.
-const PL011_BASE: u64 = 0x0900_0000;
-const PL011_SIZE: u64 = 0x1000;
+pub(crate) const PL011_BASE: u64 = 0x0900_0000;
+pub(crate) const PL011_SIZE: u64 = 0x1000;
+
+/// A snapshot loaded off disk and ready to rehydrate.
+pub(crate) struct Loaded {
+    pub snap: Snapshot,
+    pub mem_ranges: PathBuf,
+    pub num_vcpus: u32,
+    pub total_ram: u64,
+}
+
+/// Read and parse a `ch-snapshot` directory (`state.json` +
+/// `snapshot/memory-ranges`). Shared by `chm run` and the `chm serve` daemon.
+pub(crate) fn load_snapshot(dir: &Path) -> Result<Loaded, String> {
+    let state_path = dir.join("state.json");
+    let mem_ranges = dir.join("snapshot").join("memory-ranges");
+
+    if !state_path.exists() {
+        return Err(format!(
+            "{} not found — is `{}` a Cloud Hypervisor snapshot directory?",
+            state_path.display(),
+            dir.display()
+        ));
+    }
+    if !mem_ranges.exists() {
+        return Err(format!("{} not found", mem_ranges.display()));
+    }
+
+    let state_json =
+        fs::read_to_string(&state_path).map_err(|e| format!("read state.json: {e}"))?;
+    let snap = Snapshot::from_state_json(&state_json).map_err(|e| format!("parse snapshot: {e}"))?;
+    let num_vcpus = snap.num_vcpus();
+    let total_ram: u64 = snap.mem_mappings.iter().map(|m| m.size).sum();
+
+    Ok(Loaded {
+        snap,
+        mem_ranges,
+        num_vcpus,
+        total_ram,
+    })
+}
+
+/// Build the device model: a bus carrying a real PL011 at the guest's serial
+/// base. Returns the UART (to drain output) alongside the bus as `VmOps`.
+pub(crate) fn build_vm_ops() -> (Arc<Pl011>, Arc<dyn VmOps>) {
+    let uart = Arc::new(Pl011::new());
+    let mut bus = MmioBus::new();
+    bus.add(PL011_BASE, PL011_SIZE, uart.clone());
+    (uart, Arc::new(bus))
+}
 
 /// Default seconds of total console silence after which `chm` stops on its own.
 /// The resumed guest currently runs until it needs a device this build does not
@@ -35,27 +85,31 @@ struct Args {
 
 pub fn main() -> ExitCode {
     let raw: Vec<String> = env::args().skip(1).collect();
-    match parse(&raw) {
-        Parsed::Run(args) => match run(&args) {
-            Ok(code) => code,
-            Err(e) => {
-                eprintln!("chm: error: {e}");
+    match raw.first().map(String::as_str) {
+        Some("serve") => serve::serve_main(&raw[1..]),
+        Some("ctl") => serve::ctl_main(&raw[1..]),
+        _ => match parse(&raw) {
+            Parsed::Run(args) => match run(&args) {
+                Ok(code) => code,
+                Err(e) => {
+                    eprintln!("chm: error: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            Parsed::Help => {
+                print!("{}", usage());
+                ExitCode::SUCCESS
+            }
+            Parsed::Version => {
+                println!("chm {}", env!("CARGO_PKG_VERSION"));
+                ExitCode::SUCCESS
+            }
+            Parsed::Error(msg) => {
+                eprintln!("chm: {msg}\n");
+                eprint!("{}", usage());
                 ExitCode::FAILURE
             }
         },
-        Parsed::Help => {
-            print!("{}", usage());
-            ExitCode::SUCCESS
-        }
-        Parsed::Version => {
-            println!("chm {}", env!("CARGO_PKG_VERSION"));
-            ExitCode::SUCCESS
-        }
-        Parsed::Error(msg) => {
-            eprintln!("chm: {msg}\n");
-            eprint!("{}", usage());
-            ExitCode::FAILURE
-        }
     }
 }
 
@@ -74,7 +128,9 @@ fn usage() -> String {
      \n\
      USAGE:\n    \
          chm run <SNAPSHOT_DIR> [OPTIONS]\n    \
-         chm restore <SNAPSHOT_DIR> [OPTIONS]   (alias for run)\n\
+         chm restore <SNAPSHOT_DIR> [OPTIONS]   (alias for run)\n    \
+         chm serve <LIBRARY_DIR> [OPTIONS]      (background daemon)\n    \
+         chm ctl <COMMAND> [ARG] [--socket P]   (talk to a daemon)\n\
      \n\
      ARGS:\n    \
          <SNAPSHOT_DIR>    Directory holding `state.json` and\n                      \
@@ -88,6 +144,18 @@ fn usage() -> String {
          --quiet             Suppress the informational banner on stderr.\n    \
          -h, --help          Print this help.\n    \
          -V, --version       Print the version.\n\
+     \n\
+     DAEMON:\n    \
+         chm serve <LIBRARY_DIR> [--socket PATH] [--idle-exit N]\n                        \
+         [--max-seconds N]\n      \
+         Host a snapshot library (a `ch-snapshot` dir, or a directory of\n      \
+         them) behind a Unix socket (default $TMPDIR/chm.sock).\n    \
+         chm ctl list                List snapshots in the library.\n    \
+         chm ctl status              Show daemon / running-VM status.\n    \
+         chm ctl start <name>        Resume a snapshot by name.\n    \
+         chm ctl console             Stream the running guest console.\n    \
+         chm ctl stop                Stop the running guest.\n    \
+         chm ctl shutdown            Stop the guest and exit the daemon.\n\
      \n\
      NOTE: the binary must be code-signed with the\n      \
      `com.apple.security.hypervisor` entitlement (see scripts/build-chm.sh).\n"
@@ -152,36 +220,14 @@ fn parse(raw: &[String]) -> Parsed {
 
 fn run(args: &Args) -> Result<ExitCode, String> {
     let dir = &args.snapshot_dir;
-    let state_path = dir.join("state.json");
-    let mem_ranges = dir.join("snapshot").join("memory-ranges");
-
-    if !state_path.exists() {
-        return Err(format!(
-            "{} not found — is `{}` a Cloud Hypervisor snapshot directory?",
-            state_path.display(),
-            dir.display()
-        ));
-    }
-    if !mem_ranges.exists() {
-        return Err(format!("{} not found", mem_ranges.display()));
-    }
-
-    let state_json =
-        fs::read_to_string(&state_path).map_err(|e| format!("read state.json: {e}"))?;
-    let snap = Snapshot::from_state_json(&state_json).map_err(|e| format!("parse snapshot: {e}"))?;
-
-    let num_vcpus = snap.num_vcpus();
-    let total_ram: u64 = snap.mem_mappings.iter().map(|m| m.size).sum();
+    let loaded = load_snapshot(dir)?;
 
     if !args.quiet {
-        banner(dir, &mem_ranges, num_vcpus, total_ram);
+        banner(dir, &loaded.mem_ranges, loaded.num_vcpus, loaded.total_ram);
     }
 
     // Device model: a bus with a real PL011 at the guest's serial base.
-    let uart = Arc::new(Pl011::new());
-    let mut bus = MmioBus::new();
-    bus.add(PL011_BASE, PL011_SIZE, uart.clone());
-    let vm_ops: Arc<dyn VmOps> = Arc::new(bus);
+    let (uart, vm_ops) = build_vm_ops();
 
     let hv = hypervisor::new().map_err(|e| {
         format!(
@@ -191,13 +237,14 @@ fn run(args: &Args) -> Result<ExitCode, String> {
         )
     })?;
 
-    let mut rvm =
-        rehydrate(hv.as_ref(), &snap, &mem_ranges, &vm_ops).map_err(|e| format!("rehydrate: {e}"))?;
+    let mut rvm = rehydrate(hv.as_ref(), &loaded.snap, &loaded.mem_ranges, &vm_ops)
+        .map_err(|e| format!("rehydrate: {e}"))?;
 
-    if num_vcpus > 1 && !args.quiet {
+    if loaded.num_vcpus > 1 && !args.quiet {
         eprintln!(
-            "chm: note: snapshot has {num_vcpus} vCPUs; resuming vCPU0 only \
-             (SMP secondary-core bring-up via PSCI CPU_ON is not yet wired)."
+            "chm: note: snapshot has {} vCPUs; resuming vCPU0 only \
+             (SMP secondary-core bring-up via PSCI CPU_ON is not yet wired).",
+            loaded.num_vcpus
         );
     }
 

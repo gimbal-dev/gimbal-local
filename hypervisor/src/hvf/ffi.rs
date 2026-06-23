@@ -135,6 +135,12 @@ unsafe extern "C" {
     pub fn hv_vcpu_set_sys_reg(vcpu: u64, reg: u16, value: u64) -> i32;
     pub fn hv_vcpu_get_sys_reg(vcpu: u64, reg: u16, value: *mut u64) -> i32;
     pub fn hv_vcpu_run(vcpu: u64) -> i32;
+    // Force the listed vCPUs to return from `hv_vcpu_run` promptly. Safe to call
+    // from a thread other than the one running the vCPU; the interrupted run
+    // returns with `HV_EXIT_REASON_CANCELED`. Used to interrupt a guest that is
+    // executing without trapping (e.g. a CPU-bound spin) so a host-side stop can
+    // take effect.
+    pub fn hv_vcpus_exit(vcpus: *const u64, vcpu_count: u32) -> i32;
     #[allow(dead_code)]
     pub fn hv_vcpu_set_pending_interrupt(vcpu: u64, ty: u32, pending: bool) -> i32;
     pub fn hv_vcpu_set_vtimer_mask(vcpu: u64, masked: bool) -> i32;

@@ -816,6 +816,19 @@ impl Vcpu for HvfVcpu {
         Ok(())
     }
 
+    fn exit_signal(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        let id = self.id;
+        Some(Arc::new(move || {
+            let ids = [id];
+            // SAFETY: `hv_vcpus_exit` is explicitly safe to call from a thread
+            // other than the one running the vCPU; it only needs valid vcpu
+            // ids and forces them out of `hv_vcpu_run` (returning CANCELED).
+            unsafe {
+                let _ = hv_vcpus_exit(ids.as_ptr(), 1);
+            }
+        }))
+    }
+
     fn run(&mut self) -> std::result::Result<VmExit, HypervisorCpuError> {
         // SAFETY: FFI on the owning thread.
         let ret = unsafe { hv_vcpu_run(self.id) };

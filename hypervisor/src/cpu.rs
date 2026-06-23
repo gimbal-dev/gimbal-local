@@ -10,6 +10,8 @@
 //
 //
 
+use std::sync::Arc;
+
 use thiserror::Error;
 #[cfg(not(target_arch = "riscv64"))]
 use {anyhow::anyhow, vm_memory::GuestAddress};
@@ -371,6 +373,14 @@ pub type Result<T> = anyhow::Result<T, HypervisorCpuError>;
 /// Trait to represent a generic Vcpu
 ///
 pub trait Vcpu: Send + Sync {
+    /// Return a handle that, when invoked from another thread, forces this vCPU
+    /// to return from an in-progress `run()` promptly. Backends that cannot
+    /// interrupt a running vCPU return `None` (the default); the macOS HVF
+    /// backend implements it via `hv_vcpus_exit` so a host-side stop can take
+    /// effect even while the guest is executing without trapping.
+    fn exit_signal(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        None
+    }
     ///
     /// Returns StandardRegisters with default value set
     ///
