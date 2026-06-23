@@ -15,7 +15,7 @@ use crate::serve;
 
 use hypervisor::hvf::devices::{MmioBus, Pl011};
 use hypervisor::hvf::rehydrate::{rehydrate, Snapshot};
-use hypervisor::hvf::virtio::devmgr;
+use hypervisor::hvf::virtio::{devmgr, its};
 use hypervisor::hvf::virtio::GuestMemory;
 use hypervisor::{Vcpu, VmExit, VmOps};
 
@@ -99,6 +99,12 @@ pub(crate) fn wire_virtio(
         .map_err(|e| format!("create overlay dir {}: {e}", overlay_dir.display()))?;
 
     let mut summary = Vec::with_capacity(descs.len());
+    // One ITS translator shared by every device, built from the snapshot's
+    // captured gic-v3-its tables. Resolved completions land in the sink.
+    let its_engine = its::Its::from_snapshot_state(state_json)
+        .ok()
+        .map(Arc::new);
+    let sink: Arc<dyn its::LpiSink> = Arc::new(its::LoggingLpiSink::default());
     for desc in &descs {
         let kind = match &desc.backend {
             devmgr::BackendKind::Block { nsectors, .. } => {
@@ -108,7 +114,21 @@ pub(crate) fn wire_virtio(
         };
         let (base, size, dev) = devmgr::build_device(desc, guest_mem.clone(), overlay_dir)
             .map_err(|e| format!("build device {}: {e}", desc.name))?;
-        bus.add(base, size, dev);
+        // Replace the logging injector with the ITS data path so the device's
+        // MSI-X completions resolve to the guest's real LPIs.
+        if let Some(its) = &its_engine
+            && !desc.vector_events.is_empty()
+            && desc.device_id != 0
+        {
+            dev.set_injector(Box::new(its::ItsInjector::new(
+                desc.name.clone(),
+                its.clone(),
+                guest_mem.clone(),
+                desc.device_id,
+                desc.vector_events.clone(),
+                sink.clone(),
+            )));
+        }        bus.add(base, size, dev);
         summary.push(format!("{kind} @ BAR {base:#x}"));
     }
     Ok(summary)

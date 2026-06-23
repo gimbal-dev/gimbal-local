@@ -79,6 +79,11 @@ pub struct VirtioDeviceDesc {
     pub queues: Vec<QueueState>,
     /// Per-queue MSI-X vector.
     pub queue_vectors: Vec<u16>,
+    /// ITS `DeviceID` (the PCI requester id derived from this device's BDF).
+    pub device_id: u32,
+    /// MSI-X `msg_data` (the ITS `EventID`) for each table vector, indexed by
+    /// vector number.
+    pub vector_events: Vec<u32>,
     /// Restored `device_status` (expected to include DRIVER_OK = 0x4).
     pub device_status: u8,
     /// The backend to attach.
@@ -117,6 +122,9 @@ pub fn parse_devices(state_json: &str) -> Result<Vec<VirtioDeviceDesc>, DevMgrEr
         .ok_or_else(|| malformed("missing device-manager snapshots"))?;
 
     let mut out = Vec::new();
+    // The device tree (in the device-manager's own state) records each
+    // transport's PCI BDF, which is the ITS DeviceID source.
+    let bdf_map = parse_bdf_map(&root);
     for (key, node) in dm {
         let Some(backing_name) = key.strip_prefix("_virtio-pci-") else {
             continue;
@@ -124,11 +132,54 @@ pub fn parse_devices(state_json: &str) -> Result<Vec<VirtioDeviceDesc>, DevMgrEr
         let backing = dm
             .get(backing_name)
             .ok_or_else(|| malformed(format!("transport `{key}` has no backing `{backing_name}`")))?;
-        out.push(parse_one(backing_name, node, backing)?);
+        let mut desc = parse_one(backing_name, node, backing)?;
+        desc.device_id = bdf_map
+            .get(key.as_str())
+            .copied()
+            .flatten()
+            .unwrap_or(0);
+        out.push(desc);
     }
     // Stable order (BAR address) so wiring is deterministic.
     out.sort_by_key(|d| d.bar_base);
     Ok(out)
+}
+
+/// Parse the device-manager `device_tree` into a map of transport id -> ITS
+/// `DeviceID` (decoded from the recorded `pci_bdf`, `None` for non-PCI nodes).
+fn parse_bdf_map(root: &Value) -> std::collections::HashMap<String, Option<u32>> {
+    let mut map = std::collections::HashMap::new();
+    let dm_state = root
+        .pointer("/snapshots/device-manager/snapshot_data/state")
+        .and_then(Value::as_str)
+        .and_then(|s| serde_json::from_str::<Value>(s).ok());
+    if let Some(tree) = dm_state
+        .as_ref()
+        .and_then(|v| v.get("device_tree"))
+        .and_then(Value::as_object)
+    {
+        for (id, node) in tree {
+            let dev_id = node
+                .get("pci_bdf")
+                .and_then(Value::as_str)
+                .and_then(bdf_to_device_id);
+            map.insert(id.clone(), dev_id);
+        }
+    }
+    map
+}
+
+/// Decode a `"DDDD:BB:DD.F"` PCI BDF string into the ITS `DeviceID` (requester
+/// id): `(bus << 8) | (device << 3) | function`.
+fn bdf_to_device_id(bdf: &str) -> Option<u32> {
+    // segment:bus:device.function
+    let (head, func) = bdf.rsplit_once('.')?;
+    let mut parts = head.split(':');
+    let _segment = parts.next()?;
+    let bus = u32::from_str_radix(parts.next()?, 16).ok()?;
+    let device = u32::from_str_radix(parts.next()?, 16).ok()?;
+    let func: u32 = func.parse().ok()?;
+    Some((bus << 8) | (device << 3) | (func & 0x7))
 }
 
 fn parse_one(
@@ -192,6 +243,19 @@ fn parse_one(
         .map(|a| a.iter().filter_map(Value::as_u64).map(|v| v as u16).collect())
         .unwrap_or_default();
 
+    // MSI-X table: each vector's `msg_data` is the ITS EventID the device emits.
+    let vector_events: Vec<u32> = subs
+        .get("msix_config")
+        .and_then(|m| embedded(m).ok())
+        .and_then(|m| {
+            m.get("table_entries").and_then(Value::as_array).map(|a| {
+                a.iter()
+                    .map(|e| e.get("msg_data").and_then(Value::as_u64).unwrap_or(0) as u32)
+                    .collect()
+            })
+        })
+        .unwrap_or_default();
+
     // Backing device state: features + device type.
     let bstate = embedded(backing)?;
     let features = u64_at(&bstate, "acked_features")
@@ -219,6 +283,8 @@ fn parse_one(
         features,
         queues,
         queue_vectors,
+        device_id: 0,
+        vector_events,
         device_status,
         backend,
     })
@@ -354,6 +420,10 @@ mod tests {
         assert_eq!(blk.queues[0].size, 128);
         assert_eq!(blk.queues[0].desc, 1142239232);
         assert_eq!(blk.queue_vectors, vec![1]);
+        // ITS DeviceID from BDF 0000:00:01.0 -> (1<<3) = 0x8; MSI-X EventIDs are
+        // the msg_data of each vector (config vec 0 -> event 0, queue vec 1 -> 1).
+        assert_eq!(blk.device_id, 0x8);
+        assert_eq!(blk.vector_events, vec![0, 1]);
         // EVENT_IDX + VERSION_1 negotiated.
         assert!(blk.features & super::super::features::RING_EVENT_IDX != 0);
         assert!(blk.features & super::super::features::VERSION_1 != 0);
@@ -365,5 +435,7 @@ mod tests {
         // virtio-rng uses a 64-bit BAR at 0x2_0000_0000 (BAR0=0x4, BAR1=0x2).
         let rng = devs.iter().find(|d| matches!(d.backend, BackendKind::Rng)).unwrap();
         assert_eq!(rng.bar_base, 0x2_0000_0000);
+        // BDF 0000:00:03.0 -> (3<<3) = 0x18.
+        assert_eq!(rng.device_id, 0x18);
     }
 }
