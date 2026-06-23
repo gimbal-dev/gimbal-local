@@ -69,6 +69,15 @@ const GIC_V3_REDIST_SIZE: u64 = 0x02_0000;
 /// relocated here (distributor first, redistributors above) to satisfy Apple's
 /// `hv_gic_create` ordering constraint; see [`Snapshot::vgic_config`].
 const GIC_RELOCATED_BASE: u64 = 0x0800_0000;
+/// Host-side MSI doorbell window for the managed GIC. A GICv2M-routed snapshot
+/// delivers virtio completions as message-based SPIs via `hv_gic_send_msi`,
+/// which requires the GIC to be created with a reserved MSI region. This IPA
+/// sits above the relocated distributor/redistributors and below the guest's
+/// PCI MMIO (0x1000_0000), so it collides with neither; it is a host-only
+/// doorbell (the guest never accesses it — it drives ICC system registers and
+/// its own, unmapped, v2m frame). Proven on hardware by the M12/M14 tests.
+const GIC_MSI_DOORBELL_BASE: u64 = 0x0c00_0000;
+const GIC_MSI_DOORBELL_SIZE: u64 = 0x1_0000;
 
 /// Errors raised while parsing or rehydrating a snapshot.
 #[derive(Debug, thiserror::Error)]
@@ -272,9 +281,13 @@ impl Snapshot {
             dist_size: GIC_V3_DIST_SIZE,
             redists_addr,
             redists_size,
-            // Apple's managed GIC ignores the MSI frame (no ITS); leave unset.
-            msi_addr: 0,
-            msi_size: 0,
+            // Reserve the host-side MSI doorbell so the managed GIC accepts
+            // `hv_gic_send_msi`: a GICv2M-routed snapshot delivers virtio
+            // completions as message-based SPIs through this region. (An
+            // ITS/LPI snapshot has no deliverable MSIs and is rejected by the
+            // load-time guard, but reserving the region is harmless for it.)
+            msi_addr: GIC_MSI_DOORBELL_BASE,
+            msi_size: GIC_MSI_DOORBELL_SIZE,
             nr_irqs: self.num_irq,
         }
     }
@@ -457,6 +470,21 @@ pub fn rehydrate(
     }
 
     // --- distributor (global) ----------------------------------------------
+    //
+    // Skip the distributor *active* SPI registers (GICD_ICACTIVER 0x380 /
+    // GICD_ISACTIVER 0x300, the 0x300..0x400 block). Apple's managed GIC cannot
+    // accept a cold-restored active SPI: hv_gic_set_distributor_reg(ISACTIVER)
+    // walks an internal active-redistributor list that is only built as the GIC
+    // itself delivers an interrupt, so a restore-time write dereferences a null
+    // entry and faults (proven on hardware, macOS 26.x). A GICv2M-routed
+    // snapshot is the first to carry active SPIs at all (virtio completions are
+    // SPIs, not LPIs), which is why earlier ITS snapshots never hit this.
+    //
+    // Correctness is preserved without the distributor active bit: a vCPU that
+    // was mid-IRQ-handler at snapshot has its CPU-interface active-priority
+    // state (ICC_AP1R*) restored via set_state, so it still performs the
+    // priority drop on EOI and returns from the handler. The pending registers
+    // (ISPENDR/ICPENDR) ARE restored, so any not-yet-taken completion fires.
     {
         let mut guard = gic.lock().unwrap();
         let concrete = guard
@@ -466,6 +494,10 @@ pub fn rehydrate(
         let dist_pairs = dist_to_hvf(&snap.gic_dist)
             .ok_or_else(|| RehydrateError::Translate("distributor dump did not translate".into()))?;
         for (reg, val) in dist_pairs {
+            // GICD_ISACTIVER (0x300..0x380) / GICD_ICACTIVER (0x380..0x400).
+            if (0x300..0x400).contains(&reg) {
+                continue;
+            }
             concrete
                 .set_distributor_reg(reg, val)
                 .map_err(|e| RehydrateError::Hv(anyhow!("set GICD[{reg:#x}]: {e}")))?;

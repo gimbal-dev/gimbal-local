@@ -339,10 +339,29 @@ pub fn build_device(
             disk_path,
             nsectors,
         } => {
-            let overlay = overlay_dir.join(sanitize(&format!("{}-{}", desc.name, file_stem(disk_path))));
-            ensure_overlay(&overlay, *nsectors)?;
-            let fb = FileBackend::open(&overlay, *nsectors)
-                .map_err(|e| DevMgrError::Io(format!("open overlay {}: {e}", overlay.display())))?;
+            // Prefer a real disk image shipped alongside the snapshot at
+            // `<snapshot>/disks/<device-name>.raw`. CH snapshots reference their
+            // disks by host path and do not embed them, so a snapshot packaged
+            // WITH its disks lets the guest read its real filesystem (and boot
+            // for real) rather than the zero-filled overlay. The shipped image
+            // is opened read-write directly (it is a per-snapshot copy, so guest
+            // writes are local and do not touch the capture source). Absent a
+            // shipped image, fall back to the sparse zero overlay (the data path
+            // still completes; reads of unwritten sectors return zero).
+            let backing = match shipped_backing(overlay_dir, &desc.name) {
+                Some(real) => real,
+                None => {
+                    let overlay = overlay_dir.join(sanitize(&format!(
+                        "{}-{}",
+                        desc.name,
+                        file_stem(disk_path)
+                    )));
+                    ensure_overlay(&overlay, *nsectors)?;
+                    overlay
+                }
+            };
+            let fb = FileBackend::open(&backing, *nsectors)
+                .map_err(|e| DevMgrError::Io(format!("open backing {}: {e}", backing.display())))?;
             (
                 Backend::Block(BlockDevice::new(Box::new(fb), &desc.name)),
                 blk_device_config(*nsectors),
@@ -368,6 +387,23 @@ pub fn build_device(
         },
     ));
     Ok((desc.bar_base, CAPABILITY_BAR_SIZE, dev))
+}
+
+/// Resolve a real disk image shipped alongside the snapshot for `dev_name`.
+///
+/// `overlay_dir` is `<snapshot>/.chm-overlays`, so shipped disks live at
+/// `<snapshot>/disks/<device-name>.raw` (the device name is the snapshot's own
+/// node name, e.g. `_disk0`). Returns the path only when the file exists, so the
+/// caller falls back to a sparse overlay for snapshots packaged without disks.
+fn shipped_backing(overlay_dir: &std::path::Path, dev_name: &str) -> Option<std::path::PathBuf> {
+    let disks = overlay_dir.parent()?.join("disks");
+    for ext in ["raw", "img"] {
+        let cand = disks.join(format!("{}.{ext}", sanitize(dev_name)));
+        if cand.is_file() {
+            return Some(cand);
+        }
+    }
+    None
 }
 
 /// Create `path` as a sparse file of `nsectors * 512` bytes if it does not yet

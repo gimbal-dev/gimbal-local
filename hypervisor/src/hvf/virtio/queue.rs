@@ -248,6 +248,17 @@ impl Queue {
         self.next_avail = self.next_used;
         Ok(())
     }
+
+    /// The driver's published `avail.idx` (head of the available ring). Used at
+    /// resume time to detect requests left in-flight across a snapshot.
+    pub fn avail_idx_value(&self, mem: &GuestMemory) -> Result<u16, GuestMemError> {
+        self.avail_idx(mem)
+    }
+
+    /// The device's published `used.idx` (head of the used ring).
+    pub fn used_idx_value(&self, mem: &GuestMemory) -> Result<u16, GuestMemError> {
+        mem.read_u16(self.used + 2)
+    }
 }
 
 #[cfg(test)]

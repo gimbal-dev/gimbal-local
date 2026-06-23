@@ -16,7 +16,7 @@ use crate::serve;
 use hypervisor::hvf::devices::{MmioBus, Pl011};
 use hypervisor::hvf::gic::GicMsiSink;
 use hypervisor::hvf::rehydrate::{rehydrate, Snapshot};
-use hypervisor::hvf::virtio::pci::{MsiSink, MsiSpiInjector};
+use hypervisor::hvf::virtio::pci::{MsiSink, MsiSpiInjector, VirtioPciDevice};
 use hypervisor::hvf::virtio::{devmgr, its};
 use hypervisor::hvf::virtio::GuestMemory;
 use hypervisor::arch::aarch64::gic::Vgic;
@@ -150,6 +150,10 @@ pub(crate) fn wire_virtio(
         .map_err(|e| format!("create overlay dir {}: {e}", overlay_dir.display()))?;
 
     let mut summary = Vec::with_capacity(descs.len());
+    // Devices whose in-flight queues should be drained once on resume (only the
+    // deliverable message-SPI path; the logging ITS fallback has nothing to
+    // deliver). Drained after the whole tree is wired and the GIC is live.
+    let mut drainable: Vec<Arc<VirtioPciDevice>> = Vec::new();
     // An enabled gic-v3-its means completions are LPI-routed (only reachable
     // under the CHM_ALLOW_ITS_LPI bypass, since its_lpi_guard otherwise hard
     // fails first). Those resolve through the ITS but cannot be delivered, so
@@ -194,10 +198,17 @@ pub(crate) fn wire_virtio(
                     desc.vector_events.clone(),
                     sink.clone(),
                 )));
+                drainable.push(dev.clone());
             }
         }
         bus.add(base, size, dev);
         summary.push(format!("{kind} @ BAR {base:#x}"));
+    }
+    // Complete any requests left in-flight at snapshot time and deliver their
+    // interrupts, so a resumed guest waiting on pre-snapshot I/O (e.g. a mount
+    // reading the boot filesystem) makes progress instead of blocking forever.
+    for dev in &drainable {
+        dev.drain_on_resume();
     }
     Ok(summary)
 }

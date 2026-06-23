@@ -325,6 +325,9 @@ impl GicMsiSink {
 
 impl crate::hvf::virtio::pci::MsiSink for GicMsiSink {
     fn deliver_spi(&self, intid: u32) {
+        if std::env::var_os("CHM_TRACE_MSI").is_some() {
+            eprintln!("[gic-msi] delivering virtio completion as SPI {intid}");
+        }
         let mut guard = self.gic.lock().unwrap();
         let Some(gic) = guard.as_any_concrete_mut().downcast_mut::<HvfGicV3>() else {
             eprintln!("[gic-msi] GIC is not the HVF managed GIC; dropping SPI {intid}");

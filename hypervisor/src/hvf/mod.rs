@@ -58,6 +58,18 @@ type VmResult<T> = std::result::Result<T, HypervisorVmError>;
 /// deadline) can wait, and guarantees a parked vCPU can never wedge.
 const WFI_IDLE_POLL_MS: i32 = 100;
 
+/// Fill `buf` with cryptographically-strong host entropy for the guest's TRNG
+/// firmware calls. Reads `/dev/urandom` (never blocks on modern macOS); on the
+/// rare read failure the buffer is left zeroed, which only weakens one TRNG
+/// batch and never wedges the guest (Linux treats the TRNG as one of several
+/// entropy sources).
+fn host_entropy(buf: &mut [u8]) {
+    use std::io::Read;
+    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
+        let _ = f.read_exact(buf);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Neutral state payloads carried by the `hypervisor` crate enums.
 // ---------------------------------------------------------------------------
@@ -621,6 +633,9 @@ impl HvfVcpu {
         if is_write {
             let val = if srt == 31 { 0 } else { self.get_reg(srt)? };
             let bytes = val.to_le_bytes();
+            if std::env::var("CHM_TRACE_ABORT").is_ok() {
+                eprintln!("[abort] W ipa={ipa:#x} sz={access} val={val:#x}");
+            }
             vm_ops
                 .mmio_write(ipa, &bytes[..access])
                 .map_err(|e| HypervisorCpuError::RunVcpu(e.into()))?;
@@ -629,6 +644,12 @@ impl HvfVcpu {
             vm_ops
                 .mmio_read(ipa, &mut bytes[..access])
                 .map_err(|e| HypervisorCpuError::RunVcpu(e.into()))?;
+            if std::env::var("CHM_TRACE_ABORT").is_ok() {
+                eprintln!(
+                    "[abort] R ipa={ipa:#x} sz={access} -> {:#x}",
+                    u64::from_le_bytes(bytes)
+                );
+            }
             if srt != 31 {
                 self.set_reg(srt, u64::from_le_bytes(bytes))?;
             }
@@ -813,7 +834,21 @@ impl Vcpu for HvfVcpu {
         // Restore virtual-counter continuity if the snapshot carried CNTVCT, so
         // the guest's armed timer fires promptly and time advances on resume.
         if let Some(cntvct) = snapshot_cntvct {
+            if std::env::var("CHM_TRACE_VTIMER").is_ok() {
+                let cval = self.get_sysreg(0xDF1A).unwrap_or(0);
+                let ctl = self.get_sysreg(0xDF19).unwrap_or(0);
+                eprintln!(
+                    "[vtimer] vcpu {} reseed offset from CNTVCT={cntvct:#x} CVAL={cval:#x} CTL={ctl:#x} (CVAL-CNTVCT={})",
+                    self.index,
+                    (cval as i64).wrapping_sub(cntvct as i64)
+                );
+            }
             self.restore_vtimer_offset(cntvct)?;
+        } else if std::env::var("CHM_TRACE_VTIMER").is_ok() {
+            eprintln!(
+                "[vtimer] vcpu {} NO CNTVCT in snapshot -- offset not reseeded",
+                self.index
+            );
         }
         // Restore the managed-GIC CPU-interface registers (priority mask, group
         // enables, active priorities, ...). These are load-bearing for delivery
@@ -849,6 +884,18 @@ impl Vcpu for HvfVcpu {
         }
         // SAFETY: `exit` is owned by HVF and valid until the next run() call.
         let exit = unsafe { &*self.exit };
+        if std::env::var("CHM_TRACE_EXIT").is_ok() {
+            let pc = self.get_reg(HV_REG_PC).unwrap_or(0);
+            let ec = if exit.reason == HV_EXIT_REASON_EXCEPTION {
+                (exit.exception.syndrome >> 26) & 0x3f
+            } else {
+                0xff
+            };
+            eprintln!(
+                "[exit] vcpu {} reason={} ec={ec:#x} pc={pc:#x}",
+                self.index, exit.reason
+            );
+        }
         match exit.reason {
             HV_EXIT_REASON_EXCEPTION => {
                 let esr = exit.exception.syndrome;
@@ -860,6 +907,15 @@ impl Vcpu for HvfVcpu {
                         Ok(VmExit::Ignore)
                     }
                     EC_WFX => {
+                        if std::env::var("CHM_TRACE_VTIMER").is_ok() {
+                            let cv = self.get_sysreg(SYSREG_CNTVCT_EL0).unwrap_or(0);
+                            let cval = self.get_sysreg(0xDF1A).unwrap_or(0);
+                            let ctl = self.get_sysreg(0xDF19).unwrap_or(0);
+                            eprintln!(
+                                "[vtimer] vcpu {} WFI park CNTVCT={cv:#x} CVAL={cval:#x} CTL={ctl:#x}",
+                                self.index
+                            );
+                        }
                         // Trapped WFI/WFE: the guest is idling for an interrupt.
                         // Advance past the instruction so that on re-entry any
                         // interrupt the GIC has since made pending (an asserted
@@ -887,9 +943,70 @@ impl Vcpu for HvfVcpu {
                         // PSCI: x0 carries the function id. PC already points past
                         // the HVC, so do not advance it here.
                         let func = self.get_reg(0)?;
+                        if std::env::var("CHM_TRACE_HVC").is_ok() {
+                            eprintln!("[hvc] vcpu {} func={func:#x}", self.index);
+                        }
                         match func {
                             PSCI_SYSTEM_OFF => Ok(VmExit::Shutdown),
                             PSCI_SYSTEM_RESET => Ok(VmExit::Reset),
+                            TRNG_VERSION => {
+                                // Report TRNG firmware interface v1.0
+                                // (major in bits[31:16], minor in bits[15:0]).
+                                self.set_reg(0, 1u64 << 16)?;
+                                Ok(VmExit::Ignore)
+                            }
+                            TRNG_FEATURES => {
+                                let fid = self.get_reg(1)?;
+                                let supported = matches!(
+                                    fid,
+                                    TRNG_VERSION
+                                        | TRNG_FEATURES
+                                        | TRNG_GET_UUID
+                                        | TRNG_RND32
+                                        | TRNG_RND64
+                                );
+                                self.set_reg(
+                                    0,
+                                    if supported {
+                                        SMCCC_SUCCESS
+                                    } else {
+                                        SMCCC_NOT_SUPPORTED
+                                    },
+                                )?;
+                                Ok(VmExit::Ignore)
+                            }
+                            TRNG_GET_UUID => {
+                                // A stable, non-zero UUID identifying this TRNG.
+                                self.set_reg(0, 0x8c2e_b1a0)?;
+                                self.set_reg(1, 0x4d8f_11ee)?;
+                                self.set_reg(2, 0xa1b2_c3d4)?;
+                                self.set_reg(3, 0xe5f6_0718)?;
+                                Ok(VmExit::Ignore)
+                            }
+                            TRNG_RND32 | TRNG_RND64 => {
+                                let max_bits = if func == TRNG_RND64 { 192 } else { 96 };
+                                let nbits = self.get_reg(1)?;
+                                if nbits == 0 || nbits > max_bits {
+                                    self.set_reg(0, SMCCC_INVALID_PARAMETER)?;
+                                    return Ok(VmExit::Ignore);
+                                }
+                                // Fill the entropy registers (X3 = least significant,
+                                // per SMCCC TRNG) from the host CSPRNG. The guest
+                                // masks to nbits; supplying full-width entropy is
+                                // both spec-conformant and what Linux's driver reads.
+                                let mut bytes = [0u8; 24];
+                                host_entropy(&mut bytes);
+                                let w = |b: &[u8]| {
+                                    let mut a = [0u8; 8];
+                                    a.copy_from_slice(b);
+                                    u64::from_le_bytes(a)
+                                };
+                                self.set_reg(1, w(&bytes[0..8]))?;
+                                self.set_reg(2, w(&bytes[8..16]))?;
+                                self.set_reg(3, w(&bytes[16..24]))?;
+                                self.set_reg(0, SMCCC_SUCCESS)?;
+                                Ok(VmExit::Ignore)
+                            }
                             _ => {
                                 // Unknown PSCI/HVC call: report success (0) and
                                 // continue so the guest keeps running.

@@ -38,6 +38,19 @@ pub const PSTATE_EL1H_DAIF: u64 = 0x3c5;
 pub const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 pub const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
 
+// Arm SMCCC TRNG firmware interface (DEN0098). cloud-hypervisor exposes these as
+// a firmware service; a resumed guest calls TRNG_RND* during early boot to seed
+// its CRNG, so the runtime must honour them or the guest stalls before I/O.
+pub const TRNG_VERSION: u64 = 0x8400_0050;
+pub const TRNG_FEATURES: u64 = 0x8400_0051;
+pub const TRNG_GET_UUID: u64 = 0x8400_0052;
+pub const TRNG_RND32: u64 = 0x8400_0053;
+pub const TRNG_RND64: u64 = 0xc400_0053;
+// SMCCC return codes.
+pub const SMCCC_SUCCESS: u64 = 0;
+pub const SMCCC_NOT_SUPPORTED: u64 = -1i64 as u64;
+pub const SMCCC_INVALID_PARAMETER: u64 = -2i64 as u64;
+
 // hv_sys_reg_t — curated EL1 system-register ids used for snapshot/restore.
 pub const SYSREG_MDSCR_EL1: u16 = 0x8012;
 pub const SYSREG_SCTLR_EL1: u16 = 0xc080;

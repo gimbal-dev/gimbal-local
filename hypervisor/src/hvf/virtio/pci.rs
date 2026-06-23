@@ -245,6 +245,48 @@ impl VirtioPciDevice {
     pub fn name(&self) -> &str {
         &self.name
     }
+
+    /// Number of virtqueues this device exposes.
+    pub fn num_queues(&self) -> usize {
+        self.inner.lock().unwrap().queues.len()
+    }
+
+    /// Drain every virtqueue once, completing any requests that were left
+    /// in-flight in the available ring at snapshot time (submitted by the guest
+    /// but not yet completed) and delivering their completion interrupts.
+    ///
+    /// A resumed guest does not re-notify a queue it had already kicked before
+    /// the snapshot; it waits for the completion interrupt. Without this drain
+    /// such a guest blocks forever on its first post-resume I/O wait (e.g. a
+    /// mount reading the boot filesystem). Call once after the device tree is
+    /// wired and the GIC is live, on the vCPU's owning thread.
+    pub fn drain_on_resume(&self) {
+        let mut inner = self.inner.lock().unwrap();
+        let n = inner.queues.len();
+        let trace = std::env::var_os("CHM_TRACE_DRAIN").is_some();
+        let mem = inner.mem.clone();
+        for qi in 0..n as u16 {
+            if trace {
+                let q = &inner.queues[qi as usize];
+                let avail_idx = q.avail_idx_value(&mem).unwrap_or(0);
+                let used_idx = q.used_idx_value(&mem).unwrap_or(0);
+                eprintln!(
+                    "[drain {}] q{qi}: avail.idx={avail_idx} used.idx={used_idx} \
+                     next_avail={} in_flight={}",
+                    self.name,
+                    q.next_avail,
+                    avail_idx != q.next_avail
+                );
+            }
+            // Process anything the guest made available but the capture-side
+            // device never consumed; `notify` only signals a completion
+            // interrupt when it actually completes a request, so a snapshot
+            // whose queues were already quiesced (the cloud-hypervisor case)
+            // pops nothing and stays silent. Completions that the capture side
+            // DID finish are delivered by the restored GIC pending state.
+            inner.notify(qi);
+        }
+    }
 }
 
 impl Inner {
@@ -378,6 +420,9 @@ impl MmioDevice for VirtioPciDevice {
             o if (NOTIFICATION_OFFSET..NOTIFICATION_OFFSET + NOTIFICATION_SIZE).contains(&o) => {
                 // The written value is the virtqueue index (no NOTIFICATION_DATA).
                 let queue_index = parse_le(data) as u16;
+                if std::env::var_os("CHM_TRACE_NOTIFY").is_some() {
+                    eprintln!("[notify] queue {queue_index} kicked");
+                }
                 inner.notify(queue_index);
             }
             _ => {}
@@ -555,5 +600,44 @@ mod tests {
             vec![32],
             "queue completion did not deliver its SPI through the injector"
         );
+    }
+
+    #[test]
+    fn drain_on_resume_completes_in_flight_request_and_signals() {
+        // setup()'s queue is seeded with avail.idx=1 / next_avail=0, i.e. a
+        // request the guest made available but the (capture-side) device had
+        // not yet consumed. A resumed guest will not re-notify it, so the
+        // resume-time drain must complete it and deliver the completion.
+        let (dev, mem) = setup();
+        let sink = Arc::new(RecordingMsiSink::default());
+        dev.set_injector(Box::new(MsiSpiInjector::new("disk0", vec![0, 32], sink.clone())));
+        dev.drain_on_resume();
+        // Used ring advanced and the data landed, exactly as a notify would do.
+        assert_eq!(mem.read_u16(0x4000_3000 + 2).unwrap(), 1);
+        assert_eq!(mem.read_u32(0x4000_5000).unwrap(), 0xCDCD_CDCD);
+        assert_eq!(
+            *sink.spis.lock().unwrap(),
+            vec![32],
+            "in-flight completion was not delivered on resume"
+        );
+    }
+
+    #[test]
+    fn drain_on_resume_is_silent_when_queues_quiesced() {
+        // A cloud-hypervisor snapshot quiesces its queues before capturing, so
+        // there is nothing in-flight; the drain must not fabricate a spurious
+        // completion interrupt.
+        let (dev, mem) = setup();
+        // Seed next_avail == avail.idx so the queue looks already-drained.
+        dev.inner.lock().unwrap().queues[0].next_avail = 1;
+        let sink = Arc::new(RecordingMsiSink::default());
+        dev.set_injector(Box::new(MsiSpiInjector::new("disk0", vec![0, 32], sink.clone())));
+        dev.drain_on_resume();
+        assert!(
+            sink.spis.lock().unwrap().is_empty(),
+            "drain delivered a spurious interrupt on a quiesced queue"
+        );
+        // Used ring untouched.
+        assert_eq!(mem.read_u16(0x4000_3000 + 2).unwrap(), 0);
     }
 }
