@@ -862,6 +862,208 @@ fn hvf_guest_takes_message_based_spi() {
     );
 }
 
+// ===================================================================
+// M14: a REAL virtio device completion drives a real guest IRQ handler,
+// through the production InterruptInjector -> GIC sink -> managed GIC chain.
+// ===================================================================
+
+/// A constant entropy source so the virtio-rng backend has something to write.
+struct ConstEntropy(u8);
+impl hypervisor::hvf::virtio::rng::EntropySource for ConstEntropy {
+    fn fill(&mut self, buf: &mut [u8]) {
+        buf.fill(self.0);
+    }
+}
+
+/// VmOps that, at the guest's `IRQ_READY` signal, kicks a REAL virtio-rng
+/// device's notify window. The device drains its virtqueue, completes the
+/// request, and fires its `MsiSpiInjector`, which delivers the completion as a
+/// message-based SPI through the live `GicMsiSink` over the managed GIC -- the
+/// exact production chain `chm` installs for a deliverable snapshot.
+struct VirtioCompletionVmOps {
+    marker: Mutex<Vec<u32>>,
+    dev: Mutex<Option<Arc<hypervisor::hvf::virtio::pci::VirtioPciDevice>>>,
+    signalled: Mutex<bool>,
+}
+
+impl VmOps for VirtioCompletionVmOps {
+    fn guest_mem_write(&self, _gpa: u64, buf: &[u8]) -> VmOpsResult<usize> {
+        Ok(buf.len())
+    }
+    fn guest_mem_read(&self, _gpa: u64, buf: &mut [u8]) -> VmOpsResult<usize> {
+        Ok(buf.len())
+    }
+    fn mmio_read(&self, _gpa: u64, data: &mut [u8]) -> VmOpsResult<()> {
+        data.fill(0);
+        Ok(())
+    }
+    fn mmio_write(&self, gpa: u64, data: &[u8]) -> VmOpsResult<()> {
+        use hypervisor::hvf::devices::MmioDevice;
+        if gpa == IRQ_READY {
+            // Owning-thread context (inside the vCPU's MMIO exit handler), the
+            // exact context a resumed guest's queue-notify trap runs in. Kick
+            // the device's notification window (queue 0) -- the same MMIO write
+            // a real guest driver performs.
+            if let Some(dev) = self.dev.lock().unwrap().as_ref() {
+                dev.write(VIRTIO_NOTIFY_OFFSET, &0u16.to_le_bytes());
+                *self.signalled.lock().unwrap() = true;
+            }
+        } else if gpa == IRQ_MARKER {
+            let n = data.len().min(4);
+            let mut v = [0u8; 4];
+            v[..n].copy_from_slice(&data[..n]);
+            self.marker.lock().unwrap().push(u32::from_le_bytes(v));
+        }
+        Ok(())
+    }
+}
+
+/// The virtio-pci notification window offset (mirrors `pci.rs`).
+const VIRTIO_NOTIFY_OFFSET: u64 = 0x6000;
+
+/// Build a real virtio-rng device with one ready writable buffer in `mem`,
+/// using MSI-X vector `vector` for queue 0.
+fn build_rng_device(
+    mem: &Arc<hypervisor::hvf::virtio::GuestMemory>,
+    vector: u16,
+) -> Arc<hypervisor::hvf::virtio::pci::VirtioPciDevice> {
+    use hypervisor::hvf::virtio::pci::{Backend, RestoreParams, VirtioPciDevice};
+    use hypervisor::hvf::virtio::queue::Queue;
+    use hypervisor::hvf::virtio::rng::RngDevice;
+
+    let desc = 0x4010_1000u64;
+    let avail = 0x4010_2000u64;
+    let used = 0x4010_3000u64;
+    let buf = 0x4010_5000u64;
+    // desc 0: a single writable entropy buffer.
+    mem.write(desc, &buf.to_le_bytes()).unwrap();
+    mem.write_u32(desc + 8, 64).unwrap();
+    mem.write_u16(desc + 12, 0x2).unwrap(); // WRITE
+    mem.write_u16(desc + 14, 0).unwrap();
+    // avail: head 0, idx 1.
+    mem.write_u16(avail + 4, 0).unwrap();
+    mem.write_u16(avail + 2, 1).unwrap();
+
+    let queue = Queue {
+        size: 8,
+        desc,
+        avail,
+        used,
+        event_idx: false,
+        indirect: false,
+        next_avail: 0,
+        next_used: 0,
+    };
+    Arc::new(VirtioPciDevice::new(
+        "rng0",
+        Backend::Rng(RngDevice::new(Box::new(ConstEntropy(0xAB)))),
+        mem.clone(),
+        RestoreParams {
+            features: hypervisor::hvf::virtio::features::VERSION_1,
+            queues: vec![queue],
+            queue_vectors: vec![vector],
+            device_status: 0x0f,
+            device_config: vec![],
+        },
+    ))
+}
+
+/// END-TO-END (hardware): prove a real virtio device completion drives a real
+/// guest IRQ handler through the production injector -> GIC chain.
+///
+/// This is the deliverable counterpart to `hvf_managed_gic_rejects_*`: where an
+/// ITS/LPI-routed completion is undeliverable, a message-SPI-routed one is
+/// delivered live. A real GICv3 guest enables SPI 32 and idles in WFI; at its
+/// `IRQ_READY` signal we kick a REAL virtio-rng device's notify window. The
+/// device drains its virtqueue, completes the request, and fires its
+/// `MsiSpiInjector`, whose `GicMsiSink` delivers SPI 32 through the managed
+/// GIC's MSI doorbell. The guest takes INTID 32 and powers off -- the exact
+/// chain `chm` runs for a deliverable snapshot, validated on hardware.
+#[test]
+fn hvf_virtio_completion_drives_guest_irq() {
+    use hypervisor::hvf::gic::GicMsiSink;
+    use hypervisor::hvf::virtio::pci::{MsiSink, MsiSpiInjector};
+
+    let ram = HostRam::new(RAM_SIZE);
+    load_irq_guest(&ram);
+
+    let vm_ops = Arc::new(VirtioCompletionVmOps {
+        marker: Mutex::new(Vec::new()),
+        dev: Mutex::new(None),
+        signalled: Mutex::new(false),
+    });
+
+    let hv = hypervisor::new().expect("hypervisor::new() -- is the test binary codesigned?");
+    let vm = hv
+        .create_vm(HypervisorVmConfig {
+            nested: false,
+            smt_enabled: false,
+        })
+        .expect("create_vm");
+    // SAFETY: ram outlives the mapping.
+    unsafe {
+        vm.create_user_memory_region(0, RAM_BASE, ram.size, ram.ptr, false, false)
+            .expect("map ram");
+    }
+
+    // GIC with an MSI doorbell region so message-based SPIs are deliverable.
+    let gic = vm
+        .create_vgic(&irq_vgic_config_with_msi())
+        .expect("create_vgic with MSI");
+
+    // A separate guest-memory view for the device's virtqueue (the bare-metal
+    // IRQ guest does not itself run a virtio driver; the device's completion is
+    // what we are proving reaches the guest as an interrupt).
+    let dev_ram = HostRam::new(0x1_0000);
+    let dev_mem = Arc::new(hypervisor::hvf::virtio::GuestMemory::new());
+    // SAFETY: dev_ram outlives dev_mem and the device.
+    unsafe {
+        dev_mem.register(0x4010_0000, dev_ram.ptr, dev_ram.size);
+    }
+    let dev = build_rng_device(&dev_mem, 0);
+
+    // Install the PRODUCTION injector: vector 0 -> SPI 32, delivered live via
+    // the managed GIC. This is exactly what chm's wire_virtio installs.
+    let sink: Arc<dyn MsiSink> = Arc::new(GicMsiSink::new(gic.clone()));
+    dev.set_injector(Box::new(MsiSpiInjector::new(
+        "rng0",
+        vec![IRQ_SPI_INTID],
+        sink,
+    )));
+    *vm_ops.dev.lock().unwrap() = Some(dev.clone());
+
+    let mut vcpu = vm.create_vcpu(0, Some(vm_ops.clone())).expect("create_vcpu");
+    vcpu.setup_regs(0, RAM_BASE, 0).expect("setup_regs");
+
+    let exit = run_to_shutdown(vcpu.as_mut());
+    let marker = vm_ops.marker.lock().unwrap().clone();
+    assert!(
+        *vm_ops.signalled.lock().unwrap(),
+        "guest never reached IRQ_READY / device was never notified"
+    );
+    // The device actually completed its request (used ring advanced) AND the
+    // entropy landed in the guest buffer -- a real completion, not a bare poke.
+    assert_eq!(
+        dev_mem.read_u16(0x4010_3000 + 2).unwrap(),
+        1,
+        "virtio-rng used ring did not advance (no real completion)"
+    );
+    assert_eq!(
+        dev_mem.read_u32(0x4010_5000).unwrap(),
+        0xABAB_ABAB,
+        "entropy buffer not filled by the rng backend"
+    );
+    assert!(
+        matches!(exit, VmExit::Shutdown),
+        "expected Shutdown after IRQ handler, got {exit:?} (marker={marker:#x?})"
+    );
+    assert_eq!(
+        marker.first().copied(),
+        Some(IRQ_SPI_INTID),
+        "guest did not take the virtio completion as SPI 32 (marker={marker:#x?})"
+    );
+}
+
 /// Load the GICv3 interrupt guest into a fresh RAM image.
 fn load_irq_guest(ram: &HostRam) {
     ram.load(0x0000, &IRQ_BOOT);

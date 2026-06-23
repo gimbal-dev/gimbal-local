@@ -14,10 +14,14 @@ use std::{env, fs, io};
 use crate::serve;
 
 use hypervisor::hvf::devices::{MmioBus, Pl011};
+use hypervisor::hvf::gic::GicMsiSink;
 use hypervisor::hvf::rehydrate::{rehydrate, Snapshot};
+use hypervisor::hvf::virtio::pci::{MsiSink, MsiSpiInjector};
 use hypervisor::hvf::virtio::{devmgr, its};
 use hypervisor::hvf::virtio::GuestMemory;
+use hypervisor::arch::aarch64::gic::Vgic;
 use hypervisor::{Vcpu, VmExit, VmOps};
+use std::sync::Mutex;
 
 /// cloud-hypervisor's arm64 PL011 lives at the base of the mapped-IO window.
 pub(crate) const PL011_BASE: u64 = 0x0900_0000;
@@ -135,6 +139,7 @@ pub(crate) fn wire_virtio(
     guest_mem: &Arc<GuestMemory>,
     state_json: &str,
     overlay_dir: &Path,
+    gic: Option<&Arc<Mutex<dyn Vgic>>>,
 ) -> Result<Vec<String>, String> {
     let descs = devmgr::parse_devices(state_json)
         .map_err(|e| format!("parse virtio devices: {e}"))?;
@@ -145,13 +150,19 @@ pub(crate) fn wire_virtio(
         .map_err(|e| format!("create overlay dir {}: {e}", overlay_dir.display()))?;
 
     let mut summary = Vec::with_capacity(descs.len());
-    // One ITS translator shared by every device, built from the snapshot's
-    // captured gic-v3-its tables. Resolved completions land in the sink.
+    // An enabled gic-v3-its means completions are LPI-routed (only reachable
+    // under the CHM_ALLOW_ITS_LPI bypass, since its_lpi_guard otherwise hard
+    // fails first). Those resolve through the ITS but cannot be delivered, so
+    // they fall back to the logging sink. Anything else is message-SPI routed
+    // and delivered live through the GIC.
     let its_engine = its::Its::from_snapshot_state(state_json)
         .ok()
+        .filter(|its| its.enabled())
         .map(Arc::new);
+    let lpi_sink: Arc<dyn its::LpiSink> = Arc::new(its::LoggingLpiSink::default());
+    let msi_sink: Option<Arc<dyn MsiSink>> =
+        gic.map(|g| Arc::new(GicMsiSink::new(g.clone())) as Arc<dyn MsiSink>);
 
-    let sink: Arc<dyn its::LpiSink> = Arc::new(its::LoggingLpiSink::default());
     for desc in &descs {
         let kind = match &desc.backend {
             devmgr::BackendKind::Block { nsectors, .. } => {
@@ -161,21 +172,31 @@ pub(crate) fn wire_virtio(
         };
         let (base, size, dev) = devmgr::build_device(desc, guest_mem.clone(), overlay_dir)
             .map_err(|e| format!("build device {}: {e}", desc.name))?;
-        // Replace the logging injector with the ITS data path so the device's
-        // MSI-X completions resolve to the guest's real LPIs.
-        if let Some(its) = &its_engine
-            && !desc.vector_events.is_empty()
-            && desc.device_id != 0
-        {
-            dev.set_injector(Box::new(its::ItsInjector::new(
-                desc.name.clone(),
-                its.clone(),
-                guest_mem.clone(),
-                desc.device_id,
-                desc.vector_events.clone(),
-                sink.clone(),
-            )));
-        }        bus.add(base, size, dev);
+        if !desc.vector_events.is_empty() {
+            if let Some(its) = &its_engine {
+                // LPI-routed (bypass mode): resolve to the guest's real LPI and
+                // log it -- undeliverable on the managed GIC.
+                if desc.device_id != 0 {
+                    dev.set_injector(Box::new(its::ItsInjector::new(
+                        desc.name.clone(),
+                        its.clone(),
+                        guest_mem.clone(),
+                        desc.device_id,
+                        desc.vector_events.clone(),
+                        lpi_sink.clone(),
+                    )));
+                }
+            } else if let Some(sink) = &msi_sink {
+                // Deliverable: each MSI-X vector's msg_data is its target SPI
+                // INTID; deliver completions live through the managed GIC.
+                dev.set_injector(Box::new(MsiSpiInjector::new(
+                    desc.name.clone(),
+                    desc.vector_events.clone(),
+                    sink.clone(),
+                )));
+            }
+        }
+        bus.add(base, size, dev);
         summary.push(format!("{kind} @ BAR {base:#x}"));
     }
     Ok(summary)
@@ -358,7 +379,7 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     // Reconstruct the virtio device model from the snapshot and install it onto
     // the bus, sharing the just-mapped guest RAM.
     let overlay_dir = dir.join(".chm-overlays");
-    match wire_virtio(&bus, &rvm.guest_mem, &loaded.state_json, &overlay_dir) {
+    match wire_virtio(&bus, &rvm.guest_mem, &loaded.state_json, &overlay_dir, Some(&rvm.gic)) {
         Ok(devs) if !devs.is_empty() => {
             if !args.quiet {
                 eprintln!("chm: virtio device model restored:");

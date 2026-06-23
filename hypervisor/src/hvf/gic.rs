@@ -302,6 +302,40 @@ impl HvfGicV3 {
     }
 }
 
+/// A [`MsiSink`](crate::hvf::virtio::pci::MsiSink) backed by the managed GIC: it
+/// delivers a virtio completion's target SPI as a message-based SPI through this
+/// GIC's MSI doorbell (`hv_gic_send_msi`). This is the live delivery sink the
+/// virtio [`MsiSpiInjector`](crate::hvf::virtio::pci::MsiSpiInjector) hands
+/// resolved completions to for a deliverable (MBI/message-SPI-routed) snapshot.
+///
+/// It holds the GIC as the shared `Arc<Mutex<dyn Vgic>>` the rehydrated VM
+/// exposes and downcasts to the concrete [`HvfGicV3`] to reach `deliver_msi`,
+/// so a device's completion (serviced on the owning vCPU thread inside the MMIO
+/// notify path) lands the interrupt directly in Apple's GIC.
+pub struct GicMsiSink {
+    gic: std::sync::Arc<std::sync::Mutex<dyn Vgic>>,
+}
+
+impl GicMsiSink {
+    /// Wrap the rehydrated VM's GIC handle as a message-based SPI sink.
+    pub fn new(gic: std::sync::Arc<std::sync::Mutex<dyn Vgic>>) -> Self {
+        Self { gic }
+    }
+}
+
+impl crate::hvf::virtio::pci::MsiSink for GicMsiSink {
+    fn deliver_spi(&self, intid: u32) {
+        let mut guard = self.gic.lock().unwrap();
+        let Some(gic) = guard.as_any_concrete_mut().downcast_mut::<HvfGicV3>() else {
+            eprintln!("[gic-msi] GIC is not the HVF managed GIC; dropping SPI {intid}");
+            return;
+        };
+        if let Err(e) = gic.deliver_msi(intid) {
+            eprintln!("[gic-msi] deliver SPI {intid} failed: {e:?}");
+        }
+    }
+}
+
 // `hv_gic_ich_reg_t` encodings for the GIC virtualization-control registers.
 const HV_GIC_ICH_REG_VTR_EL2: u16 = 0xe659;
 const HV_GIC_ICH_REG_ELRSR_EL2: u16 = 0xe65d;

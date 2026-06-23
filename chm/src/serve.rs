@@ -494,8 +494,13 @@ fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Resu
     // Reconstruct the virtio device model from the snapshot's device-manager
     // state and install it onto the bus, sharing the just-mapped guest RAM.
     let overlay_dir = dir.join(".chm-overlays");
-    if let Err(e) = wire_virtio(&bus, &rvm.guest_mem, &loaded.state_json, &overlay_dir)
-    {
+    if let Err(e) = wire_virtio(
+        &bus,
+        &rvm.guest_mem,
+        &loaded.state_json,
+        &overlay_dir,
+        Some(&rvm.gic),
+    ) {
         eprintln!("chm serve: warning: virtio device model not wired: {e}");
     }
 

@@ -90,6 +90,69 @@ impl InterruptInjector for LoggingInjector {
     }
 }
 
+/// Delivers a message-based SPI to the guest. Apple's managed GIC backs this on
+/// hardware (`hv_gic_send_msi`); tests use a recording stub. This is the
+/// deliverable counterpart to the ITS path: where a snapshot routes its virtio
+/// completions as GICv3 message-based SPIs (MBI) rather than through a GIC ITS,
+/// the MSI-X `msg_data` IS the target SPI `INTID`, so a queue completion is
+/// delivered directly -- no ITS translation, and no impossible LPI injection.
+pub trait MsiSink: Send + Sync {
+    /// Deliver message-based SPI `intid` (within the GIC's configured MSI
+    /// range) to the guest.
+    fn deliver_spi(&self, intid: u32);
+}
+
+/// An [`InterruptInjector`] that turns a virtio device's MSI-X vector into a
+/// message-based SPI delivered through a [`MsiSink`] (the managed GIC on
+/// hardware).
+///
+/// This is the live, deliverable injector: for a snapshot whose completions are
+/// MBI/message-SPI routed, `vector_intids[vector]` is the SPI `INTID` the
+/// guest's handler is waiting on, so a queue completion delivers it straight
+/// through the GIC doorbell. It is the production path `chm` installs for a
+/// deliverable snapshot, in contrast to the ITS injector (whose LPI target the
+/// managed GIC cannot deliver).
+pub struct MsiSpiInjector {
+    name: String,
+    /// Target SPI `INTID` for each MSI-X vector, indexed by vector number.
+    vector_intids: Vec<u32>,
+    sink: Arc<dyn MsiSink>,
+}
+
+impl MsiSpiInjector {
+    /// Build an injector mapping each MSI-X vector to its SPI `INTID`.
+    pub fn new(
+        name: impl Into<String>,
+        vector_intids: Vec<u32>,
+        sink: Arc<dyn MsiSink>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            vector_intids,
+            sink,
+        }
+    }
+}
+
+impl InterruptInjector for MsiSpiInjector {
+    fn signal(&self, vector: u16) {
+        let Some(&intid) = self.vector_intids.get(vector as usize) else {
+            eprintln!(
+                "[virtio {}] MSI-X vector {vector} has no SPI mapping; dropping",
+                self.name
+            );
+            return;
+        };
+        if std::env::var_os("CHM_TRACE_MMIO").is_some() {
+            eprintln!(
+                "[virtio {}] queue completion -> message-based SPI {intid}",
+                self.name
+            );
+        }
+        self.sink.deliver_spi(intid);
+    }
+}
+
 struct CommonConfig {
     device_feature_select: u32,
     driver_feature_select: u32,
@@ -456,5 +519,41 @@ mod tests {
         let mut desc = [0u8; 8];
         dev.read(0x20, &mut desc); // queue_desc for queue_select 0
         assert_eq!(u64::from_le_bytes(desc), 0x4000_1000);
+    }
+
+    #[derive(Default)]
+    struct RecordingMsiSink {
+        spis: Mutex<Vec<u32>>,
+    }
+    impl MsiSink for RecordingMsiSink {
+        fn deliver_spi(&self, intid: u32) {
+            self.spis.lock().unwrap().push(intid);
+        }
+    }
+
+    #[test]
+    fn msi_spi_injector_maps_vector_to_spi_and_delivers() {
+        let sink = Arc::new(RecordingMsiSink::default());
+        // Vector 0 -> SPI 35, vector 1 -> SPI 36.
+        let injector = MsiSpiInjector::new("disk0", vec![35, 36], sink.clone());
+        injector.signal(1);
+        injector.signal(0);
+        // An out-of-range vector is dropped, not delivered.
+        injector.signal(7);
+        assert_eq!(*sink.spis.lock().unwrap(), vec![36, 35]);
+    }
+
+    #[test]
+    fn notify_delivers_completion_through_msi_spi_injector() {
+        let (dev, _mem) = setup();
+        let sink = Arc::new(RecordingMsiSink::default());
+        // setup()'s queue uses MSI-X vector 1; map it to SPI 32.
+        dev.set_injector(Box::new(MsiSpiInjector::new("disk0", vec![0, 32], sink.clone())));
+        dev.write(NOTIFICATION_OFFSET, &0u16.to_le_bytes());
+        assert_eq!(
+            *sink.spis.lock().unwrap(),
+            vec![32],
+            "queue completion did not deliver its SPI through the injector"
+        );
     }
 }
