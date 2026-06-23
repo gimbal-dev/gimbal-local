@@ -174,6 +174,91 @@ impl HvfGicV3 {
     }
 }
 
+// `hv_gic_ich_reg_t` encodings for the GIC virtualization-control registers.
+const HV_GIC_ICH_REG_VTR_EL2: u16 = 0xe659;
+const HV_GIC_ICH_REG_ELRSR_EL2: u16 = 0xe65d;
+const HV_GIC_ICH_REG_LR0_EL2: u16 = 0xe660;
+
+/// ICH_LR<n>_EL2 field shifts (GICv3, 64-bit List Register).
+const LR_STATE_SHIFT: u64 = 62; // [63:62] state (01 = pending)
+const LR_GROUP_SHIFT: u64 = 60; // [60] group (1 = Group 1)
+const LR_PRIORITY_SHIFT: u64 = 48; // [55:48] priority
+const LR_STATE_PENDING: u64 = 0b01;
+
+fn ich_get(vcpu_id: u64, reg: u16) -> GicResult<u64> {
+    let mut v = 0u64;
+    // SAFETY: FFI on the vCPU's owning thread; out-param valid.
+    let rc = unsafe { crate::hvf::ffi::hv_gic_get_ich_reg(vcpu_id, reg, &mut v) };
+    dev_get("hv_gic_get_ich_reg", rc)?;
+    Ok(v)
+}
+
+fn ich_set(vcpu_id: u64, reg: u16, value: u64) -> GicResult<()> {
+    // SAFETY: FFI on the vCPU's owning thread.
+    dev_set("hv_gic_set_ich_reg", unsafe {
+        crate::hvf::ffi::hv_gic_set_ich_reg(vcpu_id, reg, value)
+    })
+}
+
+/// Attempt to inject an interrupt `intid` (e.g. an LPI, `>= 8192`) directly into
+/// a vCPU's virtual CPU interface by programming a free ICH List Register.
+///
+/// IMPORTANT — hardware-proven boundary (macOS 15/26, Apple Silicon): on the
+/// managed GIC the ICH virtualization-control registers are **EL2-gated**.
+/// Apple's own header states they exist only "when EL2 is enabled... used by the
+/// guest hypervisor for injecting interrupts to its guest" (i.e. nested
+/// virtualization). For a normal non-nested EL1 guest EL2 is owned by the
+/// framework, so `hv_gic_{get,set}_ich_reg` returns `HV_UNSUPPORTED` and this
+/// function returns that error. There is therefore NO VMM-controllable path to
+/// deliver an LPI to a non-nested guest's CPU interface: the managed GIC
+/// delivers only SPIs (line-based `hv_gic_set_spi` or message-based
+/// `hv_gic_send_msi`), and exposes no LPI/ITS/PROPBASER/PENDBASER registers at
+/// all. See `hvf_managed_gic_rejects_el1_lpi_injection` and the M11 plan note.
+///
+/// Retained as a real, correct binding for the nested-guest case (a guest
+/// hypervisor injecting into ITS own guest) and as the executable record of the
+/// boundary. Must be called on the vCPU's owning thread. Returns `Ok(false)` if
+/// every List Register is occupied; `Err(..)` (typically `HV_UNSUPPORTED`) when
+/// ICH access is not permitted for this guest.
+pub fn inject_lpi_via_lr(
+    vcpu_id: u64,
+    intid: u32,
+    group1: bool,
+    priority: u8,
+) -> GicResult<bool> {
+    // ICH_VTR_EL2.ListRegs[4:0] + 1 = number of implemented List Registers.
+    let num_lrs = (ich_get(vcpu_id, HV_GIC_ICH_REG_VTR_EL2)? & 0x1f) as u16 + 1;
+    // ELRSR has a set bit per *empty* List Register; prefer it to avoid clobbering.
+    let elrsr = ich_get(vcpu_id, HV_GIC_ICH_REG_ELRSR_EL2).unwrap_or(0);
+
+    let mut chosen: Option<u16> = None;
+    for n in 0..num_lrs {
+        if elrsr != 0 {
+            if elrsr & (1 << n) != 0 {
+                chosen = Some(n);
+                break;
+            }
+        } else {
+            // No ELRSR hint: treat a List Register whose state is Invalid (00) as free.
+            let lr = ich_get(vcpu_id, HV_GIC_ICH_REG_LR0_EL2 + n)?;
+            if (lr >> LR_STATE_SHIFT) & 0b11 == 0 {
+                chosen = Some(n);
+                break;
+            }
+        }
+    }
+    let Some(n) = chosen else {
+        return Ok(false);
+    };
+
+    let value = (LR_STATE_PENDING << LR_STATE_SHIFT)
+        | ((group1 as u64) << LR_GROUP_SHIFT)
+        | ((priority as u64) << LR_PRIORITY_SHIFT)
+        | (intid as u64 & 0xffff_ffff);
+    ich_set(vcpu_id, HV_GIC_ICH_REG_LR0_EL2 + n, value)?;
+    Ok(true)
+}
+
 impl Vgic for HvfGicV3 {
     fn fdt_compatibility(&self) -> &str {
         "arm,gic-v3"

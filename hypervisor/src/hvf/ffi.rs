@@ -197,6 +197,15 @@ unsafe extern "C" {
     pub fn hv_gic_get_icc_reg(vcpu: u64, reg: u16, value: *mut u64) -> i32;
     pub fn hv_gic_set_icc_reg(vcpu: u64, reg: u16, value: u64) -> i32;
 
+    // hv_gic_ich_reg_t — per-vCPU GIC virtualization-control (ICH) registers.
+    // The List Registers (LR0..LR15, encodings 0xe660..0xe66f) drive what the
+    // guest's virtual CPU interface presents at ICC_IAR1; writing a List
+    // Register injects an arbitrary INTID — including an LPI (>= 8192) the
+    // managed GIC's redistributor cannot itself deliver. VTR/ELRSR report the
+    // implemented List-Register count and which ones are empty.
+    pub fn hv_gic_get_ich_reg(vcpu: u64, reg: u16, value: *mut u64) -> i32;
+    pub fn hv_gic_set_ich_reg(vcpu: u64, reg: u16, value: u64) -> i32;
+
     // GIC state save/restore (os_object state handle).
     pub fn hv_gic_state_create() -> *mut c_void;
     pub fn hv_gic_state_get_size(state: *mut c_void, size: *mut usize) -> i32;

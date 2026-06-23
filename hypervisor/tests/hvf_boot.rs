@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use std::{env, fs};
 
 use hypervisor::arch::aarch64::gic::{GicState, Vgic, VgicConfig};
-use hypervisor::hvf::gic::{GICD_TYPER, HvfGicV3};
+use hypervisor::hvf::gic::{inject_lpi_via_lr, GICD_TYPER, HvfGicV3};
 use hypervisor::hvf::HvfVcpu;
 use hypervisor::{CpuState, HypervisorVmConfig, HypervisorVmError, Vcpu, Vm, VmExit, VmOps};
 
@@ -539,6 +539,128 @@ fn hvf_guest_takes_injected_spi() {
         marker.first().copied(),
         Some(IRQ_SPI_INTID),
         "guest IRQ handler did not run / acknowledged the wrong INTID"
+    );
+}
+
+/// An LPI INTID, above the SPI/PPI range (>= 8192). The managed GIC's
+/// distributor/redistributor cannot deliver this, and (as this test proves) the
+/// VMM-side ICH List-Register path is unavailable for a non-nested EL1 guest.
+const IRQ_LPI_INTID: u32 = 8192;
+
+/// Like `MarkerVmOps`, but on the guest's `IRQ_READY` signal it ATTEMPTS to
+/// inject an LPI INTID directly into the vCPU's virtual CPU interface via an ICH
+/// List Register and records the outcome. This documents, on hardware, whether
+/// the managed GIC permits VMM-driven LPI delivery to a non-nested EL1 guest.
+struct LpiMarkerVmOps {
+    marker: Mutex<Vec<u32>>,
+    vcpu_id: Mutex<Option<u64>>,
+    inject_result: Mutex<Option<Result<bool, String>>>,
+}
+
+impl VmOps for LpiMarkerVmOps {
+    fn guest_mem_write(&self, _gpa: u64, buf: &[u8]) -> VmOpsResult<usize> {
+        Ok(buf.len())
+    }
+    fn guest_mem_read(&self, _gpa: u64, buf: &mut [u8]) -> VmOpsResult<usize> {
+        Ok(buf.len())
+    }
+    fn mmio_read(&self, _gpa: u64, data: &mut [u8]) -> VmOpsResult<()> {
+        data.fill(0);
+        Ok(())
+    }
+    fn mmio_write(&self, gpa: u64, data: &[u8]) -> VmOpsResult<()> {
+        if gpa == IRQ_READY {
+            // Owning-thread context (inside the vCPU's MMIO exit handler): try to
+            // present the LPI INTID via a List Register. On the managed GIC this
+            // is expected to fail with HV_UNSUPPORTED (ICH is EL2-gated).
+            if let Some(id) = *self.vcpu_id.lock().unwrap() {
+                let r = inject_lpi_via_lr(id, IRQ_LPI_INTID, true, 0).map_err(|e| format!("{e:?}"));
+                *self.inject_result.lock().unwrap() = Some(r);
+            }
+        } else if gpa == IRQ_MARKER {
+            let n = data.len().min(4);
+            let mut v = [0u8; 4];
+            v[..n].copy_from_slice(&data[..n]);
+            self.marker.lock().unwrap().push(u32::from_le_bytes(v));
+        }
+        Ok(())
+    }
+}
+
+/// Hardware-pin the M11 delivery boundary: prove that Apple's managed GIC does
+/// NOT let a VMM deliver an LPI to a non-nested EL1 guest.
+///
+/// The original M11 plan was to bypass the managed GIC's (absent) redistributor
+/// LPI logic by writing the LPI INTID straight into a guest ICH List Register.
+/// This test runs the real GICv3 guest and, on its `IRQ_READY` signal, attempts
+/// exactly that via `hv_gic_set_ich_reg`. The framework rejects it: ICH
+/// virtualization-control registers exist only when EL2 is enabled (i.e. for a
+/// guest hypervisor injecting into its OWN nested guest), so for our EL1 guest
+/// the access returns `HV_UNSUPPORTED`. We assert (a) the injection attempt
+/// errored, and (b) the guest consequently never acknowledged INTID 8192 -- there
+/// is no managed-GIC path to deliver an LPI. The managed GIC offers SPIs only
+/// (`hv_gic_set_spi` / `hv_gic_send_msi`) and exposes no LPI/ITS registers at
+/// all. Faithful virtio-completion delivery for an ITS/LPI-wired snapshot
+/// therefore requires the completion to be routed as a message-based SPI at
+/// capture time; see the M11 plan note.
+#[test]
+fn hvf_managed_gic_rejects_el1_lpi_injection() {
+    let ram = HostRam::new(RAM_SIZE);
+    load_irq_guest(&ram);
+
+    let vm_ops = Arc::new(LpiMarkerVmOps {
+        marker: Mutex::new(Vec::new()),
+        vcpu_id: Mutex::new(None),
+        inject_result: Mutex::new(None),
+    });
+
+    let hv = hypervisor::new().expect("hypervisor::new() -- is the test binary codesigned?");
+    let vm = hv
+        .create_vm(HypervisorVmConfig {
+            nested: false,
+            smt_enabled: false,
+        })
+        .expect("create_vm");
+    // SAFETY: ram outlives the mapping.
+    unsafe {
+        vm.create_user_memory_region(0, RAM_BASE, ram.size, ram.ptr, false, false)
+            .expect("map ram");
+    }
+
+    let config = irq_vgic_config();
+    // GIC must be created before the vCPU.
+    let _gic = vm.create_vgic(&config).expect("create_vgic");
+
+    let mut vcpu = vm.create_vcpu(0, Some(vm_ops.clone())).expect("create_vcpu");
+    let id = vcpu
+        .as_any_concrete_mut()
+        .downcast_mut::<HvfVcpu>()
+        .expect("HVF vCPU concrete type")
+        .vcpu_id();
+    *vm_ops.vcpu_id.lock().unwrap() = Some(id);
+    vcpu.setup_regs(0, RAM_BASE, 0).expect("setup_regs");
+
+    let _exit = run_to_shutdown(vcpu.as_mut());
+
+    let result = vm_ops
+        .inject_result
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("guest never reached the IRQ_READY injection point");
+    let err = result.expect_err(
+        "managed GIC unexpectedly ACCEPTED an EL1 LPI List-Register injection -- \
+         the M11 delivery boundary may have changed; re-evaluate the plan",
+    );
+    assert!(
+        err.contains("0xfae9400f") || err.to_lowercase().contains("unsupported"),
+        "expected HV_UNSUPPORTED (0xfae9400f) for EL1 ICH access, got: {err}"
+    );
+    // No managed-GIC path delivered the LPI, so the guest never acked INTID 8192.
+    let marker = vm_ops.marker.lock().unwrap().clone();
+    assert!(
+        !marker.contains(&IRQ_LPI_INTID),
+        "guest acknowledged the LPI ({IRQ_LPI_INTID}) -- unexpected delivery: {marker:?}"
     );
 }
 

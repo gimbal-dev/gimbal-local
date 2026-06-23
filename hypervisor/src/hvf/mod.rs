@@ -440,6 +440,13 @@ impl HvfVcpu {
             .expect("clone of the vCPU wake fd cannot fail")
     }
 
+    /// This vCPU's `hv_vcpu_t` handle. Needed by the user-space ITS to address
+    /// per-vCPU GIC virtualization (ICH List Register) injection at the owning
+    /// thread.
+    pub fn vcpu_id(&self) -> u64 {
+        self.id
+    }
+
     fn set_reg(&self, reg: u32, val: u64) -> CpuResult<()> {
         // SAFETY: FFI on the owning thread.
         let ret = unsafe { hv_vcpu_set_reg(self.id, reg, val) };
