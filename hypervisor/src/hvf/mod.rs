@@ -46,6 +46,8 @@ pub mod translate;
 pub mod devices;
 #[cfg(feature = "kvm-snapshot")]
 pub mod rehydrate;
+#[cfg(feature = "kvm-snapshot")]
+pub mod virtio;
 
 type CpuResult<T> = std::result::Result<T, HypervisorCpuError>;
 type VmResult<T> = std::result::Result<T, HypervisorVmError>;

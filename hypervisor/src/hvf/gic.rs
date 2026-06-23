@@ -154,6 +154,24 @@ impl HvfGicV3 {
         // SAFETY: FFI.
         dev_set("hv_gic_set_spi", unsafe { hv_gic_set_spi(intid, level) })
     }
+
+    /// Deliver a message-signalled interrupt: pulse SPI `intid` via the doorbell
+    /// at IPA `address`.
+    ///
+    /// IMPORTANT: Apple's managed GIC implements message-based SPIs only — it has
+    /// NO ITS. A cloud KVM snapshot whose guest routes virtio completions as
+    /// MSI-X → LPIs through a GIC ITS cannot be serviced by this: the guest's
+    /// irqdomain maps its handler to an LPI hwirq (INTID ≥ 8192) that a
+    /// message-based SPI does not invoke. This primitive is therefore retained
+    /// for future MBI-style guests; faithfully delivering an ITS-wired guest's
+    /// completions requires a user-space GICv3 + ITS (the planned M11).
+    #[allow(dead_code)]
+    pub fn send_msi(&self, address: u64, intid: u32) -> GicResult<()> {
+        // SAFETY: FFI.
+        dev_set("hv_gic_send_msi", unsafe {
+            crate::hvf::ffi::hv_gic_send_msi(address, intid)
+        })
+    }
 }
 
 impl Vgic for HvfGicV3 {

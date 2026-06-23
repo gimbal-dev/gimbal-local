@@ -15,6 +15,8 @@ use crate::serve;
 
 use hypervisor::hvf::devices::{MmioBus, Pl011};
 use hypervisor::hvf::rehydrate::{rehydrate, Snapshot};
+use hypervisor::hvf::virtio::devmgr;
+use hypervisor::hvf::virtio::GuestMemory;
 use hypervisor::{Vcpu, VmExit, VmOps};
 
 /// cloud-hypervisor's arm64 PL011 lives at the base of the mapped-IO window.
@@ -27,6 +29,9 @@ pub(crate) struct Loaded {
     pub mem_ranges: PathBuf,
     pub num_vcpus: u32,
     pub total_ram: u64,
+    /// The raw `state.json` text, retained so the virtio device model can be
+    /// reconstructed from the device-manager state after rehydration.
+    pub state_json: String,
 }
 
 /// Read and parse a `ch-snapshot` directory (`state.json` +
@@ -57,16 +62,56 @@ pub(crate) fn load_snapshot(dir: &Path) -> Result<Loaded, String> {
         mem_ranges,
         num_vcpus,
         total_ram,
+        state_json,
     })
 }
 
 /// Build the device model: a bus carrying a real PL011 at the guest's serial
-/// base. Returns the UART (to drain output) alongside the bus as `VmOps`.
-pub(crate) fn build_vm_ops() -> (Arc<Pl011>, Arc<dyn VmOps>) {
+/// base. Returns the UART (to drain output) alongside the concrete bus, so the
+/// caller can add virtio devices to it after rehydration maps guest RAM.
+pub(crate) fn build_vm_ops() -> (Arc<Pl011>, Arc<MmioBus>) {
     let uart = Arc::new(Pl011::new());
-    let mut bus = MmioBus::new();
+    let bus = Arc::new(MmioBus::new());
     bus.add(PL011_BASE, PL011_SIZE, uart.clone());
-    (uart, Arc::new(bus))
+    (uart, bus)
+}
+
+/// Reconstruct the native virtio-pci device model from the snapshot's
+/// device-manager state and install each device into `bus` at its restored BAR.
+///
+/// Block devices get a host-backed sparse overlay (under `overlay_dir`) because
+/// cloud-hypervisor snapshots reference external disk images by path and do not
+/// embed them; the overlay lets the data path complete (reads of never-written
+/// sectors return zeroes, writes persist) without the original image. Returns
+/// the number of devices wired and a human description of each.
+pub(crate) fn wire_virtio(
+    bus: &MmioBus,
+    guest_mem: &Arc<GuestMemory>,
+    state_json: &str,
+    overlay_dir: &Path,
+) -> Result<Vec<String>, String> {
+    let descs = devmgr::parse_devices(state_json)
+        .map_err(|e| format!("parse virtio devices: {e}"))?;
+    if descs.is_empty() {
+        return Ok(Vec::new());
+    }
+    fs::create_dir_all(overlay_dir)
+        .map_err(|e| format!("create overlay dir {}: {e}", overlay_dir.display()))?;
+
+    let mut summary = Vec::with_capacity(descs.len());
+    for desc in &descs {
+        let kind = match &desc.backend {
+            devmgr::BackendKind::Block { nsectors, .. } => {
+                format!("virtio-blk {} ({} sectors)", desc.name, nsectors)
+            }
+            devmgr::BackendKind::Rng => format!("virtio-rng {}", desc.name),
+        };
+        let (base, size, dev) = devmgr::build_device(desc, guest_mem.clone(), overlay_dir)
+            .map_err(|e| format!("build device {}: {e}", desc.name))?;
+        bus.add(base, size, dev);
+        summary.push(format!("{kind} @ BAR {base:#x}"));
+    }
+    Ok(summary)
 }
 
 /// Default seconds of total console silence after which `chm` stops on its own.
@@ -227,7 +272,8 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     }
 
     // Device model: a bus with a real PL011 at the guest's serial base.
-    let (uart, vm_ops) = build_vm_ops();
+    let (uart, bus) = build_vm_ops();
+    let vm_ops: Arc<dyn VmOps> = bus.clone();
 
     let hv = hypervisor::new().map_err(|e| {
         format!(
@@ -239,6 +285,22 @@ fn run(args: &Args) -> Result<ExitCode, String> {
 
     let mut rvm = rehydrate(hv.as_ref(), &loaded.snap, &loaded.mem_ranges, &vm_ops)
         .map_err(|e| format!("rehydrate: {e}"))?;
+
+    // Reconstruct the virtio device model from the snapshot and install it onto
+    // the bus, sharing the just-mapped guest RAM.
+    let overlay_dir = dir.join(".chm-overlays");
+    match wire_virtio(&bus, &rvm.guest_mem, &loaded.state_json, &overlay_dir) {
+        Ok(devs) if !devs.is_empty() => {
+            if !args.quiet {
+                eprintln!("chm: virtio device model restored:");
+                for d in &devs {
+                    eprintln!("chm:   - {d}");
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("chm: warning: virtio device model not wired: {e}"),
+    }
 
     if loaded.num_vcpus > 1 && !args.quiet {
         eprintln!(

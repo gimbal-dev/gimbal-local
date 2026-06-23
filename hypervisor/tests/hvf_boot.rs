@@ -1439,7 +1439,7 @@ fn hvf_rehydrate_real_cloud_snapshot_emits_console() {
 
     // Build the device model: a bus with a real PL011 at the guest's serial base.
     let uart = Arc::new(Pl011::new());
-    let mut bus = MmioBus::new();
+    let bus = MmioBus::new();
     bus.add(PL011_BASE, PL011_SIZE, uart.clone());
     let vm_ops: Arc<dyn VmOps> = Arc::new(bus);
 
@@ -1547,7 +1547,7 @@ fn hvf_rehydrate_real_cloud_snapshot_resumes_userspace() {
     let snap = Snapshot::from_state_json(&state_json).expect("parse snapshot");
 
     let uart = Arc::new(Pl011::new());
-    let mut bus = MmioBus::new();
+    let bus = MmioBus::new();
     bus.add(PL011_BASE, PL011_SIZE, uart.clone());
     let vm_ops: Arc<dyn VmOps> = Arc::new(bus);
 

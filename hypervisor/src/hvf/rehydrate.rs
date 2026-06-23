@@ -52,6 +52,7 @@ use crate::cpu::Vcpu;
 use crate::hvf::gic::HvfGicV3;
 use crate::hvf::translate::gic_ingest::{dist_to_hvf, num_irq_from_dist_len, redist_to_hvf};
 use crate::hvf::translate::kvm_ingest::snapshot_json_to_hvf;
+use crate::hvf::virtio::GuestMemory;
 use crate::hvf::HvfVcpu;
 use crate::hvf::VcpuHvfState;
 use crate::hypervisor::Hypervisor;
@@ -379,6 +380,11 @@ pub struct RehydratedVm {
     pub vcpus: Vec<Box<dyn Vcpu>>,
     /// The restored managed GICv3.
     pub gic: Arc<Mutex<dyn Vgic>>,
+    /// A host view of the restored guest RAM, sharing the exact backing pointers
+    /// handed to the hypervisor. The native virtio device model reads/writes the
+    /// guest's rings through this. Kept before `_ram` so it drops first (its raw
+    /// pointers must not outlive the mappings).
+    pub guest_mem: Arc<GuestMemory>,
     /// Host-side guest-RAM backings (kept alive for the VM's lifetime).
     _ram: Vec<GuestRam>,
     /// The reconstructed VM. Dropped last (`hv_vm_destroy`).
@@ -407,6 +413,7 @@ pub fn rehydrate(
         .map_err(|e| RehydrateError::Hv(anyhow!("create_vm: {e}")))?;
 
     // --- guest RAM ----------------------------------------------------------
+    let guest_mem = Arc::new(GuestMemory::new());
     let mut ram = Vec::with_capacity(snap.mem_mappings.len());
     for m in &snap.mem_mappings {
         let backing = GuestRam::map_file(memory_ranges, m.file_offset, m.size as usize)?;
@@ -414,6 +421,15 @@ pub fn rehydrate(
         unsafe {
             vm.create_user_memory_region(m.slot, m.gpa, m.size as usize, backing.ptr, false, false)
                 .map_err(|e| RehydrateError::Hv(anyhow!("map RAM @ {:#x}: {e}", m.gpa)))?;
+        }
+        // Register the SAME host pointer with the device-model memory view so a
+        // virtio device sees exactly what the guest sees.
+        // SAFETY: `backing.ptr` is valid for `m.size` bytes for the VM's
+        // lifetime; `guest_mem` is dropped before `_ram` (field order above), so
+        // the pointer never outlives its mapping, and the device model is the
+        // only other reader/writer of guest RAM.
+        unsafe {
+            guest_mem.register(m.gpa, backing.ptr, m.size as usize);
         }
         ram.push(backing);
     }
@@ -478,6 +494,7 @@ pub fn rehydrate(
     Ok(RehydratedVm {
         vcpus,
         gic,
+        guest_mem,
         _ram: ram,
         vm,
     })

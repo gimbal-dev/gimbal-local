@@ -11,7 +11,7 @@
 //! The devices use interior mutability (a `Mutex` per device) because `VmOps`
 //! is invoked through a shared `&self`.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::vm::{Result as VmOpsResult, VmOps};
 
@@ -33,6 +33,24 @@ struct BusEntry {
     dev: Arc<dyn MmioDevice>,
 }
 
+/// When `CHM_TRACE_MMIO` is set, log accesses that hit no mapped device. Used
+/// to characterize which device windows a rehydrated guest reaches for that the
+/// current model does not yet provide (PCI ECAM, virtio-pci BARs).
+fn trace_unclaimed(op: &str, gpa: u64, len: usize) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    static INIT: AtomicBool = AtomicBool::new(false);
+    if !INIT.swap(true, Ordering::Relaxed) {
+        ENABLED.store(
+            std::env::var_os("CHM_TRACE_MMIO").is_some(),
+            Ordering::Relaxed,
+        );
+    }
+    if ENABLED.load(Ordering::Relaxed) {
+        eprintln!("[mmio-unclaimed] {op} {gpa:#012x} ({len})");
+    }
+}
+
 /// An address-routed MMIO bus that implements [`VmOps`].
 ///
 /// Accesses are dispatched to the device whose `[base, base+size)` range
@@ -41,34 +59,40 @@ struct BusEntry {
 /// forward progress instead of spinning on an undefined register.
 #[derive(Default)]
 pub struct MmioBus {
-    devices: Vec<BusEntry>,
+    devices: RwLock<Vec<BusEntry>>,
 }
 
 impl MmioBus {
     /// Create an empty bus.
     pub fn new() -> Self {
         Self {
-            devices: Vec::new(),
+            devices: RwLock::new(Vec::new()),
         }
     }
 
     /// Map `dev` into `[base, base+size)`. Ranges must not overlap.
-    pub fn add(&mut self, base: u64, size: u64, dev: Arc<dyn MmioDevice>) {
+    ///
+    /// Takes `&self` (the device list is interior-mutable) so devices can be
+    /// installed after the bus is already shared as an `Arc<dyn VmOps>` — e.g.
+    /// the rehydration path adds virtio devices only once guest RAM is mapped.
+    pub fn add(&self, base: u64, size: u64, dev: Arc<dyn MmioDevice>) {
+        let mut devices = self.devices.write().unwrap();
         debug_assert!(
-            !self
-                .devices
+            !devices
                 .iter()
                 .any(|e| base < e.base + e.size && e.base < base + size),
             "MmioBus device ranges overlap"
         );
-        self.devices.push(BusEntry { base, size, dev });
+        devices.push(BusEntry { base, size, dev });
     }
 
-    fn find(&self, gpa: u64) -> Option<(&Arc<dyn MmioDevice>, u64)> {
+    fn find(&self, gpa: u64) -> Option<(Arc<dyn MmioDevice>, u64)> {
         self.devices
+            .read()
+            .unwrap()
             .iter()
             .find(|e| gpa >= e.base && gpa < e.base + e.size)
-            .map(|e| (&e.dev, gpa - e.base))
+            .map(|e| (e.dev.clone(), gpa - e.base))
     }
 }
 
@@ -87,14 +111,18 @@ impl VmOps for MmioBus {
     fn mmio_read(&self, gpa: u64, data: &mut [u8]) -> VmOpsResult<()> {
         match self.find(gpa) {
             Some((dev, offset)) => dev.read(offset, data),
-            None => data.fill(0),
+            None => {
+                data.fill(0);
+                trace_unclaimed("r", gpa, data.len());
+            }
         }
         Ok(())
     }
 
     fn mmio_write(&self, gpa: u64, data: &[u8]) -> VmOpsResult<()> {
-        if let Some((dev, offset)) = self.find(gpa) {
-            dev.write(offset, data);
+        match self.find(gpa) {
+            Some((dev, offset)) => dev.write(offset, data),
+            None => trace_unclaimed("w", gpa, data.len()),
         }
         Ok(())
     }
@@ -284,7 +312,7 @@ mod tests {
     #[test]
     fn mmio_bus_routes_by_address() {
         let uart = Arc::new(Pl011::new());
-        let mut bus = MmioBus::new();
+        let bus = MmioBus::new();
         bus.add(0x0900_0000, 0x1000, uart.clone());
 
         // Write a byte to the UART data register through the bus.

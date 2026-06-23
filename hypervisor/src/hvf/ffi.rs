@@ -169,6 +169,14 @@ unsafe extern "C" {
     #[allow(dead_code)]
     pub fn hv_gic_reset() -> i32;
     pub fn hv_gic_set_spi(intid: u32, level: bool) -> i32;
+    // Message-signalled interrupt delivery. `address` is the doorbell IPA
+    // (GICM_SET_SPI_NSR within the configured MSI region) and `intid` the SPI to
+    // pulse. NOTE: Apple's managed GIC has NO ITS, so this delivers a
+    // message-based SPI — it CANNOT replay an LPI the way a KVM ITS-wired guest
+    // expects. Kept for future MBI-style guests and documented in
+    // `HvfGicV3::send_msi`.
+    #[allow(dead_code)]
+    pub fn hv_gic_send_msi(address: u64, intid: u32) -> i32;
     pub fn hv_gic_get_distributor_reg(reg: u32, value: *mut u64) -> i32;
     pub fn hv_gic_set_distributor_reg(reg: u32, value: u64) -> i32;
     // Per-vCPU redistributor registers. `reg` is an `hv_gic_redistributor_reg_t`

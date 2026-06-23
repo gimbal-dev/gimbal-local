@@ -20,9 +20,9 @@ use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
 use hypervisor::hvf::rehydrate::rehydrate;
-use hypervisor::VmExit;
+use hypervisor::{VmExit, VmOps};
 
-use crate::imp::{build_vm_ops, load_snapshot};
+use crate::imp::{build_vm_ops, load_snapshot, wire_virtio};
 
 /// Cap the in-memory console ring so a long-lived guest cannot grow it without
 /// bound. Late `ctl console` attachers fast-forward past anything dropped.
@@ -478,7 +478,8 @@ struct EngineOpts {
 /// Returns a human-readable reason for why it stopped.
 fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Result<String, String> {
     let loaded = load_snapshot(dir)?;
-    let (uart, vm_ops) = build_vm_ops();
+    let (uart, bus) = build_vm_ops();
+    let vm_ops: Arc<dyn VmOps> = bus.clone();
 
     let hv = hypervisor::new().map_err(|e| {
         format!(
@@ -488,6 +489,14 @@ fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Resu
     })?;
     let mut rvm = rehydrate(hv.as_ref(), &loaded.snap, &loaded.mem_ranges, &vm_ops)
         .map_err(|e| format!("rehydrate: {e}"))?;
+
+    // Reconstruct the virtio device model from the snapshot's device-manager
+    // state and install it onto the bus, sharing the just-mapped guest RAM.
+    let overlay_dir = dir.join(".chm-overlays");
+    if let Err(e) = wire_virtio(&bus, &rvm.guest_mem, &loaded.state_json, &overlay_dir)
+    {
+        eprintln!("chm serve: warning: virtio device model not wired: {e}");
+    }
 
     let start = Instant::now();
     let mut last_output = Instant::now();
