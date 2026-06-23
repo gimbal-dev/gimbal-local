@@ -158,9 +158,7 @@ unsafe extern "C" {
     pub fn hv_gic_config_set_distributor_base(config: *mut c_void, base: u64) -> i32;
     pub fn hv_gic_config_set_redistributor_base(config: *mut c_void, base: u64) -> i32;
     // MSI/ITS region setup — reserved for when irqfd/GSI routing lands.
-    #[allow(dead_code)]
     pub fn hv_gic_config_set_msi_region_base(config: *mut c_void, base: u64) -> i32;
-    #[allow(dead_code)]
     pub fn hv_gic_config_set_msi_interrupt_range(config: *mut c_void, base: u32, count: u32)
         -> i32;
 
@@ -175,7 +173,6 @@ unsafe extern "C" {
     // message-based SPI — it CANNOT replay an LPI the way a KVM ITS-wired guest
     // expects. Kept for future MBI-style guests and documented in
     // `HvfGicV3::send_msi`.
-    #[allow(dead_code)]
     pub fn hv_gic_send_msi(address: u64, intid: u32) -> i32;
     pub fn hv_gic_get_distributor_reg(reg: u32, value: *mut u64) -> i32;
     pub fn hv_gic_set_distributor_reg(reg: u32, value: u64) -> i32;
@@ -190,6 +187,10 @@ unsafe extern "C" {
     pub fn hv_gic_get_distributor_size(size: *mut usize) -> i32;
     #[allow(dead_code)]
     pub fn hv_gic_get_spi_interrupt_range(base: *mut u32, count: *mut u32) -> i32;
+    // MSI region geometry — required to place the doorbell at a framework-
+    // approved base/size before `hv_gic_config_set_msi_region_base`.
+    pub fn hv_gic_get_msi_region_size(size: *mut usize) -> i32;
+    pub fn hv_gic_get_msi_region_base_alignment(alignment: *mut usize) -> i32;
 
     // Per-vCPU GIC CPU-interface (ICC) registers. The managed GIC owns these
     // (they are not reachable via hv_vcpu_get_sys_reg), so a faithful vCPU

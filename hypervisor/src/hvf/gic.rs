@@ -47,9 +47,19 @@ pub struct HvfGicV3 {
     redists_size: u64,
     msi_addr: u64,
     msi_size: u64,
+    /// Lowest INTID configured for message-signalled SPIs (0 if MSI not set up).
+    msi_intid_base: u32,
+    /// Number of message-signalled SPI INTIDs configured (0 if MSI not set up).
+    msi_intid_count: u32,
     vcpu_count: u64,
     gicr_typers: Vec<u64>,
 }
+
+/// `HV_GIC_REG_GICM_SET_SPI_NSR` — the doorbell register offset within the MSI
+/// region. A 32-bit write of an INTID here pulses that message-based SPI; this
+/// is the IPA `hv_gic_send_msi` targets (and the address a guest's MSI-X entry
+/// would carry for an MBI-routed device).
+pub const GICM_SET_SPI_NSR: u64 = 0x0040;
 
 fn dev_get(op: &'static str, code: i32) -> GicResult<()> {
     if code == 0 {
@@ -88,11 +98,89 @@ impl HvfGicV3 {
             )));
         }
 
-        // NOTE: MSI/ITS is intentionally NOT configured yet. The irqfd/GSI
-        // routing path that would deliver MSIs is not implemented, so we do not
-        // advertise MSI to the guest (`msi_compatible()` returns false). Only
-        // the distributor + redistributors are set up here.
-        //
+        // Configure the MSI region + interrupt range when the caller reserved a
+        // doorbell window (msi_addr/msi_size != 0). This is what makes the
+        // managed GIC accept `hv_gic_send_msi`: a message-based SPI delivered
+        // through the GICM frame at `msi_addr + GICM_SET_SPI_NSR`. The MSI INTID
+        // range is carved from the top of the framework's SPI range so it does
+        // not collide with line-based SPIs the snapshot may use.
+        let mut msi_intid_base = 0u32;
+        let mut msi_intid_count = 0u32;
+        if config.msi_addr != 0 && config.msi_size != 0 {
+            // SAFETY: FFI; out-params valid for the duration of the calls.
+            let geom = unsafe {
+                let mut align = 0usize;
+                let mut region_size = 0usize;
+                let mut spi_base = 0u32;
+                let mut spi_count = 0u32;
+                let mut rc = hv_gic_get_msi_region_base_alignment(&mut align);
+                if rc == 0 {
+                    rc = hv_gic_get_msi_region_size(&mut region_size);
+                }
+                if rc == 0 {
+                    rc = hv_gic_get_spi_interrupt_range(&mut spi_base, &mut spi_count);
+                }
+                (rc, align, region_size, spi_base, spi_count)
+            };
+            let (rc, align, region_size, spi_base, spi_count) = geom;
+            if rc != 0 {
+                // SAFETY: release the config before returning.
+                unsafe { os_release(cfg) };
+                return Err(GicError::CreateGic(crate::HypervisorVmError::CreateVgic(
+                    anyhow!("querying MSI region geometry failed: {:#010x}", rc as u32),
+                )));
+            }
+            let align = align as u64;
+            if align != 0 && !config.msi_addr.is_multiple_of(align) {
+                // SAFETY: release the config before returning.
+                unsafe { os_release(cfg) };
+                return Err(GicError::CreateGic(crate::HypervisorVmError::CreateVgic(
+                    anyhow!(
+                        "MSI region base {:#x} is not aligned to the required {:#x}",
+                        config.msi_addr,
+                        align
+                    ),
+                )));
+            }
+            if (config.msi_size as usize) < region_size {
+                // SAFETY: release the config before returning.
+                unsafe { os_release(cfg) };
+                return Err(GicError::CreateGic(crate::HypervisorVmError::CreateVgic(
+                    anyhow!(
+                        "MSI region size {:#x} is smaller than the required {:#x}",
+                        config.msi_size,
+                        region_size
+                    ),
+                )));
+            }
+            // Make the framework's full SPI range message-capable: any SPI can
+            // then be pulsed either by line (`hv_gic_set_spi`) or by message
+            // (`hv_gic_send_msi`) through the doorbell. This mirrors how a real
+            // VMM exposes MSIs (the whole SPI space is reachable) and keeps the
+            // SPI a device's MSI-X entry targets unconstrained.
+            msi_intid_base = spi_base;
+            msi_intid_count = spi_count;
+            // SAFETY: FFI on the valid config object.
+            let rc = unsafe {
+                let mut rc = hv_gic_config_set_msi_region_base(cfg, config.msi_addr);
+                if rc == 0 {
+                    rc = hv_gic_config_set_msi_interrupt_range(
+                        cfg,
+                        msi_intid_base,
+                        msi_intid_count,
+                    );
+                }
+                rc
+            };
+            if rc != 0 {
+                // SAFETY: release the config before returning.
+                unsafe { os_release(cfg) };
+                return Err(GicError::CreateGic(crate::HypervisorVmError::CreateVgic(
+                    anyhow!("configuring MSI region/range failed: {:#010x}", rc as u32),
+                )));
+            }
+        }
+
         // SAFETY: `cfg` is a valid configuration object for the calls below.
         let result = unsafe {
             let mut rc = hv_gic_config_set_distributor_base(cfg, config.dist_addr);
@@ -120,6 +208,8 @@ impl HvfGicV3 {
             redists_size: config.redists_size,
             msi_addr: config.msi_addr,
             msi_size: config.msi_size,
+            msi_intid_base,
+            msi_intid_count,
             vcpu_count: config.vcpu_count,
             gicr_typers: vec![0; config.vcpu_count as usize],
         })
@@ -158,19 +248,57 @@ impl HvfGicV3 {
     /// Deliver a message-signalled interrupt: pulse SPI `intid` via the doorbell
     /// at IPA `address`.
     ///
-    /// IMPORTANT: Apple's managed GIC implements message-based SPIs only — it has
-    /// NO ITS. A cloud KVM snapshot whose guest routes virtio completions as
-    /// MSI-X → LPIs through a GIC ITS cannot be serviced by this: the guest's
-    /// irqdomain maps its handler to an LPI hwirq (INTID ≥ 8192) that a
-    /// message-based SPI does not invoke. This primitive is therefore retained
-    /// for future MBI-style guests; faithfully delivering an ITS-wired guest's
-    /// completions requires a user-space GICv3 + ITS (the planned M11).
-    #[allow(dead_code)]
+    /// Deliver a message-signalled interrupt: pulse SPI `intid` via the doorbell
+    /// at IPA `address` (the `GICM_SET_SPI_NSR` register in the MSI region).
+    ///
+    /// This is the managed GIC's ONE supported message-based interrupt path.
+    /// Apple's GIC has no ITS, so this delivers a message-based SPI, NOT an LPI:
+    /// `intid` must fall within the MSI interrupt range configured at
+    /// `hv_gic_create` time (see `msi_intid_range`). A cloud snapshot whose
+    /// virtio completions are routed through a GIC ITS as LPIs (INTID >= 8192)
+    /// cannot be delivered this way (proven in `hvf_managed_gic_rejects_*`); such
+    /// a snapshot must be captured with MBI/message-based-SPI routing instead.
     pub fn send_msi(&self, address: u64, intid: u32) -> GicResult<()> {
         // SAFETY: FFI.
         dev_set("hv_gic_send_msi", unsafe {
             crate::hvf::ffi::hv_gic_send_msi(address, intid)
         })
+    }
+
+    /// Deliver a message-based SPI `intid` through this GIC's configured MSI
+    /// doorbell (`msi_addr + GICM_SET_SPI_NSR`). Convenience over [`send_msi`]
+    /// that knows the doorbell IPA. Errors if MSI was not configured or `intid`
+    /// is outside the configured MSI range.
+    pub fn deliver_msi(&self, intid: u32) -> GicResult<()> {
+        if self.msi_intid_count == 0 {
+            return Err(GicError::SetDeviceAttribute(
+                HypervisorDeviceError::SetDeviceAttribute(anyhow!(
+                    "MSI not configured for this GIC (no doorbell region reserved)"
+                )),
+            ));
+        }
+        let lo = self.msi_intid_base;
+        let hi = self.msi_intid_base + self.msi_intid_count - 1;
+        if intid < lo || intid > hi {
+            return Err(GicError::SetDeviceAttribute(
+                HypervisorDeviceError::SetDeviceAttribute(anyhow!(
+                    "MSI INTID {intid} outside configured range {lo}..={hi}"
+                )),
+            ));
+        }
+        self.send_msi(self.msi_addr + GICM_SET_SPI_NSR, intid)
+    }
+
+    /// The `[base, count]` of INTIDs reserved for message-based SPIs, or
+    /// `[0, 0]` if MSI delivery was not configured.
+    pub fn msi_intid_range(&self) -> [u32; 2] {
+        [self.msi_intid_base, self.msi_intid_count]
+    }
+
+    /// The MSI doorbell IPA (`GICM_SET_SPI_NSR`) a guest's MSI-X entry targets,
+    /// or `None` if MSI delivery was not configured.
+    pub fn msi_doorbell(&self) -> Option<u64> {
+        (self.msi_intid_count != 0).then_some(self.msi_addr + GICM_SET_SPI_NSR)
     }
 }
 

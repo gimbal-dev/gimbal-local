@@ -737,6 +737,131 @@ fn hvf_guest_takes_cross_thread_spi() {
     );
 }
 
+/// Deliver SPI 32 to the guest as a MESSAGE-BASED SPI through the managed GIC's
+/// MSI doorbell (`hv_gic_send_msi`), proving the supported substitute for LPI
+/// delivery actually lands on a real guest's CPU interface.
+///
+/// This is the affirmative half of the M11 boundary finding: LPIs are
+/// undeliverable on HVF (`hvf_managed_gic_rejects_el1_lpi_injection`), but a
+/// message-based SPI IS. A snapshot whose virtio completions are routed as MBI
+/// message-based SPIs (rather than ITS/LPI) can therefore be serviced. The
+/// guest is the same real GICv3 guest used for the line-based SPI test; the only
+/// change is that the host delivers via the doorbell write
+/// (`deliver_msi`/`hv_gic_send_msi`) instead of `hv_gic_set_spi`. A pass means
+/// the guest's IRQ handler ran, acknowledged INTID 32 at `ICC_IAR1`, recorded
+/// it, EOIed, and powered off.
+struct MsiMarkerVmOps {
+    marker: Mutex<Vec<u32>>,
+    gic: Mutex<Option<Arc<Mutex<dyn Vgic>>>>,
+    delivered: Mutex<bool>,
+}
+
+impl VmOps for MsiMarkerVmOps {
+    fn guest_mem_write(&self, _gpa: u64, buf: &[u8]) -> VmOpsResult<usize> {
+        Ok(buf.len())
+    }
+    fn guest_mem_read(&self, _gpa: u64, buf: &mut [u8]) -> VmOpsResult<usize> {
+        Ok(buf.len())
+    }
+    fn mmio_read(&self, _gpa: u64, data: &mut [u8]) -> VmOpsResult<()> {
+        data.fill(0);
+        Ok(())
+    }
+    fn mmio_write(&self, gpa: u64, data: &[u8]) -> VmOpsResult<()> {
+        if gpa == IRQ_READY {
+            // Owning-thread delivery (inside the vCPU's MMIO exit handler) -- the
+            // exact context the virtio notify->injector path runs in. Pulse SPI
+            // 32 as a message-based SPI via the doorbell.
+            if let Some(gic) = self.gic.lock().unwrap().as_ref() {
+                let mut guard = gic.lock().unwrap();
+                let concrete = guard
+                    .as_any_concrete_mut()
+                    .downcast_mut::<HvfGicV3>()
+                    .expect("HVF GIC concrete type");
+                concrete
+                    .deliver_msi(IRQ_SPI_INTID)
+                    .expect("deliver message-based SPI 32");
+                *self.delivered.lock().unwrap() = true;
+            }
+        } else if gpa == IRQ_MARKER {
+            let n = data.len().min(4);
+            let mut v = [0u8; 4];
+            v[..n].copy_from_slice(&data[..n]);
+            self.marker.lock().unwrap().push(u32::from_le_bytes(v));
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn hvf_guest_takes_message_based_spi() {
+    let ram = HostRam::new(RAM_SIZE);
+    load_irq_guest(&ram);
+
+    let vm_ops = Arc::new(MsiMarkerVmOps {
+        marker: Mutex::new(Vec::new()),
+        gic: Mutex::new(None),
+        delivered: Mutex::new(false),
+    });
+
+    let hv = hypervisor::new().expect("hypervisor::new() -- is the test binary codesigned?");
+    let vm = hv
+        .create_vm(HypervisorVmConfig {
+            nested: false,
+            smt_enabled: false,
+        })
+        .expect("create_vm");
+    // SAFETY: ram outlives the mapping.
+    unsafe {
+        vm.create_user_memory_region(0, RAM_BASE, ram.size, ram.ptr, false, false)
+            .expect("map ram");
+    }
+
+    // GIC WITH an MSI doorbell region so hv_gic_send_msi is accepted.
+    let config = irq_vgic_config_with_msi();
+    let gic = vm.create_vgic(&config).expect("create_vgic with MSI");
+    // Confirm the MSI range actually covers the INTID the guest enables.
+    {
+        let mut guard = gic.lock().unwrap();
+        let concrete = guard
+            .as_any_concrete_mut()
+            .downcast_mut::<HvfGicV3>()
+            .expect("HVF GIC concrete type");
+        let [base, count] = concrete.msi_intid_range();
+        assert!(count > 0, "MSI range was not configured");
+        assert!(
+            IRQ_SPI_INTID >= base && IRQ_SPI_INTID < base + count,
+            "INTID {IRQ_SPI_INTID} not in MSI range {base}..{}",
+            base + count
+        );
+        assert_eq!(
+            concrete.msi_doorbell(),
+            Some(IRQ_MSI_BASE + 0x40),
+            "doorbell IPA mismatch"
+        );
+    }
+    *vm_ops.gic.lock().unwrap() = Some(gic.clone());
+
+    let mut vcpu = vm.create_vcpu(0, Some(vm_ops.clone())).expect("create_vcpu");
+    vcpu.setup_regs(0, RAM_BASE, 0).expect("setup_regs");
+
+    let exit = run_to_shutdown(vcpu.as_mut());
+    let marker = vm_ops.marker.lock().unwrap().clone();
+    assert!(
+        *vm_ops.delivered.lock().unwrap(),
+        "guest never signalled GIC-configured / MSI was not delivered"
+    );
+    assert!(
+        matches!(exit, VmExit::Shutdown),
+        "expected Shutdown after IRQ handler, got {exit:?} (marker={marker:#x?})"
+    );
+    assert_eq!(
+        marker.first().copied(),
+        Some(IRQ_SPI_INTID),
+        "guest did not take the message-based SPI as INTID 32 (marker={marker:#x?})"
+    );
+}
+
 /// Load the GICv3 interrupt guest into a fresh RAM image.
 fn load_irq_guest(ram: &HostRam) {
     ram.load(0x0000, &IRQ_BOOT);
@@ -794,6 +919,21 @@ fn irq_vgic_config() -> VgicConfig {
         msi_addr: 0,
         msi_size: 0,
         nr_irqs: 256,
+    }
+}
+
+/// MSI doorbell region for the message-based-SPI delivery test. 64 KiB-aligned
+/// and clear of RAM (0x4000_0000), the GIC frames, and the marker/ready pages.
+const IRQ_MSI_BASE: u64 = 0x0c00_0000;
+const IRQ_MSI_SIZE: u64 = 0x1_0000;
+
+/// Like `irq_vgic_config`, but reserves an MSI doorbell region so the managed
+/// GIC accepts `hv_gic_send_msi` (message-based SPI delivery).
+fn irq_vgic_config_with_msi() -> VgicConfig {
+    VgicConfig {
+        msi_addr: IRQ_MSI_BASE,
+        msi_size: IRQ_MSI_SIZE,
+        ..irq_vgic_config()
     }
 }
 
