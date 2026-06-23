@@ -108,6 +108,23 @@ pub struct KvmGicV3Its {
 
     /// Number of CPUs handled by the device
     vcpu_count: u64,
+
+    /// When set, no in-kernel ITS is created and the GIC advertises a GICv2M
+    /// MSI frame instead. The guest then routes PCI MSI-X as message-based
+    /// SPIs (deliverable on Apple's managed GIC), not as ITS/LPIs. Gated by
+    /// the `CH_GIC_V2M` environment variable at VM creation time. See the
+    /// macOS Hypervisor.framework port: the managed GIC cannot deliver LPIs,
+    /// so a snapshot meant to rehydrate there must be captured SPI-routed.
+    v2m: bool,
+}
+
+/// Whether to capture an SPI-routed (GICv2M) snapshot instead of the default
+/// ITS/LPI-routed one. Enabled by `CH_GIC_V2M=1` (or `=true`).
+pub(crate) fn v2m_enabled() -> bool {
+    matches!(
+        std::env::var("CH_GIC_V2M").ok().as_deref(),
+        Some("1") | Some("true")
+    )
 }
 
 #[derive(Clone, Default, Serialize, Deserialize)]
@@ -172,37 +189,41 @@ impl KvmGicV3Its {
             0,
         )?;
 
-        // ITS part attributes
-        let mut its_device = kvm_bindings::kvm_create_device {
-            type_: kvm_bindings::kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_ITS,
-            fd: 0,
-            flags: 0,
-        };
+        // ITS part attributes. Skipped in GICv2M mode: with no in-kernel ITS,
+        // KVM clears GICD_TYPER.LPIS, so the guest binds the GICv2M frame and
+        // routes PCI MSI-X as message-based SPIs instead of ITS/LPIs.
+        if !self.v2m {
+            let mut its_device = kvm_bindings::kvm_create_device {
+                type_: kvm_bindings::kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_ITS,
+                fd: 0,
+                flags: 0,
+            };
 
-        let its_fd = vm
-            .create_device(&mut its_device)
-            .map_err(Error::CreateGic)?;
+            let its_fd = vm
+                .create_device(&mut its_device)
+                .map_err(Error::CreateGic)?;
 
-        // We know vm is KvmVm
-        let its_fd = its_fd.to_kvm().unwrap();
+            // We know vm is KvmVm
+            let its_fd = its_fd.to_kvm().unwrap();
 
-        Self::set_device_attribute(
-            &its_fd,
-            kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ADDR,
-            u64::from(kvm_bindings::KVM_VGIC_ITS_ADDR_TYPE),
-            &raw const self.msi_addr as u64,
-            0,
-        )?;
+            Self::set_device_attribute(
+                &its_fd,
+                kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ADDR,
+                u64::from(kvm_bindings::KVM_VGIC_ITS_ADDR_TYPE),
+                &raw const self.msi_addr as u64,
+                0,
+            )?;
 
-        Self::set_device_attribute(
-            &its_fd,
-            kvm_bindings::KVM_DEV_ARM_VGIC_GRP_CTRL,
-            u64::from(kvm_bindings::KVM_DEV_ARM_VGIC_CTRL_INIT),
-            0,
-            0,
-        )?;
+            Self::set_device_attribute(
+                &its_fd,
+                kvm_bindings::KVM_DEV_ARM_VGIC_GRP_CTRL,
+                u64::from(kvm_bindings::KVM_DEV_ARM_VGIC_CTRL_INIT),
+                0,
+                0,
+            )?;
 
-        self.its_device = Some(its_fd);
+            self.its_device = Some(its_fd);
+        }
 
         /* We need to tell the kernel how many irqs to support with this vgic.
          * See the `layout` module for details.
@@ -279,6 +300,7 @@ impl KvmGicV3Its {
             msi_addr: config.msi_addr,
             msi_size: config.msi_size,
             vcpu_count: config.vcpu_count,
+            v2m: v2m_enabled(),
         };
 
         gic_device.init_device_attributes(vm, config.nr_irqs)?;
@@ -297,7 +319,11 @@ impl Vgic for KvmGicV3Its {
     }
 
     fn msi_compatibility(&self) -> &str {
-        "arm,gic-v3-its"
+        if self.v2m {
+            "arm,gic-v2m-frame"
+        } else {
+            "arm,gic-v3-its"
+        }
     }
 
     fn fdt_maint_irq(&self) -> u32 {
@@ -342,44 +368,57 @@ impl Vgic for KvmGicV3Its {
 
         let icc_state = get_icc_regs(&self.device, &gicr_typers)?;
 
-        let mut its_baser_state: [u64; 8] = [0; 8];
-        for i in 0..8 {
-            its_baser_state[i as usize] = gicv3_its_attr_get(
-                self.its_device.as_ref().unwrap(),
-                kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-                GITS_BASER + i * 8,
-            )?;
-        }
+        // In GICv2M mode there is no in-kernel ITS, so the ITS register file is
+        // absent. Persist zeroed/disabled ITS state (its_ctlr bit 0 clear) so
+        // the snapshot is classified as SPI-routed on restore.
+        let (
+            its_ctlr_state,
+            its_iidr_state,
+            its_cbaser_state,
+            its_cwriter_state,
+            its_creadr_state,
+            its_baser_state,
+        ) = if let Some(its_device) = self.its_device.as_ref() {
+            let mut its_baser_state: [u64; 8] = [0; 8];
+            for i in 0..8 {
+                its_baser_state[i as usize] = gicv3_its_attr_get(
+                    its_device,
+                    kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                    GITS_BASER + i * 8,
+                )?;
+            }
 
-        let its_ctlr_state = gicv3_its_attr_get(
-            self.its_device.as_ref().unwrap(),
-            kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-            GITS_CTLR,
-        )?;
-
-        let its_cbaser_state = gicv3_its_attr_get(
-            self.its_device.as_ref().unwrap(),
-            kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-            GITS_CBASER,
-        )?;
-
-        let its_creadr_state = gicv3_its_attr_get(
-            self.its_device.as_ref().unwrap(),
-            kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-            GITS_CREADR,
-        )?;
-
-        let its_cwriter_state = gicv3_its_attr_get(
-            self.its_device.as_ref().unwrap(),
-            kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-            GITS_CWRITER,
-        )?;
-
-        let its_iidr_state = gicv3_its_attr_get(
-            self.its_device.as_ref().unwrap(),
-            kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-            GITS_IIDR,
-        )?;
+            (
+                gicv3_its_attr_get(
+                    its_device,
+                    kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                    GITS_CTLR,
+                )?,
+                gicv3_its_attr_get(
+                    its_device,
+                    kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                    GITS_IIDR,
+                )?,
+                gicv3_its_attr_get(
+                    its_device,
+                    kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                    GITS_CBASER,
+                )?,
+                gicv3_its_attr_get(
+                    its_device,
+                    kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                    GITS_CWRITER,
+                )?,
+                gicv3_its_attr_get(
+                    its_device,
+                    kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                    GITS_CREADR,
+                )?,
+                its_baser_state,
+            )
+        } else {
+            (0, 0, 0, 0, 0, [0; 8])
+        };
 
         let gic_state: GicState = Gicv3ItsState {
             dist: dist_state,
@@ -412,53 +451,60 @@ impl Vgic for KvmGicV3Its {
 
         set_icc_regs(&self.device, &gicr_typers, &kvm_state.icc)?;
 
-        //Restore GICv3ITS registers
-        gicv3_its_attr_set(
-            self.its_device.as_ref().unwrap(),
-            kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-            GITS_IIDR,
-            kvm_state.its_iidr,
-        )?;
-
-        gicv3_its_attr_set(
-            self.its_device.as_ref().unwrap(),
-            kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-            GITS_CBASER,
-            kvm_state.its_cbaser,
-        )?;
-
-        gicv3_its_attr_set(
-            self.its_device.as_ref().unwrap(),
-            kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-            GITS_CREADR,
-            kvm_state.its_creadr,
-        )?;
-
-        gicv3_its_attr_set(
-            self.its_device.as_ref().unwrap(),
-            kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-            GITS_CWRITER,
-            kvm_state.its_cwriter,
-        )?;
-
-        for i in 0..8 {
+        // Restore the in-kernel ITS register file only when one exists. A
+        // GICv2M snapshot has no ITS; its persisted ITS state is zeroed and
+        // there is nothing to restore.
+        if let Some(its_device) = self.its_device.as_ref() {
+            //Restore GICv3ITS registers
             gicv3_its_attr_set(
-                self.its_device.as_ref().unwrap(),
+                its_device,
                 kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-                GITS_BASER + i * 8,
-                kvm_state.its_baser[i as usize],
+                GITS_IIDR,
+                kvm_state.its_iidr,
+            )?;
+
+            gicv3_its_attr_set(
+                its_device,
+                kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                GITS_CBASER,
+                kvm_state.its_cbaser,
+            )?;
+
+            gicv3_its_attr_set(
+                its_device,
+                kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                GITS_CREADR,
+                kvm_state.its_creadr,
+            )?;
+
+            gicv3_its_attr_set(
+                its_device,
+                kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                GITS_CWRITER,
+                kvm_state.its_cwriter,
+            )?;
+
+            for i in 0..8 {
+                gicv3_its_attr_set(
+                    its_device,
+                    kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                    GITS_BASER + i * 8,
+                    kvm_state.its_baser[i as usize],
+                )?;
+            }
+
+            // Restore ITS tables
+            gicv3_its_tables_access(its_device, false)?;
+
+            gicv3_its_attr_set(
+                its_device,
+                kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
+                GITS_CTLR,
+                kvm_state.its_ctlr,
             )?;
         }
 
-        // Restore ITS tables
-        gicv3_its_tables_access(self.its_device.as_ref().unwrap(), false)?;
-
-        gicv3_its_attr_set(
-            self.its_device.as_ref().unwrap(),
-            kvm_bindings::KVM_DEV_ARM_VGIC_GRP_ITS_REGS,
-            GITS_CTLR,
-            kvm_state.its_ctlr,
-        )
+        Ok(())
     }
 
     /// Saves GIC internal data tables into RAM, including:
@@ -475,8 +521,11 @@ impl Vgic for KvmGicV3Its {
         self.device.set_device_attr(&init_gic_attr).map_err(|e| {
             Error::SetDeviceAttribute(HypervisorDeviceError::SetDeviceAttribute(e.into()))
         })?;
-        // Flush ITS tables to guest RAM.
-        gicv3_its_tables_access(self.its_device.as_ref().unwrap(), true)
+        // Flush ITS tables to guest RAM (only when an in-kernel ITS exists).
+        if let Some(its_device) = self.its_device.as_ref() {
+            gicv3_its_tables_access(its_device, true)?;
+        }
+        Ok(())
     }
 }
 

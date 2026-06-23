@@ -976,6 +976,28 @@ impl vm::Vm for KvmVm {
     fn make_routing_entry(&self, gsi: u32, config: &InterruptSourceConfig) -> IrqRoutingEntry {
         match &config {
             InterruptSourceConfig::MsiIrq(cfg) => {
+                // GICv2M capture mode: route PCI MSI-X as message-based SPIs
+                // (deliverable on Apple's managed GIC) instead of ITS/LPIs.
+                // The guest programs each MSI-X vector's data with the absolute
+                // SPI INTID it allocated from the GICv2M frame, so we inject it
+                // straight into the in-kernel distributor as an IRQCHIP pin
+                // (pin = INTID - SPI base) and never need the ITS/MSI path.
+                #[cfg(target_arch = "aarch64")]
+                if crate::kvm::aarch64::gic::v2m_enabled() {
+                    // GIC SPI INTIDs start at 32; an IRQCHIP routing pin is the
+                    // 0-based SPI index, so subtract the SPI base.
+                    const GIC_SPI_BASE: u32 = 32;
+                    let mut kvm_route = kvm_irq_routing_entry {
+                        gsi,
+                        type_: KVM_IRQ_ROUTING_IRQCHIP,
+                        ..Default::default()
+                    };
+                    kvm_route.u.irqchip.irqchip = 0;
+                    kvm_route.u.irqchip.pin = cfg.data - GIC_SPI_BASE;
+
+                    return kvm_route.into();
+                }
+
                 let mut kvm_route = kvm_irq_routing_entry {
                     gsi,
                     type_: KVM_IRQ_ROUTING_MSI,
