@@ -84,6 +84,52 @@ pub(crate) fn build_vm_ops() -> (Arc<Pl011>, Arc<MmioBus>) {
 /// embed them; the overlay lets the data path complete (reads of never-written
 /// sectors return zeroes, writes persist) without the original image. Returns
 /// the number of devices wired and a human description of each.
+/// Load-time interrupt-routing guard.
+///
+/// Apple's managed GIC cannot deliver LPIs to a non-nested EL1 guest
+/// (hardware-proven: ICH List Registers are EL2/nested-only -> HV_UNSUPPORTED,
+/// and there is no PROPBASER/PENDBASER/ITS API). A snapshot whose virtio
+/// completions are routed through the GIC ITS as LPIs would restore and then
+/// hang on its first device wait with no completion interrupt. Detect that here
+/// and fail loudly with an actionable message instead of a silent I/O stall.
+///
+/// Returns `Ok(())` when the snapshot is deliverable (SPI-routed, ITS disabled,
+/// or no MSI-wired virtio devices), or when `CHM_ALLOW_ITS_LPI` is set to force
+/// a run anyway. Returns `Err` with remediation guidance otherwise.
+pub(crate) fn its_lpi_guard(state_json: &str) -> Result<(), String> {
+    let descs = match devmgr::parse_devices(state_json) {
+        Ok(d) => d,
+        Err(_) => return Ok(()),
+    };
+    let wired_devices = descs
+        .iter()
+        .filter(|d| !d.vector_events.is_empty() && d.device_id != 0)
+        .count();
+    if its::classify_routing(state_json, wired_devices) != its::CompletionRouting::ItsLpi {
+        return Ok(());
+    }
+    if env::var_os("CHM_ALLOW_ITS_LPI").is_some() {
+        eprintln!(
+            "chm: warning: CHM_ALLOW_ITS_LPI set -- ignoring ITS/LPI routing \
+             guard; the guest will likely stall on its first I/O wait because \
+             LPI completions cannot be delivered on the managed GIC."
+        );
+        return Ok(());
+    }
+    Err(format!(
+        "this snapshot routes its virtio completion interrupts through the GIC \
+         ITS as LPIs ({wired_devices} MSI-wired device(s) + an enabled \
+         gic-v3-its), which Apple's Hypervisor.framework managed GIC cannot \
+         deliver. The guest would restore but then hang on its first disk/net \
+         I/O with no completion interrupt. Re-capture the snapshot with the \
+         guest's virtio MSIs routed as GICv3 message-based SPIs (MBI) or legacy \
+         INTx line SPIs rather than through a GIC ITS; the managed GIC delivers \
+         those via hv_gic_send_msi / hv_gic_set_spi. Set CHM_ALLOW_ITS_LPI=1 to \
+         bypass this guard and run anyway (the guest will likely stall on first \
+         I/O)."
+    ))
+}
+
 pub(crate) fn wire_virtio(
     bus: &MmioBus,
     guest_mem: &Arc<GuestMemory>,
@@ -104,6 +150,7 @@ pub(crate) fn wire_virtio(
     let its_engine = its::Its::from_snapshot_state(state_json)
         .ok()
         .map(Arc::new);
+
     let sink: Arc<dyn its::LpiSink> = Arc::new(its::LoggingLpiSink::default());
     for desc in &descs {
         let kind = match &desc.backend {
@@ -286,6 +333,8 @@ fn parse(raw: &[String]) -> Parsed {
 fn run(args: &Args) -> Result<ExitCode, String> {
     let dir = &args.snapshot_dir;
     let loaded = load_snapshot(dir)?;
+
+    its_lpi_guard(&loaded.state_json)?;
 
     if !args.quiet {
         banner(dir, &loaded.mem_ranges, loaded.num_vcpus, loaded.total_ram);

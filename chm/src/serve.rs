@@ -22,7 +22,7 @@ use std::{env, fs, thread};
 use hypervisor::hvf::rehydrate::rehydrate;
 use hypervisor::{VmExit, VmOps};
 
-use crate::imp::{build_vm_ops, load_snapshot, wire_virtio};
+use crate::imp::{build_vm_ops, its_lpi_guard, load_snapshot, wire_virtio};
 
 /// Cap the in-memory console ring so a long-lived guest cannot grow it without
 /// bound. Late `ctl console` attachers fast-forward past anything dropped.
@@ -478,6 +478,7 @@ struct EngineOpts {
 /// Returns a human-readable reason for why it stopped.
 fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Result<String, String> {
     let loaded = load_snapshot(dir)?;
+    its_lpi_guard(&loaded.state_json)?;
     let (uart, bus) = build_vm_ops();
     let vm_ops: Arc<dyn VmOps> = bus.clone();
 

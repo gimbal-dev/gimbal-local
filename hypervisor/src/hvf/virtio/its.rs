@@ -495,6 +495,39 @@ impl super::pci::InterruptInjector for ItsInjector {
     }
 }
 
+/// How a snapshot routes its virtio completion interrupts, which decides
+/// whether they can be delivered to the guest on Apple's managed GIC.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionRouting {
+    /// No enabled ITS with MSI-wired virtio devices. Completions arrive as
+    /// message-based / line SPIs, which the managed GIC CAN deliver
+    /// (`hv_gic_send_msi` / `hv_gic_set_spi`).
+    DeliverableSpi,
+    /// At least one virtio device routes completions through the GIC ITS as
+    /// LPIs. Apple's managed GIC has no LPI/ITS support (proven on hardware:
+    /// ICH List Registers are EL2/nested-only -> HV_UNSUPPORTED, and no
+    /// PROPBASER/PENDBASER/ITS API exists), so these completions CANNOT be
+    /// delivered: a rehydrated guest restores but then hangs on its first
+    /// device wait with no completion interrupt.
+    ItsLpi,
+}
+
+/// Classify a snapshot's virtio completion-interrupt routing.
+///
+/// `wired_devices` is the count of virtio devices that have at least one MSI-X
+/// vector mapped to a non-zero DeviceID (i.e. wired to the ITS). LPI routing is
+/// only an obstacle when an *enabled* ITS actually has MSI-wired devices; an
+/// absent or disabled ITS means completions are delivered as SPIs.
+pub fn classify_routing(state_json: &str, wired_devices: usize) -> CompletionRouting {
+    if wired_devices == 0 {
+        return CompletionRouting::DeliverableSpi;
+    }
+    match ItsConfig::from_snapshot_state(state_json) {
+        Ok(cfg) if cfg.enabled => CompletionRouting::ItsLpi,
+        _ => CompletionRouting::DeliverableSpi,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -628,5 +661,45 @@ mod tests {
             // And the table walk agrees on the same LPI.
             assert_eq!(its.translate(&mem, dev, ev).unwrap().unwrap().intid, intid);
         }
+    }
+
+    #[test]
+    fn classify_routing_flags_enabled_its_with_wired_devices() {
+        let state = its_state_json(KVM_ITS_STATE);
+        // An enabled ITS plus MSI-wired virtio devices == undeliverable LPIs.
+        assert_eq!(classify_routing(&state, 3), CompletionRouting::ItsLpi);
+        // No MSI-wired devices: completions are SPIs, deliverable.
+        assert_eq!(classify_routing(&state, 0), CompletionRouting::DeliverableSpi);
+    }
+
+    #[test]
+    fn classify_routing_allows_disabled_or_absent_its() {
+        // GITS_CTLR.Enabled clear -> SPI routing even with wired devices.
+        let disabled =
+            KVM_ITS_STATE.replace("\"its_ctlr\":2147483649", "\"its_ctlr\":2147483648");
+        let state = its_state_json(&disabled);
+        assert_eq!(classify_routing(&state, 3), CompletionRouting::DeliverableSpi);
+        // No ITS node at all -> deliverable.
+        assert_eq!(
+            classify_routing(r#"{"snapshots":{}}"#, 3),
+            CompletionRouting::DeliverableSpi
+        );
+    }
+
+    /// Wrap an inner `{"Kvm":...}` ITS blob in the snapshot tree shape that
+    /// `from_snapshot_state` walks (the `state` field is a JSON string).
+    fn its_state_json(inner: &str) -> String {
+        serde_json::json!({
+            "snapshots": {
+                "device-manager": {
+                    "snapshots": {
+                        "gic-v3-its": {
+                            "snapshot_data": { "state": inner }
+                        }
+                    }
+                }
+            }
+        })
+        .to_string()
     }
 }
