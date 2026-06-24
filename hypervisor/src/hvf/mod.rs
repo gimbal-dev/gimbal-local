@@ -542,7 +542,6 @@ impl HvfVcpu {
         Ok(v)
     }
 
-    /// Write a managed-GIC CPU-interface (ICC) register for this vCPU.
     /// Restore virtual-counter continuity from a snapshot's captured
     /// `CNTVCT_EL0`. HVF defines `CNTVCT_EL0 = mach_absolute_time() - offset`,
     /// so seeding the offset with `mach_absolute_time() - snapshot_cntvct` makes
@@ -892,8 +891,9 @@ impl Vcpu for HvfVcpu {
                 0xff
             };
             eprintln!(
-                "[exit] vcpu {} reason={} ec={ec:#x} pc={pc:#x}",
-                self.index, exit.reason
+                "[exit] vcpu {} reason={} ec={ec:#x} pc={pc:#x} ipa={:#x}",
+                self.index, exit.reason,
+                if exit.reason == HV_EXIT_REASON_EXCEPTION { exit.exception.physical_address } else { 0 }
             );
         }
         match exit.reason {

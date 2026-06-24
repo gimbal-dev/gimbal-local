@@ -325,7 +325,8 @@ impl GicMsiSink {
 
 impl crate::hvf::virtio::pci::MsiSink for GicMsiSink {
     fn deliver_spi(&self, intid: u32) {
-        if std::env::var_os("CHM_TRACE_MSI").is_some() {
+        let trace = std::env::var_os("CHM_TRACE_MSI").is_some();
+        if trace {
             eprintln!("[gic-msi] delivering virtio completion as SPI {intid}");
         }
         let mut guard = self.gic.lock().unwrap();
@@ -333,8 +334,53 @@ impl crate::hvf::virtio::pci::MsiSink for GicMsiSink {
             eprintln!("[gic-msi] GIC is not the HVF managed GIC; dropping SPI {intid}");
             return;
         };
+        if trace {
+            let word = 4 * (intid / 32);
+            let bit = intid % 32;
+            let en = gic.distributor_reg(0x0100 + word).unwrap_or(0);
+            let pend = gic.distributor_reg(0x0200 + word).unwrap_or(0);
+            let act = gic.distributor_reg(0x0300 + word).unwrap_or(0);
+            let grp = gic.distributor_reg(0x0080 + word).unwrap_or(0);
+            let prio_word = gic.distributor_reg(0x0400 + 4 * (intid / 4)).unwrap_or(0);
+            let prio = (prio_word >> (8 * (intid % 4))) & 0xff;
+            let router = gic.distributor_reg(0x6000 + 8 * intid).unwrap_or(0);
+            let ctlr = gic.distributor_reg(0x0000).unwrap_or(0);
+            eprintln!(
+                "[gic-msi] SPI {intid} pre-send: enabled={} pending={} active={} \
+                 group={} prio={prio:#x} router={router:#x} GICD_CTLR={ctlr:#x}",
+                (en >> bit) & 1,
+                (pend >> bit) & 1,
+                (act >> bit) & 1,
+                (grp >> bit) & 1,
+            );
+        }
+        // The rehydrated managed GIC does not honour affinity-based SPI routing
+        // (GICD_IROUTERn naming a specific PE by MPIDR affinity): a completion
+        // SPI restored with IROUTER = affinity 0.0.0.0 pends in the distributor
+        // but is never forwarded to vCPU0's CPU interface, so the guest wedges on
+        // its first post-resume virtio completion. The redistributor path (PPIs,
+        // e.g. the virtual timer) is unaffected, which is why a resumed guest
+        // still ticks but never takes a disk/rng completion. Routing the SPI
+        // 1-of-N (GICD_IROUTER.IRM = bit 31) delivers it to any participating PE
+        // and IS honoured. We only resume vCPU0, so 1-of-N targets exactly the PE
+        // the affinity routing intended; faithful for this single-core resume.
+        const GICD_IROUTER_IRM: u64 = 1 << 31;
+        if let Err(e) = gic.set_distributor_reg(0x6000 + 8 * intid, GICD_IROUTER_IRM) {
+            eprintln!("[gic-msi] set IROUTER 1-of-N for SPI {intid} failed: {e:?}");
+        }
         if let Err(e) = gic.deliver_msi(intid) {
             eprintln!("[gic-msi] deliver SPI {intid} failed: {e:?}");
+        }
+        if trace {
+            let word = 4 * (intid / 32);
+            let bit = intid % 32;
+            let pend = gic.distributor_reg(0x0200 + word).unwrap_or(0);
+            let act = gic.distributor_reg(0x0300 + word).unwrap_or(0);
+            eprintln!(
+                "[gic-msi] SPI {intid} post-send: pending={} active={}",
+                (pend >> bit) & 1,
+                (act >> bit) & 1
+            );
         }
     }
 }
