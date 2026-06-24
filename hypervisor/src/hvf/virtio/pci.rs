@@ -299,6 +299,7 @@ impl Inner {
         // without aliasing `self`.
         let mem = self.mem.clone();
         let mut completed_any = false;
+        let old_used = queue.next_used;
         loop {
             let chain = match queue.pop(&mem) {
                 Ok(Some(c)) => c,
@@ -319,7 +320,19 @@ impl Inner {
         }
         if completed_any {
             self.isr_status |= 0x1;
-            let needs = queue.needs_interrupt(&mem).unwrap_or(true);
+            let needs = queue
+                .needs_interrupt(&mem, old_used, queue.next_used)
+                .unwrap_or(true);
+            if std::env::var_os("CHM_TRACE_NOTIFY").is_some() {
+                let ue = mem
+                    .read_u16(queue.avail + 4 + 2 * queue.size as u64)
+                    .unwrap_or(0);
+                eprintln!(
+                    "[notify] q{queue_index} completed: old_used={old_used} \
+                     new_used={} used_event={ue} event_idx={} needs_irq={needs}",
+                    queue.next_used, queue.event_idx
+                );
+            }
             if needs {
                 let vector = self
                     .queue_vectors
@@ -329,6 +342,13 @@ impl Inner {
                 self.injector.signal(vector);
             }
         }
+        // Re-arm notification suppression so the driver kicks us for its NEXT
+        // submission. A restored queue carries the capture-side device's stale
+        // avail_event/NO_NOTIFY state; without re-arming, a post-resume guest
+        // adds buffers (e.g. a jbd2 journal commit) silently and wedges. Done
+        // on every notify (and thus on drain_on_resume) regardless of whether
+        // anything completed this pass.
+        let _ = queue.arm_notification(&mem);
     }
 
     fn read_common(&self, offset: u64, data: &mut [u8]) {
@@ -421,7 +441,17 @@ impl MmioDevice for VirtioPciDevice {
                 // The written value is the virtqueue index (no NOTIFICATION_DATA).
                 let queue_index = parse_le(data) as u16;
                 if std::env::var_os("CHM_TRACE_NOTIFY").is_some() {
-                    eprintln!("[notify] queue {queue_index} kicked");
+                    let mem = inner.mem.clone();
+                    let (ai, na) = inner
+                        .queues
+                        .get(queue_index as usize)
+                        .map_or((0, 0), |q| {
+                            (q.avail_idx_value(&mem).unwrap_or(0), q.next_avail)
+                        });
+                    eprintln!(
+                        "[notify] {} queue {queue_index} kicked: avail.idx={ai} next_avail={na}",
+                        self.name
+                    );
                 }
                 inner.notify(queue_index);
             }

@@ -215,25 +215,67 @@ impl Queue {
         Ok(())
     }
 
-    /// Whether the driver should be interrupted after the used updates so far.
+    /// Whether the driver should be interrupted after publishing used indices
+    /// in the range `(old_used, new_used]`.
     ///
     /// With `VIRTIO_RING_F_EVENT_IDX`, the driver publishes a `used_event` index
-    /// (the last u16 of the available ring) and asks to be interrupted only when
-    /// `next_used` reaches it. Otherwise we honour `VRING_AVAIL_F_NO_INTERRUPT`
-    /// in the available ring flags.
-    pub fn needs_interrupt(&self, mem: &GuestMemory) -> Result<bool, GuestMemError> {
+    /// (the last u16 of the available ring) asking to be interrupted once the
+    /// device's `used.idx` passes it. We mirror the kernel's `vring_need_event`
+    /// crossing test exactly: signal iff `used_event` lies within the freshly
+    /// published window. The earlier "exact equality" rule
+    /// (`next_used == used_event + 1`) silently dropped completions whenever the
+    /// restored `used_event` did not line up one-past the current index — which
+    /// is exactly the post-resume case, leaving a guest (e.g. jbd2) blocked on a
+    /// completion whose used element was published but never signalled.
+    /// Otherwise we honour `VRING_AVAIL_F_NO_INTERRUPT` in the avail-ring flags.
+    pub fn needs_interrupt(
+        &self,
+        mem: &GuestMemory,
+        old_used: u16,
+        new_used: u16,
+    ) -> Result<bool, GuestMemError> {
         if self.event_idx {
             let used_event = mem.read_u16(self.avail + 4 + 2 * self.size as u64)?;
-            // Interrupt when the freshly published used index equals used_event+1
-            // crossing point: signal if (next_used - used_event - 1) < (new used
-            // produced). Simplest correct rule: signal when next_used == used_event
-            // + 1, i.e. the driver asked to be woken at used_event.
-            Ok(self.next_used == used_event.wrapping_add(1))
+            // vring_need_event: (u16)(new - event - 1) < (u16)(new - old).
+            let a = new_used.wrapping_sub(used_event).wrapping_sub(1);
+            let b = new_used.wrapping_sub(old_used);
+            Ok(a < b)
         } else {
             let avail_flags = mem.read_u16(self.avail)?;
             const VRING_AVAIL_F_NO_INTERRUPT: u16 = 1;
             Ok(avail_flags & VRING_AVAIL_F_NO_INTERRUPT == 0)
         }
+    }
+
+    /// Re-arm split-ring notification suppression so the driver will kick the
+    /// device on its NEXT submission.
+    ///
+    /// A virtio driver suppresses queue notifications (the MMIO kick that wakes
+    /// this poll-on-notify device) in one of two ways:
+    /// - with `VIRTIO_RING_F_EVENT_IDX`, it only kicks when `avail.idx` crosses
+    ///   the device-published `avail_event` (the last u16 of the used ring);
+    /// - otherwise it honours `VRING_USED_F_NO_NOTIFY` in the used-ring flags.
+    ///
+    /// Both fields are written by the DEVICE. A restored snapshot carries the
+    /// capture-side device's stale values: under EVENT_IDX `avail_event` may sit
+    /// ahead of the current `avail.idx`, so the guest adds its next buffer (e.g.
+    /// a jbd2 journal commit) WITHOUT kicking and then blocks forever waiting for
+    /// a completion this device never sees. Re-pointing `avail_event` at the
+    /// current `avail.idx` (and clearing NO_NOTIFY) makes the very next
+    /// submission notify us, restoring forward progress. No-op when the device
+    /// has no queue memory mapped yet.
+    pub fn arm_notification(&self, mem: &GuestMemory) -> Result<(), GuestMemError> {
+        if self.event_idx {
+            // used ring: flags(2) + idx(2) + ring[size]*8, then avail_event(2).
+            let avail_event_addr = self.used + 4 + 8 * self.size as u64;
+            let cur = self.avail_idx(mem)?;
+            mem.write_u16(avail_event_addr, cur)?;
+        } else {
+            // Clear VRING_USED_F_NO_NOTIFY (bit 0) so the driver kicks again.
+            let flags = mem.read_u16(self.used)?;
+            mem.write_u16(self.used, flags & !1)?;
+        }
+        Ok(())
     }
 
     /// Restore the engine's progress cursors from the live rings: the device
@@ -362,9 +404,42 @@ mod tests {
         let m = mem();
         let q = queue();
         m.write_u16(AVAIL, 0).unwrap(); // flags = 0
-        assert!(q.needs_interrupt(&m).unwrap());
+        assert!(q.needs_interrupt(&m, 0, 1).unwrap());
         m.write_u16(AVAIL, 1).unwrap(); // VRING_AVAIL_F_NO_INTERRUPT
-        assert!(!q.needs_interrupt(&m).unwrap());
+        assert!(!q.needs_interrupt(&m, 0, 1).unwrap());
+    }
+
+    #[test]
+    fn event_idx_interrupt_crosses_used_event() {
+        // used_event lives at the last u16 of the avail ring.
+        let used_event_addr = AVAIL + 4 + 2 * QSZ as u64;
+        let m = mem();
+        let mut q = queue();
+        q.event_idx = true;
+
+        // Driver asks to be woken at used_event = 4 (i.e. when used.idx reaches
+        // 5). Publishing the window (4, 5] crosses it -> interrupt.
+        m.write_u16(used_event_addr, 4).unwrap();
+        assert!(q.needs_interrupt(&m, 4, 5).unwrap());
+        // A batch that stops short of the wake point (3, 4] does not cross it.
+        assert!(!q.needs_interrupt(&m, 3, 4).unwrap());
+        // A multi-completion batch that OVERSHOOTS the wake point still signals:
+        // window (4, 7] contains used_event=4's wake point (5). The old
+        // exact-equality rule (new_used == used_event+1) dropped this, leaving a
+        // post-resume guest blocked on a batched completion.
+        assert!(q.needs_interrupt(&m, 4, 7).unwrap());
+    }
+
+    #[test]
+    fn arm_notification_points_avail_event_at_current_idx() {
+        let avail_event_addr = USED + 4 + 8 * QSZ as u64;
+        let m = mem();
+        let mut q = queue();
+        q.event_idx = true;
+        m.write_u16(AVAIL + 2, 42).unwrap(); // avail.idx
+        m.write_u16(avail_event_addr, 7).unwrap(); // stale capture-side value
+        q.arm_notification(&m).unwrap();
+        assert_eq!(m.read_u16(avail_event_addr).unwrap(), 42);
     }
 
     #[test]
