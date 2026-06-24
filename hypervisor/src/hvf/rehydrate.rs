@@ -49,8 +49,11 @@ use libc::{
 
 use crate::arch::aarch64::gic::{Vgic, VgicConfig};
 use crate::cpu::Vcpu;
+use crate::hvf::ffi::SYSREG_CNTVCT_EL0;
 use crate::hvf::gic::HvfGicV3;
-use crate::hvf::translate::gic_ingest::{dist_to_hvf, num_irq_from_dist_len, redist_to_hvf};
+use crate::hvf::translate::gic_ingest::{
+    dist_to_hvf, num_irq_from_dist_len, redist_rd_base_words, redist_to_hvf, redist_words_per_vcpu,
+};
 use crate::hvf::translate::kvm_ingest::snapshot_json_to_hvf;
 use crate::hvf::virtio::GuestMemory;
 use crate::hvf::HvfVcpu;
@@ -292,17 +295,69 @@ impl Snapshot {
         }
     }
 
-    /// The redistributor dump slice belonging to vCPU `id`.
-    fn rdist_slice(&self, id: usize) -> &[u32] {
-        let per = self.gic_rdist.len() / self.vcpus.len();
-        &self.gic_rdist[id * per..(id + 1) * per]
+    /// A single virtual-counter reference shared by every vCPU, used to keep the
+    /// guest's `CNTVCT_EL0` synchronized across cores on resume.
+    ///
+    /// In a live SMP guest every vCPU reads one system counter, so all
+    /// `CNTVCT_EL0` values are identical at any instant. A snapshot, however,
+    /// reads each vCPU's registers sequentially, so the captured per-vCPU
+    /// `CNTVCT_EL0` values differ (observed ~1.3s apart on a 2-vCPU capture).
+    /// If each vCPU reseeds its HVF vtimer offset from its OWN captured value the
+    /// resumed cores' virtual counters stay that far apart, which the guest
+    /// kernel — which assumes a synchronized counter — cannot tolerate: the
+    /// secondary's tick math breaks and it spins instead of taking its timer.
+    /// We therefore pick ONE reference (vCPU0's captured `CNTVCT_EL0`) and seed
+    /// every vCPU's offset from it, restoring the synchronized-counter invariant.
+    fn reference_cntvct(&self) -> Option<u64> {
+        self.vcpus
+            .first()?
+            .sysregs
+            .iter()
+            .find(|(id, _)| *id == SYSREG_CNTVCT_EL0)
+            .map(|(_, v)| *v)
     }
+
+    /// The redistributor dump slice belonging to vCPU `id`, reassembled into the
+    /// contiguous per-vCPU order [`redist_to_hvf`] expects (RD_base words then
+    /// SGI-frame words).
+    ///
+    /// cloud-hypervisor serializes the redistributor dump in two passes: all
+    /// vCPUs' RD_base registers, then all vCPUs' SGI-frame registers. So for
+    /// `n` vCPUs the dump is `[v0 rd][v1 rd]..[v0 sgi][v1 sgi]..` and a naive
+    /// `len/n` split scrambles every secondary vCPU's frame. We stitch vCPU
+    /// `id`'s RD_base run and SGI run back together here. (For a single vCPU the
+    /// two sections are already contiguous, so this reduces to the whole dump.)
+    fn rdist_slice(&self, id: usize) -> Vec<u32> {
+        reassemble_rdist_slice(&self.gic_rdist, self.vcpus.len(), id)
+    }
+}
+
+/// Reassemble vCPU `id`'s contiguous redistributor slice (RD_base words then
+/// SGI-frame words) out of cloud-hypervisor's two-pass dump of `n` vCPUs:
+/// `[v0 rd][v1 rd]..[v0 sgi][v1 sgi]..`. Pure helper so the two-pass arithmetic
+/// — the M20 multi-vCPU fix — is unit-testable without a full snapshot.
+fn reassemble_rdist_slice(rdist: &[u32], n: usize, id: usize) -> Vec<u32> {
+    let rd_words = redist_rd_base_words();
+    let per = redist_words_per_vcpu();
+    let sgi_words = per - rd_words;
+    let sgi_base = n * rd_words;
+
+    let mut out = Vec::with_capacity(per);
+    let rd_start = id * rd_words;
+    out.extend_from_slice(&rdist[rd_start..rd_start + rd_words]);
+    let sgi_start = sgi_base + id * sgi_words;
+    out.extend_from_slice(&rdist[sgi_start..sgi_start + sgi_words]);
+    out
 }
 
 /// File-backed guest RAM: a private (copy-on-write) mapping of a region of the
 /// `memory-ranges` file. Private mapping means the resumed guest's writes never
 /// reach the on-disk snapshot, so a rehydration attempt cannot corrupt it.
-struct GuestRam {
+///
+/// Exposed (opaque) via [`PreparedVm::ram`] so the SMP resume path can keep the
+/// backings alive for the VM's lifetime; callers only ever store it, never read
+/// its fields.
+pub struct GuestRam {
     ptr: *mut u8,
     size: usize,
 }
@@ -418,6 +473,72 @@ pub fn rehydrate(
     memory_ranges: &Path,
     vm_ops: &Arc<dyn VmOps>,
 ) -> Result<RehydratedVm, RehydrateError> {
+    // Map RAM + create the managed GIC shell (no vCPUs yet).
+    let PreparedVm {
+        vm,
+        gic,
+        guest_mem,
+        ram,
+    } = prepare_vm(hv, snap, memory_ranges)?;
+
+    // --- vCPUs (created before distributor restore so the redistributors
+    //     exist) -----------------------------------------------------------
+    let mut vcpus = Vec::with_capacity(snap.vcpus.len());
+    for id in 0..snap.vcpus.len() {
+        let vcpu = vm
+            .create_vcpu(id as u32, Some(vm_ops.clone()))
+            .map_err(|e| RehydrateError::Hv(anyhow!("create_vcpu {id}: {e}")))?;
+        vcpus.push(vcpu);
+    }
+
+    // Global distributor restore, then per-vCPU register file + redistributor,
+    // then enable Group1 SPI forwarding. (Single-thread path: every vCPU was
+    // created on this thread, so its register file may be restored here too.)
+    restore_distributor(&gic, snap)?;
+    for (id, vcpu) in vcpus.iter_mut().enumerate() {
+        restore_vcpu_state(vcpu, snap, id)?;
+    }
+    enable_group1_spi_forwarding(&gic)?;
+
+    Ok(RehydratedVm {
+        vcpus,
+        gic,
+        guest_mem,
+        _ram: ram,
+        vm,
+    })
+}
+
+/// The pieces of a rehydrated VM that exist before any vCPU: the reconstructed
+/// VM handle, its mapped guest RAM, the restored-shell managed GIC, and a host
+/// view of guest memory.
+///
+/// This split exists for SMP resume: HVF binds every vCPU to the host thread
+/// that created it, so each vCPU must be created (and have its register file
+/// restored, and be run) on its own thread. The work that is NOT per-vCPU —
+/// mapping RAM and creating the GIC — happens here on the calling thread, and
+/// the caller then spawns one thread per vCPU.
+pub struct PreparedVm {
+    /// The restored-shell managed GICv3 (distributor not yet restored).
+    pub gic: Arc<Mutex<dyn Vgic>>,
+    /// Host view of guest RAM, sharing the hypervisor's backing pointers.
+    pub guest_mem: Arc<GuestMemory>,
+    /// Host-side guest-RAM backings (keep alive for the VM's lifetime; must
+    /// outlive `guest_mem` and the VM mapping).
+    pub ram: Vec<GuestRam>,
+    /// The reconstructed VM. Declared LAST so it is dropped last: HVF requires
+    /// every vCPU to be destroyed before the VM, and the GIC + guest-RAM
+    /// mappings belong to the VM, so `hv_vm_destroy` must run after them.
+    pub vm: Arc<dyn Vm>,
+}
+
+/// Create the VM, map guest RAM, and create the managed GIC shell — everything
+/// up to (but not including) vCPU creation. See [`PreparedVm`].
+pub fn prepare_vm(
+    hv: &dyn Hypervisor,
+    snap: &Snapshot,
+    memory_ranges: &Path,
+) -> Result<PreparedVm, RehydrateError> {
     let vm = hv
         .create_vm(HypervisorVmConfig {
             nested: false,
@@ -430,7 +551,7 @@ pub fn rehydrate(
     let mut ram = Vec::with_capacity(snap.mem_mappings.len());
     for m in &snap.mem_mappings {
         let backing = GuestRam::map_file(memory_ranges, m.file_offset, m.size as usize)?;
-        // SAFETY: `backing` outlives the VM (stored in RehydratedVm._ram).
+        // SAFETY: `backing` outlives the VM (the caller keeps `ram` alive).
         unsafe {
             vm.create_user_memory_region(m.slot, m.gpa, m.size as usize, backing.ptr, false, false)
                 .map_err(|e| RehydrateError::Hv(anyhow!("map RAM @ {:#x}: {e}", m.gpa)))?;
@@ -438,9 +559,9 @@ pub fn rehydrate(
         // Register the SAME host pointer with the device-model memory view so a
         // virtio device sees exactly what the guest sees.
         // SAFETY: `backing.ptr` is valid for `m.size` bytes for the VM's
-        // lifetime; `guest_mem` is dropped before `_ram` (field order above), so
-        // the pointer never outlives its mapping, and the device model is the
-        // only other reader/writer of guest RAM.
+        // lifetime; the caller drops `guest_mem` before `ram`, so the pointer
+        // never outlives its mapping, and the device model is the only other
+        // reader/writer of guest RAM.
         unsafe {
             guest_mem.register(m.gpa, backing.ptr, m.size as usize);
         }
@@ -459,106 +580,126 @@ pub fn rehydrate(
         RehydrateError::Hv(anyhow!(msg))
     })?;
 
-    // --- vCPUs (created before distributor restore so the redistributors
-    //     exist) -----------------------------------------------------------
-    let mut vcpus = Vec::with_capacity(snap.vcpus.len());
-    for id in 0..snap.vcpus.len() {
-        let vcpu = vm
-            .create_vcpu(id as u32, Some(vm_ops.clone()))
-            .map_err(|e| RehydrateError::Hv(anyhow!("create_vcpu {id}: {e}")))?;
-        vcpus.push(vcpu);
-    }
-
-    // --- distributor (global) ----------------------------------------------
-    //
-    // Skip the distributor *active* SPI registers (GICD_ICACTIVER 0x380 /
-    // GICD_ISACTIVER 0x300, the 0x300..0x400 block). Apple's managed GIC cannot
-    // accept a cold-restored active SPI: hv_gic_set_distributor_reg(ISACTIVER)
-    // walks an internal active-redistributor list that is only built as the GIC
-    // itself delivers an interrupt, so a restore-time write dereferences a null
-    // entry and faults (proven on hardware, macOS 26.x). A GICv2M-routed
-    // snapshot is the first to carry active SPIs at all (virtio completions are
-    // SPIs, not LPIs), which is why earlier ITS snapshots never hit this.
-    //
-    // Correctness is preserved without the distributor active bit: a vCPU that
-    // was mid-IRQ-handler at snapshot has its CPU-interface active-priority
-    // state (ICC_AP1R*) restored via set_state, so it still performs the
-    // priority drop on EOI and returns from the handler. The pending registers
-    // (ISPENDR/ICPENDR) ARE restored, so any not-yet-taken completion fires.
-    {
-        let mut guard = gic.lock().unwrap();
-        let concrete = guard
-            .as_any_concrete_mut()
-            .downcast_mut::<HvfGicV3>()
-            .ok_or_else(|| RehydrateError::Translate("GIC is not an HVF GIC".into()))?;
-        let dist_pairs = dist_to_hvf(&snap.gic_dist)
-            .ok_or_else(|| RehydrateError::Translate("distributor dump did not translate".into()))?;
-        for (reg, val) in dist_pairs {
-            // GICD_ISACTIVER (0x300..0x380) / GICD_ICACTIVER (0x380..0x400).
-            if (0x300..0x400).contains(&reg) {
-                continue;
-            }
-            concrete
-                .set_distributor_reg(reg, val)
-                .map_err(|e| RehydrateError::Hv(anyhow!("set GICD[{reg:#x}]: {e}")))?;
-        }
-    }
-
-    // --- per-vCPU: register file (MPIDR + ICC) then redistributor frame -----
-    for (id, vcpu) in vcpus.iter_mut().enumerate() {
-        vcpu.set_state(&CpuState::Hvf(snap.vcpus[id].clone()))
-            .map_err(|e| RehydrateError::Hv(anyhow!("restore vCPU {id} state: {e}")))?;
-
-        let redist_pairs = redist_to_hvf(snap.rdist_slice(id)).ok_or_else(|| {
-            RehydrateError::Translate(format!("vCPU {id} redistributor did not translate"))
-        })?;
-        let concrete = vcpu
-            .as_any_concrete_mut()
-            .downcast_mut::<HvfVcpu>()
-            .ok_or_else(|| RehydrateError::Translate("vCPU is not an HVF vCPU".into()))?;
-        for (reg, val) in redist_pairs {
-            concrete
-                .set_redistributor_reg(reg, val)
-                .map_err(|e| RehydrateError::Hv(anyhow!("vCPU {id} set GICR[{reg:#x}]: {e}")))?;
-        }
-    }
-
-    // --- enable Group1 SPI forwarding in the distributor --------------------
-    //
-    // cloud-hypervisor's KVM distributor dump (`VGIC_DIST_REGS`) starts at
-    // GICD_STATUSR and does NOT carry GICD_CTLR, so the restore above never
-    // enables interrupt-group forwarding. Apple's managed GIC comes up with
-    // GICD_CTLR = ARE | DS (0x50) but both group-enable bits clear, so the
-    // distributor forwards NO SPIs: a resumed guest still takes redistributor
-    // PPIs (the virtual timer, gated only by ICC_IGRPEN1) and so drives systemd,
-    // but every virtio completion delivered as a Group1 message-based SPI sits
-    // pending in the distributor and is never presented to the CPU interface —
-    // the guest blocks forever on its first post-resume disk write (jbd2). Set
-    // GICD_CTLR.EnableGrp1 so Group1 SPIs forward; the guest ran with Group1
-    // enabled at capture, so this restores its real distributor state. Done
-    // after the redistributors/MPIDR are restored to respect HVF ordering.
-    {
-        const GICD_CTLR_ENABLE_GRP1: u64 = 1 << 1;
-        let mut guard = gic.lock().unwrap();
-        let concrete = guard
-            .as_any_concrete_mut()
-            .downcast_mut::<HvfGicV3>()
-            .ok_or_else(|| RehydrateError::Translate("GIC is not an HVF GIC".into()))?;
-        let ctlr = concrete
-            .distributor_reg(0x0000)
-            .map_err(|e| RehydrateError::Hv(anyhow!("read GICD_CTLR: {e}")))?;
-        concrete
-            .set_distributor_reg(0x0000, ctlr | GICD_CTLR_ENABLE_GRP1)
-            .map_err(|e| RehydrateError::Hv(anyhow!("set GICD_CTLR: {e}")))?;
-    }
-
-    Ok(RehydratedVm {
-        vcpus,
+    Ok(PreparedVm {
+        vm,
         gic,
         guest_mem,
-        _ram: ram,
-        vm,
+        ram,
     })
+}
+
+/// Restore the global GIC distributor registers from the snapshot.
+///
+/// Skips the distributor *active* SPI registers (GICD_ISACTIVER 0x300 /
+/// GICD_ICACTIVER 0x380, the 0x300..0x400 block). Apple's managed GIC cannot
+/// accept a cold-restored active SPI: hv_gic_set_distributor_reg(ISACTIVER)
+/// walks an internal active-redistributor list that is only built as the GIC
+/// itself delivers an interrupt, so a restore-time write dereferences a null
+/// entry and faults (proven on hardware, macOS 26.x). A GICv2M-routed snapshot
+/// is the first to carry active SPIs at all (virtio completions are SPIs, not
+/// LPIs), which is why earlier ITS snapshots never hit this.
+///
+/// Correctness is preserved without the distributor active bit: a vCPU that was
+/// mid-IRQ-handler at snapshot has its CPU-interface active-priority state
+/// (ICC_AP1R*) restored via set_state, so it still performs the priority drop
+/// on EOI and returns from the handler. The pending registers (ISPENDR/ICPENDR)
+/// ARE restored, so any not-yet-taken completion fires.
+pub fn restore_distributor(
+    gic: &Arc<Mutex<dyn Vgic>>,
+    snap: &Snapshot,
+) -> Result<(), RehydrateError> {
+    let mut guard = gic.lock().unwrap();
+    let concrete = guard
+        .as_any_concrete_mut()
+        .downcast_mut::<HvfGicV3>()
+        .ok_or_else(|| RehydrateError::Translate("GIC is not an HVF GIC".into()))?;
+    let dist_pairs = dist_to_hvf(&snap.gic_dist)
+        .ok_or_else(|| RehydrateError::Translate("distributor dump did not translate".into()))?;
+    for (reg, val) in dist_pairs {
+        // GICD_ISACTIVER (0x300..0x380) / GICD_ICACTIVER (0x380..0x400).
+        if (0x300..0x400).contains(&reg) {
+            continue;
+        }
+        concrete
+            .set_distributor_reg(reg, val)
+            .map_err(|e| RehydrateError::Hv(anyhow!("set GICD[{reg:#x}]: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Restore one vCPU's architectural state: its register file (which sets MPIDR
+/// and the ICC CPU interface) and then its GIC redistributor frame.
+///
+/// MUST run on the host thread that created — and will run — this vCPU: HVF
+/// binds a vCPU to its creating thread, and the register/redistributor writes
+/// go through that thread's vCPU handle. The global distributor must already be
+/// restored ([`restore_distributor`]) so the redistributors exist.
+pub fn restore_vcpu_state(
+    vcpu: &mut Box<dyn Vcpu>,
+    snap: &Snapshot,
+    id: usize,
+) -> Result<(), RehydrateError> {
+    vcpu.set_state(&CpuState::Hvf(snap.vcpus[id].clone()))
+        .map_err(|e| RehydrateError::Hv(anyhow!("restore vCPU {id} state: {e}")))?;
+
+    let redist_pairs = redist_to_hvf(&snap.rdist_slice(id)).ok_or_else(|| {
+        RehydrateError::Translate(format!("vCPU {id} redistributor did not translate"))
+    })?;
+    let concrete = vcpu
+        .as_any_concrete_mut()
+        .downcast_mut::<HvfVcpu>()
+        .ok_or_else(|| RehydrateError::Translate("vCPU is not an HVF vCPU".into()))?;
+    for (reg, val) in redist_pairs {
+        concrete
+            .set_redistributor_reg(reg, val)
+            .map_err(|e| RehydrateError::Hv(anyhow!("vCPU {id} set GICR[{reg:#x}]: {e}")))?;
+    }
+
+    // Reseed this vCPU's virtual-counter offset from the SHARED reference (vCPU0's
+    // captured CNTVCT) rather than its own, so every core resumes on one
+    // synchronized virtual counter. `set_state` already seeded a per-vCPU offset
+    // from this vCPU's own captured CNTVCT; on an SMP guest those values diverge
+    // and the secondary's timer never fires, so this override is load-bearing for
+    // multi-vCPU resume (and a harmless no-op re-seed for a single vCPU, whose
+    // reference IS its own CNTVCT). See [`Snapshot::reference_cntvct`].
+    if let Some(reference) = snap.reference_cntvct() {
+        concrete
+            .restore_vtimer_offset(reference)
+            .map_err(|e| RehydrateError::Hv(anyhow!("vCPU {id} reseed vtimer offset: {e}")))?;
+    }
+    Ok(())
+}
+
+/// Enable Group1 SPI forwarding in the distributor.
+///
+/// cloud-hypervisor's KVM distributor dump (`VGIC_DIST_REGS`) starts at
+/// GICD_STATUSR and does NOT carry GICD_CTLR, so the distributor restore never
+/// enables interrupt-group forwarding. Apple's managed GIC comes up with
+/// GICD_CTLR = ARE | DS (0x50) but both group-enable bits clear, so the
+/// distributor forwards NO SPIs: a resumed guest still takes redistributor PPIs
+/// (the virtual timer, gated only by ICC_IGRPEN1) and so drives systemd, but
+/// every virtio completion delivered as a Group1 message-based SPI sits pending
+/// in the distributor and is never presented to the CPU interface — the guest
+/// blocks forever on its first post-resume disk write (jbd2). Set
+/// GICD_CTLR.EnableGrp1 so Group1 SPIs forward; the guest ran with Group1
+/// enabled at capture, so this restores its real distributor state. Call after
+/// the redistributors/MPIDR are restored to respect HVF ordering.
+pub fn enable_group1_spi_forwarding(
+    gic: &Arc<Mutex<dyn Vgic>>,
+) -> Result<(), RehydrateError> {
+    const GICD_CTLR_ENABLE_GRP1: u64 = 1 << 1;
+    let mut guard = gic.lock().unwrap();
+    let concrete = guard
+        .as_any_concrete_mut()
+        .downcast_mut::<HvfGicV3>()
+        .ok_or_else(|| RehydrateError::Translate("GIC is not an HVF GIC".into()))?;
+    let ctlr = concrete
+        .distributor_reg(0x0000)
+        .map_err(|e| RehydrateError::Hv(anyhow!("read GICD_CTLR: {e}")))?;
+    concrete
+        .set_distributor_reg(0x0000, ctlr | GICD_CTLR_ENABLE_GRP1)
+        .map_err(|e| RehydrateError::Hv(anyhow!("set GICD_CTLR: {e}")))?;
+    Ok(())
 }
 
 // --- small JSON helpers -----------------------------------------------------
@@ -608,4 +749,53 @@ fn u32_vec(v: &serde_json::Value, key: &str) -> Result<Vec<u32>, RehydrateError>
                 .ok_or_else(|| RehydrateError::Malformed(format!("non-integer in `{key}`")))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // cloud-hypervisor dumps redistributors in two passes: every vCPU's RD_base
+    // registers, then every vCPU's SGI-frame registers. `reassemble_rdist_slice`
+    // must stitch one vCPU's two runs back into the contiguous order
+    // `redist_to_hvf` expects. Build a synthetic 2-vCPU dump whose words encode
+    // their (section, vcpu, index) so the reassembly is checkable exactly.
+    #[test]
+    fn reassembles_two_pass_redistributor_dump() {
+        let rd = redist_rd_base_words();
+        let per = redist_words_per_vcpu();
+        let sgi = per - rd;
+        let n = 2;
+
+        // Layout: [v0 rd][v1 rd][v0 sgi][v1 sgi]. Encode each word distinctly.
+        let mut dump = vec![0u32; n * per];
+        for v in 0..n {
+            for i in 0..rd {
+                dump[v * rd + i] = 0x1000 + (v as u32) * 0x100 + i as u32; // rd
+            }
+            for i in 0..sgi {
+                dump[n * rd + v * sgi + i] = 0x2000 + (v as u32) * 0x100 + i as u32; // sgi
+            }
+        }
+
+        for v in 0..n {
+            let slice = reassemble_rdist_slice(&dump, n, v);
+            assert_eq!(slice.len(), per, "slice for vcpu {v} must be one full vcpu");
+            for i in 0..rd {
+                assert_eq!(slice[i], 0x1000 + (v as u32) * 0x100 + i as u32);
+            }
+            for i in 0..sgi {
+                assert_eq!(slice[rd + i], 0x2000 + (v as u32) * 0x100 + i as u32);
+            }
+        }
+    }
+
+    // For a single vCPU the two sections are already contiguous, so the slice is
+    // the whole dump unchanged (the pre-M20 behaviour we must not regress).
+    #[test]
+    fn single_vcpu_slice_is_identity() {
+        let per = redist_words_per_vcpu();
+        let dump: Vec<u32> = (0..per as u32).collect();
+        assert_eq!(reassemble_rdist_slice(&dump, 1, 0), dump);
+    }
 }

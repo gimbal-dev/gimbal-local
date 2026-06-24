@@ -632,6 +632,21 @@ pub mod gic_ingest {
             .sum()
     }
 
+    /// Number of `u32` words the RD_base (LPI/power) registers occupy per vCPU,
+    /// i.e. the words preceding the SGI/PPI frame. cloud-hypervisor serializes
+    /// the redistributor dump in TWO passes (`access_redists_aux`): first the
+    /// RD_base registers for every vCPU, then the SGI-frame registers for every
+    /// vCPU. A multi-vCPU dump is therefore
+    /// `[v0 rd_base][v1 rd_base]..[v0 sgi][v1 sgi]..`, NOT one contiguous block
+    /// per vCPU, so the per-vCPU slice must be reassembled from both sections.
+    pub fn redist_rd_base_words() -> usize {
+        VGIC_RDIST_REGS
+            .iter()
+            .filter(|r| r.base < GICR_SGI_OFFSET)
+            .map(|r| r.length as usize / REG_SIZE as usize)
+            .sum()
+    }
+
     /// Translate one vCPU's KVM redistributor dump slice into
     /// `(hv_gic_redistributor_reg_t, value)` writes for
     /// `hv_gic_set_redistributor_reg`. Only the SGI-frame registers (offset

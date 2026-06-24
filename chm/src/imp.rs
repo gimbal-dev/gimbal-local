@@ -7,22 +7,25 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
-use std::{env, fs, io};
+use std::{env, fs, io, thread};
 
 use crate::console::{self, RawConsole};
 use crate::serve;
 
 use hypervisor::hvf::devices::{MmioBus, Pl011};
 use hypervisor::hvf::gic::GicMsiSink;
-use hypervisor::hvf::rehydrate::{rehydrate, Snapshot};
+use hypervisor::hvf::rehydrate::{
+    enable_group1_spi_forwarding, prepare_vm, restore_distributor, restore_vcpu_state, PreparedVm,
+    Snapshot,
+};
 use hypervisor::hvf::virtio::pci::{MsiSink, MsiSpiInjector, VirtioPciDevice};
 use hypervisor::hvf::virtio::{devmgr, its};
 use hypervisor::hvf::virtio::GuestMemory;
 use hypervisor::arch::aarch64::gic::Vgic;
-use hypervisor::{Vcpu, VmExit, VmOps};
-use std::sync::Mutex;
+use hypervisor::{VmExit, VmOps};
 
 /// cloud-hypervisor's arm64 PL011 lives at the base of the mapped-IO window.
 pub(crate) const PL011_BASE: u64 = 0x0900_0000;
@@ -395,51 +398,14 @@ fn run(args: &Args) -> Result<ExitCode, String> {
         )
     })?;
 
-    let mut rvm = rehydrate(hv.as_ref(), &loaded.snap, &loaded.mem_ranges, &vm_ops)
-        .map_err(|e| format!("rehydrate: {e}"))?;
+    // Map RAM + create the managed GIC shell (no vCPUs yet). Each vCPU is then
+    // created, restored, and run on its OWN host thread (HVF binds a vCPU to its
+    // creating thread), so the snapshot's secondary cores resume concurrently.
+    let prepared = prepare_vm(hv.as_ref(), &loaded.snap, &loaded.mem_ranges)
+        .map_err(|e| format!("prepare VM: {e}"))?;
 
-    // Reconstruct the virtio device model from the snapshot and install it onto
-    // the bus, sharing the just-mapped guest RAM.
     let overlay_dir = dir.join(".chm-overlays");
-    match wire_virtio(&bus, &rvm.guest_mem, &loaded.state_json, &overlay_dir, Some(&rvm.gic)) {
-        Ok(devs) if !devs.is_empty() => {
-            if !args.quiet {
-                eprintln!("chm: virtio device model restored:");
-                for d in &devs {
-                    eprintln!("chm:   - {d}");
-                }
-            }
-        }
-        Ok(_) => {}
-        Err(e) => eprintln!("chm: warning: virtio device model not wired: {e}"),
-    }
-
-    if loaded.num_vcpus > 1 && !args.quiet {
-        eprintln!(
-            "chm: note: snapshot has {} vCPUs; resuming vCPU0 only \
-             (SMP secondary-core bring-up via PSCI CPU_ON is not yet wired).",
-            loaded.num_vcpus
-        );
-    }
-
-    if !args.quiet {
-        eprintln!("chm: guest resumed — serial console follows.\n");
-    }
-
-    // Wire the interactive console: put the terminal in raw mode and pump host
-    // keystrokes into the guest's PL011 receive path, asserting the serial SPI
-    // through the managed GIC so the guest's tty takes its receive interrupt.
-    // The guard restores the terminal when `run` returns (any exit path).
-    let raw_console = RawConsole::enable();
-    let serial_sink: Arc<dyn MsiSink> = Arc::new(GicMsiSink::new(rvm.gic.clone()));
-    console::spawn_stdin_pump(uart.clone(), serial_sink, raw_console.handle());
-    if !args.quiet {
-        eprintln!("chm: interactive console active (press Ctrl-A x to quit).\n");
-    }
-
-    let vcpu = rvm.vcpus[0].as_mut();
-    let outcome = run_loop(vcpu, &uart, args)?;
-    drop(raw_console);
+    let outcome = resume_smp(prepared, loaded, &bus, &uart, &vm_ops, &overlay_dir, args)?;
 
     if !args.quiet {
         eprintln!();
@@ -467,7 +433,364 @@ enum Outcome {
     ConsoleClosed,
 }
 
-fn run_loop(vcpu: &mut dyn Vcpu, uart: &Pl011, args: &Args) -> Result<Outcome, String> {
+/// Three-state phase gate used to coordinate the SMP restore handshake between
+/// the orchestrator thread and the per-vCPU threads. A vCPU thread blocks in
+/// [`PhaseGate::wait`] until the orchestrator advances the gate to `Go` (proceed
+/// to the next phase) or `Abort` (a sibling failed; unwind cleanly).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Gate {
+    Pending,
+    Go,
+    Abort,
+}
+
+struct PhaseGate {
+    state: Mutex<Gate>,
+    cv: Condvar,
+}
+
+impl PhaseGate {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(Gate::Pending),
+            cv: Condvar::new(),
+        }
+    }
+    fn set(&self, g: Gate) {
+        *self.state.lock().unwrap() = g;
+        self.cv.notify_all();
+    }
+    /// Block until the gate leaves `Pending`; return the terminal state.
+    fn wait(&self) -> Gate {
+        let mut s = self.state.lock().unwrap();
+        while *s == Gate::Pending {
+            s = self.cv.wait(s).unwrap();
+        }
+        *s
+    }
+}
+
+/// A boxed closure that forces one vCPU out of `hv_vcpu_run` (its `exit_signal`).
+/// Collected per-vCPU so the orchestrator can stop every thread at once.
+type ExitSignal = Arc<dyn Fn() + Send + Sync>;
+
+/// Resume every vCPU in the snapshot concurrently (SMP) on Hypervisor.framework.
+///
+/// HVF binds a vCPU to the host thread that creates it: that thread must also
+/// restore its register file and run it. So each vCPU runs on its own thread and
+/// the restore is a multi-phase handshake driven by this orchestrator thread:
+///
+/// 1. Each thread creates its vCPU and reports in (the global GIC distributor
+///    must be restored only after every redistributor exists, i.e. after every
+///    vCPU is created).
+/// 2. The orchestrator restores the global distributor, then releases the
+///    threads via `dist_gate`.
+/// 3. Each thread restores its own register file (MPIDR + ICC interface) and
+///    redistributor frame, then reports in.
+/// 4. The orchestrator enables Group1 SPI forwarding, wires the virtio device
+///    model + interactive console, then releases the threads via `go_gate`.
+/// 5. The threads run their vCPUs; the orchestrator drains the shared console
+///    and enforces the stop policy, then stops + joins every thread (each vCPU
+///    is destroyed on its owning thread).
+///
+/// mpsc channels collect the per-phase "ready" reports (rather than a barrier,
+/// which would deadlock if a thread fails early); the gates let the orchestrator
+/// broadcast `Abort` so a partially-restored set unwinds without hanging.
+#[allow(clippy::too_many_arguments)]
+fn resume_smp(
+    prepared: PreparedVm,
+    loaded: Loaded,
+    bus: &Arc<MmioBus>,
+    uart: &Arc<Pl011>,
+    vm_ops: &Arc<dyn VmOps>,
+    overlay_dir: &Path,
+    args: &Args,
+) -> Result<Outcome, String> {
+    let Loaded {
+        snap, state_json, ..
+    } = loaded;
+    let n = snap.vcpus.len();
+    let snap = Arc::new(snap);
+
+    let running = Arc::new(AtomicBool::new(true));
+    let dist_gate = Arc::new(PhaseGate::new());
+    let go_gate = Arc::new(PhaseGate::new());
+    let exits: Arc<Mutex<Vec<ExitSignal>>> = Arc::new(Mutex::new(Vec::new()));
+    let outcome: Arc<Mutex<Option<Result<Outcome, String>>>> = Arc::new(Mutex::new(None));
+    let (created_tx, created_rx) = mpsc::channel::<Result<(), String>>();
+    let (restored_tx, restored_rx) = mpsc::channel::<Result<(), String>>();
+    // Serialize vCPU creation in index order: the managed GIC associates each
+    // redistributor with a vCPU at create time, so creating them out of order
+    // (two threads racing `hv_vcpu_create`) can misassign a secondary's
+    // redistributor. A turn counter makes vCPU i create only after i-1.
+    let create_turn = Arc::new((Mutex::new(0usize), Condvar::new()));
+    // Same ordered-handshake mechanism for the per-vCPU register/redistributor
+    // restore, which also touches the managed GIC and must be serialized.
+    let restore_turn = Arc::new((Mutex::new(0usize), Condvar::new()));
+
+    let mut handles = Vec::with_capacity(n);
+    for id in 0..n {
+        let vm = prepared.vm.clone();
+        let vm_ops = vm_ops.clone();
+        let snap = snap.clone();
+        let running = running.clone();
+        let dist_gate = dist_gate.clone();
+        let go_gate = go_gate.clone();
+        let exits = exits.clone();
+        let outcome = outcome.clone();
+        let created_tx = created_tx.clone();
+        let restored_tx = restored_tx.clone();
+        let create_turn = create_turn.clone();
+        let restore_turn = restore_turn.clone();
+        let h = thread::Builder::new()
+            .name(format!("chm-vcpu{id}"))
+            .spawn(move || {
+                // --- phase 1: create this vCPU on its own thread, in id order ---
+                {
+                    let (lock, cv) = &*create_turn;
+                    let mut turn = lock.lock().unwrap();
+                    while *turn != id {
+                        turn = cv.wait(turn).unwrap();
+                    }
+                }
+                let mut vcpu = match vm.create_vcpu(id as u32, Some(vm_ops)) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = created_tx.send(Err(format!("create_vcpu {id}: {e}")));
+                        let (lock, cv) = &*create_turn;
+                        *lock.lock().unwrap() = id + 1;
+                        cv.notify_all();
+                        // Park until the orchestrator aborts the handshake.
+                        let _ = dist_gate.wait();
+                        return;
+                    }
+                };
+                {
+                    let (lock, cv) = &*create_turn;
+                    *lock.lock().unwrap() = id + 1;
+                    cv.notify_all();
+                }
+                if let Some(sig) = vcpu.exit_signal() {
+                    exits.lock().unwrap().push(sig);
+                }
+                let _ = created_tx.send(Ok(()));
+
+                // --- phase 2: wait for the global distributor restore ---
+                if dist_gate.wait() != Gate::Go {
+                    return;
+                }
+
+                // --- phase 3: restore this vCPU's register file + redist, in id
+                //     order. The managed GIC's redistributor register access is
+                //     not safe to drive concurrently from multiple vCPU threads
+                //     (a concurrent restore lands a secondary's redistributor on
+                //     the wrong one, so it then takes no PPI/SGI), so serialize. ---
+                {
+                    let (lock, cv) = &*restore_turn;
+                    let mut turn = lock.lock().unwrap();
+                    while *turn != id {
+                        turn = cv.wait(turn).unwrap();
+                    }
+                }
+                let restore_res = restore_vcpu_state(&mut vcpu, &snap, id);
+                {
+                    let (lock, cv) = &*restore_turn;
+                    *lock.lock().unwrap() = id + 1;
+                    cv.notify_all();
+                }
+                if let Err(e) = restore_res {
+                    let _ = restored_tx.send(Err(format!("restore vCPU {id}: {e}")));
+                    let _ = go_gate.wait();
+                    return;
+                }
+                let _ = restored_tx.send(Ok(()));
+
+                // --- phase 4: wait for device wiring, then run the guest ---
+                if go_gate.wait() != Gate::Go {
+                    return;
+                }
+                while running.load(Ordering::Acquire) {
+                    match vcpu.run() {
+                        Ok(VmExit::Ignore) => {}
+                        Ok(VmExit::Shutdown | VmExit::Reset) => {
+                            let mut o = outcome.lock().unwrap();
+                            if o.is_none() {
+                                *o = Some(Ok(Outcome::PoweredOff));
+                            }
+                            running.store(false, Ordering::Release);
+                            break;
+                        }
+                        Ok(other) => {
+                            let mut o = outcome.lock().unwrap();
+                            if o.is_none() {
+                                *o = Some(Err(format!("vCPU {id} unexpected exit: {other:?}")));
+                            }
+                            running.store(false, Ordering::Release);
+                            break;
+                        }
+                        Err(e) => {
+                            let mut o = outcome.lock().unwrap();
+                            if o.is_none() {
+                                *o = Some(Err(format!("vCPU {id} run: {e}")));
+                            }
+                            running.store(false, Ordering::Release);
+                            break;
+                        }
+                    }
+                }
+                // `vcpu` drops here, on its owning thread (HVF requirement).
+            })
+            .map_err(|e| format!("spawn vCPU {id} thread: {e}"))?;
+        handles.push(h);
+    }
+    drop(created_tx);
+    drop(restored_tx);
+
+    // --- phase 1 join: every vCPU created ---
+    let mut first_err: Option<String> = None;
+    for _ in 0..n {
+        match created_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                first_err.get_or_insert(e);
+            }
+            Err(_) => {
+                first_err.get_or_insert_with(|| "a vCPU thread exited before creation".into());
+            }
+        }
+    }
+    if let Some(e) = first_err {
+        dist_gate.set(Gate::Abort);
+        for h in handles {
+            let _ = h.join();
+        }
+        return Err(e);
+    }
+
+    // --- phase 2: restore the global distributor, then release the threads ---
+    if let Err(e) = restore_distributor(&prepared.gic, &snap) {
+        dist_gate.set(Gate::Abort);
+        for h in handles {
+            let _ = h.join();
+        }
+        return Err(format!("restore distributor: {e}"));
+    }
+    dist_gate.set(Gate::Go);
+
+    // --- phase 3 join: every vCPU's register file + redistributor restored ---
+    for _ in 0..n {
+        match restored_rx.recv() {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                first_err.get_or_insert(e);
+            }
+            Err(_) => {
+                first_err.get_or_insert_with(|| "a vCPU thread exited before restore".into());
+            }
+        }
+    }
+    if let Some(e) = first_err {
+        go_gate.set(Gate::Abort);
+        for h in handles {
+            let _ = h.join();
+        }
+        return Err(e);
+    }
+
+    // --- phase 4 prep: Group1 forwarding, virtio device model, console ---
+    if let Err(e) = enable_group1_spi_forwarding(&prepared.gic) {
+        go_gate.set(Gate::Abort);
+        for h in handles {
+            let _ = h.join();
+        }
+        return Err(format!("enable Group1 forwarding: {e}"));
+    }
+
+    match wire_virtio(
+        bus,
+        &prepared.guest_mem,
+        &state_json,
+        overlay_dir,
+        Some(&prepared.gic),
+    ) {
+        Ok(devs) if !devs.is_empty() => {
+            if !args.quiet {
+                eprintln!("chm: virtio device model restored:");
+                for d in &devs {
+                    eprintln!("chm:   - {d}");
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) => eprintln!("chm: warning: virtio device model not wired: {e}"),
+    }
+
+    if !args.quiet {
+        if n > 1 {
+            eprintln!("chm: resuming {n} vCPUs concurrently (SMP).");
+        }
+        eprintln!("chm: guest resumed — serial console follows.\n");
+    }
+
+    // Interactive console: raw-mode terminal + a stdin pump that feeds host
+    // keystrokes into the guest's PL011 receive path, asserting the serial SPI
+    // through the managed GIC. The guard restores the terminal on any exit path.
+    let raw_console = RawConsole::enable();
+    let serial_sink: Arc<dyn MsiSink> = Arc::new(GicMsiSink::new(prepared.gic.clone()));
+    console::spawn_stdin_pump(uart.clone(), serial_sink, raw_console.handle());
+    if !args.quiet {
+        eprintln!("chm: interactive console active (press Ctrl-A x to quit).\n");
+    }
+
+    // --- phase 4 go: release the vCPU threads to run the guest ---
+    go_gate.set(Gate::Go);
+
+    // The orchestrator drains the shared console + enforces the stop policy.
+    let coordinator = run_console(uart, &running, args);
+
+    // Stop every vCPU thread: clear the run flag, force any in-flight `run()` to
+    // return (hv_vcpus_exit), and join — each vCPU is destroyed on its thread.
+    running.store(false, Ordering::Release);
+    for sig in exits.lock().unwrap().iter() {
+        sig();
+    }
+    for h in handles {
+        let _ = h.join();
+    }
+    drop(raw_console);
+
+    // Tear the VM down now that every vCPU thread has joined: `hv_vm_destroy`
+    // (inside this drop) must run only once all vCPUs are destroyed, which they
+    // are because each thread destroyed its own vCPU before returning and we have
+    // joined them all. `PreparedVm` declares `vm` last so it drops after the GIC,
+    // guest memory and RAM backings. Dropping here (rather than at scope exit)
+    // both makes that ordering explicit and consumes `prepared` by value.
+    drop(prepared);
+
+    // Flush any final console bytes emitted just before the threads stopped.
+    let tail = uart.take_output();
+    if !tail.is_empty() {
+        let mut stdout = io::stdout();
+        let _ = stdout.write_all(&tail).and_then(|()| stdout.flush());
+    }
+
+    // A vCPU-reported terminal result (power-off / error) wins; otherwise the
+    // coordinator's stop reason (max-seconds / idle / console-closed).
+    if let Some(res) = outcome.lock().unwrap().take() {
+        return res;
+    }
+    coordinator
+}
+
+/// The orchestrator-thread console loop: drain the guest's shared PL011 output
+/// to stdout and enforce the `--max-seconds` / `--idle-exit` stop policy. Runs
+/// until a vCPU thread clears `running` (power-off / error) or a stop condition
+/// fires.
+fn run_console(
+    uart: &Arc<Pl011>,
+    running: &Arc<AtomicBool>,
+    args: &Args,
+) -> Result<Outcome, String> {
     let start = Instant::now();
     let mut last_output = Instant::now();
     let mut stdout = io::stdout();
@@ -475,15 +798,11 @@ fn run_loop(vcpu: &mut dyn Vcpu, uart: &Pl011, args: &Args) -> Result<Outcome, S
     let max = (args.max_seconds > 0).then(|| Duration::from_secs(args.max_seconds));
     let idle = (args.idle_exit_secs > 0).then(|| Duration::from_secs(args.idle_exit_secs));
 
-    loop {
-        match vcpu.run().map_err(|e| format!("vCPU run: {e}"))? {
-            VmExit::Ignore => {}
-            VmExit::Shutdown | VmExit::Reset => return Ok(Outcome::PoweredOff),
-            other => return Err(format!("unexpected guest exit: {other:?}")),
-        }
-
+    while running.load(Ordering::Acquire) {
         let bytes = uart.take_output();
-        if !bytes.is_empty() {
+        if bytes.is_empty() {
+            thread::sleep(Duration::from_millis(5));
+        } else {
             match stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
                 Ok(()) => last_output = Instant::now(),
                 // The console consumer went away (e.g. piped into `head`): stop
@@ -506,6 +825,8 @@ fn run_loop(vcpu: &mut dyn Vcpu, uart: &Pl011, args: &Args) -> Result<Outcome, S
             return Ok(Outcome::Idle(args.idle_exit_secs));
         }
     }
+    // A vCPU thread stopped the run; the caller surfaces the recorded outcome.
+    Ok(Outcome::PoweredOff)
 }
 
 fn banner(dir: &Path, mem_ranges: &Path, num_vcpus: u32, total_ram: u64) {
