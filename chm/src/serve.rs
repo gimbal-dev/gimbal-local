@@ -479,7 +479,7 @@ struct EngineOpts {
 fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Result<String, String> {
     let loaded = load_snapshot(dir)?;
     its_lpi_guard(&loaded.state_json)?;
-    let (uart, bus) = build_vm_ops();
+    let (uart, bus) = build_vm_ops(&loaded.state_json);
     let vm_ops: Arc<dyn VmOps> = bus.clone();
 
     let hv = hypervisor::new().map_err(|e| {

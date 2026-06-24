@@ -500,6 +500,7 @@ name = "cloud-hypervisor-mac"
 version = "0.1.0"
 dependencies = [
  "hypervisor",
+ "libc",
 ]
 
 [[package]]

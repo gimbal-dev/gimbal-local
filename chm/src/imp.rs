@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{env, fs, io};
 
+use crate::console::{self, RawConsole};
 use crate::serve;
 
 use hypervisor::hvf::devices::{MmioBus, Pl011};
@@ -73,8 +74,14 @@ pub(crate) fn load_snapshot(dir: &Path) -> Result<Loaded, String> {
 /// Build the device model: a bus carrying a real PL011 at the guest's serial
 /// base. Returns the UART (to drain output) alongside the concrete bus, so the
 /// caller can add virtio devices to it after rehydration maps guest RAM.
-pub(crate) fn build_vm_ops() -> (Arc<Pl011>, Arc<MmioBus>) {
+pub(crate) fn build_vm_ops(state_json: &str) -> (Arc<Pl011>, Arc<MmioBus>) {
     let uart = Arc::new(Pl011::new());
+    // Seed the UART's line/interrupt state from the snapshot so the resumed
+    // guest's interrupt-driven tty receives host keystrokes (RXIM is programmed
+    // pre-snapshot and never re-issued after resume).
+    if let Some(s) = devmgr::parse_serial_state(state_json) {
+        uart.restore(s.imsc, s.cr, s.lcr_h, s.ibrd, s.fbrd, s.ifls);
+    }
     let bus = Arc::new(MmioBus::new());
     bus.add(PL011_BASE, PL011_SIZE, uart.clone());
     (uart, bus)
@@ -373,7 +380,7 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     }
 
     // Device model: a bus with a real PL011 at the guest's serial base.
-    let (uart, bus) = build_vm_ops();
+    let (uart, bus) = build_vm_ops(&loaded.state_json);
     let vm_ops: Arc<dyn VmOps> = bus.clone();
 
     let hv = hypervisor::new().map_err(|e| {
@@ -415,8 +422,20 @@ fn run(args: &Args) -> Result<ExitCode, String> {
         eprintln!("chm: guest resumed — serial console follows.\n");
     }
 
+    // Wire the interactive console: put the terminal in raw mode and pump host
+    // keystrokes into the guest's PL011 receive path, asserting the serial SPI
+    // through the managed GIC so the guest's tty takes its receive interrupt.
+    // The guard restores the terminal when `run` returns (any exit path).
+    let raw_console = RawConsole::enable();
+    let serial_sink: Arc<dyn MsiSink> = Arc::new(GicMsiSink::new(rvm.gic.clone()));
+    console::spawn_stdin_pump(uart.clone(), serial_sink, raw_console.handle());
+    if !args.quiet {
+        eprintln!("chm: interactive console active (press Ctrl-A x to quit).\n");
+    }
+
     let vcpu = rvm.vcpus[0].as_mut();
     let outcome = run_loop(vcpu, &uart, args)?;
+    drop(raw_console);
 
     if !args.quiet {
         eprintln!();

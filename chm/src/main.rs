@@ -24,6 +24,9 @@ use std::process::ExitCode;
 mod imp;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod console;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod serve;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

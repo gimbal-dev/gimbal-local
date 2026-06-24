@@ -26,6 +26,7 @@ hypervisor = { path = "../hypervisor", default-features = false, features = [
   "hvf",
   "kvm-snapshot",
 ] }
+libc = { workspace = true }
 
 [lints]
 workspace = true
