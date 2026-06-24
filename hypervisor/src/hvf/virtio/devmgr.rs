@@ -145,6 +145,49 @@ pub fn parse_devices(state_json: &str) -> Result<Vec<VirtioDeviceDesc>, DevMgrEr
     Ok(out)
 }
 
+/// The captured PL011 line/interrupt configuration that a resumed guest's
+/// driver believes the hardware still holds (it programmed these before the
+/// snapshot and does NOT re-issue them after resume). Restoring them into our
+/// fresh [`crate::hvf::devices::Pl011`] is what lets a host keystroke raise the
+/// guest's receive interrupt: `int_enabled` (UARTIMSC) carries RXIM, without
+/// which an interrupt-driven `agetty` never reads typed input.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SerialRegs {
+    /// UARTIMSC interrupt mask (cloud-hypervisor `int_enabled`).
+    pub imsc: u32,
+    /// UARTCR control register.
+    pub cr: u32,
+    /// UARTLCR_H line control (cloud-hypervisor `lcr`).
+    pub lcr_h: u32,
+    /// Integer baud divisor.
+    pub ibrd: u32,
+    /// Fractional baud divisor.
+    pub fbrd: u32,
+    /// UARTIFLS FIFO level select (cloud-hypervisor `ifl`).
+    pub ifls: u32,
+}
+
+/// Parse the `__serial` device node's captured PL011 register state, if present.
+///
+/// cloud-hypervisor serializes the UART under
+/// `snapshots/device-manager/snapshots/__serial` as a JSON string with the
+/// PrimeCell register fields. Returns `None` when the node is absent or
+/// malformed (a guest that polls its UART still works without this).
+pub fn parse_serial_state(state_json: &str) -> Option<SerialRegs> {
+    let root: Value = serde_json::from_str(state_json).ok()?;
+    let node = root.pointer("/snapshots/device-manager/snapshots/__serial")?;
+    let st = embedded(node).ok()?;
+    let u32_at = |k: &str| st.get(k).and_then(Value::as_u64).map(|v| v as u32);
+    Some(SerialRegs {
+        imsc: u32_at("int_enabled").unwrap_or(0),
+        cr: u32_at("cr").unwrap_or(0),
+        lcr_h: u32_at("lcr").unwrap_or(0),
+        ibrd: u32_at("ibrd").unwrap_or(0),
+        fbrd: u32_at("fbrd").unwrap_or(0),
+        ifls: u32_at("ifl").unwrap_or(0),
+    })
+}
+
 /// Parse the device-manager `device_tree` into a map of transport id -> ITS
 /// `DeviceID` (decoded from the recorded `pci_bdf`, `None` for non-PCI nodes).
 fn parse_bdf_map(root: &Value) -> std::collections::HashMap<String, Option<u32>> {
@@ -473,5 +516,23 @@ mod tests {
         assert_eq!(rng.bar_base, 0x2_0000_0000);
         // BDF 0000:00:03.0 -> (3<<3) = 0x18.
         assert_eq!(rng.device_id, 0x18);
+    }
+
+    #[test]
+    fn parses_serial_register_state() {
+        // A minimal device-manager tree carrying just the `__serial` node, with
+        // the PL011 register fields cloud-hypervisor serializes (the embedded
+        // `state` is itself a JSON string). int_enabled = 0x50 = RXIM|RTIM.
+        let json = r#"{"snapshots":{"device-manager":{"snapshots":{"__serial":{"snapshots":{},"snapshot_data":{"state":"{\"flags\":144,\"lcr\":112,\"cr\":3841,\"int_enabled\":80,\"ibrd\":39,\"fbrd\":4,\"ifl\":18}"}}}}}}"#;
+        let regs = parse_serial_state(json).expect("serial state");
+        assert_eq!(regs.imsc, 0x50, "RXIM|RTIM recovered from int_enabled");
+        assert_eq!(regs.cr, 3841);
+        assert_eq!(regs.lcr_h, 112);
+        assert_eq!(regs.ibrd, 39);
+        assert_eq!(regs.fbrd, 4);
+        assert_eq!(regs.ifls, 18);
+
+        // Absent node -> None (a polling guest still works without it).
+        assert!(parse_serial_state(r#"{"snapshots":{}}"#).is_none());
     }
 }
