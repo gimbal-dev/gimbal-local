@@ -287,7 +287,7 @@ pub mod kvm_ingest {
         raise_from_kvm(&from_kvm(core_regs, sys_regs))
     }
 
-    use kvm_bindings::kvm_mp_state;
+    use kvm_bindings::{kvm_mp_state, KVM_MP_STATE_STOPPED};
     use serde::Deserialize;
 
     /// The aarch64 `VcpuKvmState` exactly as cloud-hypervisor serializes it into
@@ -327,7 +327,12 @@ pub mod kvm_ingest {
     /// As [`from_snapshot_json`] but translate the rest of the way to an HVF
     /// `VcpuHvfState` ready for `Vcpu::set_state`.
     pub fn snapshot_json_to_hvf(state_json: &str) -> Result<VcpuHvfState, serde_json::Error> {
-        Ok(raise_from_kvm(&from_snapshot_json(state_json)?))
+        let CpuStateSnapshot::Kvm(s) = serde_json::from_str::<CpuStateSnapshot>(state_json)?;
+        let mut hvf = raise_from_kvm(&from_kvm(&s.core_regs, &s.sys_regs));
+        // A stopped KVM MP state means this vCPU was offline at snapshot time
+        // and should not run until a PSCI CPU_ON wakes it.
+        hvf.mp_state_running = s.mp_state.mp_state != KVM_MP_STATE_STOPPED;
+        Ok(hvf)
     }
 }
 

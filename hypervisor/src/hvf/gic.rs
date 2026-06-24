@@ -354,18 +354,17 @@ impl crate::hvf::virtio::pci::MsiSink for GicMsiSink {
                 (grp >> bit) & 1,
             );
         }
-        // The rehydrated managed GIC does not honour affinity-based SPI routing
-        // (GICD_IROUTERn naming a specific PE by MPIDR affinity): a completion
-        // SPI restored with IROUTER = affinity 0.0.0.0 pends in the distributor
-        // but is never forwarded to vCPU0's CPU interface, so the guest wedges on
-        // its first post-resume virtio completion. The redistributor path (PPIs,
-        // e.g. the virtual timer) is unaffected, which is why a resumed guest
-        // still ticks but never takes a disk/rng completion. Routing the SPI
-        // 1-of-N (GICD_IROUTER.IRM = bit 31) delivers it to any participating PE
-        // and IS honoured. We only resume vCPU0, so 1-of-N targets exactly the PE
-        // the affinity routing intended; faithful for this single-core resume.
+        // Hardware-proven boundary: Apple's managed GIC accepts affinity-routed
+        // message SPIs (the INTID becomes pending in GICD_ISPENDR) but does not
+        // forward them to the target vCPU's CPU interface. Routing the INTID
+        // 1-of-N via GICD_IROUTER.IRM *is* forwarded and is the deliverable path
+        // for message-based SPI snapshots on HVF. Keep an affinity-only escape
+        // hatch for diagnostics/proofs, but the production path deliberately
+        // re-routes before delivery.
         const GICD_IROUTER_IRM: u64 = 1 << 31;
-        if let Err(e) = gic.set_distributor_reg(0x6000 + 8 * intid, GICD_IROUTER_IRM) {
+        if std::env::var_os("CHM_DISABLE_SPI_1_OF_N_FALLBACK").is_none()
+            && let Err(e) = gic.set_distributor_reg(0x6000 + 8 * intid, GICD_IROUTER_IRM)
+        {
             eprintln!("[gic-msi] set IROUTER 1-of-N for SPI {intid} failed: {e:?}");
         }
         if let Err(e) = gic.deliver_msi(intid) {

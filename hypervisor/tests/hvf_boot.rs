@@ -12,7 +12,7 @@
 
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 #[cfg(feature = "kvm-snapshot")]
@@ -45,6 +45,34 @@ const GUEST_CODE: [u8; 40] = [
     0xab, 0xff, 0xff, 0x54, // b.lt loop
     0x00, 0x01, 0x80, 0xd2, // movz x0, #0x8
     0x00, 0x80, 0xb0, 0xf2, // movk x0, #0x8400, lsl #16
+    0x02, 0x00, 0x00, 0xd4, // hvc  #0
+    0x00, 0x00, 0x00, 0x14, // b    .
+];
+
+/// vCPU0: PSCI CPU_ON(target MPIDR 1, entry RAM_BASE+0x100, context 0x1234),
+/// then SYSTEM_OFF.
+#[rustfmt::skip]
+const PSCI_CPU_ON_PRIMARY: [u8; 44] = [
+    0x60, 0x00, 0x80, 0xd2, // movz x0, #0x3
+    0x00, 0x80, 0xb8, 0xf2, // movk x0, #0xc400, lsl #16 (PSCI CPU_ON 64-bit)
+    0x21, 0x00, 0x80, 0xd2, // movz x1, #0x1 (target MPIDR Aff0=1)
+    0x02, 0x20, 0x80, 0xd2, // movz x2, #0x100
+    0x02, 0x00, 0xa8, 0xf2, // movk x2, #0x4000, lsl #16 (RAM_BASE+0x100)
+    0x83, 0x46, 0x82, 0xd2, // movz x3, #0x1234 (context)
+    0x02, 0x00, 0x00, 0xd4, // hvc  #0
+    0x00, 0x01, 0x80, 0xd2, // movz x0, #0x8
+    0x00, 0x80, 0xb0, 0xf2, // movk x0, #0x8400, lsl #16 (SYSTEM_OFF)
+    0x02, 0x00, 0x00, 0xd4, // hvc  #0
+    0x00, 0x00, 0x00, 0x14, // b    .
+];
+
+/// vCPU1 entry: write x0 (the PSCI context) to MMIO_TX and power off.
+#[rustfmt::skip]
+const PSCI_CPU_ON_SECONDARY: [u8; 24] = [
+    0x0a, 0x00, 0xa2, 0xd2, // movz x10, #0x1000, lsl #16 (MMIO_TX)
+    0x40, 0x01, 0x00, 0xb9, // str  w0, [x10]
+    0x00, 0x01, 0x80, 0xd2, // movz x0, #0x8
+    0x00, 0x80, 0xb0, 0xf2, // movk x0, #0x8400, lsl #16 (SYSTEM_OFF)
     0x02, 0x00, 0x00, 0xd4, // hvc  #0
     0x00, 0x00, 0x00, 0x14, // b    .
 ];
@@ -139,6 +167,55 @@ impl VmOps for RecordingVmOps {
     }
 }
 
+struct PsciCpuOnVmOps {
+    request: Mutex<Option<(u64, u64, u64)>>,
+    cv: Condvar,
+    writes: Mutex<Vec<u32>>,
+}
+
+impl PsciCpuOnVmOps {
+    fn wait_for_cpu_on(&self) -> (u64, u64, u64) {
+        let mut req = self.request.lock().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Some(req) = req.take() {
+                return req;
+            }
+            let now = Instant::now();
+            assert!(now < deadline, "timed out waiting for PSCI CPU_ON");
+            let timeout = deadline.saturating_duration_since(now);
+            req = self.cv.wait_timeout(req, timeout).unwrap().0;
+        }
+    }
+}
+
+impl VmOps for PsciCpuOnVmOps {
+    fn guest_mem_write(&self, _gpa: u64, buf: &[u8]) -> VmOpsResult<usize> {
+        Ok(buf.len())
+    }
+    fn guest_mem_read(&self, _gpa: u64, buf: &mut [u8]) -> VmOpsResult<usize> {
+        Ok(buf.len())
+    }
+    fn mmio_read(&self, _gpa: u64, data: &mut [u8]) -> VmOpsResult<()> {
+        data.fill(0);
+        Ok(())
+    }
+    fn mmio_write(&self, gpa: u64, data: &[u8]) -> VmOpsResult<()> {
+        if gpa == MMIO_TX {
+            let n = data.len().min(4);
+            let mut v = [0u8; 4];
+            v[..n].copy_from_slice(&data[..n]);
+            self.writes.lock().unwrap().push(u32::from_le_bytes(v));
+        }
+        Ok(())
+    }
+    fn psci_vcpu_on(&self, target_mpidr: u64, entry: u64, context: u64) -> VmOpsResult<i64> {
+        *self.request.lock().unwrap() = Some((target_mpidr, entry, context));
+        self.cv.notify_all();
+        Ok(0)
+    }
+}
+
 /// Build a VM, map `ram`, and create a single vCPU wired to `vm_ops`.
 fn build_vm(ram: &HostRam, vm_ops: Arc<RecordingVmOps>) -> (Arc<dyn Vm>, Box<dyn Vcpu>) {
     let hv = hypervisor::new().expect("hypervisor::new() — is the test binary codesigned?");
@@ -185,6 +262,66 @@ fn hvf_cold_boot_mmio_sequence() {
         "expected Shutdown, got {exit:?}"
     );
     assert_eq!(*vm_ops.writes.lock().unwrap(), vec![1, 2, 3, 4, 5, 6]);
+}
+
+#[test]
+fn hvf_psci_cpu_on_starts_secondary_vcpu() {
+    let ram = HostRam::new(RAM_SIZE);
+    ram.load(0, &PSCI_CPU_ON_PRIMARY);
+    ram.load(0x100, &PSCI_CPU_ON_SECONDARY);
+    let vm_ops = Arc::new(PsciCpuOnVmOps {
+        request: Mutex::new(None),
+        cv: Condvar::new(),
+        writes: Mutex::new(Vec::new()),
+    });
+
+    let hv = hypervisor::new().expect("hypervisor::new() -- is the test binary codesigned?");
+    let vm = hv
+        .create_vm(HypervisorVmConfig {
+            nested: false,
+            smt_enabled: false,
+        })
+        .expect("create_vm");
+    // SAFETY: ram outlives the mapping and both vCPU threads.
+    unsafe {
+        vm.create_user_memory_region(0, RAM_BASE, ram.size, ram.ptr, false, false)
+            .expect("map ram");
+    }
+
+    let secondary_vm = vm.clone();
+    let secondary_ops = vm_ops.clone();
+    let secondary = thread::spawn(move || {
+        let mut vcpu = secondary_vm
+            .create_vcpu(1, Some(secondary_ops.clone()))
+            .expect("create secondary");
+        let (target_mpidr, entry, context) = secondary_ops.wait_for_cpu_on();
+        assert_eq!(target_mpidr, 1, "CPU_ON target MPIDR");
+        assert_eq!(entry, RAM_BASE + 0x100, "CPU_ON entry");
+        assert_eq!(context, 0x1234, "CPU_ON context");
+        vcpu.setup_regs(1, entry, context).expect("setup secondary");
+        run_to_shutdown(vcpu.as_mut())
+    });
+
+    let mut primary = vm
+        .create_vcpu(0, Some(vm_ops.clone()))
+        .expect("create primary");
+    primary.setup_regs(0, RAM_BASE, 0).expect("setup primary");
+    let primary_exit = run_to_shutdown(primary.as_mut());
+    let secondary_exit = secondary.join().expect("secondary thread");
+
+    assert!(
+        matches!(primary_exit, VmExit::Shutdown),
+        "primary did not power off after CPU_ON: {primary_exit:?}"
+    );
+    assert!(
+        matches!(secondary_exit, VmExit::Shutdown),
+        "secondary did not start and power off: {secondary_exit:?}"
+    );
+    assert_eq!(
+        *vm_ops.writes.lock().unwrap(),
+        vec![0x1234],
+        "secondary did not run at the CPU_ON entry with x0=context"
+    );
 }
 
 #[test]

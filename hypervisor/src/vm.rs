@@ -516,6 +516,15 @@ pub trait VmOps: Send + Sync {
     fn guest_mem_read(&self, gpa: u64, buf: &mut [u8]) -> Result<usize>;
     fn mmio_read(&self, gpa: u64, data: &mut [u8]) -> Result<()>;
     fn mmio_write(&self, gpa: u64, data: &[u8]) -> Result<()>;
+    /// Handle a guest PSCI `CPU_ON` request on aarch64.
+    ///
+    /// Returns the PSCI status code (`0` success, negative error code on
+    /// failure). The default implementation reports "not supported" so existing
+    /// backends/device models remain unchanged.
+    #[cfg(target_arch = "aarch64")]
+    fn psci_vcpu_on(&self, _target_mpidr: u64, _entry: u64, _context: u64) -> Result<i64> {
+        Ok(-1)
+    }
     #[cfg(target_arch = "x86_64")]
     fn pio_read(&self, port: u64, data: &mut [u8]) -> Result<()>;
     #[cfg(target_arch = "x86_64")]

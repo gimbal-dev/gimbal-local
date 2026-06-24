@@ -8,28 +8,33 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use std::{env, fs, io, thread};
 
 use crate::console::{self, RawConsole};
 use crate::serve;
 
+use hypervisor::arch::aarch64::gic::Vgic;
 use hypervisor::hvf::devices::{MmioBus, Pl011};
 use hypervisor::hvf::gic::GicMsiSink;
 use hypervisor::hvf::rehydrate::{
-    enable_group1_spi_forwarding, prepare_vm, restore_distributor, restore_vcpu_state, PreparedVm,
-    Snapshot,
+    PreparedVm, Snapshot, enable_group1_spi_forwarding, prepare_vm, restore_distributor,
+    restore_vcpu_state,
 };
+use hypervisor::hvf::virtio::GuestMemory;
 use hypervisor::hvf::virtio::pci::{MsiSink, MsiSpiInjector, VirtioPciDevice};
 use hypervisor::hvf::virtio::{devmgr, its};
-use hypervisor::hvf::virtio::GuestMemory;
-use hypervisor::arch::aarch64::gic::Vgic;
-use hypervisor::{VmExit, VmOps};
+use hypervisor::{HypervisorVmError, StandardRegisters, Vcpu, VmExit, VmOps};
 
 /// cloud-hypervisor's arm64 PL011 lives at the base of the mapped-IO window.
 pub(crate) const PL011_BASE: u64 = 0x0900_0000;
 pub(crate) const PL011_SIZE: u64 = 0x1000;
+const PSCI_SUCCESS: i64 = 0;
+const PSCI_NOT_SUPPORTED: i64 = -1;
+const PSCI_INVALID_PARAMS: i64 = -2;
+const PSCI_ALREADY_ON: i64 = -4;
+const PSCI_ON_PENDING: i64 = -5;
 
 /// A snapshot loaded off disk and ready to rehydrate.
 pub(crate) struct Loaded {
@@ -61,7 +66,8 @@ pub(crate) fn load_snapshot(dir: &Path) -> Result<Loaded, String> {
 
     let state_json =
         fs::read_to_string(&state_path).map_err(|e| format!("read state.json: {e}"))?;
-    let snap = Snapshot::from_state_json(&state_json).map_err(|e| format!("parse snapshot: {e}"))?;
+    let snap =
+        Snapshot::from_state_json(&state_json).map_err(|e| format!("parse snapshot: {e}"))?;
     let num_vcpus = snap.num_vcpus();
     let total_ram: u64 = snap.mem_mappings.iter().map(|m| m.size).sum();
 
@@ -88,6 +94,116 @@ pub(crate) fn build_vm_ops(state_json: &str) -> (Arc<Pl011>, Arc<MmioBus>) {
     let bus = Arc::new(MmioBus::new());
     bus.add(PL011_BASE, PL011_SIZE, uart.clone());
     (uart, bus)
+}
+
+#[derive(Default)]
+struct CpuPowerState {
+    online: bool,
+    cpu_on: Option<(u64, u64)>,
+}
+
+type CpuPowerSlot = Arc<(Mutex<CpuPowerState>, Condvar)>;
+type VmOpsResult<T> = Result<T, HypervisorVmError>;
+
+#[derive(Default)]
+struct PsciCoordinator {
+    slots: Vec<CpuPowerSlot>,
+}
+
+impl PsciCoordinator {
+    fn from_snapshot(snap: &Snapshot) -> Arc<Self> {
+        let mut slots = Vec::with_capacity(snap.vcpus.len());
+        for vcpu in &snap.vcpus {
+            slots.push(Arc::new((
+                Mutex::new(CpuPowerState {
+                    online: vcpu.mp_state_running,
+                    cpu_on: None,
+                }),
+                Condvar::new(),
+            )));
+        }
+        Arc::new(Self { slots })
+    }
+
+    fn slot(&self, id: usize) -> CpuPowerSlot {
+        self.slots[id].clone()
+    }
+
+    fn wake_all(&self) {
+        for slot in &self.slots {
+            slot.1.notify_all();
+        }
+    }
+
+    fn mpidr_to_vcpu_id(mpidr: u64) -> usize {
+        let aff0 = mpidr & 0xff;
+        let aff1 = (mpidr >> 8) & 0xff;
+        let aff2 = (mpidr >> 16) & 0xff;
+        let aff3 = (mpidr >> 32) & 0xff;
+        (aff0 | (aff1 << 8) | (aff2 << 16) | (aff3 << 24)) as usize
+    }
+
+    fn cpu_on(&self, target_mpidr: u64, entry: u64, context: u64) -> i64 {
+        let target = Self::mpidr_to_vcpu_id(target_mpidr);
+        let Some(slot) = self.slots.get(target) else {
+            return PSCI_INVALID_PARAMS;
+        };
+        let (lock, cv) = &**slot;
+        let mut st = lock.lock().unwrap();
+        if st.online {
+            return PSCI_ALREADY_ON;
+        }
+        if st.cpu_on.is_some() {
+            return PSCI_ON_PENDING;
+        }
+        st.online = true;
+        st.cpu_on = Some((entry, context));
+        cv.notify_all();
+        PSCI_SUCCESS
+    }
+}
+
+struct ChmVmOps {
+    bus: Arc<MmioBus>,
+    psci: Mutex<Option<Arc<PsciCoordinator>>>,
+}
+
+impl ChmVmOps {
+    fn new(bus: Arc<MmioBus>) -> Self {
+        Self {
+            bus,
+            psci: Mutex::new(None),
+        }
+    }
+
+    fn set_psci_coordinator(&self, psci: Arc<PsciCoordinator>) {
+        *self.psci.lock().unwrap() = Some(psci);
+    }
+}
+
+impl VmOps for ChmVmOps {
+    fn guest_mem_write(&self, gpa: u64, buf: &[u8]) -> VmOpsResult<usize> {
+        self.bus.guest_mem_write(gpa, buf)
+    }
+
+    fn guest_mem_read(&self, gpa: u64, buf: &mut [u8]) -> VmOpsResult<usize> {
+        self.bus.guest_mem_read(gpa, buf)
+    }
+
+    fn mmio_read(&self, gpa: u64, data: &mut [u8]) -> VmOpsResult<()> {
+        self.bus.mmio_read(gpa, data)
+    }
+
+    fn mmio_write(&self, gpa: u64, data: &[u8]) -> VmOpsResult<()> {
+        self.bus.mmio_write(gpa, data)
+    }
+
+    fn psci_vcpu_on(&self, target_mpidr: u64, entry: u64, context: u64) -> VmOpsResult<i64> {
+        let Some(psci) = self.psci.lock().unwrap().clone() else {
+            return Ok(PSCI_NOT_SUPPORTED);
+        };
+        Ok(psci.cpu_on(target_mpidr, entry, context))
+    }
 }
 
 /// Reconstruct the native virtio-pci device model from the snapshot's
@@ -151,8 +267,8 @@ pub(crate) fn wire_virtio(
     overlay_dir: &Path,
     gic: Option<&Arc<Mutex<dyn Vgic>>>,
 ) -> Result<Vec<String>, String> {
-    let descs = devmgr::parse_devices(state_json)
-        .map_err(|e| format!("parse virtio devices: {e}"))?;
+    let descs =
+        devmgr::parse_devices(state_json).map_err(|e| format!("parse virtio devices: {e}"))?;
     if descs.is_empty() {
         return Ok(Vec::new());
     }
@@ -388,7 +504,7 @@ fn run(args: &Args) -> Result<ExitCode, String> {
 
     // Device model: a bus with a real PL011 at the guest's serial base.
     let (uart, bus) = build_vm_ops(&loaded.state_json);
-    let vm_ops: Arc<dyn VmOps> = bus.clone();
+    let vm_ops = Arc::new(ChmVmOps::new(bus.clone()));
 
     let hv = hypervisor::new().map_err(|e| {
         format!(
@@ -474,6 +590,41 @@ impl PhaseGate {
 /// Collected per-vCPU so the orchestrator can stop every thread at once.
 type ExitSignal = Arc<dyn Fn() + Send + Sync>;
 
+fn wait_for_cpu_on_request(slot: &CpuPowerSlot, running: &AtomicBool) -> Option<(u64, u64)> {
+    let (lock, cv) = &**slot;
+    let mut st = lock.lock().unwrap();
+    loop {
+        if !running.load(Ordering::Acquire) {
+            return None;
+        }
+        if st.online {
+            if let Some(req) = st.cpu_on.take() {
+                return Some(req);
+            }
+            // Online without an outstanding CPU_ON request means this vCPU was
+            // already runnable at snapshot time; the caller should not be waiting.
+            return None;
+        }
+        let (next, _) = cv.wait_timeout(st, Duration::from_millis(100)).unwrap();
+        st = next;
+    }
+}
+
+fn apply_psci_cpu_on_state(vcpu: &mut dyn Vcpu, entry: u64, context: u64) -> Result<(), String> {
+    let mut regs = vcpu
+        .get_regs()
+        .map_err(|e| format!("read regs for CPU_ON: {e}"))?;
+    #[allow(irrefutable_let_patterns)]
+    let StandardRegisters::Hvf(ref mut hvf) = regs else {
+        return Err("CPU_ON: expected HVF register state".into());
+    };
+    hvf.pc = entry;
+    hvf.regs[0] = context;
+    vcpu.set_regs(&regs)
+        .map_err(|e| format!("write regs for CPU_ON: {e}"))?;
+    Ok(())
+}
+
 /// Resume every vCPU in the snapshot concurrently (SMP) on Hypervisor.framework.
 ///
 /// HVF binds a vCPU to the host thread that creates it: that thread must also
@@ -502,7 +653,7 @@ fn resume_smp(
     loaded: Loaded,
     bus: &Arc<MmioBus>,
     uart: &Arc<Pl011>,
-    vm_ops: &Arc<dyn VmOps>,
+    vm_ops: &Arc<ChmVmOps>,
     overlay_dir: &Path,
     args: &Args,
 ) -> Result<Outcome, String> {
@@ -511,6 +662,8 @@ fn resume_smp(
     } = loaded;
     let n = snap.vcpus.len();
     let snap = Arc::new(snap);
+    let psci = PsciCoordinator::from_snapshot(&snap);
+    vm_ops.set_psci_coordinator(psci.clone());
 
     let running = Arc::new(AtomicBool::new(true));
     let dist_gate = Arc::new(PhaseGate::new());
@@ -542,6 +695,7 @@ fn resume_smp(
         let restored_tx = restored_tx.clone();
         let create_turn = create_turn.clone();
         let restore_turn = restore_turn.clone();
+        let power_slot = psci.slot(id);
         let h = thread::Builder::new()
             .name(format!("chm-vcpu{id}"))
             .spawn(move || {
@@ -609,7 +763,28 @@ fn resume_smp(
                 if go_gate.wait() != Gate::Go {
                     return;
                 }
+                let mut online = power_slot.0.lock().unwrap().online;
                 while running.load(Ordering::Acquire) {
+                    if !online {
+                        match wait_for_cpu_on_request(&power_slot, &running) {
+                            Some((entry, context)) => {
+                                if let Err(e) =
+                                    apply_psci_cpu_on_state(vcpu.as_mut(), entry, context)
+                                {
+                                    let mut o = outcome.lock().unwrap();
+                                    if o.is_none() {
+                                        *o = Some(Err(format!(
+                                            "vCPU {id} PSCI CPU_ON state apply failed: {e}"
+                                        )));
+                                    }
+                                    running.store(false, Ordering::Release);
+                                    break;
+                                }
+                                online = true;
+                            }
+                            None => break,
+                        }
+                    }
                     match vcpu.run() {
                         Ok(VmExit::Ignore) => {}
                         Ok(VmExit::Shutdown | VmExit::Reset) => {
@@ -751,6 +926,7 @@ fn resume_smp(
     // Stop every vCPU thread: clear the run flag, force any in-flight `run()` to
     // return (hv_vcpus_exit), and join — each vCPU is destroyed on its thread.
     running.store(false, Ordering::Release);
+    psci.wake_all();
     for sig in exits.lock().unwrap().iter() {
         sig();
     }

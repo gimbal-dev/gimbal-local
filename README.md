@@ -112,15 +112,13 @@ Milestones completed (all hardware-verified on Apple Silicon):
 | M7 | **`chm`**: standalone, signed, runnable executable. |
 | M8 | **`chm serve`**: daemon + control socket; forced stop via `hv_vcpus_exit`. |
 | M9 | Repo refocused as a standalone macOS local-runtime project. |
+| M10–M20 | Native virtio block/rng/net, interactive serial console, bidirectional net, and multi-vCPU snapshot resume. |
+| R3 | PSCI `CPU_ON` path hardware-proven; HVF SPI affinity routing remains unsupported, so message-SPI delivery deliberately uses the proven 1-of-N route. |
 
 Next:
 
-- **Device model (Phase 3):** virtio block/net/console over PCI so a guest runs
-  open-endedly instead of going quiet at the first unmodelled device; host I/O
-  on `kqueue` (the macOS analogue of `epoll`/`EventFd`). This is the gating work
-  for everything below.
-- **SMP:** secondary-core bring-up via PSCI `CPU_ON` (today `chm` resumes vCPU0
-  only).
+- **Real cloud round-trip:** capture on an actual AWS Graviton / Oracle A1 host
+  and rehydrate locally, rather than relying on nested-KVM captures from Lima.
 - **Desktop app:** a SwiftUI/menu-bar (or Tauri) shell over `chm serve` —
   library view, Start/Stop, console/terminal — plus lifecycle (graceful PSCI
   shutdown, pause/resume, re-snapshot).

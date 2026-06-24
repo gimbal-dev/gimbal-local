@@ -37,6 +37,8 @@ pub const PSTATE_EL1H_DAIF: u64 = 0x3c5;
 // PSCI 0.2 function ids issued via HVC.
 pub const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 pub const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
+pub const PSCI_CPU_ON: u64 = 0xc400_0003;
+pub const PSCI_CPU_ON_32: u64 = 0x8400_0003;
 
 // Arm SMCCC TRNG firmware interface (DEN0098). cloud-hypervisor exposes these as
 // a firmware service; a resumed guest calls TRNG_RND* during early boot to seed
@@ -173,7 +175,7 @@ unsafe extern "C" {
     // MSI/ITS region setup — reserved for when irqfd/GSI routing lands.
     pub fn hv_gic_config_set_msi_region_base(config: *mut c_void, base: u64) -> i32;
     pub fn hv_gic_config_set_msi_interrupt_range(config: *mut c_void, base: u32, count: u32)
-        -> i32;
+    -> i32;
 
     // GIC lifecycle, register access and interrupt injection.
     pub fn hv_gic_create(config: *mut c_void) -> i32;

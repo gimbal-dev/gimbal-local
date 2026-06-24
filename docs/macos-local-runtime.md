@@ -115,8 +115,9 @@ virtio devices (block/net/console over PCI) a guest needs to run open-endedly.
 
 `chm/` is the standalone executable.
 
-- `chm run <dir>` loads a snapshot, wires the PL011, rehydrates, and runs vCPU0,
-  streaming the serial console to stdout.
+- `chm run <dir>` loads a snapshot, wires the PL011 and native virtio devices,
+  rehydrates, and runs the snapshot's vCPUs, streaming the serial console to
+  stdout.
 - `chm serve <library>` is a daemon: it hosts a directory of snapshots behind a
   Unix socket, runs one guest at a time on a worker thread, buffers its console
   into a capped ring, and serves `list` / `start` / `console` / `status` /
@@ -132,9 +133,14 @@ compiles to a small stub on a Linux workspace build.
 Works, hardware-verified on Apple Silicon: VM creation, RAM mapping, vCPU
 register restore, KVM→HVF translation, managed GICv3 with SPI/PPI delivery,
 virtual-timer continuity, WFI idle with cross-thread wakeup, end-to-end
-rehydration of a real cloud snapshot booting into systemd userspace, the
-standalone `chm` binary, and the `chm serve` daemon with forced stop.
+rehydration of a real cloud snapshot booting into systemd userspace, native
+virtio block/rng/net, interactive serial console, multi-vCPU snapshot resume,
+the PSCI `CPU_ON` path for parked secondaries, the standalone `chm` binary, and
+the `chm serve` daemon with forced stop.
 
-Not yet: the virtio device model over PCI (so a resumed guest currently goes
-quiet at the first unmodelled device), host I/O on `kqueue`, SMP secondary-core
-bring-up (`PSCI CPU_ON`), and the desktop GUI. These are the next milestones.
+Still bounded: stock arm64 cloud snapshots that route virtio completions through
+ITS/LPIs cannot be delivered by Apple's managed GIC; use GICv2M/message-SPI
+captures. HVF also accepts affinity-routed message SPIs but leaves them pending
+instead of forwarding them, so `chm` intentionally re-routes message SPIs as
+1-of-N before delivery. The next milestones are a real AWS/Oracle cloud
+round-trip and a desktop GUI around `chm serve`.

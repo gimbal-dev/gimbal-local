@@ -41,11 +41,11 @@ mod ffi;
 use ffi::*;
 pub mod gic;
 use gic::HvfGicV3;
-pub mod translate;
 #[cfg(feature = "kvm-snapshot")]
 pub mod devices;
 #[cfg(feature = "kvm-snapshot")]
 pub mod rehydrate;
+pub mod translate;
 #[cfg(feature = "kvm-snapshot")]
 pub mod virtio;
 
@@ -892,8 +892,13 @@ impl Vcpu for HvfVcpu {
             };
             eprintln!(
                 "[exit] vcpu {} reason={} ec={ec:#x} pc={pc:#x} ipa={:#x}",
-                self.index, exit.reason,
-                if exit.reason == HV_EXIT_REASON_EXCEPTION { exit.exception.physical_address } else { 0 }
+                self.index,
+                exit.reason,
+                if exit.reason == HV_EXIT_REASON_EXCEPTION {
+                    exit.exception.physical_address
+                } else {
+                    0
+                }
             );
         }
         match exit.reason {
@@ -949,6 +954,20 @@ impl Vcpu for HvfVcpu {
                         match func {
                             PSCI_SYSTEM_OFF => Ok(VmExit::Shutdown),
                             PSCI_SYSTEM_RESET => Ok(VmExit::Reset),
+                            PSCI_CPU_ON | PSCI_CPU_ON_32 => {
+                                let Some(vm_ops) = self.vm_ops.as_ref() else {
+                                    self.set_reg(0, SMCCC_NOT_SUPPORTED)?;
+                                    return Ok(VmExit::Ignore);
+                                };
+                                let target_mpidr = self.get_reg(1)?;
+                                let entry = self.get_reg(2)?;
+                                let context = self.get_reg(3)?;
+                                let rc = vm_ops
+                                    .psci_vcpu_on(target_mpidr, entry, context)
+                                    .map_err(|e| HypervisorCpuError::RunVcpu(e.into()))?;
+                                self.set_reg(0, rc as u64)?;
+                                Ok(VmExit::Ignore)
+                            }
                             TRNG_VERSION => {
                                 // Report TRNG firmware interface v1.0
                                 // (major in bits[31:16], minor in bits[15:0]).
