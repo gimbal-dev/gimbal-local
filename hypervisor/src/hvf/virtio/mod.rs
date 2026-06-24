@@ -29,6 +29,7 @@ use std::sync::Mutex;
 pub mod block;
 pub mod devmgr;
 pub mod its;
+pub mod net;
 pub mod pci;
 pub mod queue;
 pub mod rng;

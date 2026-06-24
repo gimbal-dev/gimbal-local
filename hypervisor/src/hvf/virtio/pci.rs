@@ -16,6 +16,7 @@ use std::sync::{Arc, Mutex};
 
 use super::super::devices::MmioDevice;
 use super::block::BlockDevice;
+use super::net::{NetDevice, VIRTIO_NET_HDR_LEN};
 use super::queue::Queue;
 use super::rng::RngDevice;
 use super::GuestMemory;
@@ -41,7 +42,14 @@ pub enum Backend {
     Block(BlockDevice),
     /// A `virtio-rng` device.
     Rng(RngDevice),
+    /// A `virtio-net` device. Its receive direction is host-driven, so the
+    /// transport handles its RX/TX queues specially (see [`Inner::notify_net`]).
+    Net(NetDevice),
 }
+
+/// virtio-net queue indices (max_virtqueue_pairs = 1): receive then transmit.
+const NET_RX_QUEUE: u16 = 0;
+const NET_TX_QUEUE: u16 = 1;
 
 /// Notified when a queue completion needs to interrupt the guest.
 ///
@@ -292,6 +300,10 @@ impl VirtioPciDevice {
 impl Inner {
     /// Service a queue notification: drain and process the available ring.
     fn notify(&mut self, queue_index: u16) {
+        if matches!(self.backend, Backend::Net(_)) {
+            self.notify_net(queue_index);
+            return;
+        }
         let Some(queue) = self.queues.get_mut(queue_index as usize) else {
             return;
         };
@@ -314,6 +326,8 @@ impl Inner {
             let used_len = match &mut self.backend {
                 Backend::Block(b) => b.process(&mem, &chain).used_len,
                 Backend::Rng(r) => r.process(&mem, &chain),
+                // Net is dispatched to notify_net before this loop is reached.
+                Backend::Net(_) => 0,
             };
             let _ = queue.add_used(&mem, chain.head, used_len);
             completed_any = true;
@@ -349,6 +363,143 @@ impl Inner {
         // on every notify (and thus on drain_on_resume) regardless of whether
         // anything completed this pass.
         let _ = queue.arm_notification(&mem);
+    }
+
+    /// Service a virtio-net queue notification.
+    ///
+    /// A guest notify on the TX queue means it has frames to send: drain them,
+    /// hand each (header-stripped) frame to the responder, complete the TX
+    /// descriptors, then push any reply frames into the RX queue. A notify on
+    /// the RX queue means the guest posted fresh receive buffers: flush any
+    /// backlog into them. Either way we end by trying to deliver pending RX
+    /// frames, since a reply produced by a TX notify needs an RX buffer the
+    /// guest may already have posted.
+    fn notify_net(&mut self, queue_index: u16) {
+        let mem = self.mem.clone();
+        if queue_index == NET_TX_QUEUE {
+            let mut completed = false;
+            let Some(tx) = self.queues.get_mut(NET_TX_QUEUE as usize) else {
+                return;
+            };
+            let old_used = tx.next_used;
+            while let Ok(Some(chain)) = tx.pop(&mem) {
+                // Reassemble the frame from the readable segments and strip the
+                // virtio-net header.
+                let mut buf = Vec::new();
+                for seg in chain.readable() {
+                    let mut s = vec![0u8; seg.len as usize];
+                    if mem.read(seg.gpa, &mut s).is_ok() {
+                        buf.extend_from_slice(&s);
+                    }
+                }
+                if buf.len() > VIRTIO_NET_HDR_LEN
+                    && let Backend::Net(n) = &mut self.backend
+                {
+                    n.handle_tx_frame(&buf[VIRTIO_NET_HDR_LEN..]);
+                }
+                let _ = tx.add_used(&mem, chain.head, 0);
+                completed = true;
+            }
+            if completed {
+                self.isr_status |= 0x1;
+                let needs = self
+                    .queues
+                    .get(NET_TX_QUEUE as usize)
+                    .and_then(|q| q.needs_interrupt(&mem, old_used, q.next_used).ok())
+                    .unwrap_or(true);
+                if needs {
+                    let vector = self.queue_vectors.get(NET_TX_QUEUE as usize).copied().unwrap_or(0);
+                    self.injector.signal(vector);
+                }
+            }
+            if let Some(tx) = self.queues.get(NET_TX_QUEUE as usize) {
+                let _ = tx.arm_notification(&mem);
+            }
+        } else if queue_index == NET_RX_QUEUE
+            && let Some(rx) = self.queues.get(NET_RX_QUEUE as usize)
+        {
+            let _ = rx.arm_notification(&mem);
+        }
+        self.flush_rx();
+    }
+
+    /// Deliver as many backlogged receive frames as the guest has posted buffers
+    /// for: each frame gets a zeroed virtio-net header (`num_buffers = 1`) and is
+    /// written into one popped RX descriptor chain, then the RX completion vector
+    /// is signalled. A frame with no available buffer is requeued for the next RX
+    /// notify.
+    fn flush_rx(&mut self) {
+        let mem = self.mem.clone();
+        let mut delivered = false;
+        let old_used = self
+            .queues
+            .get(NET_RX_QUEUE as usize)
+            .map_or(0, |q| q.next_used);
+        loop {
+            let has_pending = matches!(&self.backend, Backend::Net(n) if n.has_pending_rx());
+            if !has_pending {
+                break;
+            }
+            let Some(rx) = self.queues.get_mut(NET_RX_QUEUE as usize) else {
+                break;
+            };
+            let chain = match rx.pop(&mem) {
+                Ok(Some(c)) => c,
+                _ => break, // no posted buffer: leave the backlog for later
+            };
+            let frame = match &mut self.backend {
+                Backend::Net(n) => n.pop_rx(),
+                _ => None,
+            };
+            let Some(frame) = frame else { break };
+
+            // Compose [virtio-net header][frame] and spread it across the
+            // chain's writable segments.
+            let mut payload = vec![0u8; VIRTIO_NET_HDR_LEN];
+            payload[10] = 1; // num_buffers = 1 (little-endian u16)
+            payload.extend_from_slice(&frame);
+            let mut written = 0usize;
+            let mut offset = 0usize;
+            for seg in chain.writable() {
+                if offset >= payload.len() {
+                    break;
+                }
+                let take = (seg.len as usize).min(payload.len() - offset);
+                if mem.write(seg.gpa, &payload[offset..offset + take]).is_err() {
+                    break;
+                }
+                offset += take;
+                written += take;
+            }
+            if written < payload.len() {
+                // The guest's buffer could not hold the frame; drop it (a real
+                // NIC would too without mergeable buffers) but still complete the
+                // descriptor so the guest reclaims it.
+                if std::env::var_os("CHM_TRACE_NET").is_some() {
+                    eprintln!("[virtio net] rx frame {} bytes truncated to {written}", payload.len());
+                }
+            }
+            let _ = rx.add_used(&mem, chain.head, written as u32);
+            delivered = true;
+            if std::env::var_os("CHM_TRACE_NET").is_some() {
+                eprintln!("[virtio net] injected rx frame ({} bytes) into guest", frame.len());
+            }
+        }
+        if delivered {
+            self.isr_status |= 0x1;
+            let needs = self
+                .queues
+                .get(NET_RX_QUEUE as usize)
+                .and_then(|q| q.needs_interrupt(&mem, old_used, q.next_used).ok())
+                .unwrap_or(true);
+            if needs {
+                let vector = self.queue_vectors.get(NET_RX_QUEUE as usize).copied().unwrap_or(0);
+                self.injector.signal(vector);
+            }
+            if let Some(rx) = self.queues.get(NET_RX_QUEUE as usize) {
+                let _ = rx.arm_notification(&mem);
+            }
+        }
     }
 
     fn read_common(&self, offset: u64, data: &mut [u8]) {
@@ -669,5 +820,112 @@ mod tests {
         );
         // Used ring untouched.
         assert_eq!(mem.read_u16(0x4000_3000 + 2).unwrap(), 0);
+    }
+
+    #[test]
+    fn net_tx_arp_request_injects_a_reply_into_rx_and_signals() {
+        use super::super::net::{EchoResponder, NetDevice, VIRTIO_NET_HDR_LEN};
+
+        let guest_mac: [u8; 6] = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc];
+        let guest_ip: [u8; 4] = [192, 168, 249, 2];
+        let gw_ip: [u8; 4] = [192, 168, 249, 1];
+        let gw_mac: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
+
+        let mem = Arc::new(GuestMemory::new());
+        mem.register_owned(0x4000_0000, 0x2_0000);
+        let wr_desc = |gpa: u64, addr: u64, len: u32, flags: u16| {
+            mem.write(gpa, &addr.to_le_bytes()).unwrap();
+            mem.write_u32(gpa + 8, len).unwrap();
+            mem.write_u16(gpa + 12, flags).unwrap();
+            mem.write_u16(gpa + 14, 0).unwrap();
+        };
+
+        // RX queue (index 0): one empty device-writable buffer.
+        let (rx_desc, rx_avail, rx_used, rx_buf) =
+            (0x4000_1000u64, 0x4000_1100u64, 0x4000_1200u64, 0x4000_1400u64);
+        wr_desc(rx_desc, rx_buf, 256, 0x2); // WRITE
+        mem.write_u16(rx_avail + 4, 0).unwrap();
+        mem.write_u16(rx_avail + 2, 1).unwrap();
+
+        // TX queue (index 1): a virtio-net header followed by an ARP request.
+        let (tx_desc, tx_avail, tx_used, tx_buf) =
+            (0x4000_2000u64, 0x4000_2100u64, 0x4000_2200u64, 0x4000_2400u64);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0xff; 6]); // broadcast
+        frame.extend_from_slice(&guest_mac);
+        frame.extend_from_slice(&0x0806u16.to_be_bytes()); // ARP
+        frame.extend_from_slice(&1u16.to_be_bytes()); // htype
+        frame.extend_from_slice(&0x0800u16.to_be_bytes()); // ptype
+        frame.push(6);
+        frame.push(4);
+        frame.extend_from_slice(&1u16.to_be_bytes()); // request
+        frame.extend_from_slice(&guest_mac);
+        frame.extend_from_slice(&guest_ip);
+        frame.extend_from_slice(&[0u8; 6]);
+        frame.extend_from_slice(&gw_ip);
+        let mut tx_payload = vec![0u8; VIRTIO_NET_HDR_LEN];
+        tx_payload.extend_from_slice(&frame);
+        mem.write(tx_buf, &tx_payload).unwrap();
+        wr_desc(tx_desc, tx_buf, tx_payload.len() as u32, 0x0); // readable
+        mem.write_u16(tx_avail + 4, 0).unwrap();
+        mem.write_u16(tx_avail + 2, 1).unwrap();
+
+        let mk_queue = |desc, avail, used| Queue {
+            size: 8,
+            desc,
+            avail,
+            used,
+            event_idx: false,
+            indirect: false,
+            next_avail: 0,
+            next_used: 0,
+        };
+
+        let responder = EchoResponder::new(gw_ip, gw_mac);
+        let dev = VirtioPciDevice::new(
+            "net2",
+            Backend::Net(NetDevice::new(Box::new(responder))),
+            mem.clone(),
+            RestoreParams {
+                features: super::super::features::VERSION_1,
+                queues: vec![
+                    mk_queue(rx_desc, rx_avail, rx_used),
+                    mk_queue(tx_desc, tx_avail, tx_used),
+                ],
+                queue_vectors: vec![10, 11], // RX vector 10, TX vector 11
+                device_status: 0x0f,
+                device_config: vec![],
+            },
+        );
+        let sink = Arc::new(RecordingMsiSink::default());
+        // vector 10 -> SPI 130 (RX), vector 11 -> SPI 131 (TX).
+        let mut intids = vec![0u32; 12];
+        intids[10] = 130;
+        intids[11] = 131;
+        dev.set_injector(Box::new(MsiSpiInjector::new("net2", intids, sink.clone())));
+
+        // Notify the TX queue (index 1): the device parses the frame, produces an
+        // ARP reply, and injects it into the RX queue.
+        dev.write(NOTIFICATION_OFFSET, &1u16.to_le_bytes());
+
+        // TX consumed.
+        assert_eq!(mem.read_u16(tx_used + 2).unwrap(), 1, "TX descriptor completed");
+        // RX got the reply.
+        assert_eq!(mem.read_u16(rx_used + 2).unwrap(), 1, "RX reply injected");
+        let rx_len = mem.read_u32(rx_used + 8).unwrap();
+        assert_eq!(rx_len as usize, VIRTIO_NET_HDR_LEN + 42, "header + ARP reply");
+        // Ethernet dst of the injected frame is the guest MAC.
+        let mut dst = [0u8; 6];
+        mem.read(rx_buf + VIRTIO_NET_HDR_LEN as u64, &mut dst).unwrap();
+        assert_eq!(dst, guest_mac, "reply addressed to the guest");
+        // It is an ARP reply (opcode 2, network byte order) from the gateway.
+        let arp = rx_buf + VIRTIO_NET_HDR_LEN as u64 + 14;
+        let mut op = [0u8; 2];
+        mem.read(arp + 6, &mut op).unwrap();
+        assert_eq!(u16::from_be_bytes(op), 2, "ARP reply opcode");
+        // Both the RX completion (130) and TX completion (131) were delivered.
+        let spis = sink.spis.lock().unwrap().clone();
+        assert!(spis.contains(&130), "RX completion SPI delivered, got {spis:?}");
+        assert!(spis.contains(&131), "TX completion SPI delivered, got {spis:?}");
     }
 }

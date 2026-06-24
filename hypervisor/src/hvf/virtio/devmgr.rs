@@ -14,6 +14,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use super::block::{BlockDevice, FileBackend};
+use super::net::{EchoResponder, NetDevice};
 use super::pci::{Backend, RestoreParams, VirtioPciDevice, CAPABILITY_BAR_SIZE};
 use super::queue::Queue;
 use super::rng::{RngDevice, UrandomSource};
@@ -456,11 +457,12 @@ pub fn build_device(
             (Backend::Rng(RngDevice::new(Box::new(src))), Vec::new())
         }
         BackendKind::Net => {
-            return Err(DevMgrError::Unsupported(format!(
-                "virtio-net device `{}` is present in this snapshot but the \
-                 net backend is not yet wired in this build",
-                desc.name
-            )));
+            // The gateway the resumed guest talks to. The capture-side
+            // cloud-init configures the guest as 192.168.249.2/24 with this
+            // gateway, so the host responder owns .1 and answers the guest's
+            // ARP + ICMP echo over the deliverable message-based-SPI path.
+            let responder = EchoResponder::new([192, 168, 249, 1], [0x02, 0, 0, 0, 0, 1]);
+            (Backend::Net(NetDevice::new(Box::new(responder))), Vec::new())
         }
         BackendKind::Unsupported { virtio_type } => {
             return Err(DevMgrError::Unsupported(format!(
