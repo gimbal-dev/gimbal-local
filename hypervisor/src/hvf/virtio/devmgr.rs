@@ -26,6 +26,9 @@ pub enum DevMgrError {
     Malformed(String),
     /// A host-side overlay/backing file could not be created or opened.
     Io(String),
+    /// A device type this build does not model (rather than silently
+    /// mismodeling it).
+    Unsupported(String),
 }
 
 impl std::fmt::Display for DevMgrError {
@@ -33,6 +36,7 @@ impl std::fmt::Display for DevMgrError {
         match self {
             Self::Malformed(m) => write!(f, "device-manager state malformed: {m}"),
             Self::Io(m) => write!(f, "device backing I/O error: {m}"),
+            Self::Unsupported(m) => write!(f, "unsupported device: {m}"),
         }
     }
 }
@@ -53,18 +57,41 @@ pub struct QueueState {
 }
 
 /// The backend a restored virtio-pci device drives.
+///
+/// The variant is chosen authoritatively from the device's PCI Device ID
+/// (`0x1040 + virtio_device_type`), not from heuristics on the backing state,
+/// so a device is modeled as exactly what the guest negotiated it to be. An
+/// unrecognised type becomes [`BackendKind::Unsupported`] and is rejected at
+/// build time rather than silently mismodeled.
 #[derive(Debug, Clone)]
 pub enum BackendKind {
-    /// virtio-blk: a disk image (by file name) with `nsectors` capacity.
+    /// virtio-blk (type 2): a disk image (by file name) with `nsectors`.
     Block {
         /// File name of the disk image as recorded in the snapshot.
         disk_path: String,
         /// Capacity in 512-byte sectors.
         nsectors: u64,
     },
-    /// virtio-rng entropy source.
+    /// virtio-net (type 1).
+    Net,
+    /// virtio-rng (type 4) entropy source.
     Rng,
+    /// A virtio device whose type this build does not model. Carries the raw
+    /// virtio device type so the rejection message can name it.
+    Unsupported {
+        /// The virtio device type (PCI Device ID minus `0x1040`).
+        virtio_type: u32,
+    },
 }
+
+/// virtio device type for virtio-net (PCI Device ID `0x1041`).
+pub const VIRTIO_TYPE_NET: u32 = 1;
+/// virtio device type for virtio-block (PCI Device ID `0x1042`).
+pub const VIRTIO_TYPE_BLOCK: u32 = 2;
+/// virtio device type for virtio-rng (PCI Device ID `0x1044`).
+pub const VIRTIO_TYPE_RNG: u32 = 4;
+/// Modern virtio-pci PCI Device IDs are `0x1040 + virtio_device_type`.
+const VIRTIO_PCI_DEVICE_ID_BASE: u32 = 0x1040;
 
 /// A fully-parsed virtio-pci device ready to be turned into a live device.
 #[derive(Debug, Clone)]
@@ -275,6 +302,16 @@ fn parse_one(
         bar0 & !0xfu64
     };
 
+    // PCI config register 0 is [vendor:device]. A modern virtio-pci function
+    // encodes its virtio device type in the Device ID as 0x1040 + type, which
+    // is the authoritative classifier (block=0x1042, net=0x1041, rng=0x1044).
+    let reg0 = registers
+        .first()
+        .and_then(Value::as_u64)
+        .ok_or_else(|| malformed("missing PCI Device/Vendor ID register"))?;
+    let pci_device_id = ((reg0 >> 16) & 0xffff) as u32;
+    let virtio_type = pci_device_id.saturating_sub(VIRTIO_PCI_DEVICE_ID_BASE);
+
     let common = subs
         .get("virtio_pci_common_config")
         .ok_or_else(|| malformed("missing virtio_pci_common_config"))?;
@@ -305,19 +342,22 @@ fn parse_one(
         .or_else(|_| u64_at(&bstate, "avail_features"))
         .unwrap_or(0);
 
-    let backend = if let Ok(nsectors) = u64_at(&bstate, "disk_nsectors") {
-        let disk_path = bstate
-            .get("disk_path")
-            .and_then(Value::as_str)
-            .unwrap_or(name)
-            .to_string();
-        BackendKind::Block {
-            disk_path,
-            nsectors,
+    let backend = match virtio_type {
+        VIRTIO_TYPE_BLOCK => {
+            let nsectors = u64_at(&bstate, "disk_nsectors")?;
+            let disk_path = bstate
+                .get("disk_path")
+                .and_then(Value::as_str)
+                .unwrap_or(name)
+                .to_string();
+            BackendKind::Block {
+                disk_path,
+                nsectors,
+            }
         }
-    } else {
-        // virtio-rng (or any non-block device) gets the entropy backend.
-        BackendKind::Rng
+        VIRTIO_TYPE_NET => BackendKind::Net,
+        VIRTIO_TYPE_RNG => BackendKind::Rng,
+        other => BackendKind::Unsupported { virtio_type: other },
     };
 
     Ok(VirtioDeviceDesc {
@@ -415,6 +455,22 @@ pub fn build_device(
                 .map_err(|e| DevMgrError::Io(format!("open /dev/urandom: {e}")))?;
             (Backend::Rng(RngDevice::new(Box::new(src))), Vec::new())
         }
+        BackendKind::Net => {
+            return Err(DevMgrError::Unsupported(format!(
+                "virtio-net device `{}` is present in this snapshot but the \
+                 net backend is not yet wired in this build",
+                desc.name
+            )));
+        }
+        BackendKind::Unsupported { virtio_type } => {
+            return Err(DevMgrError::Unsupported(format!(
+                "device `{}` is virtio type {virtio_type} (PCI Device ID \
+                 {:#06x}), which this build does not model; refusing to \
+                 mismodel it",
+                desc.name,
+                0x1040 + virtio_type
+            )));
+        }
     };
 
     let dev = Arc::new(VirtioPciDevice::new(
@@ -486,6 +542,90 @@ mod tests {
     use super::*;
 
     const FIXTURE: &str = include_str!("../../../tests/data/devmgr_fixture.json");
+
+    /// Build a minimal one-device `device-manager` tree whose virtio-pci
+    /// function advertises `pci_device_id`, so classification can be exercised
+    /// without a full captured snapshot. `extra_backing` is merged into the
+    /// backing device state (e.g. `disk_nsectors` for a block device).
+    fn one_device_tree(name: &str, pci_device_id: u32, extra_backing: serde_json::Value) -> String {
+        let s = |v: &serde_json::Value| serde_json::to_string(v).unwrap();
+        let transport = serde_json::json!({
+            "snapshot_data": { "state": s(&serde_json::json!({
+                "queues": [{
+                    "size": 64, "desc_table": 0x1000,
+                    "avail_ring": 0x2000, "used_ring": 0x3000
+                }]
+            })) },
+            "snapshots": {
+                "pci_configuration": { "snapshot_data": { "state": s(&serde_json::json!({
+                    "registers": [
+                        0x1af4 | (pci_device_id << 16),
+                        0, 0, 0,
+                        0x1000_0000u64, 0
+                    ]
+                })) } },
+                "virtio_pci_common_config": { "snapshot_data": { "state": s(&serde_json::json!({
+                    "driver_status": 4, "msix_queues": [1]
+                })) } }
+            }
+        });
+        let mut backing_state = serde_json::json!({
+            "avail_features": 0, "acked_features": 0
+        });
+        if let serde_json::Value::Object(extra) = extra_backing {
+            for (k, v) in extra {
+                backing_state[k] = v;
+            }
+        }
+        let backing = serde_json::json!({
+            "snapshot_data": { "state": s(&backing_state) }
+        });
+        let root = serde_json::json!({
+            "snapshots": { "device-manager": { "snapshots": {
+                name: backing,
+                format!("_virtio-pci-{name}"): transport
+            } } }
+        });
+        serde_json::to_string(&root).unwrap()
+    }
+
+    #[test]
+    fn classifies_devices_by_pci_device_id() {
+        // virtio-net (0x1041) -> Net.
+        let net = parse_devices(&one_device_tree("_net0", 0x1041, serde_json::json!({})))
+            .expect("parse net");
+        assert!(matches!(net[0].backend, BackendKind::Net), "0x1041 -> Net");
+
+        // virtio-block (0x1042) -> Block, reading nsectors from backing state.
+        let blk = parse_devices(&one_device_tree(
+            "_disk0",
+            0x1042,
+            serde_json::json!({ "disk_nsectors": 2048, "disk_path": "/x.raw" }),
+        ))
+        .expect("parse block");
+        match &blk[0].backend {
+            BackendKind::Block { nsectors, disk_path } => {
+                assert_eq!(*nsectors, 2048);
+                assert_eq!(disk_path, "/x.raw");
+            }
+            other => panic!("0x1042 should be Block, got {other:?}"),
+        }
+
+        // virtio-rng (0x1044) -> Rng.
+        let rng = parse_devices(&one_device_tree("_rng0", 0x1044, serde_json::json!({})))
+            .expect("parse rng");
+        assert!(matches!(rng[0].backend, BackendKind::Rng), "0x1044 -> Rng");
+
+        // An unknown type (here 0x1050 -> type 0x10) is flagged Unsupported,
+        // NOT silently mismodeled as rng.
+        let unk = parse_devices(&one_device_tree("_mystery", 0x1050, serde_json::json!({})))
+            .expect("parse unknown");
+        assert!(
+            matches!(unk[0].backend, BackendKind::Unsupported { virtio_type: 0x10 }),
+            "unknown type -> Unsupported, got {:?}",
+            unk[0].backend
+        );
+    }
 
     #[test]
     fn parses_block_and_rng_devices() {

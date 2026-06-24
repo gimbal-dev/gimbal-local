@@ -179,7 +179,11 @@ pub(crate) fn wire_virtio(
             devmgr::BackendKind::Block { nsectors, .. } => {
                 format!("virtio-blk {} ({} sectors)", desc.name, nsectors)
             }
+            devmgr::BackendKind::Net => format!("virtio-net {}", desc.name),
             devmgr::BackendKind::Rng => format!("virtio-rng {}", desc.name),
+            devmgr::BackendKind::Unsupported { virtio_type } => {
+                format!("virtio type {virtio_type} {}", desc.name)
+            }
         };
         let (base, size, dev) = devmgr::build_device(desc, guest_mem.clone(), overlay_dir)
             .map_err(|e| format!("build device {}: {e}", desc.name))?;
