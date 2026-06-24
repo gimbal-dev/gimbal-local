@@ -523,6 +523,35 @@ pub fn rehydrate(
         }
     }
 
+    // --- enable Group1 SPI forwarding in the distributor --------------------
+    //
+    // cloud-hypervisor's KVM distributor dump (`VGIC_DIST_REGS`) starts at
+    // GICD_STATUSR and does NOT carry GICD_CTLR, so the restore above never
+    // enables interrupt-group forwarding. Apple's managed GIC comes up with
+    // GICD_CTLR = ARE | DS (0x50) but both group-enable bits clear, so the
+    // distributor forwards NO SPIs: a resumed guest still takes redistributor
+    // PPIs (the virtual timer, gated only by ICC_IGRPEN1) and so drives systemd,
+    // but every virtio completion delivered as a Group1 message-based SPI sits
+    // pending in the distributor and is never presented to the CPU interface —
+    // the guest blocks forever on its first post-resume disk write (jbd2). Set
+    // GICD_CTLR.EnableGrp1 so Group1 SPIs forward; the guest ran with Group1
+    // enabled at capture, so this restores its real distributor state. Done
+    // after the redistributors/MPIDR are restored to respect HVF ordering.
+    {
+        const GICD_CTLR_ENABLE_GRP1: u64 = 1 << 1;
+        let mut guard = gic.lock().unwrap();
+        let concrete = guard
+            .as_any_concrete_mut()
+            .downcast_mut::<HvfGicV3>()
+            .ok_or_else(|| RehydrateError::Translate("GIC is not an HVF GIC".into()))?;
+        let ctlr = concrete
+            .distributor_reg(0x0000)
+            .map_err(|e| RehydrateError::Hv(anyhow!("read GICD_CTLR: {e}")))?;
+        concrete
+            .set_distributor_reg(0x0000, ctlr | GICD_CTLR_ENABLE_GRP1)
+            .map_err(|e| RehydrateError::Hv(anyhow!("set GICD_CTLR: {e}")))?;
+    }
+
     Ok(RehydratedVm {
         vcpus,
         gic,
