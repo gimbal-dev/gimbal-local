@@ -138,6 +138,7 @@ Use that only to retest future SDK/hardware behavior.
 | `docs/macos-local-runtime.md` | Main technical explainer |
 | `docs/aws-byo-setup.md` | Beginner-safe AWS setup/runbook |
 | `docs/raspberry-pi-offbox-plan.md` | Immediate off-box Linux/KVM proof plan |
+| `docs/control-plane-orchestrator-handoff.md` | Starting brief for the sister cloud-orchestrator repo |
 | `docs/agent-chat-history.md` | Curated agent/user history archive for repo migration |
 
 ## Build and run
@@ -269,6 +270,12 @@ GUI over `chm serve`: library view, start/stop, console, lifecycle controls.
 
 ## Control-plane sister repo prep
 
+Detailed starting brief:
+
+```text
+docs/control-plane-orchestrator-handoff.md
+```
+
 Before creating the repo, write a boundary RFC. Suggested repo name:
 
 ```text
@@ -309,4 +316,3 @@ Recommended migration sequence:
 4. Keep `LICENSES/`, SPDX headers, upstream attribution, and relevant docs.
 5. Start the control-plane repo separately rather than mixing orchestration into
    the local runtime.
-
