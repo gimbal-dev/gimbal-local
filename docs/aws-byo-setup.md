@@ -92,17 +92,41 @@ export AWS_PROFILE=chm-aws
 
 ## Step 2: Login to AWS from your Mac
 
-Preferred path if your AWS account uses IAM Identity Center / SSO:
+For a personal AWS account, do **not** start with SSO. SSO / IAM Identity
+Center is mostly for companies or multi-account setups. It is fine later, but it
+is unnecessary ceremony for this prototype.
+
+Do this instead:
+
+1. Log in to the AWS Console with your root user.
+2. Create an IAM admin user for this prototype.
+3. Create an access key for that IAM user.
+4. Store that access key only in your local Mac AWS CLI profile.
+5. Stop using the root user for day-to-day commands.
+
+Then configure the local profile:
+
+```bash
+aws configure --profile chm-aws
+```
+
+It will ask for:
+
+```text
+AWS Access Key ID:     <paste IAM user's access key id>
+AWS Secret Access Key: <paste IAM user's secret access key>
+Default region name:   us-east-1
+Default output format: json
+```
+
+Do **not** create access keys for the root user. If you accidentally do, delete
+them and create IAM-user keys instead.
+
+Only use this SSO path if you deliberately set up IAM Identity Center:
 
 ```bash
 aws configure sso --profile chm-aws
 aws sso login --profile chm-aws
-```
-
-Simpler access-key path if you are using an IAM user:
-
-```bash
-aws configure --profile chm-aws
 ```
 
 Check the login works:
@@ -118,8 +142,17 @@ If that command fails, stop here and fix login before creating anything.
 For the first prototype, the AWS identity behind `chm-aws` needs permission to
 manage a small set of EC2 and S3 resources.
 
-If you have an AWS admin helping you, ask for a temporary sandbox permission set
-that can:
+For a personal throwaway AWS account, the simplest safe-enough first pass is:
+
+1. Enable MFA on the root user.
+2. Create one IAM user for local CLI use.
+3. Attach `AdministratorAccess` temporarily while proving the loop.
+4. Run cleanup after each experiment.
+5. Replace admin permissions with a narrow policy before anything becomes
+   regular or long-lived.
+
+If you have an AWS admin helping you instead, ask for a temporary sandbox
+permission set that can:
 
 - create/delete an S3 bucket and objects;
 - create/delete EC2 key pairs;
@@ -128,10 +161,6 @@ that can:
 - describe EC2 images, subnets, VPCs, instances, volumes and quotas;
 - delete project EBS volumes/snapshots;
 - release project Elastic IPs if any are created.
-
-If this is your own throwaway AWS account, using administrator permissions for
-the first manual prototype is acceptable, as long as you run the cleanup script
-and then tighten permissions before anything becomes long-lived.
 
 Quick permission smoke test:
 
