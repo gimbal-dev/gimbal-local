@@ -255,24 +255,85 @@ aws s3api list-buckets \
 
 If either command fails with `AccessDenied`, fix permissions before continuing.
 
-## Step 4: Check whether you have bare-metal quota
+## Step 4: Check whether you have enough EC2 quota
+
+The quota that normally blocks `c7g.metal` / `m7g.metal` is not named
+"Graviton bare metal". It is the regional EC2 On-Demand **vCPU** quota:
+
+```text
+Running On-Demand Standard (A, C, D, H, I, M, R, T, Z) instances
+Quota code: L-1216C47A
+```
+
+Bare-metal instances in those families still count against this quota by vCPU.
+For example, `c7g.metal` commonly needs **64 vCPUs** of quota in the selected
+region. If your quota is below the vCPU count of the instance type, launch will
+fail.
+
+Check the quota from your Mac:
+
+```bash
+aws service-quotas get-service-quota \
+  --service-code ec2 \
+  --quota-code L-1216C47A \
+  --query 'Quota.{Name:QuotaName,Value:Value}' \
+  --output table \
+  --profile chm-aws \
+  --region "$AWS_REGION"
+```
+
+Check how many vCPUs your intended instance type needs:
+
+```bash
+export CHM_INSTANCE_TYPE=c7g.metal
+
+aws ec2 describe-instance-types \
+  --instance-types "$CHM_INSTANCE_TYPE" \
+  --query 'InstanceTypes[0].{InstanceType:InstanceType,Vcpus:VCpuInfo.DefaultVCpus,Arch:ProcessorInfo.SupportedArchitectures}' \
+  --output table \
+  --profile chm-aws \
+  --region "$AWS_REGION"
+```
+
+If the quota value is lower than the instance vCPU count, request an increase.
+Ask for at least the instance's vCPU count; **128 vCPUs** gives enough room for
+one 64-vCPU bare-metal host plus a bit of breathing room.
 
 In the AWS Console:
 
 1. Open **Service Quotas**.
-2. Search for **EC2**.
-3. Search within EC2 quotas for the Graviton bare-metal family you want.
-4. If the quota is zero, request an increase.
+2. Open **AWS services**.
+3. Search for **Amazon Elastic Compute Cloud (Amazon EC2)**.
+4. Search within EC2 quotas for `L-1216C47A` or **Running On-Demand Standard**.
+5. Click the quota.
+6. Click **Request increase at account-level**.
+7. Request `128` if AWS asks for a number and you are using `c7g.metal`.
+8. Wait for approval before trying to launch the bare-metal host.
+
+Also check that the instance type exists in your selected region:
+
+```bash
+aws ec2 describe-instance-type-offerings \
+  --location-type region \
+  --filters Name=instance-type,Values="$CHM_INSTANCE_TYPE" \
+  --query 'InstanceTypeOfferings[].InstanceType' \
+  --output text \
+  --profile chm-aws \
+  --region "$AWS_REGION"
+```
+
+If that prints nothing, pick another region or another arm64 `*.metal` instance
+type.
 
 In the EC2 Console:
 
 1. Open **EC2**.
 2. Go to **Instance Types**.
 3. Search for `metal` and `arm64` / Graviton families.
-4. Confirm the selected region has a suitable type.
+4. Confirm the selected region has a suitable type, such as `c7g.metal`.
 
-If there is no bare-metal arm64 capacity or quota, do not continue in that
-region.
+If there is no bare-metal arm64 instance type in the region, or the quota
+increase is not approved, do not continue in that region.
 
 ## Step 5: Create a private S3 bucket for snapshot handoff
 
