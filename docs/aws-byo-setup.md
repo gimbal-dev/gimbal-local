@@ -155,3 +155,66 @@ The local runtime should always be able to tear down what it created:
 
 Until the remote control plane exists, the local app owns orchestration and
 cleanup.
+
+## 9. Destructive cleanup script
+
+Every resource created by the AWS prototype must be tagged:
+
+```text
+Project=cloud-hypervisor-mac
+```
+
+That tag is the blast-radius guard for the cleanup script. The script defaults
+to dry-run and only deletes when both `--execute` and `--yes` are present.
+
+Dry-run:
+
+```bash
+scripts/aws-cleanup-chm.sh \
+  --profile chm-aws \
+  --region us-east-1 \
+  --project cloud-hypervisor-mac \
+  --bucket <your-chm-snapshot-bucket>
+```
+
+Destructive cleanup:
+
+```bash
+scripts/aws-cleanup-chm.sh \
+  --profile chm-aws \
+  --region us-east-1 \
+  --project cloud-hypervisor-mac \
+  --bucket <your-chm-snapshot-bucket> \
+  --execute \
+  --yes
+```
+
+Delete the bucket too:
+
+```bash
+scripts/aws-cleanup-chm.sh \
+  --profile chm-aws \
+  --region us-east-1 \
+  --project cloud-hypervisor-mac \
+  --bucket <your-chm-snapshot-bucket> \
+  --delete-bucket \
+  --execute \
+  --yes
+```
+
+The script targets:
+
+- tagged EC2 instances;
+- tagged NAT gateways;
+- tagged Elastic IPs;
+- tagged available EBS volumes;
+- tagged EBS snapshots;
+- tagged non-default security groups;
+- tagged EC2 key pairs;
+- optional S3 prefix/bucket artifacts.
+
+It intentionally does **not** delete IAM users, roles, policies or instance
+profiles. Remove those manually after confirming nothing else uses them.
+
+If the script terminates instances, re-run it after a few minutes to catch EBS
+volumes that only become `available` after termination and detach completes.
