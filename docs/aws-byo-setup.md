@@ -169,6 +169,31 @@ Default region name:   us-east-1
 Default output format: json
 ```
 
+If the AWS CLI asks for an **SSO start URL**, stop. You are in the wrong
+configure flow for this guide. Press `Ctrl+C` and use the non-interactive setup
+below instead:
+
+```bash
+aws configure set aws_access_key_id "<paste IAM user's access key id>" \
+  --profile chm-aws
+aws configure set aws_secret_access_key "<paste IAM user's secret access key>" \
+  --profile chm-aws
+aws configure set region "$AWS_REGION" \
+  --profile chm-aws
+aws configure set output json \
+  --profile chm-aws
+```
+
+If you already half-configured SSO for this profile and later commands still try
+SSO, remove the bad profile block from your local AWS config:
+
+```bash
+open -e ~/.aws/config
+```
+
+Delete the whole block that starts with `[profile chm-aws]`, save the file, and
+then run the `aws configure set ... --profile chm-aws` commands above again.
+
 Do **not** create access keys for the root user. If you accidentally do, delete
 them and create IAM-user keys instead.
 
