@@ -1,127 +1,376 @@
 # AWS setup for the first real cloud round-trip
 
-This is the minimum AWS setup needed for the local Mac runtime to prove the
-remote -> local -> remote loop with a bring-your-own AWS subscription.
+This is the beginner-safe AWS checklist for proving:
 
-The important constraint: the capture host must expose **KVM on arm64**. A
-normal Graviton EC2 VM is not enough. Use a Graviton **bare-metal** instance
-type in a region where your account has quota, or another arm64 cloud host that
-exposes `/dev/kvm`.
-
-## 1. AWS account prerequisites
-
-- An AWS account with billing enabled.
-- A region with Graviton bare-metal capacity, for example a `*.metal` Graviton
-  family where available.
-- An EC2 quota that allows launching that bare-metal instance type.
-- A VPC/subnet with outbound internet access.
-- Either:
-    - SSH access via a key pair, or
-    - AWS Systems Manager Session Manager access.
-
-## Cost expectation
-
-Just setting up the IAM profile, an empty private S3 bucket, and local AWS CLI
-configuration should be effectively zero-cost.
-
-Standing still can still cost money if any billable infrastructure is left
-allocated:
-
-- **Running Graviton bare-metal capture host:** expect roughly \*\*$2.30-$2.70 per
-  hour\*\* in `us-east-1`-class regions for `c7g.metal` / `m7g.metal`-class
-  instances. This is the expensive part; terminate it when not actively
-  capturing.
-- **Stopped EC2 instance:** no compute charge, but attached EBS volumes still
-  charge.
-- **EBS gp3 volumes:** roughly **$0.08 per GB-month**. A 100 GiB volume is about
-  **$8/month** while it exists.
-- **S3 Standard artifacts:** roughly **$0.023 per GB-month**. A 20 GiB snapshot
-  bundle is about **$0.46/month** before request/transfer costs.
-- **NAT Gateway:** avoid for this project if possible. It costs roughly
-  **$0.045/hour** plus data processing, or about **$32/month** even while idle.
-- **Public IPv4 / Elastic IP:** AWS charges for public IPv4 addresses; expect
-  roughly **$0.005/hour** per address, or about **$3.60/month**.
-
-The intended cost posture for the first milestone is: keep only the private S3
-bucket and maybe small retained artifacts between runs; launch the bare-metal
-host only for capture; then terminate the host and delete temporary EBS/network
-resources during cleanup.
-
-## 2. Local tools
-
-Install and configure:
-
-```bash
-brew install awscli
-aws configure sso
-# or: aws configure --profile chm-aws
+```text
+AWS arm64 KVM host -> snapshot bundle -> local Mac chm -> return artifacts -> AWS
 ```
 
-Useful environment:
+The goal is **not** to build a hosted control plane yet. The Mac stays in charge
+and uses your AWS subscription directly.
+
+## Read this first
+
+### The one hard technical requirement
+
+The remote capture machine must expose **arm64 KVM**:
 
 ```bash
-export AWS_PROFILE=chm-aws
-export AWS_REGION=us-east-1
-```
-
-## 3. IAM permissions for the local app
-
-The first version is local-managed: the Mac app/CLI uses your AWS credentials
-directly. There is no hosted control plane yet.
-
-Create a role/user/profile for the local runtime with permission to:
-
-- describe, launch, stop, start and terminate EC2 instances;
-- create, attach, detach and delete EBS volumes used for test disks;
-- read/write a dedicated S3 bucket for snapshot bundles;
-- use SSM if you want shell access without inbound SSH;
-- pass only the specific EC2 instance role used by the capture host.
-
-Keep this scoped to a dedicated resource prefix such as:
-
-- instance tag: `Project=cloud-hypervisor-mac`
-- S3 bucket/prefix: `s3://<your-bucket>/cloud-hypervisor-mac/`
-- IAM role name: `cloud-hypervisor-mac-capture-role`
-
-## 4. S3 artifact bucket
-
-Create one private bucket for handoff artifacts:
-
-```bash
-aws s3 mb s3://<your-chm-snapshot-bucket>
-aws s3api put-public-access-block \
-  --bucket <your-chm-snapshot-bucket> \
-  --public-access-block-configuration \
-  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
-```
-
-The local runtime will use this bucket for:
-
-- captured cloud-hypervisor snapshot directories;
-- disk/overlay artifacts needed to rehydrate locally;
-- logs and proof files from the remote capture worker.
-
-## 5. Capture host shape
-
-Start with:
-
-- Ubuntu arm64 AMI;
-- Graviton bare-metal instance;
-- one root EBS volume;
-- optional extra EBS volume for guest disk images;
-- security group with SSH from your IP only, or no inbound access if using SSM.
-
-On the host we need:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y build-essential git curl jq qemu-utils
 test -e /dev/kvm
 ```
 
-If `/dev/kvm` is missing, the instance is not suitable for this milestone.
+A normal Graviton EC2 VM usually will **not** work because it does not expose
+nested KVM. For the real AWS proof, start with a **Graviton bare-metal**
+instance type, for example a `*.metal` Graviton family in a region where your
+account has quota.
 
-## 6. Snapshot compatibility requirement
+### The one hard cost rule
+
+Do **not** leave the bare-metal instance running.
+
+The intended pattern is:
+
+1. Launch capture host.
+2. Capture snapshot.
+3. Upload snapshot to S3.
+4. Terminate capture host.
+5. Rehydrate locally on the Mac.
+
+## What costs money?
+
+Setup-only should be close to zero cost:
+
+- IAM profile/role: no direct cost.
+- Local AWS CLI config: no cost.
+- Empty private S3 bucket: effectively no cost.
+
+Standing still can cost money if resources are left allocated:
+
+| Resource | Cost shape | What to do |
+| --- | --- | --- |
+| Running Graviton bare-metal EC2 | Roughly `$2.30-$2.70/hour` for `c7g.metal` / `m7g.metal` class instances in us-east-1-style regions | Terminate when not capturing |
+| Stopped EC2 | No compute charge, but attached EBS still bills | Prefer terminate, not stop |
+| EBS gp3 volume | Roughly `$0.08/GB-month`; 100 GiB is about `$8/month` | Delete temporary volumes |
+| S3 Standard | Roughly `$0.023/GB-month`; 20 GiB is about `$0.46/month` | Keep only wanted snapshot bundles |
+| NAT Gateway | Roughly `$0.045/hour` plus data, about `$32/month` idle | Avoid for this prototype |
+| Public IPv4 / Elastic IP | Roughly `$0.005/hour`, about `$3.60/month` | Release when done |
+
+## Naming and tagging rule
+
+Everything we create for this project should use:
+
+```text
+Project=cloud-hypervisor-mac
+```
+
+This tag lets the cleanup script find and delete project resources without
+touching unrelated AWS resources.
+
+Use these names unless you have a reason not to:
+
+```text
+AWS profile:       chm-aws
+Project tag:       cloud-hypervisor-mac
+S3 prefix:         cloud-hypervisor-mac/
+EC2 role name:     cloud-hypervisor-mac-capture-role
+```
+
+## Step 1: Install the AWS CLI on your Mac
+
+```bash
+brew install awscli
+aws --version
+```
+
+Pick a region. Start with whatever region has Graviton bare-metal capacity and
+quota for your account:
+
+```bash
+export AWS_REGION=us-east-1
+export AWS_PROFILE=chm-aws
+```
+
+## Step 2: Login to AWS from your Mac
+
+Preferred path if your AWS account uses IAM Identity Center / SSO:
+
+```bash
+aws configure sso --profile chm-aws
+aws sso login --profile chm-aws
+```
+
+Simpler access-key path if you are using an IAM user:
+
+```bash
+aws configure --profile chm-aws
+```
+
+Check the login works:
+
+```bash
+aws sts get-caller-identity --profile chm-aws
+```
+
+If that command fails, stop here and fix login before creating anything.
+
+## Step 3: Make sure your login has enough permissions
+
+For the first prototype, the AWS identity behind `chm-aws` needs permission to
+manage a small set of EC2 and S3 resources.
+
+If you have an AWS admin helping you, ask for a temporary sandbox permission set
+that can:
+
+- create/delete an S3 bucket and objects;
+- create/delete EC2 key pairs;
+- create/delete security groups;
+- launch/terminate EC2 instances;
+- describe EC2 images, subnets, VPCs, instances, volumes and quotas;
+- delete project EBS volumes/snapshots;
+- release project Elastic IPs if any are created.
+
+If this is your own throwaway AWS account, using administrator permissions for
+the first manual prototype is acceptable, as long as you run the cleanup script
+and then tighten permissions before anything becomes long-lived.
+
+Quick permission smoke test:
+
+```bash
+aws ec2 describe-vpcs \
+  --profile chm-aws \
+  --region "$AWS_REGION" \
+  --max-items 1 >/dev/null
+
+aws s3api list-buckets \
+  --profile chm-aws >/dev/null
+```
+
+If either command fails with `AccessDenied`, fix permissions before continuing.
+
+## Step 4: Check whether you have bare-metal quota
+
+In the AWS Console:
+
+1. Open **Service Quotas**.
+2. Search for **EC2**.
+3. Search within EC2 quotas for the Graviton bare-metal family you want.
+4. If the quota is zero, request an increase.
+
+In the EC2 Console:
+
+1. Open **EC2**.
+2. Go to **Instance Types**.
+3. Search for `metal` and `arm64` / Graviton families.
+4. Confirm the selected region has a suitable type.
+
+If there is no bare-metal arm64 capacity or quota, do not continue in that
+region.
+
+## Step 5: Create a private S3 bucket for snapshot handoff
+
+Bucket names are globally unique, so choose your own:
+
+```bash
+export CHM_BUCKET=<your-unique-chm-snapshot-bucket>
+```
+
+Create the bucket:
+
+```bash
+aws s3 mb "s3://$CHM_BUCKET" \
+  --profile chm-aws \
+  --region "$AWS_REGION"
+```
+
+Block public access:
+
+```bash
+aws s3api put-public-access-block \
+  --bucket "$CHM_BUCKET" \
+  --public-access-block-configuration \
+  BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true \
+  --profile chm-aws \
+  --region "$AWS_REGION"
+```
+
+Add a lifecycle rule so old experimental artifacts expire automatically after 7
+days:
+
+```bash
+cat >/tmp/chm-s3-lifecycle.json <<'JSON'
+{
+  "Rules": [
+    {
+      "ID": "expire-cloud-hypervisor-mac-artifacts",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "cloud-hypervisor-mac/" },
+      "Expiration": { "Days": 7 },
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 1 }
+    }
+  ]
+}
+JSON
+
+aws s3api put-bucket-lifecycle-configuration \
+  --bucket "$CHM_BUCKET" \
+  --lifecycle-configuration file:///tmp/chm-s3-lifecycle.json \
+  --profile chm-aws \
+  --region "$AWS_REGION"
+```
+
+Smoke test:
+
+```bash
+echo "hello from chm aws setup" >/tmp/chm-smoke.txt
+aws s3 cp /tmp/chm-smoke.txt "s3://$CHM_BUCKET/cloud-hypervisor-mac/smoke.txt" \
+  --profile chm-aws \
+  --region "$AWS_REGION"
+aws s3 rm "s3://$CHM_BUCKET/cloud-hypervisor-mac/smoke.txt" \
+  --profile chm-aws \
+  --region "$AWS_REGION"
+```
+
+## Step 6: Create or choose network access
+
+Beginner path:
+
+1. Use the default VPC in your selected region.
+2. Use a public subnet.
+3. Avoid NAT Gateway.
+4. Either use SSH from your current IP or use SSM Session Manager.
+
+If using SSH, create a security group that only allows your IP:
+
+```bash
+export MY_IP=$(curl -s https://checkip.amazonaws.com)/32
+export VPC_ID=$(aws ec2 describe-vpcs \
+  --filters Name=is-default,Values=true \
+  --query 'Vpcs[0].VpcId' \
+  --output text \
+  --profile chm-aws \
+  --region "$AWS_REGION")
+
+export CHM_SG_ID=$(aws ec2 create-security-group \
+  --group-name cloud-hypervisor-mac-capture \
+  --description "cloud-hypervisor-mac capture host" \
+  --vpc-id "$VPC_ID" \
+  --tag-specifications 'ResourceType=security-group,Tags=[{Key=Project,Value=cloud-hypervisor-mac}]' \
+  --query 'GroupId' \
+  --output text \
+  --profile chm-aws \
+  --region "$AWS_REGION")
+
+aws ec2 authorize-security-group-ingress \
+  --group-id "$CHM_SG_ID" \
+  --protocol tcp \
+  --port 22 \
+  --cidr "$MY_IP" \
+  --profile chm-aws \
+  --region "$AWS_REGION"
+```
+
+## Step 7: Create an SSH key pair
+
+```bash
+aws ec2 create-key-pair \
+  --key-name cloud-hypervisor-mac-capture \
+  --tag-specifications 'ResourceType=key-pair,Tags=[{Key=Project,Value=cloud-hypervisor-mac}]' \
+  --query 'KeyMaterial' \
+  --output text \
+  --profile chm-aws \
+  --region "$AWS_REGION" > ~/.ssh/cloud-hypervisor-mac-capture.pem
+
+chmod 600 ~/.ssh/cloud-hypervisor-mac-capture.pem
+```
+
+If the key already exists, either reuse it or delete/recreate it deliberately.
+
+## Step 8: Pick an Ubuntu arm64 AMI
+
+Use the AWS Console if you are unsure:
+
+1. Open **EC2**.
+2. Click **Launch instance**.
+3. Search for **Ubuntu Server arm64**.
+4. Copy the AMI ID for your region.
+
+Then set:
+
+```bash
+export CHM_AMI_ID=<ami-id>
+```
+
+## Step 9: Launch the bare-metal capture host
+
+Choose the instance type you have quota for:
+
+```bash
+export CHM_INSTANCE_TYPE=c7g.metal
+```
+
+Pick a subnet from your default VPC:
+
+```bash
+export CHM_SUBNET_ID=$(aws ec2 describe-subnets \
+  --filters Name=vpc-id,Values="$VPC_ID" Name=default-for-az,Values=true \
+  --query 'Subnets[0].SubnetId' \
+  --output text \
+  --profile chm-aws \
+  --region "$AWS_REGION")
+```
+
+Launch:
+
+```bash
+export CHM_INSTANCE_ID=$(aws ec2 run-instances \
+  --image-id "$CHM_AMI_ID" \
+  --instance-type "$CHM_INSTANCE_TYPE" \
+  --key-name cloud-hypervisor-mac-capture \
+  --security-group-ids "$CHM_SG_ID" \
+  --subnet-id "$CHM_SUBNET_ID" \
+  --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=100,VolumeType=gp3,DeleteOnTermination=true}' \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Project,Value=cloud-hypervisor-mac},{Key=Name,Value=cloud-hypervisor-mac-capture}]' \
+  --query 'Instances[0].InstanceId' \
+  --output text \
+  --profile chm-aws \
+  --region "$AWS_REGION")
+
+aws ec2 wait instance-running \
+  --instance-ids "$CHM_INSTANCE_ID" \
+  --profile chm-aws \
+  --region "$AWS_REGION"
+```
+
+Get its public DNS:
+
+```bash
+export CHM_HOST=$(aws ec2 describe-instances \
+  --instance-ids "$CHM_INSTANCE_ID" \
+  --query 'Reservations[0].Instances[0].PublicDnsName' \
+  --output text \
+  --profile chm-aws \
+  --region "$AWS_REGION")
+
+echo "$CHM_HOST"
+```
+
+## Step 10: SSH in and check KVM
+
+```bash
+ssh -i ~/.ssh/cloud-hypervisor-mac-capture.pem "ubuntu@$CHM_HOST"
+```
+
+On the AWS host:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y build-essential git curl jq qemu-utils pkg-config libssl-dev
+test -e /dev/kvm && echo "KVM is present"
+```
+
+If `/dev/kvm` is missing, stop and terminate the instance. It is not suitable.
+
+## Step 11: Snapshot compatibility requirement
 
 For macOS Hypervisor.framework today, do **not** capture a stock ITS/LPI-routed
 arm64 cloud-hypervisor snapshot. Apple's managed GIC cannot deliver LPIs to a
@@ -131,60 +380,81 @@ The capture must use the project-supported **GICv2M/message-SPI** path so virtio
 completion interrupts are deliverable locally through `hv_gic_send_msi` and the
 proven 1-of-N SPI route.
 
-## 7. First manual proof loop
+## Step 12: First manual proof loop
 
 The first milestone should prove this manually before the app automates it:
 
 1. Local Mac launches or connects to the AWS capture host.
 2. Remote host builds/runs the compatible cloud-hypervisor capture workload.
 3. Remote host creates a snapshot bundle.
-4. Remote host uploads the bundle to S3.
-5. Local Mac downloads the bundle.
-6. `chm run <snapshot>` rehydrates it locally.
-7. Local Mac uploads any changed overlay/proof artifacts back to S3.
-8. Remote host consumes those artifacts for the return leg.
+4. Local Mac copies the bundle down from the remote host:
 
-## 8. Cleanup expectation
-
-The local runtime should always be able to tear down what it created:
-
-- terminate capture instances;
-- delete temporary volumes;
-- delete temporary security groups if it created them;
-- keep or expire S3 artifacts according to a user-selected retention policy.
-
-Until the remote control plane exists, the local app owns orchestration and
-cleanup.
-
-## 9. Destructive cleanup script
-
-Every resource created by the AWS prototype must be tagged:
-
-```text
-Project=cloud-hypervisor-mac
+```bash
+mkdir -p ./snapshots/<name>
+rsync -avz \
+  -e "ssh -i ~/.ssh/cloud-hypervisor-mac-capture.pem" \
+  "ubuntu@$CHM_HOST:<snapshot-dir>/" \
+  ./snapshots/<name>/
 ```
 
-That tag is the blast-radius guard for the cleanup script. The script defaults
-to dry-run and only deletes when both `--execute` and `--yes` are present.
+5. Local Mac uploads a copy to S3 for handoff/audit:
 
-Dry-run:
+```bash
+aws s3 sync ./snapshots/<name> "s3://$CHM_BUCKET/cloud-hypervisor-mac/snapshots/<name>/" \
+  --profile chm-aws \
+  --region "$AWS_REGION"
+```
+
+6. Local Mac runs:
+
+```bash
+target/debug/chm ./snapshots/<name> --max-seconds 30 --idle-exit 0
+```
+
+7. Local Mac uploads changed overlay/proof artifacts back to S3:
+
+```bash
+aws s3 sync ./snapshots/<name>/.chm-overlays \
+  "s3://$CHM_BUCKET/cloud-hypervisor-mac/returns/<name>/.chm-overlays/" \
+  --profile chm-aws \
+  --region "$AWS_REGION"
+```
+
+8. Local Mac copies return artifacts back to the remote host if needed:
+
+```bash
+rsync -avz \
+  -e "ssh -i ~/.ssh/cloud-hypervisor-mac-capture.pem" \
+  ./snapshots/<name>/.chm-overlays/ \
+  "ubuntu@$CHM_HOST:~/chm-return/<name>/.chm-overlays/"
+```
+
+This avoids putting AWS credentials on the remote host for the first prototype.
+Later, the local app can attach a narrow instance role and let the capture host
+upload directly to S3.
+
+## Stop spending money
+
+Use this any time you want to remove project resources.
+
+Dry-run first:
 
 ```bash
 scripts/aws-cleanup-chm.sh \
   --profile chm-aws \
-  --region us-east-1 \
+  --region "$AWS_REGION" \
   --project cloud-hypervisor-mac \
-  --bucket <your-chm-snapshot-bucket>
+  --bucket "$CHM_BUCKET"
 ```
 
-Destructive cleanup:
+Actually delete tagged AWS resources and the project S3 prefix:
 
 ```bash
 scripts/aws-cleanup-chm.sh \
   --profile chm-aws \
-  --region us-east-1 \
+  --region "$AWS_REGION" \
   --project cloud-hypervisor-mac \
-  --bucket <your-chm-snapshot-bucket> \
+  --bucket "$CHM_BUCKET" \
   --execute \
   --yes
 ```
@@ -194,15 +464,15 @@ Delete the bucket too:
 ```bash
 scripts/aws-cleanup-chm.sh \
   --profile chm-aws \
-  --region us-east-1 \
+  --region "$AWS_REGION" \
   --project cloud-hypervisor-mac \
-  --bucket <your-chm-snapshot-bucket> \
+  --bucket "$CHM_BUCKET" \
   --delete-bucket \
   --execute \
   --yes
 ```
 
-The script targets:
+The cleanup script targets:
 
 - tagged EC2 instances;
 - tagged NAT gateways;
@@ -218,3 +488,14 @@ profiles. Remove those manually after confirming nothing else uses them.
 
 If the script terminates instances, re-run it after a few minutes to catch EBS
 volumes that only become `available` after termination and detach completes.
+
+## Console checklist
+
+Before you walk away from AWS, check these console pages:
+
+1. **EC2 -> Instances:** no `cloud-hypervisor-mac` instances running or stopped.
+2. **EC2 -> Volumes:** no unattached test volumes.
+3. **EC2 -> Elastic IPs:** no allocated project IPs.
+4. **VPC -> NAT Gateways:** none created for this project.
+5. **S3:** only the artifacts you intentionally kept.
+6. **Billing -> Cost Explorer:** check the next day for unexpected spend.
