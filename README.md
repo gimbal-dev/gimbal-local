@@ -117,8 +117,12 @@ Milestones completed (all hardware-verified on Apple Silicon):
 
 Next:
 
-- **Real cloud round-trip:** capture on an actual AWS Graviton / Oracle A1 host
-  and rehydrate locally, rather than relying on nested-KVM captures from Lima.
+- **Raspberry Pi off-box proof:** capture on a physically separate arm64
+  Linux/KVM host and rehydrate locally, rather than relying only on nested-KVM
+  captures from Lima. See
+  [`docs/raspberry-pi-offbox-plan.md`](docs/raspberry-pi-offbox-plan.md).
+- **Real cloud round-trip:** return to AWS Graviton / Oracle A1 once quota or a
+  suitable bare-metal host is available.
 - **BYO-subscription loop:** add a small local-managed AWS extension that can
   launch/connect to a capture host, move snapshot bundles through S3, run them
   locally, and push return artifacts back without a hosted control plane.
@@ -126,7 +130,7 @@ Next:
   library view, Start/Stop, console/terminal — plus lifecycle (graceful PSCI
   shutdown, pause/resume, re-snapshot).
 
-AWS setup notes for the first round-trip live in
+AWS setup notes for the later cloud round-trip live in
 [`docs/aws-byo-setup.md`](docs/aws-byo-setup.md).
 
 ## Relationship to upstream Cloud Hypervisor

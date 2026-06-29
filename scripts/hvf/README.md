@@ -8,7 +8,7 @@ gicd_ctlr }`). cloud-hypervisor serializes all of it into the snapshot's
 `state.json`.
 
 A snapshot can only be **produced** on a host with real `/dev/kvm` on arm64.
-There are two ways to get one.
+There are now three ways to get one.
 
 ## Option A — entirely on an Apple M3+ Mac (recommended)
 
@@ -35,7 +35,25 @@ downloads are cached.
 > Requires Apple **M3 or later**. M1/M2 have no nested virtualization — the
 > script detects this and points you at Option B.
 
-## Option B — a cloud ARM bare-metal box (fallback)
+## Option B — a Raspberry Pi / local ARM Linux box (off-box proof)
+
+Use this while cloud bare-metal quota is blocked. It proves the snapshot was
+captured on a physically separate Linux/KVM arm64 host, but it is not a real
+cloud proof.
+
+The hard gate is **KVM VGICv3**, not just `/dev/kvm`. Raspberry Pi 5 is the best
+candidate; Raspberry Pi 4 is likely not enough for the current VGICv3-only
+capture path. See [`../../docs/raspberry-pi-offbox-plan.md`](../../docs/raspberry-pi-offbox-plan.md).
+
+```sh
+# from the Mac:
+scp scripts/hvf/capture-arm-snapshot.sh pi@raspberrypi.local:/tmp/
+ssh pi@raspberrypi.local \
+  'CH_GIC_V2M=1 OUT_DIR=$HOME/ch-arm-snapshot bash /tmp/capture-arm-snapshot.sh'
+rsync -avz pi@raspberrypi.local:~/ch-arm-snapshot/snapshot/ ./snapshots/pi-offbox/
+```
+
+## Option C — a cloud ARM bare-metal box (fallback)
 
 Use any arm64 host with real `/dev/kvm`: an AWS Graviton `c7g.metal` /
 `m7g.metal`, an Oracle `BM.Standard.A1.160`, or any ARM `*.metal`. Regular ARM
@@ -49,7 +67,8 @@ ssh user@host 'bash /tmp/capture-arm-snapshot.sh'
 # then copy ./ch-arm-snapshot/ch-arm-snapshot.tar.zst back
 ```
 
-A `c7g.metal` spot instance for ~20 minutes costs roughly a dollar.
+A `c7g.metal` spot instance for ~20 minutes costs roughly a dollar, but account
+quota/capacity can block this path.
 
 ## What you get
 
@@ -70,5 +89,6 @@ fully offline on the Mac.
 ## Tunables
 
 Both scripts honour environment variables, e.g. `GUEST_CPUS`, `GUEST_MEM_MB`,
-`CH_VERSION`, `IMG_URL`, `OUT_DIR`, `BOOT_TIMEOUT`. See the CONFIG block at the
-top of `capture-arm-snapshot.sh`.
+`CH_VERSION`, `IMG_URL`, `OUT_DIR`, `BOOT_TIMEOUT`. `CH_GIC_V2M` defaults to
+`1` so captures are HVF-compatible message-SPI snapshots unless explicitly
+overridden. See the CONFIG block at the top of `capture-arm-snapshot.sh`.

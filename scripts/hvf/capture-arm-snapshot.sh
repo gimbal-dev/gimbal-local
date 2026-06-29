@@ -35,6 +35,7 @@ IMG_URL="${IMG_URL:-https://cloud-images.ubuntu.com/noble/current/noble-server-c
 GUEST_CPUS="${GUEST_CPUS:-1}"
 GUEST_MEM_MB="${GUEST_MEM_MB:-1024}"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-300}"   # seconds to wait for the in-guest marker
+CH_GIC_V2M="${CH_GIC_V2M:-1}"         # 1 = HVF-compatible message-SPI capture
 
 WORK_DIR="${WORK_DIR:-$HOME/.cache/ch-arm-snapshot}"
 OUT_DIR="${OUT_DIR:-$PWD/ch-arm-snapshot}"
@@ -127,7 +128,12 @@ cleanup() {
 trap cleanup EXIT
 
 log "booting guest (${GUEST_CPUS} vCPU, ${GUEST_MEM_MB} MiB) under cloud-hypervisor"
-"${KVM_PREFIX[@]}" ./cloud-hypervisor \
+log "GIC capture mode: CH_GIC_V2M=${CH_GIC_V2M} (1 means message-SPI, not ITS/LPI)"
+CH_ENV=(env "CH_GIC_V2M=$CH_GIC_V2M")
+if [ "${#KVM_PREFIX[@]}" -gt 0 ]; then
+  CH_ENV=(sudo env "CH_GIC_V2M=$CH_GIC_V2M")
+fi
+"${CH_ENV[@]}" ./cloud-hypervisor \
   --api-socket "$API_SOCK" \
   --firmware ./CLOUDHV_EFI.fd \
   --disk path=guest.raw --disk path=seed.img,readonly=on \

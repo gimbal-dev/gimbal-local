@@ -270,6 +270,19 @@ For example, `c7g.metal` commonly needs **64 vCPUs** of quota in the selected
 region. If your quota is below the vCPU count of the instance type, launch will
 fail.
 
+If the console shows:
+
+```text
+Utilization: 0
+Applied account-level quota value: 0
+AWS default quota value: 5
+```
+
+that does **not** mean "request 5". It means the normal default is only \*\*5
+vCPUs\*\*, which is fine for small EC2 VMs but still nowhere near enough for a
+64-vCPU bare-metal host. Request the number you actually need for the selected
+instance type.
+
 Check the quota from your Mac:
 
 ```bash
@@ -307,7 +320,8 @@ In the AWS Console:
 4. Search within EC2 quotas for `L-1216C47A` or **Running On-Demand Standard**.
 5. Click the quota.
 6. Click **Request increase at account-level**.
-7. Request `128` if AWS asks for a number and you are using `c7g.metal`.
+7. Request at least `64` if AWS asks for a number and you are using
+   `c7g.metal`; request `128` if you want one host plus breathing room.
 8. Wait for approval before trying to launch the bare-metal host.
 
 Also check that the instance type exists in your selected region:
