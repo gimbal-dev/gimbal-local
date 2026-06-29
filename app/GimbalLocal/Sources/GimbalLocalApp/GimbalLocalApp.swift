@@ -14,7 +14,7 @@ struct GimbalLocalApp: App {
                 .environmentObject(model)
                 .frame(minWidth: 1120, minHeight: 760)
                 .task {
-                    await model.refreshAll()
+                    await model.bootstrap()
                 }
         }
         .commands {

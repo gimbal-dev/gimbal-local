@@ -40,7 +40,9 @@ creates `target/GimbalLocal.app`.
 
 - Polished macOS dashboard with a glass-card layout, hero launch area, status
   pills, premium sidebar, and terminal-styled console/activity panes.
-- Start/shutdown a local `chm serve` daemon.
+- Auto-start `chm serve` on launch when the local daemon is not reachable, and
+  create the configured snapshot library folder if needed.
+- Start/shutdown a local `chm serve` daemon manually when desired.
 - Configure `chm`, snapshot library, socket, and control-plane URL.
 - List local snapshot sandboxes from `chm ctl list --json`.
 - Start/stop a selected sandbox and attach to its serial console.

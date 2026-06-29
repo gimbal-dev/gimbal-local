@@ -20,6 +20,20 @@ final class AppModel: ObservableObject {
     private let controlPlane = CloudControlClient()
     private var daemonProcess: Process?
     private var consoleProcess: Process?
+    private var attemptedAutoStart = false
+
+    func bootstrap() async {
+        await refreshAll()
+        guard status.state == .disconnected, !attemptedAutoStart else {
+            return
+        }
+
+        attemptedAutoStart = true
+        appendLog("local daemon not reachable; starting chm serve automatically")
+        startDaemon(reason: "auto-start")
+        try? await Task.sleep(for: .milliseconds(500))
+        await refreshAll()
+    }
 
     func refreshAll() async {
         isRefreshing = true
@@ -46,8 +60,22 @@ final class AppModel: ObservableObject {
     }
 
     func startDaemon() {
+        startDaemon(reason: "manual")
+    }
+
+    private func startDaemon(reason: String) {
         guard daemonProcess == nil else {
             appendLog("chm serve is already managed by this app")
+            return
+        }
+
+        do {
+            try FileManager.default.createDirectory(
+                atPath: settings.libraryPath,
+                withIntermediateDirectories: true
+            )
+        } catch {
+            appendLog("failed to create snapshot library: \(error.localizedDescription)")
             return
         }
 
@@ -71,12 +99,20 @@ final class AppModel: ObservableObject {
             let text = String(decoding: data, as: UTF8.self)
             Task { @MainActor in self?.appendLog(text.trimmingCharacters(in: .newlines)) }
         }
+        process.terminationHandler = { [weak self] process in
+            Task { @MainActor in
+                guard self?.daemonProcess === process else { return }
+                self?.daemonProcess = nil
+                self?.daemonPID = nil
+                self?.appendLog("chm serve exited with status \(process.terminationStatus)")
+            }
+        }
 
         do {
             try process.run()
             daemonProcess = process
             daemonPID = process.processIdentifier
-            appendLog("started chm serve (pid \(process.processIdentifier))")
+            appendLog("started chm serve via \(reason) (pid \(process.processIdentifier))")
             Task { await refreshLocal() }
         } catch {
             appendLog("failed to start chm serve: \(error.localizedDescription)")
