@@ -131,6 +131,23 @@ virtio devices (block/net/console over PCI) a guest needs to run open-endedly.
   uploads return artifacts, and `cleanup` wraps the tag-scoped destructive
   cleanup script.
 
+## Gimbal Local desktop app
+
+`app/GimbalLocal` is the M23 native macOS app. It deliberately stays outside the
+Rust runtime and treats `chm` as the local worker contract:
+
+- launches `chm serve <library> --socket <path>`;
+- reads local state with `chm ctl list --json` and `chm ctl status --json`;
+- starts/stops selected snapshots through `chm ctl start/stop`;
+- attaches to the live serial console through `chm ctl console`;
+- optionally points at `gimbal-cloud-control` and reads `/healthz`, `/runners`,
+  `/snapshots`, `/sandboxes`, and `/cost/running`.
+
+That makes the split explicit: the desktop app manages local sandboxes and
+reports control-plane readiness, while `gimbal-cloud-control` remains the source
+of truth for leases, resources, artifacts, cleanup, and audit once the hosted
+path is enabled.
+
 The Hypervisor.framework dependency is target-gated to
 `cfg(all(target_os = "macos", target_arch = "aarch64"))`, so the crate still
 compiles to a small stub on a Linux workspace build.
@@ -153,5 +170,6 @@ instead of forwarding them, so `chm` intentionally re-routes message SPIs as
 arm64 KVM capacity: AWS bare-metal quota is pending, OCI Ampere capacity is not
 available in the tested region, and the available Raspberry Pi hardware is not
 strong enough. The local-managed BYO cloud loop is now scriptable through
-`chm cloud init/preflight/capture/pull/push/cleanup aws`; the remote proof still
-waits for real arm64 KVM capacity. See [`aws-byo-setup.md`](aws-byo-setup.md).
+`chm cloud init/preflight/capture/pull/push/cleanup aws`, and the desktop shell
+can manage local sandboxes through `chm serve`; the remote proof still waits for
+real arm64 KVM capacity. See [`aws-byo-setup.md`](aws-byo-setup.md).

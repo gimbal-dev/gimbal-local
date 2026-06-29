@@ -85,6 +85,23 @@ a Unix socket — the control plane a desktop app talks to:
 One guest runs at a time (HVF is one-VM-per-process today). This daemon is the
 foundation for a Docker-Desktop-style GUI — see the roadmap.
 
+## Run the desktop app (`Gimbal Local`)
+
+M23 adds a native macOS SwiftUI app over the daemon: **Gimbal Local**. It is a
+Docker Desktop-style dashboard for local sandboxes, with an optional
+`gimbal-cloud-control` status panel.
+
+```sh
+# Build the signed chm binary and a clickable app bundle.
+APP=$(./scripts/build-gimbal-local-app.sh)
+open "$APP"
+```
+
+The app can start/shutdown `chm serve`, list snapshots, start/stop a selected
+sandbox, attach to the serial console, show daemon state, and display control
+plane health/count/cost signals when `gctl server` is running. Source and app
+notes live in [`app/GimbalLocal/`](app/GimbalLocal/).
+
 ## How it works
 
 `chm` is a thin front end over the in-tree `hypervisor` crate's `hvf` backend.
@@ -116,6 +133,7 @@ Milestones completed (all hardware-verified on Apple Silicon):
 | M9 | Repo refocused as a standalone macOS local-runtime project. |
 | M10–M20 | Native virtio block/rng/net, interactive serial console, bidirectional net, and multi-vCPU snapshot resume. |
 | R3 | PSCI `CPU_ON` path hardware-proven; HVF SPI affinity routing remains unsupported, so message-SPI delivery deliberately uses the proven 1-of-N route. |
+| M23 | **Gimbal Local** native macOS app: local sandbox dashboard, daemon controls, console view, and optional gimbal-cloud-control health/cost panel. |
 
 Next:
 
@@ -125,9 +143,8 @@ Next:
   available: `init`, `preflight`, `capture`, `pull`, `push`, and `cleanup`.
   They let the Mac manage a user's AWS profile, S3 handoff bucket, and existing
   SSH capture host without a hosted control plane.
-- **Desktop app:** first app-facing surface is now in the daemon:
-  `chm ctl list --json` and `chm ctl status --json`. A SwiftUI/menu-bar (or
-  Tauri) shell can wrap those plus Start/Stop/console next.
+- **Desktop app:** native SwiftUI shell is stood up in `app/GimbalLocal`, backed
+  by `chm serve` / `chm ctl` plus the optional `gimbal-cloud-control` API.
 
 AWS setup notes for the later cloud round-trip live in
 [`docs/aws-byo-setup.md`](docs/aws-byo-setup.md).
