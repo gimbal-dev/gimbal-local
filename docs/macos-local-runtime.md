@@ -121,8 +121,15 @@ virtio devices (block/net/console over PCI) a guest needs to run open-endedly.
 - `chm serve <library>` is a daemon: it hosts a directory of snapshots behind a
   Unix socket, runs one guest at a time on a worker thread, buffers its console
   into a capped ring, and serves `list` / `start` / `console` / `status` /
-  `stop` / `shutdown` to `chm ctl` clients. It is the control plane a desktop
-  GUI will drive.
+  `stop` / `shutdown` to `chm ctl` clients. It also exposes
+  `chm ctl list --json` and `chm ctl status --json`, which are the first
+  machine-readable app-facing state surfaces for a desktop shell.
+- `chm cloud <command> aws` is the local-managed BYO AWS loop. `init` persists
+  profile/region/bucket defaults locally, `preflight` checks identity/quota/
+  bucket safety, `capture` can run an SSH capture command then rsync/import the
+  snapshot and upload it to S3, `pull` retrieves a snapshot bundle, `push`
+  uploads return artifacts, and `cleanup` wraps the tag-scoped destructive
+  cleanup script.
 
 The Hypervisor.framework dependency is target-gated to
 `cfg(all(target_os = "macos", target_arch = "aarch64"))`, so the crate still
@@ -145,7 +152,6 @@ instead of forwarding them, so `chm` intentionally re-routes message SPIs as
 1-of-N before delivery. Remote capture validation is currently blocked on real
 arm64 KVM capacity: AWS bare-metal quota is pending, OCI Ampere capacity is not
 available in the tested region, and the available Raspberry Pi hardware is not
-strong enough. The next active milestone is local-managed BYO cloud plumbing:
-`chm cloud preflight aws` and `chm cloud cleanup aws` provide safe account,
-quota, bucket and cleanup checks before any paid host is launched. See
-[`aws-byo-setup.md`](aws-byo-setup.md).
+strong enough. The local-managed BYO cloud loop is now scriptable through
+`chm cloud init/preflight/capture/pull/push/cleanup aws`; the remote proof still
+waits for real arm64 KVM capacity. See [`aws-byo-setup.md`](aws-byo-setup.md).

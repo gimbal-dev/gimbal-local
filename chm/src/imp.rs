@@ -431,8 +431,8 @@ fn usage() -> String {
          [--max-seconds N]\n      \
          Host a snapshot library (a `ch-snapshot` dir, or a directory of\n      \
          them) behind a Unix socket (default $TMPDIR/chm.sock).\n    \
-         chm ctl list                List snapshots in the library.\n    \
-         chm ctl status              Show daemon / running-VM status.\n    \
+         chm ctl list [--json]       List snapshots in the library.\n    \
+         chm ctl status [--json]     Show daemon / running-VM status.\n    \
          chm ctl start <name>        Resume a snapshot by name.\n    \
          chm ctl console             Stream the running guest console.\n    \
          chm ctl stop                Stop the running guest.\n    \

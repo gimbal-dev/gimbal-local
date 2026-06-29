@@ -14,7 +14,7 @@
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::process::{exit, ExitCode};
+use std::process::{ExitCode, exit};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{env, fs, thread};
@@ -177,9 +177,10 @@ fn scan_library(root: &Path) -> Result<Vec<Entry>, String> {
 
     if root.join("state.json").exists() {
         let loaded = load_snapshot(root)?;
-        let name = root
-            .file_name()
-            .map_or_else(|| "snapshot".to_string(), |s| s.to_string_lossy().into_owned());
+        let name = root.file_name().map_or_else(
+            || "snapshot".to_string(),
+            |s| s.to_string_lossy().into_owned(),
+        );
         entries.push(Entry {
             name,
             dir: root.to_path_buf(),
@@ -289,8 +290,14 @@ fn handle_conn(stream: UnixStream, daemon: &Daemon) {
             }
             let _ = writer.write_all(out.as_bytes());
         }
+        "list-json" => {
+            let _ = writer.write_all(list_json(daemon).as_bytes());
+        }
         "status" => {
             let _ = writer.write_all(status_line(daemon).as_bytes());
+        }
+        "status-json" => {
+            let _ = writer.write_all(status_json(daemon).as_bytes());
         }
         "start" => {
             let resp = match start_vm(daemon, arg) {
@@ -335,11 +342,73 @@ fn status_line(daemon: &Daemon) -> String {
                     bytes
                 ),
                 RunStatus::Stopped(reason) => {
-                    format!("stopped\t{}\t{}\t{} console bytes\n", vm.name, reason, bytes)
+                    format!(
+                        "stopped\t{}\t{}\t{} console bytes\n",
+                        vm.name, reason, bytes
+                    )
                 }
             }
         }
     }
+}
+
+fn list_json(daemon: &Daemon) -> String {
+    let mut out = String::from("{\"snapshots\":[");
+    for (idx, e) in daemon.library.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"name\":\"{}\",\"path\":\"{}\",\"vcpus\":{},\"ram_mib\":{}}}",
+            json_escape(&e.name),
+            json_escape(&e.dir.display().to_string()),
+            e.num_vcpus,
+            e.total_ram / (1024 * 1024)
+        ));
+    }
+    out.push_str("]}\n");
+    out
+}
+
+fn status_json(daemon: &Daemon) -> String {
+    let guard = daemon.current.lock().unwrap();
+    match guard.as_ref() {
+        None => "{\"state\":\"idle\"}\n".to_string(),
+        Some(vm) => {
+            let inner = vm.inner.lock().unwrap();
+            let bytes = inner.dropped + inner.console.len();
+            match &inner.status {
+                RunStatus::Running => format!(
+                    "{{\"state\":\"running\",\"name\":\"{}\",\"uptime_seconds\":{},\"console_bytes\":{}}}\n",
+                    json_escape(&vm.name),
+                    vm.started.elapsed().as_secs(),
+                    bytes
+                ),
+                RunStatus::Stopped(reason) => format!(
+                    "{{\"state\":\"stopped\",\"name\":\"{}\",\"reason\":\"{}\",\"console_bytes\":{}}}\n",
+                    json_escape(&vm.name),
+                    json_escape(reason),
+                    bytes
+                ),
+            }
+        }
+    }
+}
+
+fn json_escape(s: &str) -> String {
+    let mut out = String::new();
+    for ch in s.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 fn start_vm(daemon: &Daemon, name: &str) -> Result<String, String> {
@@ -576,11 +645,11 @@ fn ctl(raw: &[String]) -> Result<(), String> {
     let (socket, rest) = take_socket(raw)?;
     if rest.is_empty() {
         return Err(
-            "missing command (list | status | start <name> | console | stop | shutdown)"
+            "missing command (list [--json] | status [--json] | start <name> | console | stop | shutdown)"
                 .to_string(),
         );
     }
-    let command = rest.join(" ");
+    let command = ctl_command(&rest)?;
 
     let mut stream = UnixStream::connect(&socket).map_err(|e| {
         format!(
@@ -610,4 +679,44 @@ fn ctl(raw: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+fn ctl_command(rest: &[String]) -> Result<String, String> {
+    match rest {
+        [cmd] => Ok(cmd.clone()),
+        [cmd, json] if matches!(cmd.as_str(), "list" | "status") && json == "--json" => {
+            Ok(format!("{cmd}-json"))
+        }
+        [cmd, ..] if matches!(cmd.as_str(), "list" | "status") => {
+            Err(format!("unexpected argument `{}`", rest[1]))
+        }
+        _ => Ok(rest.join(" ")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn s(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[test]
+    fn ctl_json_commands_map_to_daemon_protocol() {
+        assert_eq!(ctl_command(&s(&["list", "--json"])).unwrap(), "list-json");
+        assert_eq!(
+            ctl_command(&s(&["status", "--json"])).unwrap(),
+            "status-json"
+        );
+        assert_eq!(ctl_command(&s(&["start", "vm1"])).unwrap(), "start vm1");
+    }
+
+    #[test]
+    fn json_escape_handles_control_characters() {
+        assert_eq!(
+            json_escape("vm\"one\\two\n"),
+            "vm\\\"one\\\\two\\n".to_string()
+        );
+    }
 }

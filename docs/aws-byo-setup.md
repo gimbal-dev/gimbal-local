@@ -270,6 +270,22 @@ target/debug/chm cloud preflight aws \
 Run it after building `chm` with `bash scripts/build-chm.sh`. It does not launch
 or create paid resources.
 
+You can persist the common AWS settings locally first, then omit them from later
+commands:
+
+```bash
+target/debug/chm cloud init aws \
+  --profile chm-aws \
+  --region "$AWS_REGION" \
+  --bucket "$CHM_BUCKET" \
+  --prefix cloud-hypervisor-mac/
+
+target/debug/chm cloud preflight aws
+```
+
+The config is written only on the Mac, under
+`~/Library/Application Support/gimbal-local/cloud-aws.env`.
+
 The quota that normally blocks `c7g.metal` / `m7g.metal` is not named
 "Graviton bare metal". It is the regional EC2 On-Demand **vCPU** quota:
 
@@ -583,23 +599,21 @@ The first milestone should prove this manually before the app automates it:
 1. Local Mac launches or connects to the AWS capture host.
 2. Remote host builds/runs the compatible cloud-hypervisor capture workload.
 3. Remote host creates a snapshot bundle.
-4. Local Mac copies the bundle down from the remote host:
+4. Local Mac optionally runs a capture command over SSH, copies the bundle down,
+   and uploads a copy to S3 for handoff/audit:
 
 ```bash
-mkdir -p ./snapshots/<name>
-rsync -avz \
-  -e "ssh -i ~/.ssh/cloud-hypervisor-mac-capture.pem" \
-  "ubuntu@$CHM_HOST:<snapshot-dir>/" \
-  ./snapshots/<name>/
+target/debug/chm cloud capture aws \
+  --name <name> \
+  --host "ubuntu@$CHM_HOST" \
+  --ssh-key ~/.ssh/cloud-hypervisor-mac-capture.pem \
+  --remote-capture-command 'CH_GIC_V2M=1 ./capture.sh' \
+  --remote-snapshot-dir <snapshot-dir> \
+  --to ./snapshots
 ```
 
-5. Local Mac uploads a copy to S3 for handoff/audit:
-
-```bash
-aws s3 sync ./snapshots/<name> "s3://$CHM_BUCKET/cloud-hypervisor-mac/snapshots/<name>/" \
-  --profile chm-aws \
-  --region "$AWS_REGION"
-```
+If the remote host has already produced the bundle, omit
+`--remote-capture-command`.
 
 6. Local Mac runs:
 
@@ -610,10 +624,15 @@ target/debug/chm ./snapshots/<name> --max-seconds 30 --idle-exit 0
 7. Local Mac uploads changed overlay/proof artifacts back to S3:
 
 ```bash
-aws s3 sync ./snapshots/<name>/.chm-overlays \
-  "s3://$CHM_BUCKET/cloud-hypervisor-mac/returns/<name>/.chm-overlays/" \
-  --profile chm-aws \
-  --region "$AWS_REGION"
+target/debug/chm cloud push aws \
+  --name <name> \
+  --from-local ./snapshots/<name>/.chm-overlays
+```
+
+To retrieve a previously uploaded snapshot bundle on another Mac, use:
+
+```bash
+target/debug/chm cloud pull aws --name <name> --to ./snapshots
 ```
 
 8. Local Mac copies return artifacts back to the remote host if needed:

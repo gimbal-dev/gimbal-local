@@ -25,12 +25,12 @@ chm: guest resumed — serial console follows.
 [  ...  ] cloud-init[754]: Cloud-init v. 26.1 running 'modules:config' ...
 ```
 
-> **Status: real, and honestly bounded.** A captured `arm64` KVM snapshot
-> rehydrates onto HVF and boots into real Linux userspace (systemd, D-Bus,
-> cloud-init). It runs vCPU0 until it needs a device this build does not yet
-> model (virtio block/net/console over PCI), then goes quiet. Closing that gap
-> is the device-model work tracked below. There are no stubbed VMs or fake
-> consoles here — everything streamed above is the guest actually executing.
+> **Status: real, and honestly bounded.** Captured `arm64` KVM snapshots
+> rehydrate onto HVF, run multi-vCPU Linux guests, service native virtio
+> block/rng/net, and expose an interactive serial console. Stock ITS/LPI-routed
+> snapshots remain blocked by Apple's managed-GIC limits; supported captures use
+> GICv2M/message-SPIs. There are no stubbed VMs or fake consoles here —
+> everything streamed above is the guest actually executing.
 
 ---
 
@@ -73,9 +73,11 @@ a Unix socket — the control plane a desktop app talks to:
 "$BIN" serve /path/to/library &
 
 "$BIN" ctl list                 # enumerate snapshots
+"$BIN" ctl list --json          # machine-readable library state for an app
 "$BIN" ctl start <name>         # resume one
 "$BIN" ctl console              # stream its live console
 "$BIN" ctl status               # running / stopped + console bytes
+"$BIN" ctl status --json        # machine-readable VM state for an app
 "$BIN" ctl stop                 # stop the guest (forced, ~instant)
 "$BIN" ctl shutdown             # stop + exit the daemon
 ```
@@ -120,11 +122,12 @@ Next:
 - **Remote capture validation:** blocked on real arm64 KVM capacity. Raspberry
   Pi/OCI options were checked; AWS bare-metal quota is the current route back.
 - **BYO-subscription loop:** first local-managed AWS helper commands are now
-  landing (`chm cloud preflight aws`, `chm cloud cleanup aws`) so setup, safety
-  checks, and cleanup can progress without launching paid hosts yet.
-- **Desktop app:** a SwiftUI/menu-bar (or Tauri) shell over `chm serve` —
-  library view, Start/Stop, console/terminal — plus lifecycle (graceful PSCI
-  shutdown, pause/resume, re-snapshot).
+  available: `init`, `preflight`, `capture`, `pull`, `push`, and `cleanup`.
+  They let the Mac manage a user's AWS profile, S3 handoff bucket, and existing
+  SSH capture host without a hosted control plane.
+- **Desktop app:** first app-facing surface is now in the daemon:
+  `chm ctl list --json` and `chm ctl status --json`. A SwiftUI/menu-bar (or
+  Tauri) shell can wrap those plus Start/Stop/console next.
 
 AWS setup notes for the later cloud round-trip live in
 [`docs/aws-byo-setup.md`](docs/aws-byo-setup.md).
