@@ -24,12 +24,6 @@ struct ContentView: View {
                 }
                 .disabled(model.isRefreshing)
 
-                Button {
-                    model.startDaemon()
-                } label: {
-                    Label("Start Daemon", systemImage: "play.circle.fill")
-                }
-
                 Button(role: .destructive) {
                     model.stopSandbox()
                 } label: {
@@ -55,6 +49,10 @@ private struct Sidebar: View {
                         .listRowBackground(Color.clear)
                 }
 
+                Section {
+                    CreateSandboxButton()
+                }
+
                 Section("Sandboxes") {
                     ForEach(model.snapshots) { snapshot in
                         SnapshotRow(snapshot: snapshot)
@@ -65,23 +63,15 @@ private struct Sidebar: View {
                     }
                 }
 
-                Section("Connection") {
-                    CompactStatusRow(
-                        title: "Local daemon",
-                        subtitle: localDaemonSubtitle,
-                        systemImage: "bolt.horizontal.circle.fill",
-                        color: localDaemonColor
-                    )
-                    CompactStatusRow(
-                        title: "Control plane",
-                        subtitle: cloudSubtitle,
-                        systemImage: "cloud.fill",
-                        color: cloudColor
-                    )
+                Section("System health") {
+                    CompactStatusRow(title: "Local engine", subtitle: localDaemonSubtitle, systemImage: "heart.fill", color: localDaemonColor)
+                    CompactStatusRow(title: "Control plane", subtitle: cloudSubtitle, systemImage: "cloud.fill", color: cloudColor)
                 }
 
-                Section("Settings") {
-                    SettingsFields()
+                Section("Advanced") {
+                    DisclosureGroup("Runtime paths") {
+                        SettingsFields()
+                    }
                 }
             }
             .scrollContentBackground(.hidden)
@@ -131,6 +121,26 @@ private struct Sidebar: View {
         case .offline:
             return Theme.purple
         }
+    }
+}
+
+private struct CreateSandboxButton: View {
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Button {
+            } label: {
+                Label("Create from container image", systemImage: "plus.circle.fill")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(true)
+
+            Text("Coming soon: pull an OCI image, build a VM snapshot behind the scenes, then run it here.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.vertical, 6)
     }
 }
 
@@ -193,6 +203,9 @@ private struct EmptySidebarState: View {
             Text("Point the library at a folder of ch-snapshot directories.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
+            Text("Container-image creation is planned; for now sandboxes are imported snapshots.")
+                .font(.caption2)
+                .foregroundStyle(.tertiary)
         }
         .padding(.vertical, 8)
     }
@@ -266,18 +279,15 @@ private struct Dashboard: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     Hero()
+                    HealthStrip()
 
                     HStack(alignment: .top, spacing: 16) {
-                        RuntimeCard()
-                        CloudCard()
-                    }
-
-                    HStack(alignment: .top, spacing: 16) {
-                        SandboxCard()
                         SnapshotCard()
+                        SandboxCard()
                     }
 
                     ConsoleCard()
+                    CloudCard()
                     ActivityCard()
                 }
                 .padding(28)
@@ -329,11 +339,11 @@ private struct Hero: View {
                 }
 
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Run cloud sandboxes like they belong on your Mac.")
+                    Text("Create and run local sandboxes.")
                         .font(.system(size: 42, weight: .black, design: .rounded))
                         .foregroundStyle(.white)
                         .fixedSize(horizontal: false, vertical: true)
-                    Text("Rehydrate Cloud Hypervisor snapshots locally, watch the guest console, and keep a control-plane-shaped view of what will become the cloud loop.")
+                    Text("Pick a sandbox, start it, and watch the guest console. The local engine starts itself; container-image creation will hide the snapshot factory behind one button.")
                         .font(.title3)
                         .foregroundStyle(.white.opacity(0.78))
                         .frame(maxWidth: 760, alignment: .leading)
@@ -343,7 +353,7 @@ private struct Hero: View {
                     Button {
                         model.startSelectedSnapshot()
                     } label: {
-                        Label("Launch selected sandbox", systemImage: "play.fill")
+                        Label("Start selected sandbox", systemImage: "play.fill")
                             .font(.headline)
                             .padding(.horizontal, 6)
                     }
@@ -352,13 +362,13 @@ private struct Hero: View {
                     .disabled(model.selectedSnapshot == nil)
 
                     Button {
-                        model.startDaemon()
                     } label: {
-                        Label("Start daemon", systemImage: "bolt.fill")
+                        Label("Create from image", systemImage: "plus")
                             .font(.headline)
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.large)
+                    .disabled(true)
                 }
             }
             .padding(34)
@@ -382,6 +392,78 @@ private struct Hero: View {
         case .offline:
             return Theme.purple
         }
+    }
+}
+
+private struct HealthStrip: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        HStack(spacing: 12) {
+            HealthPill(title: "Local engine", detail: localDetail, color: localColor, systemImage: "cpu")
+            HealthPill(title: "Library", detail: "\(model.snapshots.count) sandbox\(model.snapshots.count == 1 ? "" : "es")", color: Theme.cyan, systemImage: "square.stack.3d.up")
+            HealthPill(title: "Control plane", detail: cloudDetail, color: cloudColor, systemImage: "cloud")
+            Spacer()
+        }
+    }
+
+    private var localDetail: String {
+        switch model.status.state {
+        case .disconnected:
+            return "starting or offline"
+        case .running:
+            return "sandbox running"
+        case .idle, .stopped:
+            return "ready"
+        case .unknown:
+            return "unknown"
+        }
+    }
+
+    private var localColor: Color {
+        model.status.state == .disconnected ? Theme.orange : Theme.green
+    }
+
+    private var cloudDetail: String {
+        switch model.cloud.state {
+        case .online:
+            return "online"
+        case .offline:
+            return "optional"
+        }
+    }
+
+    private var cloudColor: Color {
+        switch model.cloud.state {
+        case .online:
+            return Theme.green
+        case .offline:
+            return Theme.purple
+        }
+    }
+}
+
+private struct HealthPill: View {
+    let title: String
+    let detail: String
+    let color: Color
+    let systemImage: String
+
+    var body: some View {
+        HStack(spacing: 9) {
+            Image(systemName: systemImage)
+                .foregroundStyle(color)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.caption.weight(.bold))
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .padding(.horizontal, 13)
+        .padding(.vertical, 9)
+        .background(.ultraThinMaterial, in: Capsule())
     }
 }
 
@@ -518,7 +600,7 @@ private struct SandboxCard: View {
     @EnvironmentObject private var model: AppModel
 
     var body: some View {
-        GlassCard(title: "Running sandbox", subtitle: "local HVF guest", systemImage: "shippingbox.fill") {
+        GlassCard(title: "Sandbox state", subtitle: "local HVF guest", systemImage: "shippingbox.fill") {
             HStack(spacing: 12) {
                 BigMetric(title: "State", value: model.status.state.rawValue.capitalized, color: statusColor)
                 BigMetric(title: "Console", value: consoleBytes, color: Theme.cyan)
@@ -526,11 +608,12 @@ private struct SandboxCard: View {
 
             Divider().opacity(0.35)
 
+            if model.status.state == .stopped, let reason = model.status.reason {
+                FailureBanner(reason: reason)
+            }
+
             MetricRow(label: "Name", value: model.status.name ?? "none")
             MetricRow(label: "Uptime", value: uptime)
-            if let reason = model.status.reason {
-                MetricRow(label: "Reason", value: reason)
-            }
 
             HStack {
                 Button("Attach console") {
@@ -573,7 +656,7 @@ private struct SnapshotCard: View {
     @EnvironmentObject private var model: AppModel
 
     var body: some View {
-        GlassCard(title: "Selected snapshot", subtitle: "ready to rehydrate", systemImage: "externaldrive.fill") {
+        GlassCard(title: "Selected sandbox", subtitle: "snapshot-backed", systemImage: "externaldrive.fill") {
             if let snapshot = model.selectedSnapshot {
                 HStack(spacing: 12) {
                     BigMetric(title: "vCPU", value: "\(snapshot.vcpus)", color: Theme.cyan)
@@ -585,10 +668,15 @@ private struct SnapshotCard: View {
                 MetricRow(label: "Name", value: snapshot.name)
                 MetricRow(label: "Path", value: snapshot.path)
 
+                Text("This sandbox starts from a Cloud Hypervisor snapshot. Container-image creation will generate one of these behind the scenes.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
                 Button {
                     model.startSelectedSnapshot()
                 } label: {
-                    Label("Start local sandbox", systemImage: "play.fill")
+                    Label("Start sandbox", systemImage: "play.fill")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
@@ -623,9 +711,43 @@ private struct ConsoleCard: View {
 
     var body: some View {
         GlassCard(title: "Live console", subtitle: "guest serial output", systemImage: "terminal.fill") {
-            TerminalPane(text: model.consoleText.isEmpty ? "Console output will appear here after attach/start." : model.consoleText)
+            TerminalPane(text: model.consoleDisplayText)
                 .frame(minHeight: 270)
         }
+    }
+}
+
+private struct FailureBanner: View {
+    let reason: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Sandbox stopped before it became interactive", systemImage: "exclamationmark.triangle.fill")
+                .font(.headline)
+                .foregroundStyle(Theme.orange)
+            Text(shortReason)
+                .font(.caption)
+                .foregroundStyle(.primary)
+                .lineLimit(6)
+                .textSelection(.enabled)
+            if reason.contains("ITS") || reason.contains("LPI") {
+                Text("This is a snapshot compatibility issue, not a UI/console issue. Re-capture with GICv2M/message-SPI routing before it can run locally.")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(14)
+        .background(Theme.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay {
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .stroke(Theme.orange.opacity(0.35), lineWidth: 1)
+        }
+    }
+
+    private var shortReason: String {
+        reason.replacingOccurrences(of: "Set CHM_ALLOW_ITS_LPI=1 to bypass this guard and run anyway (the guest will likely stall on first I/O).", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 }
 

@@ -42,10 +42,13 @@ creates `target/GimbalLocal.app`.
   pills, premium sidebar, and terminal-styled console/activity panes.
 - Auto-start `chm serve` on launch when the local daemon is not reachable, and
   create the configured snapshot library folder if needed.
-- Start/shutdown a local `chm serve` daemon manually when desired.
+- Focus on creating and managing sandboxes; the local daemon is background
+  plumbing and appears only as a health signal.
 - Configure `chm`, snapshot library, socket, and control-plane URL.
 - List local snapshot sandboxes from `chm ctl list --json`.
 - Start/stop a selected sandbox and attach to its serial console.
 - Show local daemon/VM state from `chm ctl status --json`.
+- Surface immediate start failures, including unsupported ITS/LPI snapshots,
+  directly in the sandbox state and console panels.
 - Show optional cloud-control health, runner count, snapshot count, sandbox
   count, and cost summary when `gimbal-cloud-control` is reachable.

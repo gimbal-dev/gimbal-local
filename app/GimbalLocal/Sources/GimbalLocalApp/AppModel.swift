@@ -139,12 +139,17 @@ final class AppModel: ObservableObject {
             appendLog("select a snapshot first")
             return
         }
+        consoleText = ""
         Task {
             do {
                 let output = try await chm.startSnapshot(snapshot.name, settings: settings)
                 appendLog(output)
                 attachConsole()
+                try? await Task.sleep(for: .milliseconds(900))
                 await refreshLocal()
+                if status.state == .stopped, let reason = status.reason {
+                    appendLog("sandbox stopped before producing console output: \(reason)")
+                }
             } catch {
                 appendLog("start failed: \(error.localizedDescription)")
             }
@@ -197,5 +202,19 @@ final class AppModel: ObservableObject {
         guard !trimmed.isEmpty else { return }
         let timestamp = ISO8601DateFormatter().string(from: Date())
         activityLog.append("[\(timestamp)] \(trimmed)\n")
+    }
+
+    var consoleDisplayText: String {
+        if !consoleText.isEmpty {
+            return consoleText
+        }
+        if status.state == .stopped, let reason = status.reason {
+            return """
+            Sandbox stopped before guest console output was available.
+
+            \(reason)
+            """
+        }
+        return "Console output will appear here after a sandbox is running."
     }
 }
