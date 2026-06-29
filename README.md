@@ -119,9 +119,15 @@ Next:
 
 - **Real cloud round-trip:** capture on an actual AWS Graviton / Oracle A1 host
   and rehydrate locally, rather than relying on nested-KVM captures from Lima.
+- **BYO-subscription loop:** add a small local-managed AWS extension that can
+  launch/connect to a capture host, move snapshot bundles through S3, run them
+  locally, and push return artifacts back without a hosted control plane.
 - **Desktop app:** a SwiftUI/menu-bar (or Tauri) shell over `chm serve` —
   library view, Start/Stop, console/terminal — plus lifecycle (graceful PSCI
   shutdown, pause/resume, re-snapshot).
+
+AWS setup notes for the first round-trip live in
+[`docs/aws-byo-setup.md`](docs/aws-byo-setup.md).
 
 ## Relationship to upstream Cloud Hypervisor
 

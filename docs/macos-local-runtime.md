@@ -143,4 +143,6 @@ ITS/LPIs cannot be delivered by Apple's managed GIC; use GICv2M/message-SPI
 captures. HVF also accepts affinity-routed message SPIs but leaves them pending
 instead of forwarding them, so `chm` intentionally re-routes message SPIs as
 1-of-N before delivery. The next milestones are a real AWS/Oracle cloud
-round-trip and a desktop GUI around `chm serve`.
+round-trip, a local-managed bring-your-own-subscription AWS loop, and a desktop
+GUI around `chm serve`. See [`aws-byo-setup.md`](aws-byo-setup.md) for the AWS
+setup needed for the first proof.
