@@ -27,6 +27,9 @@ mod imp;
 mod console;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod cloud;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod serve;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

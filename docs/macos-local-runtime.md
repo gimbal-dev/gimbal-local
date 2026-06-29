@@ -142,8 +142,10 @@ Still bounded: stock arm64 cloud snapshots that route virtio completions through
 ITS/LPIs cannot be delivered by Apple's managed GIC; use GICv2M/message-SPI
 captures. HVF also accepts affinity-routed message SPIs but leaves them pending
 instead of forwarding them, so `chm` intentionally re-routes message SPIs as
-1-of-N before delivery. The immediate next milestone is an off-box Raspberry Pi
-Linux/KVM capture while AWS bare-metal quota is blocked; see
-[`raspberry-pi-offbox-plan.md`](raspberry-pi-offbox-plan.md). The real
-AWS/Oracle cloud round-trip remains the follow-on proof once quota/capacity is
-available; see [`aws-byo-setup.md`](aws-byo-setup.md).
+1-of-N before delivery. Remote capture validation is currently blocked on real
+arm64 KVM capacity: AWS bare-metal quota is pending, OCI Ampere capacity is not
+available in the tested region, and the available Raspberry Pi hardware is not
+strong enough. The next active milestone is local-managed BYO cloud plumbing:
+`chm cloud preflight aws` and `chm cloud cleanup aws` provide safe account,
+quota, bucket and cleanup checks before any paid host is launched. See
+[`aws-byo-setup.md`](aws-byo-setup.md).

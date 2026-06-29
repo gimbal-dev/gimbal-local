@@ -117,15 +117,11 @@ Milestones completed (all hardware-verified on Apple Silicon):
 
 Next:
 
-- **Raspberry Pi off-box proof:** capture on a physically separate arm64
-  Linux/KVM host and rehydrate locally, rather than relying only on nested-KVM
-  captures from Lima. See
-  [`docs/raspberry-pi-offbox-plan.md`](docs/raspberry-pi-offbox-plan.md).
-- **Real cloud round-trip:** return to AWS Graviton / Oracle A1 once quota or a
-  suitable bare-metal host is available.
-- **BYO-subscription loop:** add a small local-managed AWS extension that can
-  launch/connect to a capture host, move snapshot bundles through S3, run them
-  locally, and push return artifacts back without a hosted control plane.
+- **Remote capture validation:** blocked on real arm64 KVM capacity. Raspberry
+  Pi/OCI options were checked; AWS bare-metal quota is the current route back.
+- **BYO-subscription loop:** first local-managed AWS helper commands are now
+  landing (`chm cloud preflight aws`, `chm cloud cleanup aws`) so setup, safety
+  checks, and cleanup can progress without launching paid hosts yet.
 - **Desktop app:** a SwiftUI/menu-bar (or Tauri) shell over `chm serve` —
   library view, Start/Stop, console/terminal — plus lifecycle (graceful PSCI
   shutdown, pause/resume, re-snapshot).

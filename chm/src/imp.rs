@@ -12,6 +12,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use std::{env, fs, io, thread};
 
+use crate::cloud;
 use crate::console::{self, RawConsole};
 use crate::serve;
 
@@ -360,6 +361,7 @@ struct Args {
 pub fn main() -> ExitCode {
     let raw: Vec<String> = env::args().skip(1).collect();
     match raw.first().map(String::as_str) {
+        Some("cloud") => cloud::cloud_main(&raw[1..]),
         Some("serve") => serve::serve_main(&raw[1..]),
         Some("ctl") => serve::ctl_main(&raw[1..]),
         _ => match parse(&raw) {
@@ -403,6 +405,7 @@ fn usage() -> String {
      USAGE:\n    \
          chm run <SNAPSHOT_DIR> [OPTIONS]\n    \
          chm restore <SNAPSHOT_DIR> [OPTIONS]   (alias for run)\n    \
+         chm cloud <COMMAND> aws [OPTIONS]      (BYO cloud helpers)\n    \
          chm serve <LIBRARY_DIR> [OPTIONS]      (background daemon)\n    \
          chm ctl <COMMAND> [ARG] [--socket P]   (talk to a daemon)\n\
      \n\
@@ -418,6 +421,10 @@ fn usage() -> String {
          --quiet             Suppress the informational banner on stderr.\n    \
          -h, --help          Print this help.\n    \
          -V, --version       Print the version.\n\
+     \n\
+     CLOUD:\n    \
+         chm cloud preflight aws --profile P --region R [--bucket B]\n    \
+         chm cloud cleanup aws --profile P --region R [--bucket B]\n\
      \n\
      DAEMON:\n    \
          chm serve <LIBRARY_DIR> [--socket PATH] [--idle-exit N]\n                        \

@@ -257,6 +257,19 @@ If either command fails with `AccessDenied`, fix permissions before continuing.
 
 ## Step 4: Check whether you have enough EC2 quota
 
+The local runtime now has a read-only preflight command for this section:
+
+```bash
+target/debug/chm cloud preflight aws \
+  --profile chm-aws \
+  --region "$AWS_REGION" \
+  --bucket "$CHM_BUCKET" \
+  --instance-type c7g.metal
+```
+
+Run it after building `chm` with `bash scripts/build-chm.sh`. It does not launch
+or create paid resources.
+
 The quota that normally blocks `c7g.metal` / `m7g.metal` is not named
 "Graviton bare metal". It is the regional EC2 On-Demand **vCPU** quota:
 
@@ -623,7 +636,7 @@ Use this any time you want to remove project resources.
 Dry-run first:
 
 ```bash
-scripts/aws-cleanup-chm.sh \
+target/debug/chm cloud cleanup aws \
   --profile chm-aws \
   --region "$AWS_REGION" \
   --project cloud-hypervisor-mac \
@@ -633,7 +646,7 @@ scripts/aws-cleanup-chm.sh \
 Actually delete tagged AWS resources and the project S3 prefix:
 
 ```bash
-scripts/aws-cleanup-chm.sh \
+target/debug/chm cloud cleanup aws \
   --profile chm-aws \
   --region "$AWS_REGION" \
   --project cloud-hypervisor-mac \
@@ -645,7 +658,7 @@ scripts/aws-cleanup-chm.sh \
 Delete the bucket too:
 
 ```bash
-scripts/aws-cleanup-chm.sh \
+target/debug/chm cloud cleanup aws \
   --profile chm-aws \
   --region "$AWS_REGION" \
   --project cloud-hypervisor-mac \
