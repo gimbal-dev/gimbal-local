@@ -145,6 +145,10 @@ Next:
   SSH capture host without a hosted control plane.
 - **Desktop app:** native SwiftUI shell is stood up in `app/GimbalLocal`, backed
   by `chm serve` / `chm ctl` plus the optional `gimbal-cloud-control` API.
+- **Create from container image:** future app action that accepts an OCI/Docker
+  image reference, hides the pull/rootfs/disk/capture process, produces an
+  HVF-compatible snapshot in the local library, and then starts it like any
+  other sandbox.
 
 AWS setup notes for the later cloud round-trip live in
 [`docs/aws-byo-setup.md`](docs/aws-byo-setup.md).

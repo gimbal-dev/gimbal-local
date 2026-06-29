@@ -173,3 +173,11 @@ strong enough. The local-managed BYO cloud loop is now scriptable through
 `chm cloud init/preflight/capture/pull/push/cleanup aws`, and the desktop shell
 can manage local sandboxes through `chm serve`; the remote proof still waits for
 real arm64 KVM capacity. See [`aws-byo-setup.md`](aws-byo-setup.md).
+
+Future UX: "Create from container image" should be a hidden snapshot factory,
+not direct container execution. The user enters an OCI image reference; Gimbal
+pulls/unpacks it, builds a bootable arm64 sandbox disk or initramfs, boots it on
+a KVM-capable capture host, captures an HVF-compatible GICv2M/message-SPI
+snapshot, imports that into the local library, and starts it through the same
+`chm serve` path. The app should hide those mechanics unless the user opens
+details.
