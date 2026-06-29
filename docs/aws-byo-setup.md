@@ -16,8 +16,36 @@ exposes `/dev/kvm`.
 - An EC2 quota that allows launching that bare-metal instance type.
 - A VPC/subnet with outbound internet access.
 - Either:
-  - SSH access via a key pair, or
-  - AWS Systems Manager Session Manager access.
+    - SSH access via a key pair, or
+    - AWS Systems Manager Session Manager access.
+
+## Cost expectation
+
+Just setting up the IAM profile, an empty private S3 bucket, and local AWS CLI
+configuration should be effectively zero-cost.
+
+Standing still can still cost money if any billable infrastructure is left
+allocated:
+
+- **Running Graviton bare-metal capture host:** expect roughly \*\*$2.30-$2.70 per
+  hour\*\* in `us-east-1`-class regions for `c7g.metal` / `m7g.metal`-class
+  instances. This is the expensive part; terminate it when not actively
+  capturing.
+- **Stopped EC2 instance:** no compute charge, but attached EBS volumes still
+  charge.
+- **EBS gp3 volumes:** roughly **$0.08 per GB-month**. A 100 GiB volume is about
+  **$8/month** while it exists.
+- **S3 Standard artifacts:** roughly **$0.023 per GB-month**. A 20 GiB snapshot
+  bundle is about **$0.46/month** before request/transfer costs.
+- **NAT Gateway:** avoid for this project if possible. It costs roughly
+  **$0.045/hour** plus data processing, or about **$32/month** even while idle.
+- **Public IPv4 / Elastic IP:** AWS charges for public IPv4 addresses; expect
+  roughly **$0.005/hour** per address, or about **$3.60/month**.
+
+The intended cost posture for the first milestone is: keep only the private S3
+bucket and maybe small retained artifacts between runs; launch the bare-metal
+host only for capture; then terminate the host and delete temporary EBS/network
+resources during cleanup.
 
 ## 2. Local tools
 
