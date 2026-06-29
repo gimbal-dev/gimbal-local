@@ -38,6 +38,8 @@ creates `target/GimbalLocal.app`.
 
 ## Current M23 surface
 
+- Polished macOS dashboard with a glass-card layout, hero launch area, status
+  pills, premium sidebar, and terminal-styled console/activity panes.
 - Start/shutdown a local `chm serve` daemon.
 - Configure `chm`, snapshot library, socket, and control-plane URL.
 - List local snapshot sandboxes from `chm ctl list --json`.
