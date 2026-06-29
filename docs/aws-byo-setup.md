@@ -99,10 +99,60 @@ is unnecessary ceremony for this prototype.
 Do this instead:
 
 1. Log in to the AWS Console with your root user.
-2. Create an IAM admin user for this prototype.
-3. Create an access key for that IAM user.
-4. Store that access key only in your local Mac AWS CLI profile.
-5. Stop using the root user for day-to-day commands.
+2. Turn on MFA for the root user if AWS prompts you to.
+3. Create one IAM user named `cloud-hypervisor-mac-cli`.
+4. Give that IAM user temporary `AdministratorAccess` for this prototype.
+5. Create an access key for that IAM user.
+6. Store that access key only in your local Mac AWS CLI profile.
+7. Stop using the root user for day-to-day commands.
+
+### Create the IAM user in the AWS Console
+
+In the AWS Console:
+
+1. Search for **IAM** in the top search bar.
+2. Open **IAM**.
+3. Click **Users** in the left sidebar.
+4. Click **Create user**.
+5. Enter this user name:
+
+```text
+cloud-hypervisor-mac-cli
+```
+
+6. Leave **Provide user access to the AWS Management Console** unchecked.
+   This user is only for local CLI access.
+7. Click **Next**.
+8. Select **Attach policies directly**.
+9. Search for `AdministratorAccess`.
+10. Tick the checkbox next to **AdministratorAccess**.
+11. Click **Next**.
+12. Click **Create user**.
+
+This is intentionally broad for the first manual proof. The account should be
+treated as a temporary sandbox, and cleanup must be run after experiments.
+
+### Create the access key
+
+Still in IAM:
+
+1. Click the new `cloud-hypervisor-mac-cli` user.
+2. Open the **Security credentials** tab.
+3. Scroll to **Access keys**.
+4. Click **Create access key**.
+5. Choose **Command Line Interface (CLI)**.
+6. Tick the confirmation checkbox.
+7. Set the description to:
+
+```text
+cloud-hypervisor-mac local CLI
+```
+
+8. Click **Create access key**.
+9. Copy the **Access key** and **Secret access key**, or download the `.csv`.
+
+The secret access key is shown only once. If you lose it, delete that key and
+create a new one.
 
 Then configure the local profile:
 
@@ -142,13 +192,17 @@ If that command fails, stop here and fix login before creating anything.
 For the first prototype, the AWS identity behind `chm-aws` needs permission to
 manage a small set of EC2 and S3 resources.
 
-For a personal throwaway AWS account, the simplest safe-enough first pass is:
+If you followed Step 2 and attached `AdministratorAccess`, you can continue to
+the smoke test below.
 
-1. Enable MFA on the root user.
-2. Create one IAM user for local CLI use.
-3. Attach `AdministratorAccess` temporarily while proving the loop.
-4. Run cleanup after each experiment.
-5. Replace admin permissions with a narrow policy before anything becomes
+That broad permission is not the final desired state. It is a beginner-friendly
+bootstrap choice for a personal sandbox account while the workflow is still
+manual. The safety rules are:
+
+1. Do not create root access keys.
+2. Do not leave the bare-metal instance running.
+3. Run cleanup after each experiment.
+4. Replace `AdministratorAccess` with a narrow policy before anything becomes
    regular or long-lived.
 
 If you have an AWS admin helping you instead, ask for a temporary sandbox
