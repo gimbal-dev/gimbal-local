@@ -182,6 +182,14 @@ private struct Dashboard: View {
                 }
                 .padding(28)
             }
+            .task {
+                while !Task.isCancelled {
+                    if model.status.state == .running {
+                        await model.refreshLocal()
+                    }
+                    try? await Task.sleep(for: .seconds(2))
+                }
+            }
         }
     }
 }
@@ -248,6 +256,16 @@ private struct Hero: View {
                             .padding(.horizontal, 6)
                     }
                     .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                    .disabled(model.selectedSnapshot == nil)
+
+                    Button {
+                        model.connectToSelectedSnapshot()
+                    } label: {
+                        Label("Connect to session", systemImage: "terminal")
+                            .font(.headline)
+                    }
+                    .buttonStyle(.bordered)
                     .controlSize(.large)
                     .disabled(model.selectedSnapshot == nil)
 
@@ -392,7 +410,7 @@ private struct SandboxCard: View {
             MetricRow(label: "Uptime", value: uptime)
 
             HStack {
-                Button("Attach console") {
+                Button("Open read-only stream") {
                     model.attachConsole()
                 }
                 .buttonStyle(.bordered)
@@ -458,6 +476,15 @@ private struct SnapshotCard: View {
                 .buttonStyle(.borderedProminent)
                 .controlSize(.large)
                 .padding(.top, 4)
+
+                Button {
+                    model.connectToSelectedSnapshot()
+                } label: {
+                    Label("Connect to session", systemImage: "terminal")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
             } else {
                 EmptySelection()
             }
@@ -486,8 +513,30 @@ private struct ConsoleCard: View {
     @EnvironmentObject private var model: AppModel
 
     var body: some View {
-        GlassCard(title: "Live console", subtitle: "guest serial output", systemImage: "terminal.fill") {
-            TerminalPane(text: model.consoleDisplayText)
+        GlassCard(title: "Console stream", subtitle: "read-only guest serial output", systemImage: "text.alignleft") {
+            HStack(spacing: 10) {
+                StatusPill(
+                    text: model.isConsoleStreaming ? "Streaming live" : "Read-only output",
+                    systemImage: model.isConsoleStreaming ? "dot.radiowaves.left.and.right" : "eye.fill",
+                    color: model.isConsoleStreaming ? Theme.green : Theme.cyan
+                )
+                StatusPill(
+                    text: "Keyboard input disabled",
+                    systemImage: "keyboard.badge.eye",
+                    color: Theme.purple
+                )
+                Spacer()
+            }
+
+            Text("This is a serial-output viewer, not an interactive terminal yet. It follows the guest console and keeps text selectable/copyable.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            TerminalPane(
+                text: model.consoleDisplayText,
+                mode: .console(isStreaming: model.isConsoleStreaming)
+            )
                 .frame(minHeight: 270)
         }
     }
@@ -532,7 +581,10 @@ private struct ActivityCard: View {
 
     var body: some View {
         GlassCard(title: "Activity", subtitle: "local orchestration log", systemImage: "waveform.path.ecg.rectangle.fill") {
-            TerminalPane(text: model.activityLog.isEmpty ? "No app activity yet." : model.activityLog, compact: true)
+            TerminalPane(
+                text: model.activityLog.isEmpty ? "No app activity yet." : model.activityLog,
+                mode: .activity
+            )
                 .frame(minHeight: 130)
         }
     }
@@ -642,26 +694,55 @@ private struct StatusPill: View {
 }
 
 private struct TerminalPane: View {
+    enum Mode: Equatable {
+        case console(isStreaming: Bool)
+        case activity
+    }
+
     let text: String
-    var compact = false
+    var mode: Mode = .console(isStreaming: false)
 
     var body: some View {
-        ScrollView {
-            Text(text)
-                .font(.system(compact ? .caption : .body, design: .monospaced))
-                .foregroundStyle(text == placeholder ? .secondary : Theme.terminalText)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .textSelection(.enabled)
-                .padding(16)
+        ScrollViewReader { proxy in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 0) {
+                    Text(text)
+                        .font(.system(isCompact ? .caption : .body, design: .monospaced))
+                        .foregroundStyle(text == placeholder ? .secondary : Theme.terminalText)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .textSelection(.enabled)
+                        .padding(16)
+                    Color.clear
+                        .frame(height: 1)
+                        .id("terminal-bottom")
+                }
+            }
+            .onChange(of: text) {
+                withAnimation(.easeOut(duration: 0.18)) {
+                    proxy.scrollTo("terminal-bottom", anchor: .bottom)
+                }
+            }
         }
         .background {
             RoundedRectangle(cornerRadius: 18, style: .continuous)
                 .fill(Theme.terminalBackground)
                 .overlay(alignment: .topLeading) {
-                    HStack(spacing: 6) {
-                        Circle().fill(Color(red: 1.0, green: 0.37, blue: 0.32)).frame(width: 10, height: 10)
-                        Circle().fill(Color(red: 1.0, green: 0.78, blue: 0.27)).frame(width: 10, height: 10)
-                        Circle().fill(Color(red: 0.20, green: 0.82, blue: 0.38)).frame(width: 10, height: 10)
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(streamColor)
+                            .frame(width: 9, height: 9)
+                            .shadow(color: streamColor.opacity(0.9), radius: isStreaming ? 8 : 0)
+                        Text(headerText)
+                            .font(.system(size: 10, weight: .black, design: .monospaced))
+                            .foregroundStyle(.white.opacity(0.72))
+                        if case .console = mode {
+                            Text("READ ONLY")
+                                .font(.system(size: 10, weight: .black, design: .monospaced))
+                                .foregroundStyle(Theme.purple)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 3)
+                                .background(Theme.purple.opacity(0.16), in: Capsule())
+                        }
                     }
                     .padding(13)
                 }
@@ -669,8 +750,32 @@ private struct TerminalPane: View {
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
     }
 
+    private var isCompact: Bool {
+        mode == .activity
+    }
+
+    private var isStreaming: Bool {
+        if case let .console(isStreaming) = mode {
+            return isStreaming
+        }
+        return false
+    }
+
+    private var streamColor: Color {
+        isStreaming ? Theme.green : Theme.cyan.opacity(0.65)
+    }
+
+    private var headerText: String {
+        switch mode {
+        case let .console(isStreaming):
+            return isStreaming ? "SERIAL STREAM LIVE" : "SERIAL STREAM"
+        case .activity:
+            return "ACTIVITY LOG"
+        }
+    }
+
     private var placeholder: String {
-        compact ? "No app activity yet." : "Console output will appear here after attach/start."
+        isCompact ? "No app activity yet." : "Read-only serial output will stream here after a sandbox is running."
     }
 }
 

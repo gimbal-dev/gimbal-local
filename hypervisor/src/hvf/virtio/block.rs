@@ -198,6 +198,135 @@ impl BlockBackend for FileBackend {
     }
 }
 
+/// A copy-on-write [`BlockBackend`]: an immutable base image with every write
+/// redirected to a per-run sparse overlay.
+///
+/// This is the backing used when a snapshot ships its real disk. Keeping the
+/// base pristine is what makes rehydration *repeatable*: a cloud-hypervisor
+/// snapshot restores guest RAM (including the page cache) to the exact instant
+/// the snapshot was taken, so the disk the guest sees must also be that exact
+/// instant. If guest writes leaked into the base image, the next resume would
+/// pair snapshot-era RAM with a drifted disk and the guest's ext4 metadata would
+/// fail its checksums (observed as `deleted inode referenced` / EIO). By writing
+/// only to an overlay that is recreated each run, every resume starts from the
+/// snapshot-consistent disk while writes still persist for the life of the run.
+///
+/// Reads return overlay bytes for sectors written this run and base bytes
+/// otherwise. The written-sector set is an in-memory bitmap (1 bit per 512-byte
+/// sector), which is ephemeral by design — it is rebuilt empty on every open.
+pub struct OverlayBackend {
+    base: std::fs::File,
+    overlay: std::fs::File,
+    nsectors: u64,
+    /// 1 bit per 512-byte sector: set when that sector lives in the overlay.
+    written: Vec<u64>,
+}
+
+impl OverlayBackend {
+    /// Open `base_path` read-only and (re)create a fresh, empty sparse overlay.
+    ///
+    /// The overlay is truncated on open so each run starts from the base image.
+    pub fn open(
+        base_path: &std::path::Path,
+        overlay_path: &std::path::Path,
+        nsectors: u64,
+    ) -> io::Result<Self> {
+        let base = std::fs::OpenOptions::new().read(true).open(base_path)?;
+        let overlay = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(overlay_path)?;
+        overlay.set_len(nsectors.saturating_mul(SECTOR_SIZE))?;
+        let words = nsectors.div_ceil(64) as usize;
+        Ok(Self { base, overlay, nsectors, written: vec![0u64; words] })
+    }
+
+    #[inline]
+    fn is_written(&self, sector: u64) -> bool {
+        let (w, b) = ((sector / 64) as usize, sector % 64);
+        self.written.get(w).is_some_and(|word| (word >> b) & 1 != 0)
+    }
+
+    #[inline]
+    fn mark_written(&mut self, sector: u64) {
+        let (w, b) = ((sector / 64) as usize, sector % 64);
+        if let Some(word) = self.written.get_mut(w) {
+            *word |= 1u64 << b;
+        }
+    }
+
+    /// Copy a not-yet-written sector from the base into the overlay so that a
+    /// subsequent partial write leaves the untouched bytes equal to the base.
+    fn seed_sector(&mut self, sector: u64) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        if self.is_written(sector) {
+            return Ok(());
+        }
+        let mut tmp = [0u8; SECTOR_SIZE as usize];
+        let off = sector * SECTOR_SIZE;
+        self.base.read_exact_at(&mut tmp, off)?;
+        self.overlay.write_all_at(&tmp, off)?;
+        self.mark_written(sector);
+        Ok(())
+    }
+}
+
+impl BlockBackend for OverlayBackend {
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let cur = offset + done as u64;
+            let from_overlay = self.is_written(cur / SECTOR_SIZE);
+            // Coalesce a run of same-source sectors to limit syscalls.
+            let mut run = 0usize;
+            while done + run < buf.len() {
+                let pos = cur + run as u64;
+                if self.is_written(pos / SECTOR_SIZE) != from_overlay {
+                    break;
+                }
+                let in_sec = (SECTOR_SIZE - (pos % SECTOR_SIZE)) as usize;
+                run += in_sec.min(buf.len() - done - run);
+            }
+            let src = if from_overlay { &self.overlay } else { &self.base };
+            src.read_exact_at(&mut buf[done..done + run], cur)?;
+            done += run;
+        }
+        Ok(())
+    }
+
+    fn write_at(&mut self, offset: u64, buf: &[u8]) -> io::Result<()> {
+        use std::os::unix::fs::FileExt;
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let end = offset + buf.len() as u64;
+        // Seed partially-covered edge sectors so their untouched bytes stay equal
+        // to the base content (full-sector writes need no seeding).
+        if !offset.is_multiple_of(SECTOR_SIZE) {
+            self.seed_sector(offset / SECTOR_SIZE)?;
+        }
+        if !end.is_multiple_of(SECTOR_SIZE) {
+            self.seed_sector((end - 1) / SECTOR_SIZE)?;
+        }
+        self.overlay.write_all_at(buf, offset)?;
+        for sector in (offset / SECTOR_SIZE)..=((end - 1) / SECTOR_SIZE) {
+            self.mark_written(sector);
+        }
+        Ok(())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.overlay.sync_data()
+    }
+
+    fn nsectors(&self) -> u64 {
+        self.nsectors
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::queue::Segment;
@@ -318,5 +447,78 @@ mod tests {
         ]);
         let done = dev.process(&m, &c);
         assert_eq!(done.status, VIRTIO_BLK_S_UNSUPP);
+    }
+
+    /// The copy-on-write overlay must keep the base file pristine while still
+    /// reflecting writes back to the guest within the same run.
+    #[test]
+    fn overlay_writes_do_not_touch_the_base() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("chm-cow-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let base_path = dir.join("base.raw");
+        let overlay_path = dir.join("over.raw");
+
+        // Base: 4 sectors, each filled with its (index+1) byte value.
+        let mut base_bytes = Vec::new();
+        for s in 0..4u8 {
+            base_bytes.extend(std::iter::repeat(s + 1).take(SECTOR_SIZE as usize));
+        }
+        std::fs::File::create(&base_path).unwrap().write_all(&base_bytes).unwrap();
+        let base_before = std::fs::read(&base_path).unwrap();
+
+        let mut ob = OverlayBackend::open(&base_path, &overlay_path, 4).unwrap();
+
+        // Unwritten sectors read through to the base.
+        let mut got = [0u8; SECTOR_SIZE as usize];
+        ob.read_at(2 * SECTOR_SIZE, &mut got).unwrap();
+        assert!(got.iter().all(|&b| b == 3), "sector 2 should read base value 3");
+
+        // Overwrite sector 1 with 0xEE; read it back from the overlay.
+        let patch = [0xEEu8; SECTOR_SIZE as usize];
+        ob.write_at(SECTOR_SIZE, &patch).unwrap();
+        let mut after = [0u8; SECTOR_SIZE as usize];
+        ob.read_at(SECTOR_SIZE, &mut after).unwrap();
+        assert!(after.iter().all(|&b| b == 0xEE), "sector 1 should read overlay value");
+
+        // A neighbouring, unwritten sector still reads the base value.
+        ob.read_at(0, &mut after).unwrap();
+        assert!(after.iter().all(|&b| b == 1), "sector 0 stays base value 1");
+
+        // The base file on disk is byte-for-byte unchanged.
+        ob.flush().unwrap();
+        drop(ob);
+        let base_after = std::fs::read(&base_path).unwrap();
+        assert_eq!(base_before, base_after, "base image must remain pristine");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A sub-sector (partial) write must preserve the surrounding base bytes by
+    /// seeding the affected sector from the base first.
+    #[test]
+    fn overlay_partial_write_preserves_base_bytes() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("chm-cow-part-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let base_path = dir.join("base.raw");
+        let overlay_path = dir.join("over.raw");
+
+        // One sector full of 0xAB.
+        let base_bytes = vec![0xABu8; SECTOR_SIZE as usize];
+        std::fs::File::create(&base_path).unwrap().write_all(&base_bytes).unwrap();
+
+        let mut ob = OverlayBackend::open(&base_path, &overlay_path, 1).unwrap();
+
+        // Write 4 bytes in the middle of the sector.
+        ob.write_at(100, &[1, 2, 3, 4]).unwrap();
+
+        let mut got = vec![0u8; SECTOR_SIZE as usize];
+        ob.read_at(0, &mut got).unwrap();
+        assert_eq!(&got[100..104], &[1, 2, 3, 4], "patched bytes present");
+        assert!(got[..100].iter().all(|&b| b == 0xAB), "leading bytes from base");
+        assert!(got[104..].iter().all(|&b| b == 0xAB), "trailing bytes from base");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

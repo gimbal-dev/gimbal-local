@@ -36,6 +36,7 @@ final class AppModel: ObservableObject {
     private var daemonProcess: Process?
     private var consoleProcess: Process?
     private var attemptedAutoStart = false
+    private let consoleLimit = 512 * 1024
 
     private let recentsDefaultsKey = "gimbal.recentSandboxNames"
     private let maxRecents = 8
@@ -70,6 +71,9 @@ final class AppModel: ObservableObject {
             status = try await loadedStatus
             if selectedSnapshot == nil {
                 selectedSnapshot = snapshots.first
+            }
+            if status.state == .running, consoleProcess == nil {
+                attachConsole(clear: consoleText.isEmpty)
             }
         } catch {
             status = SandboxStatus.disconnected
@@ -183,7 +187,7 @@ final class AppModel: ObservableObject {
             do {
                 let output = try await chm.startSnapshot(snapshot.name, settings: settings)
                 appendLog(output)
-                attachConsole()
+                attachConsole(clear: true)
                 try? await Task.sleep(for: .milliseconds(900))
                 await refreshLocal()
                 if status.state == .stopped, let reason = status.reason {
@@ -191,6 +195,24 @@ final class AppModel: ObservableObject {
                 }
             } catch {
                 appendLog("start failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func connectToSelectedSnapshot() {
+        guard let snapshot = selectedSnapshot else {
+            appendLog("select a snapshot first")
+            return
+        }
+
+        Task {
+            do {
+                try openInteractiveTerminal(for: snapshot)
+                appendLog("opened interactive terminal for \(snapshot.name)")
+                try? await Task.sleep(for: .milliseconds(500))
+                await refreshLocal()
+            } catch {
+                appendLog("terminal connect failed: \(error.localizedDescription)")
             }
         }
     }
@@ -203,15 +225,18 @@ final class AppModel: ObservableObject {
             } catch {
                 appendLog("stop failed: \(error.localizedDescription)")
             }
-            consoleProcess?.terminate()
+            let process = consoleProcess
+            process?.terminate()
             consoleProcess = nil
             await refreshLocal()
         }
     }
 
-    func attachConsole() {
+    func attachConsole(clear: Bool = false) {
         consoleProcess?.terminate()
-        consoleText = ""
+        if clear {
+            consoleText = ""
+        }
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: settings.chmPath)
@@ -224,16 +249,75 @@ final class AppModel: ObservableObject {
             let data = handle.availableData
             guard !data.isEmpty else { return }
             let text = String(decoding: data, as: UTF8.self)
-            Task { @MainActor in self?.consoleText.append(text) }
+            Task { @MainActor in self?.appendConsole(text) }
+        }
+        process.terminationHandler = { [weak self] process in
+            Task { @MainActor in
+                guard self?.consoleProcess === process else { return }
+                pipe.fileHandleForReading.readabilityHandler = nil
+                self?.consoleProcess = nil
+                self?.appendLog("read-only console stream ended with status \(process.terminationStatus)")
+            }
         }
 
         do {
             try process.run()
             consoleProcess = process
-            appendLog("attached console")
+            appendLog("attached read-only console stream")
         } catch {
             appendLog("console attach failed: \(error.localizedDescription)")
         }
+    }
+
+    private func appendConsole(_ text: String) {
+        consoleText.append(text)
+        if consoleText.count > consoleLimit {
+            consoleText.removeFirst(consoleText.count - consoleLimit)
+        }
+    }
+
+    private func openInteractiveTerminal(for snapshot: SnapshotSummary) throws {
+        let command = [
+            "cd \(shellQuote(FileManager.default.currentDirectoryPath))",
+            "echo 'Gimbal Local interactive session: \(snapshot.name)'",
+            "echo 'Login with ubuntu / ubuntu if prompted. Exit the console with Ctrl-A x.'",
+            "\(shellQuote(settings.chmPath)) connect \(shellQuote(snapshot.path)) --socket \(shellQuote(settings.socketPath)) --idle-exit 0",
+        ].joined(separator: " && ")
+
+        let script = """
+        tell application "Terminal"
+            activate
+            do script \(appleScriptString(command))
+        end tell
+        """
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        process.arguments = ["-e", script]
+
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+
+        try process.run()
+        process.waitUntilExit()
+        guard process.terminationStatus == 0 else {
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            let output = String(decoding: data, as: UTF8.self)
+            throw NSError(
+                domain: "GimbalLocal.Terminal",
+                code: Int(process.terminationStatus),
+                userInfo: [NSLocalizedDescriptionKey: output.trimmingCharacters(in: .whitespacesAndNewlines)]
+            )
+        }
+    }
+
+    private func shellQuote(_ value: String) -> String {
+        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+
+    private func appleScriptString(_ value: String) -> String {
+        "\"\(value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\""
     }
 
     func appendLog(_ text: String) {
@@ -323,6 +407,10 @@ final class AppModel: ObservableObject {
             \(reason)
             """
         }
-        return "Console output will appear here after a sandbox is running."
+        return "Read-only serial output will stream here after a sandbox is running."
+    }
+
+    var isConsoleStreaming: Bool {
+        consoleProcess != nil && status.state == .running
     }
 }

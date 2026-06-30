@@ -52,7 +52,10 @@ creates `target/GimbalLocal.app`.
   three most recently active sandboxes with "See more", "Shut Down Engine", and
   "Open Main App".
 - List local snapshot sandboxes from `chm ctl list --json`.
-- Start/stop a selected sandbox and attach to its serial console.
+- Start/stop a selected sandbox and follow its serial console as an explicit
+  read-only live stream. Keyboard input is not wired through the app yet; use
+  **Connect to session** to open Terminal.app with an interactive `chm run`
+  serial session for the selected sandbox.
 - Show local daemon/VM state from `chm ctl status --json`.
 - Surface immediate start failures, including unsupported ITS/LPI snapshots,
   directly in the sandbox state and console panels.

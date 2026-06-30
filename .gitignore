@@ -11,3 +11,9 @@
 /target
 /vendor
 __pycache__
+
+# Gimbal Local runtime artifacts (large, machine-local snapshots + COW overlays).
+# Captured snapshot bundles (RAM image + multi-GB disk images) and per-run
+# copy-on-write overlays must never be committed.
+/snapshots/
+**/.chm-overlays/
