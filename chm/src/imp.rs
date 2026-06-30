@@ -4,7 +4,8 @@
 
 //! macOS / Apple-Silicon implementation of the `chm` CLI.
 
-use std::io::Write;
+use std::io::{Read, Write};
+use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -358,12 +359,41 @@ struct Args {
     quiet: bool,
 }
 
+struct ConnectArgs {
+    run: Args,
+    socket_path: PathBuf,
+    no_stop_daemon: bool,
+}
+
 pub fn main() -> ExitCode {
     let raw: Vec<String> = env::args().skip(1).collect();
     match raw.first().map(String::as_str) {
         Some("cloud") => cloud::cloud_main(&raw[1..]),
         Some("serve") => serve::serve_main(&raw[1..]),
         Some("ctl") => serve::ctl_main(&raw[1..]),
+        Some("connect") => match parse_connect(&raw[1..]) {
+            Parsed::Connect(args) => match connect(&args) {
+                Ok(code) => code,
+                Err(e) => {
+                    eprintln!("chm connect: {e}");
+                    ExitCode::FAILURE
+                }
+            },
+            Parsed::Help => {
+                print!("{}", usage());
+                ExitCode::SUCCESS
+            }
+            Parsed::Version => {
+                println!("chm {}", env!("CARGO_PKG_VERSION"));
+                ExitCode::SUCCESS
+            }
+            Parsed::Error(msg) => {
+                eprintln!("chm connect: {msg}\n");
+                eprint!("{}", usage());
+                ExitCode::FAILURE
+            }
+            Parsed::Run(_) => unreachable!("parse_connect never returns Parsed::Run"),
+        },
         _ => match parse(&raw) {
             Parsed::Run(args) => match run(&args) {
                 Ok(code) => code,
@@ -372,6 +402,7 @@ pub fn main() -> ExitCode {
                     ExitCode::FAILURE
                 }
             },
+            Parsed::Connect(_) => unreachable!("parse never returns Parsed::Connect"),
             Parsed::Help => {
                 print!("{}", usage());
                 ExitCode::SUCCESS
@@ -391,6 +422,7 @@ pub fn main() -> ExitCode {
 
 enum Parsed {
     Run(Args),
+    Connect(ConnectArgs),
     Help,
     Version,
     Error(String),
@@ -405,6 +437,7 @@ fn usage() -> String {
      USAGE:\n    \
          chm run <SNAPSHOT_DIR> [OPTIONS]\n    \
          chm restore <SNAPSHOT_DIR> [OPTIONS]   (alias for run)\n    \
+         chm connect <SNAPSHOT_DIR> [OPTIONS]   (interactive session)\n    \
          chm cloud <COMMAND> aws [OPTIONS]      (BYO cloud helpers)\n    \
          chm serve <LIBRARY_DIR> [OPTIONS]      (background daemon)\n    \
          chm ctl <COMMAND> [ARG] [--socket P]   (talk to a daemon)\n\
@@ -419,6 +452,9 @@ fn usage() -> String {
          --idle-exit <N>     Stop after N seconds with no console output\n                        \
          (0 = disabled; default 10).\n    \
          --quiet             Suppress the informational banner on stderr.\n    \
+         --socket <PATH>      For `connect`, stop any app/daemon-run VM on this\n                        \
+         socket before taking the snapshot over interactively.\n    \
+         --no-stop-daemon     For `connect`, do not stop a daemon-run VM first.\n    \
          -h, --help          Print this help.\n    \
          -V, --version       Print the version.\n\
      \n\
@@ -497,6 +533,122 @@ fn parse(raw: &[String]) -> Parsed {
         }),
         None => Parsed::Error("missing <SNAPSHOT_DIR>".to_string()),
     }
+}
+
+fn parse_connect(raw: &[String]) -> Parsed {
+    let mut snapshot_dir: Option<PathBuf> = None;
+    let mut max_seconds = 0u64;
+    let mut idle_exit_secs = 0u64;
+    let mut quiet = false;
+    let mut socket_path = env::temp_dir().join("chm.sock");
+    let mut no_stop_daemon = false;
+
+    let mut i = 0;
+    while i < raw.len() {
+        let a = &raw[i];
+        match a.as_str() {
+            "-h" | "--help" => return Parsed::Help,
+            "-V" | "--version" => return Parsed::Version,
+            "--quiet" => quiet = true,
+            "--no-stop-daemon" => no_stop_daemon = true,
+            "--socket" | "--max-seconds" | "--idle-exit" => {
+                i += 1;
+                let Some(v) = raw.get(i) else {
+                    return Parsed::Error(format!("{a} requires a value"));
+                };
+                match a.as_str() {
+                    "--socket" => socket_path = PathBuf::from(v),
+                    "--max-seconds" | "--idle-exit" => {
+                        let Ok(n) = v.parse::<u64>() else {
+                            return Parsed::Error(format!("{a}: `{v}` is not a number"));
+                        };
+                        if a == "--max-seconds" {
+                            max_seconds = n;
+                        } else {
+                            idle_exit_secs = n;
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            other if other.starts_with('-') => {
+                return Parsed::Error(format!("unknown option `{other}`"));
+            }
+            _ => {
+                if snapshot_dir.is_some() {
+                    return Parsed::Error(format!("unexpected extra argument `{a}`"));
+                }
+                snapshot_dir = Some(PathBuf::from(a));
+            }
+        }
+        i += 1;
+    }
+
+    match snapshot_dir {
+        Some(snapshot_dir) => Parsed::Connect(ConnectArgs {
+            run: Args {
+                snapshot_dir,
+                max_seconds,
+                idle_exit_secs,
+                quiet,
+            },
+            socket_path,
+            no_stop_daemon,
+        }),
+        None => Parsed::Error("missing <SNAPSHOT_DIR>".to_string()),
+    }
+}
+
+fn connect(args: &ConnectArgs) -> Result<ExitCode, String> {
+    if !args.no_stop_daemon {
+        stop_daemon_vm_if_present(&args.socket_path)?;
+    }
+    run(&args.run)
+}
+
+fn stop_daemon_vm_if_present(socket_path: &Path) -> Result<(), String> {
+    let mut stream = match UnixStream::connect(socket_path) {
+        Ok(stream) => stream,
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound
+                    | io::ErrorKind::ConnectionRefused
+                    | io::ErrorKind::AddrNotAvailable
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(format!(
+                "connect to daemon socket {}: {e}",
+                socket_path.display()
+            ));
+        }
+    };
+    stream
+        .set_read_timeout(Some(Duration::from_secs(5)))
+        .map_err(|e| format!("set daemon socket timeout: {e}"))?;
+    stream
+        .write_all(b"stop\n")
+        .map_err(|e| format!("send daemon stop: {e}"))?;
+    stream.flush().ok();
+
+    let mut reply = String::new();
+    match stream.read_to_string(&mut reply) {
+        Ok(_) => {}
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut | io::ErrorKind::UnexpectedEof
+            ) => {}
+        Err(e) => return Err(format!("read daemon stop reply: {e}")),
+    }
+    let trimmed = reply.trim();
+    if !trimmed.is_empty() {
+        eprintln!("chm connect: {trimmed}");
+    }
+    Ok(())
 }
 
 fn run(args: &Args) -> Result<ExitCode, String> {
