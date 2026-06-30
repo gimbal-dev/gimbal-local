@@ -78,13 +78,38 @@ ch-arm-snapshot/
     state.json              vCPU VcpuKvmState + GIC Gicv3ItsState (the fixture)
     config.json             VM config
     memory-ranges …         guest RAM (large; not needed by the translator)
+  disks/                    exported guest disk images (the COW base images)
+    _disk0.raw              root disk, keyed by the snapshot's device-node id
+    _disk1.raw              cloud-init seed, etc.
   state.json                copy of the above, for convenience
-  ch-arm-snapshot.tar.zst   packaged snapshot
+  ch-arm-snapshot.tar.zst   packaged, self-contained snapshot (snapshot+disks)
 ```
 
 `state.json` is the artifact the translator consumes. It is small enough to
 commit as a test fixture under `hypervisor/tests/data/` so future iteration is
 fully offline on the Mac.
+
+The `disks/` images are what make a snapshot **runnable** (not just
+translatable): `chm` opens each as an immutable base and redirects guest writes
+to a per-run copy-on-write overlay, so the guest reads/writes its real
+filesystem and every resume stays consistent with the restored RAM. See
+[`../../docs/hvf-compatible-snapshots.md`](../../docs/hvf-compatible-snapshots.md).
+
+## Verifying the full loop (boot → log in → write a file → ls)
+
+`e2e-microvm-loop.sh` is an automated regression guard for the whole local
+sandbox path. It boots a real snapshot under `chm`, logs in over a PTY, writes a
+file inside the guest, lists it, reads pre-existing base-disk content back (with
+caches dropped), and asserts there are no ext4 / I/O errors:
+
+```sh
+scripts/hvf/e2e-microvm-loop.sh [SNAPSHOT_DIR]   # defaults to ./snapshots/ch-arm-v2m-demo
+```
+
+It wraps the `#[ignore]`d integration test `chm/tests/e2e_microvm_loop.rs`
+(which builds + ad-hoc-signs `chm` itself). A plain `cargo test` never boots a
+VM; the loop only runs when invoked this way (or with `CHM_E2E_SNAPSHOT` set and
+`-- --ignored`). Set `CHM_E2E_LOG=/path` to dump the guest console transcript.
 
 ## Tunables
 
