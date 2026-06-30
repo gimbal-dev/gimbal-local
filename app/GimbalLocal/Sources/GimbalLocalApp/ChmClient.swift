@@ -46,6 +46,37 @@ struct ChmClient {
         try await runChecked(settings: settings, args: ["ctl", "shutdown"])
     }
 
+    /// Fork a snapshot's current revision into a new snapshot directory (a
+    /// branch in the lineage). Unlike the daemon commands this takes no socket,
+    /// so it runs `chm fork` directly rather than through `run`.
+    func fork(from src: String, to dst: String, settings: AppSettings) async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let process = Process()
+                    process.executableURL = URL(fileURLWithPath: settings.chmPath)
+                    process.arguments = ["fork", src, dst]
+                    let pipe = Pipe()
+                    process.standardOutput = pipe
+                    process.standardError = pipe
+                    try process.run()
+                    process.waitUntilExit()
+                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    let output = String(decoding: data, as: UTF8.self)
+                    if process.terminationStatus == 0 {
+                        continuation.resume(returning: output)
+                    } else {
+                        continuation.resume(
+                            throwing: ChmClientError.commandFailed(output, process.terminationStatus)
+                        )
+                    }
+                } catch {
+                    continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
     func run(settings: AppSettings, args: [String]) async throws -> CommandResult {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {

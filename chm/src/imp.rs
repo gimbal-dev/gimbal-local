@@ -386,6 +386,13 @@ pub fn main() -> ExitCode {
         Some("cloud") => cloud::cloud_main(&raw[1..]),
         Some("serve") => serve::serve_main(&raw[1..]),
         Some("ctl") => serve::ctl_main(&raw[1..]),
+        Some("fork") => match fork(&raw[1..]) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("chm fork: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Some("connect") => match parse_connect(&raw[1..]) {
             Parsed::Connect(args) => match connect(&args) {
                 Ok(code) => code,
@@ -453,6 +460,7 @@ fn usage() -> String {
          chm run <SNAPSHOT_DIR> [OPTIONS]\n    \
          chm restore <SNAPSHOT_DIR> [OPTIONS]   (alias for run)\n    \
          chm resume <SNAPSHOT_DIR> [OPTIONS]    (restore a saved checkpoint)\n    \
+         chm fork <SRC_DIR> <DST_DIR>           (branch a saved revision)\n    \
          chm connect <SNAPSHOT_DIR> [OPTIONS]   (interactive session)\n    \
          chm cloud <COMMAND> aws [OPTIONS]      (BYO cloud helpers)\n    \
          chm serve <LIBRARY_DIR> [OPTIONS]      (background daemon)\n    \
@@ -633,6 +641,41 @@ fn parse_connect(raw: &[String]) -> Parsed {
         }),
         None => Parsed::Error("missing <SNAPSHOT_DIR>".to_string()),
     }
+}
+
+/// `chm fork <SRC_SNAPSHOT_DIR> <DST_SNAPSHOT_DIR>` — branch a sandbox.
+///
+/// Creates DST as an independent fork of SRC's current saved revision: DST
+/// references SRC's immutable base read-only and copies SRC's live checkpoint +
+/// disk overlays, re-parented in the lineage. `chm resume <DST>` then runs the
+/// fork, diverging from SRC. The graph branches here (see
+/// `docs/gimbal-local-fork-model.md`).
+fn fork(raw: &[String]) -> Result<ExitCode, String> {
+    let positionals: Vec<&String> = raw.iter().filter(|a| !a.starts_with('-')).collect();
+    if raw.iter().any(|a| a == "-h" || a == "--help") || positionals.len() != 2 {
+        eprintln!(
+            "usage: chm fork <SRC_SNAPSHOT_DIR> <DST_SNAPSHOT_DIR>\n\
+             \n\
+             Branch SRC's current saved revision into a new, independent\n\
+             snapshot DST that shares SRC's base but diverges from a copy of\n\
+             its live state. Run the fork with `chm resume <DST>`."
+        );
+        return if positionals.len() == 2 {
+            Ok(ExitCode::SUCCESS)
+        } else {
+            Err("expected exactly two directory arguments".to_string())
+        };
+    }
+    let src = PathBuf::from(positionals[0]);
+    let dst = PathBuf::from(positionals[1]);
+    checkpoint::fork_into(&src, &dst)?;
+    eprintln!(
+        "chm: forked {} -> {} (resume the fork with `chm resume {}`)",
+        src.display(),
+        dst.display(),
+        dst.display()
+    );
+    Ok(ExitCode::SUCCESS)
 }
 
 fn connect(args: &ConnectArgs) -> Result<ExitCode, String> {

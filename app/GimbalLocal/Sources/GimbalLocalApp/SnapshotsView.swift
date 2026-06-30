@@ -275,6 +275,17 @@ private struct LineageCard: View {
                             badge: sandbox.location.label
                         )
                     }
+                    HStack {
+                        Spacer()
+                        Button {
+                            model.forkSnapshot(named: snapshotName)
+                        } label: {
+                            Label("Fork this revision", systemImage: "arrow.triangle.branch")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+                    .padding(.top, 2)
                 } else {
                     ForEach(derived) { sandbox in
                         LineageRow(
@@ -301,7 +312,7 @@ private struct LineageCard: View {
 
             Divider().opacity(0.25)
             Label(
-                "Forking a revision into independent sandboxes that share its memory and disk is coming next — the graph will branch here.",
+                "Fork branches a revision into an independent sandbox that shares its base but diverges from a copy of its live state — the graph branches here.",
                 systemImage: "arrow.triangle.branch"
             )
             .font(.caption)

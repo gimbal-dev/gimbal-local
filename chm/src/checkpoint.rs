@@ -217,6 +217,93 @@ fn dump_guest_ram(
     Ok(())
 }
 
+/// Fork a snapshot's current revision into a new snapshot directory.
+///
+/// The new directory is an independent fork point that descends from the
+/// source's current revision (the branch in the lineage DAG). It **references**
+/// the source's immutable base read-only (the `state.json`, base RAM and base
+/// disks are symlinked, so a large base is not copied) and **copies** the
+/// mutable state — the checkpoint (the live RAM + hardware state to resume from)
+/// and the disk overlays — so the fork diverges from the parent without
+/// disturbing it. The copied revision is re-parented (`parent` = the source
+/// revision id, a fresh id, `origin = "fork"`).
+///
+/// `chm resume <dst>` then runs the fork; the source and the fork now have
+/// independent state, both descended from the same revision.
+pub(crate) fn fork_into(src_dir: &Path, dst_dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::symlink;
+
+    if !has_checkpoint(src_dir) {
+        return Err(format!(
+            "{} has no saved revision to fork (run and suspend it first)",
+            src_dir.display()
+        ));
+    }
+    if dst_dir.exists() {
+        return Err(format!("destination {} already exists", dst_dir.display()));
+    }
+    fs::create_dir_all(dst_dir).map_err(|e| format!("create {}: {e}", dst_dir.display()))?;
+
+    // Reference the immutable base read-only. Symlinks avoid copying a large
+    // base RAM image / disks; the base is never written, so sharing is safe.
+    for item in ["state.json", "snapshot", "disks"] {
+        let from = src_dir.join(item);
+        if from.exists() {
+            let from_abs = from
+                .canonicalize()
+                .map_err(|e| format!("resolve {}: {e}", from.display()))?;
+            symlink(&from_abs, dst_dir.join(item))
+                .map_err(|e| format!("link {item} into the fork: {e}"))?;
+        }
+    }
+
+    // Copy the mutable state the fork diverges from: the checkpoint (live RAM +
+    // hardware state) and the disk overlays.
+    copy_tree(&checkpoint_dir(src_dir), &checkpoint_dir(dst_dir))?;
+    let overlays = src_dir.join(".chm-overlays");
+    if overlays.is_dir() {
+        copy_tree(&overlays, &dst_dir.join(".chm-overlays"))?;
+    }
+
+    // Re-parent the forked revision: it descends from the source's revision.
+    let mut rev = read_revision(dst_dir)?;
+    let created_at_ms = now_ms();
+    rev.parent = Some(rev.id.clone());
+    rev.id = mint_revision_id(created_at_ms);
+    rev.created_at_ms = created_at_ms;
+    rev.origin = "fork".to_string();
+    rev.base_image = dst_dir
+        .file_name()
+        .map_or_else(
+            || dst_dir.display().to_string(),
+            |s| s.to_string_lossy().into_owned(),
+        );
+    let json = serde_json::to_string(&rev).map_err(|e| format!("serialize revision: {e}"))?;
+    fs::write(checkpoint_dir(dst_dir).join(MANIFEST), json.as_bytes())
+        .map_err(|e| format!("write forked manifest: {e}"))?;
+    Ok(())
+}
+
+/// Recursively copy a directory tree (files + subdirectories).
+fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
+    fs::create_dir_all(to).map_err(|e| format!("create {}: {e}", to.display()))?;
+    for entry in fs::read_dir(from).map_err(|e| format!("read {}: {e}", from.display()))? {
+        let entry = entry.map_err(|e| format!("read {}: {e}", from.display()))?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        let ft = entry
+            .file_type()
+            .map_err(|e| format!("stat {}: {e}", src.display()))?;
+        if ft.is_dir() {
+            copy_tree(&src, &dst)?;
+        } else {
+            fs::copy(&src, &dst)
+                .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -270,5 +357,73 @@ mod tests {
         // lineage view can sort revisions by id.
         assert!(mint_revision_id(1) < mint_revision_id(2));
         assert!(mint_revision_id(999) < mint_revision_id(1000));
+    }
+
+    #[test]
+    fn fork_branches_a_revision_and_reparents_it() {
+        use hypervisor::hvf::checkpoint::{CHECKPOINT_VERSION, CheckpointState};
+
+        let valid_state = CheckpointState {
+            version: CHECKPOINT_VERSION,
+            ..Default::default()
+        };
+
+        let root = env::temp_dir().join(format!("chm-fork-test-{}-{}", process::id(), now_ms()));
+        let src = root.join("src");
+        let dst = root.join("dst");
+        let _ = fs::remove_dir_all(&root);
+
+        // A minimal source snapshot with a base + a checkpoint + an overlay.
+        fs::create_dir_all(src.join("snapshot")).unwrap();
+        fs::create_dir_all(src.join("disks")).unwrap();
+        fs::write(src.join("state.json"), b"{}").unwrap();
+        fs::write(src.join("snapshot/memory-ranges"), b"base-ram").unwrap();
+        fs::create_dir_all(src.join(".chm-overlays")).unwrap();
+        fs::write(src.join(".chm-overlays/d-cow.raw"), b"overlay-bytes").unwrap();
+
+        let ckpt = checkpoint_dir(&src);
+        fs::create_dir_all(&ckpt).unwrap();
+        fs::write(ckpt.join(MEMORY_RANGES), b"live-ram").unwrap();
+        let parent_rev = Revision {
+            manifest_version: REVISION_MANIFEST_VERSION,
+            id: "rev-0000000000001-aaaa".into(),
+            parent: None,
+            base_image: "src".into(),
+            created_at_ms: 1,
+            origin: "connect".into(),
+            label: None,
+            state: valid_state,
+        };
+        fs::write(ckpt.join(MANIFEST), serde_json::to_string(&parent_rev).unwrap()).unwrap();
+
+        fork_into(&src, &dst).expect("fork");
+
+        // The fork copied the mutable state and re-parented the revision.
+        let forked = read_revision(&dst).expect("read fork revision");
+        assert_eq!(forked.parent.as_deref(), Some("rev-0000000000001-aaaa"));
+        assert_ne!(forked.id, "rev-0000000000001-aaaa");
+        assert_eq!(forked.origin, "fork");
+        assert_eq!(
+            fs::read(memory_ranges_path(&dst)).unwrap(),
+            b"live-ram",
+            "the fork copies the live RAM to diverge from"
+        );
+        assert_eq!(
+            fs::read(dst.join(".chm-overlays/d-cow.raw")).unwrap(),
+            b"overlay-bytes",
+            "the fork copies the disk overlay delta"
+        );
+        // The base is referenced (symlinked), not copied.
+        assert!(
+            fs::symlink_metadata(dst.join("snapshot"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the immutable base is shared via a symlink, not copied"
+        );
+        // Forking a dir with no checkpoint is refused.
+        assert!(fork_into(&root.join("nope"), &root.join("nope2")).is_err());
+
+        let _ = fs::remove_dir_all(&root);
     }
 }

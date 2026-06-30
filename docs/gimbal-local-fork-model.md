@@ -178,8 +178,13 @@ on another Mac), fork either side.
    origin }`. UI lineage view renders the Image→Revision chain.
 2. **Revision store** — key revisions by id under `.chm-revisions/`, keep
    history (not just HEAD), add Resume-here / rollback (Make HEAD).
-3. **Fork** — `chm fork <revision>` / app "Fork": new sandbox from a revision
-   with its own CoW overlay; the graph grows branches. (Phase 3 parity.)
+3. **Fork** *(landed: data layer + UI)* — `chm fork <SRC> <DST>` / the app's
+   "Fork this revision" button create a new snapshot that shares the parent's
+   immutable base (symlinked) and diverges from a copy of its live checkpoint +
+   disk overlays, re-parented in the lineage; the graph branches. (Phase 3
+   parity.) Next: per-sandbox workspaces so N forks of one image coexist without
+   colliding on the shared `.chm-checkpoint`/`.chm-overlays`, and running forks
+   concurrently.
 4. **Sparse revisions** — store only touched memory pages + disk blocks per
    revision over a shared base; wire the offload daemon / memfd overlay so a
    revision is cheap. (Phase 2/3 parity.)
