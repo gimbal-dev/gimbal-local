@@ -325,14 +325,18 @@ final class AppModel: ObservableObject {
     }
 
     private func openInteractiveTerminal(for snapshot: SnapshotSummary, lockPath: String? = nil) throws {
-        var connectCmd = "\(shellQuote(settings.chmPath)) connect \(shellQuote(snapshot.path)) --socket \(shellQuote(settings.socketPath)) --idle-exit 0"
+        // `--checkpoint` makes the session resume from a saved checkpoint if one
+        // exists and capture a fresh one when it ends cleanly — so closing the
+        // window suspends the sandbox and reconnecting brings it back where it
+        // was (live memory + disk), rather than cold-booting.
+        var connectCmd = "\(shellQuote(settings.chmPath)) connect \(shellQuote(snapshot.path)) --socket \(shellQuote(settings.socketPath)) --checkpoint --idle-exit 0"
         if let lockPath {
             connectCmd += " --session-lock \(shellQuote(lockPath))"
         }
         let command = [
             "cd \(shellQuote(FileManager.default.currentDirectoryPath))",
             "echo 'Gimbal Local interactive session: \(snapshot.name)'",
-            "echo 'Login with ubuntu / ubuntu if prompted. Close this window or press Ctrl-A x to end the session — it shuts the sandbox down cleanly.'",
+            "echo 'Login with ubuntu / ubuntu if prompted. Close this window or press Ctrl-A x to end the session — it suspends the sandbox (live state saved); reconnect to resume where you left off.'",
             connectCmd,
         ].joined(separator: " && ")
 
