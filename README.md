@@ -156,10 +156,19 @@ AWS setup notes for the later cloud round-trip live in
 ## Relationship to upstream Cloud Hypervisor
 
 This repository is a fork and is **not** tracking upstream for merge-back; it is
-its own project focused on the macOS local runtime. The upstream crates
-(`vmm`, `virtio-devices`, `vhost_*`, `pci`, …) are kept in the tree because the
-`hypervisor` crate depends on them and they are the device-model substrate the
-Phase 3 work will draw from.
+its own project focused on the macOS local runtime.
+
+The macOS product is small and self-contained: `chm` depends only on the
+`hypervisor` crate (built with `--features hvf,kvm-snapshot`), which in turn has
+**no** local-crate dependencies. None of the upstream VMM crates (`vmm`,
+`virtio-devices`, `vhost_*`, `pci`, …) are compiled into `chm` or the app.
+
+Those upstream crates are kept in the tree for two reasons: they build the
+patched Linux `cloud-hypervisor` binary used to **capture** HVF-compatible
+snapshots (the `CH_GIC_V2M` message-SPI patch; see
+[`scripts/hvf/`](scripts/hvf/)), and they remain the device-model substrate that
+later phases can draw from. If you are here for the macOS port, you only need
+`chm/`, `hypervisor/src/hvf/`, and `app/GimbalLocal/`.
 
 The original upstream project README — covering the general KVM/MSHV VMM, its
 device model, and full documentation under [`docs/`](docs/) — is preserved
