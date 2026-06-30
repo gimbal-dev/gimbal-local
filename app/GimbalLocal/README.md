@@ -42,9 +42,15 @@ creates `target/GimbalLocal.app`.
   pills, premium sidebar, and terminal-styled console/activity panes.
 - Auto-start `chm serve` on launch when the local daemon is not reachable, and
   create the configured snapshot library folder if needed.
-- Focus on creating and managing sandboxes; the local daemon is background
-  plumbing and appears only as a health signal.
-- Configure `chm`, snapshot library, socket, and control-plane URL.
+- Focus on creating and managing sandboxes; the local engine is background
+  plumbing surfaced only as an always-visible status bar at the bottom of the
+  window (a small colour icon for the engine and the optional control plane).
+- Move all engine tweaks into a dedicated Settings window (⌘,): configure `chm`,
+  snapshot library, socket, and control-plane URL, and start/restart/shut down
+  the local engine — including a one-click restart when it becomes unresponsive.
+- Menu bar extra so the app stays useful with the main window closed: lists the
+  three most recently active sandboxes with "See more", "Shut Down Engine", and
+  "Open Main App".
 - List local snapshot sandboxes from `chm ctl list --json`.
 - Start/stop a selected sandbox and follow its serial console as an explicit
   read-only live stream. Keyboard input is not wired through the app yet; use

@@ -23,7 +23,7 @@ struct GimbalLocalApp: App {
     @StateObject private var model = AppModel()
 
     var body: some Scene {
-        WindowGroup {
+        Window("Gimbal Local", id: "main") {
             ContentView()
                 .environmentObject(model)
                 .frame(minWidth: 1120, minHeight: 760)
@@ -38,11 +38,33 @@ struct GimbalLocalApp: App {
                 }
                 .keyboardShortcut("r")
 
-                Button("Start Local Daemon") {
+                Divider()
+
+                Button("Start Local Engine") {
                     model.startDaemon()
                 }
                 .keyboardShortcut("d")
+
+                Button("Restart Local Engine") {
+                    model.restartDaemon()
+                }
+
+                Button("Shut Down Local Engine") {
+                    model.shutdownDaemon()
+                }
             }
+        }
+
+        Settings {
+            SettingsView()
+                .environmentObject(model)
+        }
+
+        MenuBarExtra {
+            MenuBarView()
+                .environmentObject(model)
+        } label: {
+            Image(systemName: model.engineIndicator.symbol)
         }
     }
 }
