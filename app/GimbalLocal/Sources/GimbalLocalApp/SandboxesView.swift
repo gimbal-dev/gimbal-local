@@ -256,7 +256,7 @@ private struct WorkInsideCard: View {
 
     var body: some View {
         GlassCard(title: "Work inside", subtitle: "interactive shell session", systemImage: "terminal.fill") {
-            Text("Open a terminal into the sandbox and run commands directly. Log in with `ubuntu` / `ubuntu` if prompted, and exit the console with Ctrl-A x.")
+            Text("Open a terminal into the sandbox and run commands directly. Log in with `ubuntu` / `ubuntu` if prompted. Close the window or press Ctrl-A x to end the session — either way the sandbox shuts down cleanly.")
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)

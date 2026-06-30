@@ -160,4 +160,26 @@ final class GimbalLocalAppTests: XCTestCase {
         model.status = SandboxStatus(state: .stopped, name: "ubuntu", uptimeSeconds: nil, consoleBytes: nil, reason: "boom", message: nil)
         XCTAssertEqual(model.sandbox(id: a.id)?.state, .failed)
     }
+
+    func testInteractiveLivenessDecision() {
+        // Lock present + owner alive => session is still live.
+        XCTAssertFalse(InteractiveLiveness.sessionEnded(
+            lockExists: true, ownerAlive: true, lockSeen: true, pastStartDeadline: false))
+
+        // Lock present but the owning process is gone (stale SIGKILL lock) => ended.
+        XCTAssertTrue(InteractiveLiveness.sessionEnded(
+            lockExists: true, ownerAlive: false, lockSeen: true, pastStartDeadline: false))
+
+        // Lock removed after we had seen it (clean teardown / window close) => ended.
+        XCTAssertTrue(InteractiveLiveness.sessionEnded(
+            lockExists: false, ownerAlive: false, lockSeen: true, pastStartDeadline: false))
+
+        // Not seen yet and still within the start grace window => not ended (starting).
+        XCTAssertFalse(InteractiveLiveness.sessionEnded(
+            lockExists: false, ownerAlive: false, lockSeen: false, pastStartDeadline: false))
+
+        // Never appeared and the grace window elapsed => give up, treat as ended.
+        XCTAssertTrue(InteractiveLiveness.sessionEnded(
+            lockExists: false, ownerAlive: false, lockSeen: false, pastStartDeadline: true))
+    }
 }

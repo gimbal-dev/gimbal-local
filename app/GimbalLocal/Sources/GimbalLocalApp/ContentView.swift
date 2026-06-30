@@ -198,6 +198,9 @@ private struct Detail: View {
         }
         .task {
             while !Task.isCancelled {
+                // Detect when an interactive Terminal session has ended (e.g. the
+                // user closed the window) even though the daemon isn't running.
+                model.reconcileInteractiveSession()
                 if model.status.state == .running {
                     await model.refreshLocal()
                 }

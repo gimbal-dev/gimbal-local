@@ -18,6 +18,34 @@ struct EngineIndicator {
     let tone: EngineTone
 }
 
+/// Pure decision for whether an interactive `chm connect` session has ended,
+/// based on its PID lock file. Factored out so it is unit-testable without a
+/// running VM. `chm connect --session-lock` writes the file on start and its
+/// graceful teardown removes it on EVERY exit (window close, Ctrl-A x, a
+/// terminating signal, or guest power-off), so the file vanishing is an honest
+/// end-of-session signal; the embedded PID lets us also catch a stale lock left
+/// only by an uncatchable SIGKILL.
+enum InteractiveLiveness {
+    static func sessionEnded(
+        lockExists: Bool,
+        ownerAlive: Bool,
+        lockSeen: Bool,
+        pastStartDeadline: Bool
+    ) -> Bool {
+        if lockExists {
+            // Live only while the process that owns the lock is still around.
+            return !ownerAlive
+        }
+        // No lock file. If we already saw it, a clean teardown removed it.
+        if lockSeen {
+            return true
+        }
+        // Never seen yet: the session may still be starting — only give up once
+        // the start grace period has elapsed (so a slow launch isn't dropped).
+        return pastStartDeadline
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     @Published var settings = AppSettings.defaults
@@ -45,6 +73,15 @@ final class AppModel: ObservableObject {
     private var consoleProcess: Process?
     private var attemptedAutoStart = false
     private let consoleLimit = 512 * 1024
+
+    // Liveness tracking for an open `chm connect` session. The interactive
+    // console runs in Terminal.app (outside our process) and stops the daemon
+    // VM, so the daemon cannot report it; instead `chm connect --session-lock`
+    // maintains a PID file we watch to learn when the user ends the session —
+    // including by simply closing the Terminal window.
+    private var interactiveLockPath: String?
+    private var interactiveLockSeen = false
+    private var interactiveDeadline: Date?
 
     private let recentsDefaultsKey = "gimbal.recentSandboxNames"
     private let sandboxesDefaultsKey = "gimbal.sandboxes"
@@ -287,12 +324,16 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func openInteractiveTerminal(for snapshot: SnapshotSummary) throws {
+    private func openInteractiveTerminal(for snapshot: SnapshotSummary, lockPath: String? = nil) throws {
+        var connectCmd = "\(shellQuote(settings.chmPath)) connect \(shellQuote(snapshot.path)) --socket \(shellQuote(settings.socketPath)) --idle-exit 0"
+        if let lockPath {
+            connectCmd += " --session-lock \(shellQuote(lockPath))"
+        }
         let command = [
             "cd \(shellQuote(FileManager.default.currentDirectoryPath))",
             "echo 'Gimbal Local interactive session: \(snapshot.name)'",
-            "echo 'Login with ubuntu / ubuntu if prompted. Exit the console with Ctrl-A x.'",
-            "\(shellQuote(settings.chmPath)) connect \(shellQuote(snapshot.path)) --socket \(shellQuote(settings.socketPath)) --idle-exit 0",
+            "echo 'Login with ubuntu / ubuntu if prompted. Close this window or press Ctrl-A x to end the session — it shuts the sandbox down cleanly.'",
+            connectCmd,
         ].joined(separator: " && ")
 
         let script = """
@@ -325,6 +366,71 @@ final class AppModel: ObservableObject {
 
     private func shellQuote(_ value: String) -> String {
         "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
+    }
+
+    /// Reconcile an open interactive session against its PID lock file, clearing
+    /// the "connected" state once the user has ended it (e.g. by closing the
+    /// Terminal window). Cheap; driven by the periodic refresh loop.
+    func reconcileInteractiveSession() {
+        guard let id = interactiveSandboxID, let lockPath = interactiveLockPath else {
+            return
+        }
+        let fm = FileManager.default
+        let lockExists = fm.fileExists(atPath: lockPath)
+        if lockExists {
+            interactiveLockSeen = true
+        }
+        let ownerAlive = lockExists && lockOwnerAlive(lockPath)
+        let pastDeadline = interactiveDeadline.map { Date() > $0 } ?? false
+        let ended = InteractiveLiveness.sessionEnded(
+            lockExists: lockExists,
+            ownerAlive: ownerAlive,
+            lockSeen: interactiveLockSeen,
+            pastStartDeadline: pastDeadline
+        )
+        guard ended else { return }
+
+        appendLog("interactive session for \(sandbox(id: id)?.name ?? id) ended")
+        // The connect process stopped the daemon VM and owned the slot itself,
+        // so once it's gone the sandbox is no longer running locally.
+        if activeLocalSandboxID == id { activeLocalSandboxID = nil }
+        // Remove a stale lock left only by an uncatchable SIGKILL.
+        if lockExists { try? fm.removeItem(atPath: lockPath) }
+        clearInteractiveTracking()
+        Task { await refreshLocal() }
+    }
+
+    /// True if the PID recorded in `lockPath` names a live process.
+    private func lockOwnerAlive(_ lockPath: String) -> Bool {
+        guard
+            let body = try? String(contentsOfFile: lockPath, encoding: .utf8),
+            let pid = Int32(body.trimmingCharacters(in: .whitespacesAndNewlines))
+        else {
+            // Unreadable/unparseable lock: treat as not-alive so we never wedge.
+            return false
+        }
+        // kill(pid, 0): 0 => alive; EPERM => alive but not ours; ESRCH => gone.
+        if kill(pid, 0) == 0 { return true }
+        return errno == EPERM
+    }
+
+    /// Path of the per-sandbox interactive session lock file, under the app's
+    /// Application Support directory.
+    private func sessionLockPath(for id: String) -> String {
+        let base = FileManager.default
+            .urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+            .appendingPathComponent("gimbal-local/sessions", isDirectory: true)
+        try? FileManager.default.createDirectory(at: base, withIntermediateDirectories: true)
+        let safe = String(id.map { $0.isLetter || $0.isNumber ? $0 : "-" })
+        return base.appendingPathComponent("\(safe).lock").path
+    }
+
+    /// Clear all interactive-session tracking in one place.
+    private func clearInteractiveTracking() {
+        interactiveSandboxID = nil
+        interactiveLockPath = nil
+        interactiveLockSeen = false
+        interactiveDeadline = nil
     }
 
     private func appleScriptString(_ value: String) -> String {
@@ -441,7 +547,7 @@ final class AppModel: ObservableObject {
         }
         activeLocalSandboxID = sandbox.id
         startingSandboxID = sandbox.id
-        interactiveSandboxID = nil
+        clearInteractiveTracking()
         consoleText = ""
         recordRecentActivity(sandbox.snapshotName)
         Task {
@@ -472,18 +578,24 @@ final class AppModel: ObservableObject {
         activeLocalSandboxID = sandbox.id
         startingSandboxID = nil
         interactiveSandboxID = sandbox.id
+        // Maintain a PID lock so the session's end (including a closed window) is
+        // detectable by reconcileInteractiveSession.
+        let lockPath = sessionLockPath(for: sandbox.id)
+        interactiveLockPath = lockPath
+        interactiveLockSeen = false
+        interactiveDeadline = Date().addingTimeInterval(20)
         // `chm connect` stops the daemon-run VM and takes over; drop our
         // read-only console stream so the two don't fight over the slot.
         consoleProcess?.terminate()
         consoleProcess = nil
         Task {
             do {
-                try openInteractiveTerminal(for: snapshot)
+                try openInteractiveTerminal(for: snapshot, lockPath: lockPath)
                 appendLog("opened interactive terminal for \(sandbox.name)")
             } catch {
                 appendLog("terminal connect failed: \(error.localizedDescription)")
                 if interactiveSandboxID == sandbox.id {
-                    interactiveSandboxID = nil
+                    clearInteractiveTracking()
                 }
             }
         }
@@ -499,7 +611,7 @@ final class AppModel: ObservableObject {
             }
             if activeLocalSandboxID == sandbox.id { activeLocalSandboxID = nil }
             if startingSandboxID == sandbox.id { startingSandboxID = nil }
-            if interactiveSandboxID == sandbox.id { interactiveSandboxID = nil }
+            if interactiveSandboxID == sandbox.id { clearInteractiveTracking() }
             consoleProcess?.terminate()
             consoleProcess = nil
             await refreshLocal()
