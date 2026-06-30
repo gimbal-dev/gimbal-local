@@ -15,6 +15,7 @@ use std::{env, fs, io, thread};
 
 use crate::cloud;
 use crate::console::{self, RawConsole};
+use crate::console_filter::ConsoleFilter;
 use crate::serve;
 
 use hypervisor::arch::aarch64::gic::Vgic;
@@ -1129,15 +1130,22 @@ fn run_console(
     let start = Instant::now();
     let mut last_output = Instant::now();
     let mut stdout = io::stdout();
+    let mut filter = ConsoleFilter::new();
 
     let max = (args.max_seconds > 0).then(|| Duration::from_secs(args.max_seconds));
     let idle = (args.idle_exit_secs > 0).then(|| Duration::from_secs(args.idle_exit_secs));
 
     while running.load(Ordering::Acquire) {
-        let bytes = uart.take_output();
-        if bytes.is_empty() {
+        let raw = uart.take_output();
+        if raw.is_empty() {
             thread::sleep(Duration::from_millis(5));
         } else {
+            // Drop the one documented cosmetic genirq line from the rendered
+            // console (see console_filter); everything else passes through.
+            let bytes = filter.feed(&raw);
+            if bytes.is_empty() {
+                continue;
+            }
             match stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
                 Ok(()) => last_output = Instant::now(),
                 // The console consumer went away (e.g. piped into `head`): stop
@@ -1160,7 +1168,12 @@ fn run_console(
             return Ok(Outcome::Idle(args.idle_exit_secs));
         }
     }
-    // A vCPU thread stopped the run; the caller surfaces the recorded outcome.
+    // A vCPU thread stopped the run; flush any withheld partial line and surface
+    // the recorded outcome.
+    let tail = filter.flush();
+    if !tail.is_empty() {
+        let _ = stdout.write_all(&tail).and_then(|()| stdout.flush());
+    }
     Ok(Outcome::PoweredOff)
 }
 

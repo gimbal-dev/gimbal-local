@@ -23,6 +23,11 @@ use std::process::ExitCode;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod imp;
 
+// Console-output filtering for the interactive serial stream. Pure logic, but
+// only used by the macOS console paths, so it is gated like the rest.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod console_filter;
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod console;
 
