@@ -520,6 +520,39 @@ final class AppModel: ObservableObject {
         return try? JSONDecoder().decode(Revision.self, from: data)
     }
 
+    /// Fork a snapshot's current revision into a new branched snapshot in the
+    /// library, then surface it (refresh) and focus it. The fork shares the
+    /// parent's immutable base and diverges from a copy of its live state — the
+    /// branch point in the lineage graph. Requires a saved revision (suspend the
+    /// sandbox first).
+    func forkSnapshot(named name: String) {
+        guard let image = snapshot(named: name) else {
+            appendLog("cannot fork: snapshot \(name) not in library")
+            return
+        }
+        guard revision(forSnapshotNamed: name) != nil else {
+            appendLog("cannot fork \(name): no saved revision yet — suspend it first")
+            return
+        }
+        let forkName = "\(name)-fork-\(Int(Date().timeIntervalSince1970))"
+        let dst = URL(fileURLWithPath: settings.libraryPath)
+            .appendingPathComponent(forkName)
+            .path
+        Task {
+            do {
+                let output = try await chm.fork(from: image.path, to: dst, settings: settings)
+                appendLog(output.trimmingCharacters(in: .whitespacesAndNewlines))
+                await refreshLocal()
+                // Surface the fork as a sandbox the user can launch immediately.
+                if snapshot(named: forkName) != nil {
+                    _ = createSandbox(fromSnapshotNamed: forkName)
+                }
+            } catch {
+                appendLog("fork failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
     /// Create a new sandbox instance from a snapshot image and focus it, without
     /// starting it. Names are made unique so several sandboxes can come from the
     /// same image. Returns the created sandbox (its live state is derived).
