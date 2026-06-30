@@ -426,6 +426,29 @@ impl GuestRam {
             })?;
         Ok(ram)
     }
+
+    /// A host view of this region's live guest-RAM bytes.
+    ///
+    /// Used to dump memory at checkpoint time. Callers MUST pause every vCPU
+    /// before reading so the captured page contents are consistent (no vCPU is
+    /// mid-write). The slice is valid for `size` bytes for the life of `self`.
+    pub fn as_bytes(&self) -> &[u8] {
+        // SAFETY: `ptr` is a live mapping of exactly `size` bytes owned by this
+        // struct; with all vCPUs paused there is no concurrent guest writer, so
+        // a shared read is sound.
+        unsafe { std::slice::from_raw_parts(self.ptr, self.size) }
+    }
+
+    /// This region's size in bytes.
+    pub fn len(&self) -> usize {
+        self.size
+    }
+
+    /// Whether this region is empty (never true for a mapped region; provided to
+    /// satisfy the `len`-without-`is_empty` lint).
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
 }
 
 impl Drop for GuestRam {

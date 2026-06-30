@@ -677,6 +677,89 @@ pub mod gic_ingest {
         }
         Some(out)
     }
+
+    /// The architectural GICD register offsets a live distributor capture must
+    /// read — exactly the offsets [`dist_to_hvf`] emits for a `num_irq`-wide
+    /// GICv3, in the same order. Reading `hv_gic_get_distributor_reg(off)` for
+    /// each yields the `(off, value)` pairs that [`super`]'s `restore_distributor`
+    /// applies, so a checkpoint round-trips through Apple's per-register API
+    /// without going through the KVM dump encoding. `GICD_STATUSR` (RAZ/WI) is
+    /// excluded because it carries no architectural state.
+    pub fn dist_capture_offsets(num_irq: u32) -> Vec<u32> {
+        let mut out = Vec::new();
+        for reg in VGIC_DIST_REGS {
+            let start = reg.base + REG_SIZE * reg.bpi as u32;
+            let words = dist_reg_words(reg, num_irq);
+            if reg.bpi == 64 {
+                let mut off = start;
+                let mut w = 0;
+                while w < words {
+                    if reg.restore {
+                        out.push(off);
+                    }
+                    w += 2;
+                    off += 8;
+                }
+            } else {
+                for k in 0..words {
+                    if reg.restore {
+                        out.push(start + k * REG_SIZE);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// The architectural GICR (SGI-frame) register offsets a live per-vCPU
+    /// redistributor capture must read — exactly the offsets [`redist_to_hvf`]
+    /// emits. The RD_base LPI/power registers Apple owns are excluded, matching
+    /// the restore path.
+    pub fn rdist_capture_offsets() -> Vec<u32> {
+        let mut out = Vec::new();
+        for reg in VGIC_RDIST_REGS {
+            if reg.base < GICR_SGI_OFFSET {
+                continue;
+            }
+            let words = reg.length as u32 / REG_SIZE;
+            for k in 0..words {
+                out.push(reg.base + k * REG_SIZE);
+            }
+        }
+        out
+    }
+
+    #[cfg(test)]
+    mod capture_tests {
+        use super::*;
+
+        /// The live distributor-capture offsets must be EXACTLY the offsets the
+        /// restore path writes (`dist_to_hvf`), in the same order — otherwise a
+        /// checkpoint reads registers the restore never sets (or misses some).
+        #[test]
+        fn dist_capture_offsets_match_restore_offsets() {
+            for num_irq in [32u32, 64, 256, 1024] {
+                let len = dist_total_words(num_irq) as usize;
+                let dump = vec![0u32; len];
+                let restore_offsets: Vec<u32> =
+                    dist_to_hvf(&dump).expect("dump translates").into_iter().map(|(o, _)| o).collect();
+                assert_eq!(
+                    dist_capture_offsets(num_irq),
+                    restore_offsets,
+                    "dist capture/restore offset mismatch at num_irq={num_irq}"
+                );
+            }
+        }
+
+        /// Same invariant for the per-vCPU redistributor SGI frame.
+        #[test]
+        fn rdist_capture_offsets_match_restore_offsets() {
+            let dump = vec![0u32; redist_words_per_vcpu()];
+            let restore_offsets: Vec<u32> =
+                redist_to_hvf(&dump).expect("dump translates").into_iter().map(|(o, _)| o).collect();
+            assert_eq!(rdist_capture_offsets(), restore_offsets);
+        }
+    }
 }
 
 #[cfg(test)]

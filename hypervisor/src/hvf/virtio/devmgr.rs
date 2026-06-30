@@ -411,6 +411,7 @@ pub fn build_device(
     desc: &VirtioDeviceDesc,
     mem: Arc<GuestMemory>,
     overlay_dir: &std::path::Path,
+    resume: bool,
 ) -> Result<(u64, u64, Arc<VirtioPciDevice>), DevMgrError> {
     let queues = desc
         .queues
@@ -424,7 +425,7 @@ pub fn build_device(
             nsectors,
         } => {
             let (backend, _backing) =
-                resolve_block_backend(overlay_dir, &desc.name, disk_path, *nsectors)?;
+                resolve_block_backend(overlay_dir, &desc.name, disk_path, *nsectors, resume)?;
             (
                 Backend::Block(BlockDevice::new(backend, &desc.name)),
                 blk_device_config(*nsectors),
@@ -499,11 +500,19 @@ pub(crate) fn resolve_block_backend(
     dev_name: &str,
     disk_path: &str,
     nsectors: u64,
+    resume: bool,
 ) -> Result<(Box<dyn BlockBackend>, BlockBacking), DevMgrError> {
     match shipped_backing(overlay_dir, dev_name) {
         Some(base) => {
             let overlay = overlay_dir.join(sanitize(&format!("{dev_name}-cow.raw")));
-            let ob = OverlayBackend::open(&base, &overlay, nsectors).map_err(|e| {
+            // On resume, reattach the overlay from the prior run (so disk writes
+            // made before the checkpoint survive); on cold boot, start fresh.
+            let ob = if resume {
+                OverlayBackend::resume(&base, &overlay, nsectors)
+            } else {
+                OverlayBackend::open(&base, &overlay, nsectors)
+            }
+            .map_err(|e| {
                 DevMgrError::Io(format!(
                     "open COW base {} / overlay {}: {e}",
                     base.display(),
@@ -737,7 +746,7 @@ mod tests {
 
         // Shipped path -> COW over the real disk.
         let (mut backend, kind) =
-            resolve_block_backend(&overlay_dir, "_disk0", "/capture/guest.raw", 2).unwrap();
+            resolve_block_backend(&overlay_dir, "_disk0", "/capture/guest.raw", 2, false).unwrap();
         assert_eq!(kind, BlockBacking::ShippedCow, "shipped disk must select COW");
 
         // Reads return the REAL disk content (a zero overlay would return 0x00 —
@@ -762,7 +771,7 @@ mod tests {
 
         // No shipped disk -> zero overlay fallback (unwritten reads return zero).
         let (mut zero, zkind) =
-            resolve_block_backend(&overlay_dir, "_disk1", "/capture/seed.img", 2).unwrap();
+            resolve_block_backend(&overlay_dir, "_disk1", "/capture/seed.img", 2, false).unwrap();
         assert_eq!(zkind, BlockBacking::ZeroOverlay, "absent disk falls back to zero overlay");
         zero.read_at(0, &mut buf).unwrap();
         assert!(buf.iter().all(|&b| b == 0), "zero-overlay reads return zero");
