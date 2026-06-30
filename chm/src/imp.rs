@@ -1274,7 +1274,7 @@ fn resume_smp(
         if external_stop {
             match collect_checkpoint(&captured_rx, &prepared, &snap, num_irq, n) {
                 Ok(state) => {
-                    match checkpoint::write_checkpoint(dir, &state, &prepared.guest_mem, &snap.mem_mappings) {
+                    match checkpoint::write_checkpoint(dir, &state, &prepared.guest_mem, &snap.mem_mappings, "connect") {
                         Ok(()) => {
                             if !args.quiet {
                                 eprintln!("\nchm: suspended — checkpoint saved (resume to continue).");

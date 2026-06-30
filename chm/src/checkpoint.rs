@@ -29,14 +29,50 @@
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::process;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use hypervisor::hvf::checkpoint::{CHECKPOINT_VERSION, CheckpointState};
 use hypervisor::hvf::rehydrate::MemMapping;
 use hypervisor::hvf::virtio::GuestMemory;
+use serde::{Deserialize, Serialize};
 
 const CHECKPOINT_SUBDIR: &str = ".chm-checkpoint";
 const MANIFEST: &str = "checkpoint.json";
 const MEMORY_RANGES: &str = "memory-ranges";
+
+/// On-disk manifest version for the lineage header (independent of the
+/// hardware [`CheckpointState`] version).
+const REVISION_MANIFEST_VERSION: u32 = 1;
+
+/// A committed revision: the lineage header plus the captured hardware state.
+///
+/// The header is the spine of the fork/lineage model (see
+/// `docs/gimbal-local-fork-model.md`): every checkpoint records the revision it
+/// descends from, so a sandbox's suspends form a chain and forks form branches.
+/// Today checkpoints are HEAD-only (each suspend overwrites the previous), but
+/// the `parent` pointer is preserved so the graph's depth and origin are
+/// addressable now and a full revision store is an additive change later.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct Revision {
+    /// Manifest format version.
+    pub manifest_version: u32,
+    /// This revision's stable id.
+    pub id: String,
+    /// The revision this descends from (the previous HEAD), or `None` when it is
+    /// rooted directly on the base image.
+    pub parent: Option<String>,
+    /// The base image (snapshot directory name) this revision deltas.
+    pub base_image: String,
+    /// Capture time, Unix epoch milliseconds.
+    pub created_at_ms: u64,
+    /// What produced it (e.g. `"connect"` or `"daemon"`).
+    pub origin: String,
+    /// Optional human label/message.
+    pub label: Option<String>,
+    /// The captured live hardware state (vCPU + GIC).
+    pub state: CheckpointState,
+}
 
 /// The checkpoint directory for a snapshot.
 pub(crate) fn checkpoint_dir(snapshot_dir: &Path) -> PathBuf {
@@ -54,39 +90,80 @@ pub(crate) fn has_checkpoint(snapshot_dir: &Path) -> bool {
         && memory_ranges_path(snapshot_dir).is_file()
 }
 
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Mint a revision id that sorts by creation time and is unique enough for the
+/// local store (millisecond timestamp + this process's low pid bits).
+fn mint_revision_id(created_at_ms: u64) -> String {
+    format!("rev-{created_at_ms:013}-{:04x}", process::id() & 0xffff)
+}
+
 /// Remove any checkpoint so the next start cold-boots from the parent snapshot.
 pub(crate) fn clear_checkpoint(snapshot_dir: &Path) {
     let _ = fs::remove_dir_all(checkpoint_dir(snapshot_dir));
 }
 
-/// Read a checkpoint's hardware state, rejecting an incompatible version.
-pub(crate) fn read_checkpoint(snapshot_dir: &Path) -> Result<CheckpointState, String> {
+/// Read a revision's full manifest (lineage header + hardware state).
+pub(crate) fn read_revision(snapshot_dir: &Path) -> Result<Revision, String> {
     let path = checkpoint_dir(snapshot_dir).join(MANIFEST);
     let body = fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let state: CheckpointState =
+    let rev: Revision =
         serde_json::from_str(&body).map_err(|e| format!("parse {}: {e}", path.display()))?;
-    if state.version != CHECKPOINT_VERSION {
+    if rev.state.version != CHECKPOINT_VERSION {
         return Err(format!(
             "checkpoint version {} is not the supported version {} \
              (delete {} to cold-boot)",
-            state.version,
+            rev.state.version,
             CHECKPOINT_VERSION,
             checkpoint_dir(snapshot_dir).display()
         ));
     }
-    Ok(state)
+    Ok(rev)
 }
 
-/// Write a checkpoint atomically: dump live guest RAM into the parent's
-/// memory-region layout, then the small hardware-state manifest. The whole
-/// checkpoint is staged in a sibling `.tmp` directory and renamed into place so a
-/// crash mid-write never leaves a half-written checkpoint a resume would trust.
+/// Read just the hardware state to resume from (the lineage header is metadata).
+pub(crate) fn read_checkpoint(snapshot_dir: &Path) -> Result<CheckpointState, String> {
+    Ok(read_revision(snapshot_dir)?.state)
+}
+
+/// Write a revision atomically: dump live guest RAM into the parent's
+/// memory-region layout, then the manifest (lineage header + hardware state).
+/// The whole revision is staged in a sibling `.tmp` directory and renamed into
+/// place so a crash mid-write never leaves a half-written checkpoint a resume
+/// would trust. The new revision's `parent` is the previous HEAD's id, so the
+/// lineage chain is preserved even though only HEAD is kept on disk today.
 pub(crate) fn write_checkpoint(
     snapshot_dir: &Path,
     state: &CheckpointState,
     guest_mem: &GuestMemory,
     mem_mappings: &[MemMapping],
+    origin: &str,
 ) -> Result<(), String> {
+    // The current HEAD (if any) becomes this revision's parent.
+    let parent = read_revision(snapshot_dir).ok().map(|r| r.id);
+    let created_at_ms = now_ms();
+    let base_image = snapshot_dir
+        .file_name()
+        .map_or_else(
+            || snapshot_dir.display().to_string(),
+            |s| s.to_string_lossy().into_owned(),
+        );
+    let revision = Revision {
+        manifest_version: REVISION_MANIFEST_VERSION,
+        id: mint_revision_id(created_at_ms),
+        parent,
+        base_image,
+        created_at_ms,
+        origin: origin.to_string(),
+        label: None,
+        state: state.clone(),
+    };
+
     let dir = checkpoint_dir(snapshot_dir);
     let mut tmp = dir.clone().into_os_string();
     tmp.push(".tmp");
@@ -98,11 +175,11 @@ pub(crate) fn write_checkpoint(
     dump_guest_ram(&tmp.join(MEMORY_RANGES), guest_mem, mem_mappings)?;
 
     let json =
-        serde_json::to_string(state).map_err(|e| format!("serialize checkpoint state: {e}"))?;
+        serde_json::to_string(&revision).map_err(|e| format!("serialize revision: {e}"))?;
     fs::write(tmp.join(MANIFEST), json.as_bytes())
         .map_err(|e| format!("write {}: {e}", tmp.join(MANIFEST).display()))?;
 
-    // Swap the staged checkpoint into place.
+    // Swap the staged revision into place.
     let _ = fs::remove_dir_all(&dir);
     fs::rename(&tmp, &dir)
         .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), dir.display()))?;
@@ -163,5 +240,35 @@ mod tests {
         assert!(!has_checkpoint(&tmp));
         clear_checkpoint(&tmp);
         let _ = fs::remove_dir_all(&tmp);
+    }
+
+    #[test]
+    fn revision_manifest_carries_lineage_through_json() {
+        use hypervisor::hvf::checkpoint::CheckpointState;
+        let rev = Revision {
+            manifest_version: REVISION_MANIFEST_VERSION,
+            id: "rev-0000000000001-abcd".into(),
+            parent: Some("rev-0000000000000-abcd".into()),
+            base_image: "ubuntu-24.04".into(),
+            created_at_ms: 1,
+            origin: "daemon".into(),
+            label: Some("after apt install".into()),
+            state: CheckpointState::default(),
+        };
+        let json = serde_json::to_string(&rev).unwrap();
+        let back: Revision = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.id, "rev-0000000000001-abcd");
+        assert_eq!(back.parent.as_deref(), Some("rev-0000000000000-abcd"));
+        assert_eq!(back.base_image, "ubuntu-24.04");
+        assert_eq!(back.origin, "daemon");
+        assert_eq!(back.label.as_deref(), Some("after apt install"));
+    }
+
+    #[test]
+    fn revision_ids_sort_by_creation_time() {
+        // Zero-padded millis keep ids lexicographically ordered by time, so a
+        // lineage view can sort revisions by id.
+        assert!(mint_revision_id(1) < mint_revision_id(2));
+        assert!(mint_revision_id(999) < mint_revision_id(1000));
     }
 }
