@@ -13,7 +13,7 @@ use std::sync::Arc;
 
 use serde_json::Value;
 
-use super::block::{BlockDevice, FileBackend};
+use super::block::{BlockBackend, BlockDevice, FileBackend, OverlayBackend};
 use super::net::{EchoResponder, NetDevice};
 use super::pci::{Backend, RestoreParams, VirtioPciDevice, CAPABILITY_BAR_SIZE};
 use super::queue::Queue;
@@ -423,31 +423,10 @@ pub fn build_device(
             disk_path,
             nsectors,
         } => {
-            // Prefer a real disk image shipped alongside the snapshot at
-            // `<snapshot>/disks/<device-name>.raw`. CH snapshots reference their
-            // disks by host path and do not embed them, so a snapshot packaged
-            // WITH its disks lets the guest read its real filesystem (and boot
-            // for real) rather than the zero-filled overlay. The shipped image
-            // is opened read-write directly (it is a per-snapshot copy, so guest
-            // writes are local and do not touch the capture source). Absent a
-            // shipped image, fall back to the sparse zero overlay (the data path
-            // still completes; reads of unwritten sectors return zero).
-            let backing = match shipped_backing(overlay_dir, &desc.name) {
-                Some(real) => real,
-                None => {
-                    let overlay = overlay_dir.join(sanitize(&format!(
-                        "{}-{}",
-                        desc.name,
-                        file_stem(disk_path)
-                    )));
-                    ensure_overlay(&overlay, *nsectors)?;
-                    overlay
-                }
-            };
-            let fb = FileBackend::open(&backing, *nsectors)
-                .map_err(|e| DevMgrError::Io(format!("open backing {}: {e}", backing.display())))?;
+            let (backend, _backing) =
+                resolve_block_backend(overlay_dir, &desc.name, disk_path, *nsectors)?;
             (
-                Backend::Block(BlockDevice::new(Box::new(fb), &desc.name)),
+                Backend::Block(BlockDevice::new(backend, &desc.name)),
                 blk_device_config(*nsectors),
             )
         }
@@ -488,6 +467,60 @@ pub fn build_device(
         },
     ));
     Ok((desc.bar_base, CAPABILITY_BAR_SIZE, dev))
+}
+
+/// Which host backing a virtio-blk device resolved to. Surfaced so the wiring
+/// (and its tests) can reason about whether a snapshot shipped its real disk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BlockBacking {
+    /// A real shipped disk, opened as an immutable base with guest writes
+    /// redirected to a fresh per-run copy-on-write overlay.
+    ShippedCow,
+    /// No shipped disk: a sparse zero-filled overlay (unwritten reads return 0).
+    ZeroOverlay,
+}
+
+/// Resolve the host-side block backend for a device.
+///
+/// Prefers a real disk image shipped alongside the snapshot at
+/// `<snapshot>/disks/<device-name>.raw`. CH snapshots reference their disks by
+/// host path and do not embed them, so a snapshot packaged WITH its disks lets
+/// the guest read its real filesystem (and do post-resume I/O) rather than a
+/// zero-filled overlay.
+///
+/// A shipped image is treated as an **immutable base**: writes go to a fresh
+/// per-run copy-on-write overlay (see [`OverlayBackend`]). That keeps every
+/// resume consistent with the snapshot's restored RAM, so rehydration is
+/// repeatable and never drifts the base into the ext4 metadata-mismatch / EIO
+/// failure mode. Absent a shipped image, fall back to a sparse zero overlay (the
+/// data path still completes; reads of unwritten sectors return zero).
+pub(crate) fn resolve_block_backend(
+    overlay_dir: &std::path::Path,
+    dev_name: &str,
+    disk_path: &str,
+    nsectors: u64,
+) -> Result<(Box<dyn BlockBackend>, BlockBacking), DevMgrError> {
+    match shipped_backing(overlay_dir, dev_name) {
+        Some(base) => {
+            let overlay = overlay_dir.join(sanitize(&format!("{dev_name}-cow.raw")));
+            let ob = OverlayBackend::open(&base, &overlay, nsectors).map_err(|e| {
+                DevMgrError::Io(format!(
+                    "open COW base {} / overlay {}: {e}",
+                    base.display(),
+                    overlay.display()
+                ))
+            })?;
+            Ok((Box::new(ob), BlockBacking::ShippedCow))
+        }
+        None => {
+            let overlay =
+                overlay_dir.join(sanitize(&format!("{dev_name}-{}", file_stem(disk_path))));
+            ensure_overlay(&overlay, nsectors)?;
+            let fb = FileBackend::open(&overlay, nsectors)
+                .map_err(|e| DevMgrError::Io(format!("open backing {}: {e}", overlay.display())))?;
+            Ok((Box::new(fb), BlockBacking::ZeroOverlay))
+        }
+    }
 }
 
 /// Resolve a real disk image shipped alongside the snapshot for `dev_name`.
@@ -676,5 +709,64 @@ mod tests {
 
         // Absent node -> None (a polling guest still works without it).
         assert!(parse_serial_state(r#"{"snapshots":{}}"#).is_none());
+    }
+
+    /// The disk-backing selection is the heart of the post-resume I/O fix: when a
+    /// snapshot ships its real disk, the guest must read that disk's content
+    /// through a copy-on-write overlay (so the base stays pristine and resumes
+    /// stay repeatable); when no disk is shipped it falls back to a zero overlay.
+    /// This guards both halves of that wiring so a future change cannot silently
+    /// regress to the zero-overlay-only behaviour that caused ext4/EIO failures.
+    #[test]
+    fn resolve_block_backend_prefers_shipped_disk_as_cow() {
+        use std::io::Write;
+
+        let root = std::env::temp_dir().join(format!("chm-resolve-cow-{}", std::process::id()));
+        let overlay_dir = root.join(".chm-overlays");
+        let disks_dir = root.join("disks");
+        std::fs::create_dir_all(&overlay_dir).unwrap();
+        std::fs::create_dir_all(&disks_dir).unwrap();
+
+        // Ship a 2-sector disk for `_disk0`: sector 0 = 0xC0, sector 1 = 0xC1.
+        let sector = 512usize;
+        let mut base = vec![0xC0u8; sector];
+        base.extend(std::iter::repeat(0xC1u8).take(sector));
+        let base_path = disks_dir.join("_disk0.raw");
+        std::fs::File::create(&base_path).unwrap().write_all(&base).unwrap();
+        let base_sha_before = std::fs::read(&base_path).unwrap();
+
+        // Shipped path -> COW over the real disk.
+        let (mut backend, kind) =
+            resolve_block_backend(&overlay_dir, "_disk0", "/capture/guest.raw", 2).unwrap();
+        assert_eq!(kind, BlockBacking::ShippedCow, "shipped disk must select COW");
+
+        // Reads return the REAL disk content (a zero overlay would return 0x00 —
+        // this is precisely the bug that produced ext4 checksum failures / EIO).
+        let mut buf = [0u8; 512];
+        backend.read_at(0, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0xC0), "sector 0 reads the shipped disk");
+        backend.read_at(512, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0xC1), "sector 1 reads the shipped disk");
+
+        // Writes are visible within the run but isolated to the overlay.
+        backend.write_at(0, &[0x99u8; 512]).unwrap();
+        backend.read_at(0, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0x99), "write is visible to the guest");
+        backend.flush().unwrap();
+        drop(backend);
+        assert_eq!(
+            base_sha_before,
+            std::fs::read(&base_path).unwrap(),
+            "the shipped base image must never be mutated by guest writes"
+        );
+
+        // No shipped disk -> zero overlay fallback (unwritten reads return zero).
+        let (mut zero, zkind) =
+            resolve_block_backend(&overlay_dir, "_disk1", "/capture/seed.img", 2).unwrap();
+        assert_eq!(zkind, BlockBacking::ZeroOverlay, "absent disk falls back to zero overlay");
+        zero.read_at(0, &mut buf).unwrap();
+        assert!(buf.iter().all(|&b| b == 0), "zero-overlay reads return zero");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
