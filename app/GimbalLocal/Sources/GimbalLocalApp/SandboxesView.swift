@@ -168,11 +168,15 @@ private struct SandboxCard: View {
                     } label: {
                         Label("Start", systemImage: "play.fill")
                     }
+                    .disabled(isLive)
+
                     Button {
                         model.stop(sandbox)
                     } label: {
                         Label("Stop", systemImage: "stop.fill")
                     }
+                    .disabled(!isLive)
+
                     Button {
                         model.selection = .sandbox(sandbox.id)
                     } label: {
@@ -204,6 +208,10 @@ private struct SandboxCard: View {
         }
         .contentShape(Rectangle())
         .onTapGesture { model.selection = .sandbox(sandbox.id) }
+    }
+
+    private var isLive: Bool {
+        sandbox.state == .running || sandbox.state == .starting
     }
 }
 
@@ -286,9 +294,10 @@ private struct SandboxControlsCard: View {
                 Button {
                     model.startSandbox(sandbox)
                 } label: {
-                    Label("Start", systemImage: "play.fill")
+                    Label(sandbox.state == .starting ? "Starting…" : "Start", systemImage: "play.fill")
                 }
                 .buttonStyle(.borderedProminent)
+                .disabled(isLive)
 
                 Button(role: .destructive) {
                     model.stop(sandbox)
@@ -296,6 +305,7 @@ private struct SandboxControlsCard: View {
                     Label("Stop", systemImage: "stop.fill")
                 }
                 .buttonStyle(.bordered)
+                .disabled(!isLive)
 
                 Spacer()
 
@@ -307,6 +317,10 @@ private struct SandboxControlsCard: View {
                 .buttonStyle(.bordered)
             }
         }
+    }
+
+    private var isLive: Bool {
+        sandbox.state == .running || sandbox.state == .starting
     }
 
     private func uptime(_ sandbox: Sandbox) -> String {
@@ -329,29 +343,36 @@ private struct ConsoleExpander: View {
 
     var body: some View {
         GlassCard(title: "Console output", subtitle: "read-only serial stream", systemImage: "text.alignleft") {
-            DisclosureGroup(isExpanded: $expanded) {
-                VStack(alignment: .leading, spacing: 10) {
-                    HStack(spacing: 10) {
-                        StatusPill(
-                            text: model.isConsoleStreaming ? "Streaming live" : "Read-only output",
-                            systemImage: model.isConsoleStreaming ? "dot.radiowaves.left.and.right" : "eye.fill",
-                            color: model.isConsoleStreaming ? Theme.green : Theme.cyan
+            if model.hasInteractiveSession {
+                Label("This sandbox is open in a Terminal session — work in that window. The read-only stream pauses while you're connected.", systemImage: "terminal.fill")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                DisclosureGroup(isExpanded: $expanded) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        HStack(spacing: 10) {
+                            StatusPill(
+                                text: model.isConsoleStreaming ? "Streaming live" : "Read-only output",
+                                systemImage: model.isConsoleStreaming ? "dot.radiowaves.left.and.right" : "eye.fill",
+                                color: model.isConsoleStreaming ? Theme.green : Theme.cyan
+                            )
+                            Button("Refresh") { model.attachConsole() }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                            Spacer()
+                        }
+                        TerminalPane(
+                            text: model.consoleDisplayText,
+                            mode: .console(isStreaming: model.isConsoleStreaming)
                         )
-                        Button("Refresh") { model.attachConsole() }
-                            .buttonStyle(.bordered)
-                            .controlSize(.small)
-                        Spacer()
+                        .frame(minHeight: 260)
                     }
-                    TerminalPane(
-                        text: model.consoleDisplayText,
-                        mode: .console(isStreaming: model.isConsoleStreaming)
-                    )
-                    .frame(minHeight: 260)
+                    .padding(.top, 10)
+                } label: {
+                    Text(expanded ? "Hide console" : "Show console")
+                        .font(.callout.weight(.semibold))
                 }
-                .padding(.top, 10)
-            } label: {
-                Text(expanded ? "Hide console" : "Show console")
-                    .font(.callout.weight(.semibold))
             }
         }
     }

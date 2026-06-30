@@ -35,6 +35,8 @@ final class AppModel: ObservableObject {
     @Published var selection: SidebarItem? = .sandboxesHome
     @Published var storedSandboxes: [StoredSandbox] = []
     @Published var activeLocalSandboxID: String?
+    @Published var startingSandboxID: String?
+    @Published var interactiveSandboxID: String?
     @Published var welcomeDismissed = UserDefaults.standard.bool(forKey: "gimbal.welcomeDismissed")
 
     private let chm = ChmClient()
@@ -338,21 +340,17 @@ final class AppModel: ObservableObject {
 
     // MARK: - Sandbox instances
 
-    /// Live sandboxes, derived from the persisted instances plus the engine
-    /// status. Because the local engine runs one VM at a time, at most one
-    /// sandbox is `.running` (the one we last started); the rest are `.stopped`.
+    /// Live sandboxes, derived from the persisted instances plus runtime state.
+    /// Three signals drive a sandbox's state: an in-flight start
+    /// (`startingSandboxID`), an open interactive terminal session
+    /// (`interactiveSandboxID`, which the daemon can't see because `chm connect`
+    /// takes over the VM in its own process), and the daemon's reported status
+    /// for the active local sandbox. Because the local engine runs one VM at a
+    /// time, at most one sandbox is live.
     var sandboxes: [Sandbox] {
         storedSandboxes.map { stored in
+            let state = liveState(for: stored.id)
             let isActive = stored.id == activeLocalSandboxID
-            let state: Sandbox.State
-            switch (isActive, status.state) {
-            case (true, .running):
-                state = .running
-            case (true, .stopped):
-                state = status.reason != nil ? .failed : .stopped
-            default:
-                state = .stopped
-            }
             return Sandbox(
                 id: stored.id,
                 name: stored.name,
@@ -361,9 +359,34 @@ final class AppModel: ObservableObject {
                 state: state,
                 uptimeSeconds: isActive ? status.uptimeSeconds : nil,
                 consoleBytes: isActive ? status.consoleBytes : nil,
-                reason: isActive ? status.reason : nil
+                reason: (isActive && state == .failed) ? status.reason : nil
             )
         }
+    }
+
+    private func liveState(for id: String) -> Sandbox.State {
+        if id == interactiveSandboxID {
+            return .running
+        }
+        if id == startingSandboxID {
+            return .starting
+        }
+        guard id == activeLocalSandboxID else {
+            return .stopped
+        }
+        switch status.state {
+        case .running:
+            return .running
+        case .stopped:
+            return status.reason != nil ? .failed : .stopped
+        case .idle, .disconnected, .unknown:
+            return .stopped
+        }
+    }
+
+    /// Is there already a live local sandbox occupying the single VM slot?
+    var hasLiveLocalSandbox: Bool {
+        sandboxes.contains { $0.state == .running || $0.state == .starting }
     }
 
     func sandbox(id: String) -> Sandbox? {
@@ -374,10 +397,11 @@ final class AppModel: ObservableObject {
         snapshots.first { $0.name == name }
     }
 
-    /// Create a new sandbox instance from a snapshot image and focus it. Names
-    /// are made unique so several sandboxes can come from the same image.
+    /// Create a new sandbox instance from a snapshot image and focus it, without
+    /// starting it. Names are made unique so several sandboxes can come from the
+    /// same image. Returns the created sandbox (its live state is derived).
     @discardableResult
-    func newSandbox(fromSnapshotNamed name: String) -> Sandbox? {
+    func createSandbox(fromSnapshotNamed name: String) -> Sandbox? {
         guard let snapshot = snapshot(named: name) else {
             appendLog("cannot create sandbox: snapshot \(name) not in library")
             return nil
@@ -402,8 +426,22 @@ final class AppModel: ObservableObject {
         return sandbox(id: stored.id)
     }
 
+    /// Create a sandbox and immediately auto-start it (the "New sandbox" action).
+    @discardableResult
+    func newSandbox(fromSnapshotNamed name: String) -> Sandbox? {
+        guard let created = createSandbox(fromSnapshotNamed: name) else { return nil }
+        startSandbox(created)
+        return created
+    }
+
     func startSandbox(_ sandbox: Sandbox) {
+        guard liveState(for: sandbox.id) != .running, liveState(for: sandbox.id) != .starting else {
+            appendLog("\(sandbox.name) is already running")
+            return
+        }
         activeLocalSandboxID = sandbox.id
+        startingSandboxID = sandbox.id
+        interactiveSandboxID = nil
         consoleText = ""
         recordRecentActivity(sandbox.snapshotName)
         Task {
@@ -416,25 +454,37 @@ final class AppModel: ObservableObject {
             } catch {
                 appendLog("start failed: \(error.localizedDescription)")
             }
+            if startingSandboxID == sandbox.id {
+                startingSandboxID = nil
+            }
         }
     }
 
     /// Open an interactive terminal *inside* the sandbox — the primary way to
-    /// work in a sandbox (vs. only viewing its console).
+    /// work in a sandbox. `chm connect` takes over the local VM slot in its own
+    /// process, so we mark the sandbox interactive here (the daemon can't report
+    /// it) and keep it shown as running until the user stops it.
     func connect(to sandbox: Sandbox) {
         guard let snapshot = snapshot(named: sandbox.snapshotName) else {
             appendLog("cannot connect: snapshot \(sandbox.snapshotName) not in library")
             return
         }
         activeLocalSandboxID = sandbox.id
+        startingSandboxID = nil
+        interactiveSandboxID = sandbox.id
+        // `chm connect` stops the daemon-run VM and takes over; drop our
+        // read-only console stream so the two don't fight over the slot.
+        consoleProcess?.terminate()
+        consoleProcess = nil
         Task {
             do {
                 try openInteractiveTerminal(for: snapshot)
                 appendLog("opened interactive terminal for \(sandbox.name)")
-                try? await Task.sleep(for: .milliseconds(500))
-                await refreshLocal()
             } catch {
                 appendLog("terminal connect failed: \(error.localizedDescription)")
+                if interactiveSandboxID == sandbox.id {
+                    interactiveSandboxID = nil
+                }
             }
         }
     }
@@ -447,9 +497,9 @@ final class AppModel: ObservableObject {
             } catch {
                 appendLog("stop failed: \(error.localizedDescription)")
             }
-            if activeLocalSandboxID == sandbox.id {
-                activeLocalSandboxID = nil
-            }
+            if activeLocalSandboxID == sandbox.id { activeLocalSandboxID = nil }
+            if startingSandboxID == sandbox.id { startingSandboxID = nil }
+            if interactiveSandboxID == sandbox.id { interactiveSandboxID = nil }
             consoleProcess?.terminate()
             consoleProcess = nil
             await refreshLocal()
@@ -457,7 +507,7 @@ final class AppModel: ObservableObject {
     }
 
     func deleteSandbox(_ sandbox: Sandbox) {
-        if activeLocalSandboxID == sandbox.id {
+        if activeLocalSandboxID == sandbox.id || interactiveSandboxID == sandbox.id {
             stop(sandbox)
         }
         storedSandboxes.removeAll { $0.id == sandbox.id }
@@ -571,5 +621,12 @@ final class AppModel: ObservableObject {
 
     var isConsoleStreaming: Bool {
         consoleProcess != nil && status.state == .running
+    }
+
+    /// True while a sandbox is being worked in via an interactive Terminal
+    /// session (`chm connect`), whose console lives in Terminal.app rather than
+    /// the app's read-only stream.
+    var hasInteractiveSession: Bool {
+        interactiveSandboxID != nil
     }
 }
