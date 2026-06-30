@@ -7,6 +7,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
+use std::env;
 
 const DEFAULT_PROJECT: &str = "cloud-hypervisor-mac";
 const DEFAULT_INSTANCE_TYPE: &str = "c7g.metal";
@@ -511,7 +512,7 @@ fn cleanup_aws(mut args: AwsArgs) -> ExitCode {
     }
 
     match run_status_code(&mut cmd) {
-        Ok(code) if code == 0 => ExitCode::SUCCESS,
+        Ok(0) => ExitCode::SUCCESS,
         Ok(code) => ExitCode::from(code as u8),
         Err(e) => {
             eprintln!("chm cloud: {e}");
@@ -546,20 +547,20 @@ fn apply_config(args: &mut AwsArgs) -> Result<(), String> {
     if args.bucket.is_none() {
         args.bucket = cfg.bucket;
     }
-    if args.project == DEFAULT_PROJECT {
-        if let Some(project) = cfg.project {
-            args.project = project;
-        }
+    if args.project == DEFAULT_PROJECT
+        && let Some(project) = cfg.project
+    {
+        args.project = project;
     }
-    if args.instance_type == DEFAULT_INSTANCE_TYPE {
-        if let Some(instance_type) = cfg.instance_type {
-            args.instance_type = instance_type;
-        }
+    if args.instance_type == DEFAULT_INSTANCE_TYPE
+        && let Some(instance_type) = cfg.instance_type
+    {
+        args.instance_type = instance_type;
     }
-    if args.prefix == DEFAULT_PREFIX {
-        if let Some(prefix) = cfg.prefix {
-            args.prefix = prefix;
-        }
+    if args.prefix == DEFAULT_PREFIX
+        && let Some(prefix) = cfg.prefix
+    {
+        args.prefix = prefix;
     }
     args.prefix = normalized_prefix(&args.prefix);
     Ok(())
@@ -615,7 +616,7 @@ fn load_config() -> Result<Option<AwsConfig>, String> {
 }
 
 fn config_path() -> Result<PathBuf, String> {
-    let home = std::env::var_os("HOME").ok_or("HOME is not set")?;
+    let home = env::var_os("HOME").ok_or("HOME is not set")?;
     Ok(PathBuf::from(home)
         .join("Library")
         .join("Application Support")
