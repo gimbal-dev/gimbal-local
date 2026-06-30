@@ -25,12 +25,10 @@ Related, outside this directory:
 - Code: [`../chm/`](../chm/) (CLI/daemon), `../hypervisor/src/hvf/` (the HVF
   backend), and [`../app/GimbalLocal/`](../app/GimbalLocal/) (the desktop app).
 
-## Upstream Cloud Hypervisor reference
+## A note on the upstream VMM
 
-Every other file in this directory is upstream Cloud Hypervisor documentation,
-kept verbatim so the fork stays a useful reference for the underlying VMM,
-its device model, and the Linux/KVM features that the snapshot-capture path
-relies on (`cpu.md`, `memory.md`, `snapshot_restore.md`, `vfio.md`, `iommu.md`,
-`tracing.md`, `windows.md`, and so on). These describe the general
-KVM/MSHV VMM, not the macOS port. The original upstream project README is
-preserved at [`../README.upstream.md`](../README.upstream.md).
+This is a fork of Cloud Hypervisor. The Linux/KVM VMM crates (`vmm`,
+`virtio-devices`, `pci`, `devices`, …) are not part of the macOS product — they
+exist only to build the patched `cloud-hypervisor` binary used to *capture*
+HVF-compatible snapshots (see [`../scripts/hvf/`](../scripts/hvf/)). You do not
+need to read or touch them to work on the macOS port.

@@ -163,16 +163,11 @@ The macOS product is small and self-contained: `chm` depends only on the
 **no** local-crate dependencies. None of the upstream VMM crates (`vmm`,
 `virtio-devices`, `vhost_*`, `pci`, …) are compiled into `chm` or the app.
 
-Those upstream crates are kept in the tree for two reasons: they build the
+Those upstream crates are kept in the tree for one reason: they build the
 patched Linux `cloud-hypervisor` binary used to **capture** HVF-compatible
 snapshots (the `CH_GIC_V2M` message-SPI patch; see
-[`scripts/hvf/`](scripts/hvf/)), and they remain the device-model substrate that
-later phases can draw from. If you are here for the macOS port, you only need
-`chm/`, `hypervisor/src/hvf/`, and `app/GimbalLocal/`.
-
-The original upstream project README — covering the general KVM/MSHV VMM, its
-device model, and full documentation under [`docs/`](docs/) — is preserved
-verbatim at **[`README.upstream.md`](README.upstream.md)**.
+[`scripts/hvf/`](scripts/hvf/)). If you are here for the macOS port, you only
+need `chm/`, `hypervisor/src/hvf/`, and `app/GimbalLocal/`.
 
 ## License
 
