@@ -15,6 +15,9 @@ struct ContentView: View {
             Dashboard()
         }
         .tint(Theme.cyan)
+        .safeAreaInset(edge: .bottom, spacing: 0) {
+            EngineStatusBar()
+        }
         .toolbar {
             ToolbarItemGroup {
                 Button {
@@ -62,64 +65,9 @@ private struct Sidebar: View {
                         EmptySidebarState()
                     }
                 }
-
-                Section("System health") {
-                    CompactStatusRow(title: "Local engine", subtitle: localDaemonSubtitle, systemImage: "heart.fill", color: localDaemonColor)
-                    CompactStatusRow(title: "Control plane", subtitle: cloudSubtitle, systemImage: "cloud.fill", color: cloudColor)
-                }
-
-                Section("Advanced") {
-                    DisclosureGroup("Runtime paths") {
-                        SettingsFields()
-                    }
-                }
             }
             .scrollContentBackground(.hidden)
             .navigationTitle("Gimbal")
-        }
-    }
-
-    private var localDaemonSubtitle: String {
-        switch model.status.state {
-        case .disconnected:
-            return "not reachable"
-        case .idle:
-            return "ready"
-        case .running:
-            return "sandbox running"
-        case .stopped:
-            return "last sandbox stopped"
-        case .unknown:
-            return "unknown"
-        }
-    }
-
-    private var localDaemonColor: Color {
-        switch model.status.state {
-        case .running:
-            return Theme.green
-        case .idle, .stopped:
-            return Theme.cyan
-        case .disconnected, .unknown:
-            return Theme.orange
-        }
-    }
-
-    private var cloudSubtitle: String {
-        switch model.cloud.state {
-        case .online:
-            return "gctl online"
-        case .offline:
-            return "optional"
-        }
-    }
-
-    private var cloudColor: Color {
-        switch model.cloud.state {
-        case .online:
-            return Theme.green
-        case .offline:
-            return Theme.purple
         }
     }
 }
@@ -211,63 +159,6 @@ private struct EmptySidebarState: View {
     }
 }
 
-private struct CompactStatusRow: View {
-    let title: String
-    let subtitle: String
-    let systemImage: String
-    let color: Color
-
-    var body: some View {
-        HStack(spacing: 10) {
-            Image(systemName: systemImage)
-                .foregroundStyle(color)
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                Text(subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-    }
-}
-
-private struct SettingsFields: View {
-    @EnvironmentObject private var model: AppModel
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
-            PrettyTextField(title: "chm", text: $model.settings.chmPath, placeholder: "target/debug/chm")
-            PrettyTextField(title: "Library", text: $model.settings.libraryPath, placeholder: "snapshots")
-            PrettyTextField(title: "Socket", text: $model.settings.socketPath, placeholder: "/tmp/chm.sock")
-            PrettyTextField(
-                title: "Control plane",
-                text: $model.settings.controlPlaneURL,
-                placeholder: "http://127.0.0.1:8080"
-            )
-        }
-        .padding(.vertical, 4)
-    }
-}
-
-private struct PrettyTextField: View {
-    let title: String
-    @Binding var text: String
-    let placeholder: String
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
-            Text(title.uppercased())
-                .font(.system(size: 10, weight: .bold))
-                .foregroundStyle(.secondary)
-            TextField(placeholder, text: $text)
-                .textFieldStyle(.plain)
-                .font(.system(.caption, design: .monospaced))
-                .padding(8)
-                .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 9, style: .continuous))
-        }
-    }
-}
-
 private struct Dashboard: View {
     @EnvironmentObject private var model: AppModel
 
@@ -279,7 +170,6 @@ private struct Dashboard: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 20) {
                     Hero()
-                    HealthStrip()
 
                     HStack(alignment: .top, spacing: 16) {
                         SnapshotCard()
@@ -395,78 +285,6 @@ private struct Hero: View {
     }
 }
 
-private struct HealthStrip: View {
-    @EnvironmentObject private var model: AppModel
-
-    var body: some View {
-        HStack(spacing: 12) {
-            HealthPill(title: "Local engine", detail: localDetail, color: localColor, systemImage: "cpu")
-            HealthPill(title: "Library", detail: "\(model.snapshots.count) sandbox\(model.snapshots.count == 1 ? "" : "es")", color: Theme.cyan, systemImage: "square.stack.3d.up")
-            HealthPill(title: "Control plane", detail: cloudDetail, color: cloudColor, systemImage: "cloud")
-            Spacer()
-        }
-    }
-
-    private var localDetail: String {
-        switch model.status.state {
-        case .disconnected:
-            return "starting or offline"
-        case .running:
-            return "sandbox running"
-        case .idle, .stopped:
-            return "ready"
-        case .unknown:
-            return "unknown"
-        }
-    }
-
-    private var localColor: Color {
-        model.status.state == .disconnected ? Theme.orange : Theme.green
-    }
-
-    private var cloudDetail: String {
-        switch model.cloud.state {
-        case .online:
-            return "online"
-        case .offline:
-            return "optional"
-        }
-    }
-
-    private var cloudColor: Color {
-        switch model.cloud.state {
-        case .online:
-            return Theme.green
-        case .offline:
-            return Theme.purple
-        }
-    }
-}
-
-private struct HealthPill: View {
-    let title: String
-    let detail: String
-    let color: Color
-    let systemImage: String
-
-    var body: some View {
-        HStack(spacing: 9) {
-            Image(systemName: systemImage)
-                .foregroundStyle(color)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title)
-                    .font(.caption.weight(.bold))
-                Text(detail)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(.horizontal, 13)
-        .padding(.vertical, 9)
-        .background(.ultraThinMaterial, in: Capsule())
-    }
-}
-
 private struct OrbitalBadge: View {
     var body: some View {
         ZStack {
@@ -493,48 +311,6 @@ private struct OrbitalBadge: View {
                 .frame(width: 11, height: 11)
                 .offset(x: -62, y: 42)
         }
-    }
-}
-
-private struct RuntimeCard: View {
-    @EnvironmentObject private var model: AppModel
-
-    var body: some View {
-        GlassCard(title: "Local runtime", subtitle: "chm serve", systemImage: "desktopcomputer") {
-            HStack(spacing: 12) {
-                BigMetric(title: "Daemon", value: daemonBadge, color: daemonColor)
-                BigMetric(title: "Snapshots", value: "\(model.snapshots.count)", color: Theme.cyan)
-            }
-
-            Divider().opacity(0.35)
-
-            MetricRow(label: "Socket", value: model.settings.socketPath)
-            MetricRow(label: "Library", value: model.settings.libraryPath)
-
-            HStack {
-                Button("Start") {
-                    model.startDaemon()
-                }
-                .buttonStyle(.borderedProminent)
-
-                Button("Shutdown", role: .destructive) {
-                    model.shutdownDaemon()
-                }
-                .buttonStyle(.bordered)
-            }
-            .padding(.top, 4)
-        }
-    }
-
-    private var daemonBadge: String {
-        if model.daemonPID != nil {
-            return "Managed"
-        }
-        return model.status.state == .disconnected ? "Offline" : "Online"
-    }
-
-    private var daemonColor: Color {
-        model.status.state == .disconnected ? Theme.orange : Theme.green
     }
 }
 
@@ -917,13 +693,95 @@ private struct MetricRow: View {
     }
 }
 
-private enum Theme {
+struct StatusDot: View {
+    let color: Color
+    var size: CGFloat = 9
+
+    var body: some View {
+        Circle()
+            .fill(color)
+            .frame(width: size, height: size)
+            .overlay {
+                Circle().stroke(.white.opacity(0.35), lineWidth: 0.5)
+            }
+            .shadow(color: color.opacity(0.7), radius: 3)
+    }
+}
+
+private struct EngineStatusBar: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        let engine = model.engineIndicator
+        HStack(spacing: 10) {
+            StatusDot(color: Theme.color(for: engine.tone))
+            Text(engine.label)
+                .font(.caption.weight(.semibold))
+            Text(engine.detail)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+
+            Spacer(minLength: 12)
+
+            if model.isRefreshing {
+                ProgressView()
+                    .controlSize(.small)
+                    .padding(.trailing, 2)
+            }
+
+            HStack(spacing: 6) {
+                StatusDot(color: cloudColor, size: 7)
+                Text(cloudLabel)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+
+            SettingsLink {
+                Image(systemName: "slider.horizontal.3")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Engine settings")
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(.bar)
+        .overlay(alignment: .top) { Divider() }
+    }
+
+    private var cloudLabel: String {
+        switch model.cloud.state {
+        case .online: return "Control plane online"
+        case .offline: return "Control plane optional"
+        }
+    }
+
+    private var cloudColor: Color {
+        switch model.cloud.state {
+        case .online: return Theme.green
+        case .offline: return Theme.purple
+        }
+    }
+}
+
+enum Theme {
     static let cyan = Color(red: 0.18, green: 0.78, blue: 0.96)
     static let green = Color(red: 0.25, green: 0.86, blue: 0.55)
     static let purple = Color(red: 0.62, green: 0.43, blue: 1.0)
     static let orange = Color(red: 1.0, green: 0.60, blue: 0.22)
     static let terminalText = Color(red: 0.74, green: 0.99, blue: 0.89)
     static let terminalBackground = Color(red: 0.02, green: 0.05, blue: 0.09)
+
+    static func color(for tone: EngineTone) -> Color {
+        switch tone {
+        case .active: return green
+        case .ready: return cyan
+        case .offline: return orange
+        case .unknown: return .gray
+        }
+    }
 
     static let logoGradient = LinearGradient(
         colors: [cyan, purple],

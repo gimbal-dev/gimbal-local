@@ -56,4 +56,42 @@ final class GimbalLocalAppTests: XCTestCase {
             "1 running cloud resource(s)"
         )
     }
+
+    @MainActor
+    func testEngineIndicatorReflectsSandboxState() {
+        let model = AppModel()
+
+        model.status = SandboxStatus(state: .disconnected, name: nil, uptimeSeconds: nil, consoleBytes: nil, reason: nil, message: nil)
+        XCTAssertEqual(model.engineIndicator.tone, .offline)
+
+        model.status = SandboxStatus(state: .idle, name: nil, uptimeSeconds: nil, consoleBytes: nil, reason: nil, message: nil)
+        XCTAssertEqual(model.engineIndicator.tone, .ready)
+
+        model.status = SandboxStatus(state: .stopped, name: nil, uptimeSeconds: nil, consoleBytes: nil, reason: "boom", message: nil)
+        XCTAssertEqual(model.engineIndicator.tone, .ready)
+
+        model.status = SandboxStatus(state: .running, name: "ubuntu", uptimeSeconds: 3, consoleBytes: 0, reason: nil, message: nil)
+        XCTAssertEqual(model.engineIndicator.tone, .active)
+        XCTAssertEqual(model.engineIndicator.detail, "ubuntu")
+    }
+
+    @MainActor
+    func testRecentSandboxesFloatRecentsToFront() {
+        let model = AppModel()
+        let alpha = SnapshotSummary(name: "alpha", path: "/a", vcpus: 1, ramMib: 256)
+        let bravo = SnapshotSummary(name: "bravo", path: "/b", vcpus: 2, ramMib: 512)
+        let charlie = SnapshotSummary(name: "charlie", path: "/c", vcpus: 4, ramMib: 1024)
+        model.snapshots = [alpha, bravo, charlie]
+
+        // No recents yet → fall back to library order.
+        XCTAssertEqual(model.recentSandboxes.map(\.name), ["alpha", "bravo", "charlie"])
+
+        // Recents float to the front (most-recent first); the rest follow.
+        model.recentSandboxNames = ["charlie", "alpha"]
+        XCTAssertEqual(model.recentSandboxes.map(\.name), ["charlie", "alpha", "bravo"])
+
+        // Stale names not present in the library are ignored.
+        model.recentSandboxNames = ["ghost", "bravo"]
+        XCTAssertEqual(model.recentSandboxes.map(\.name), ["bravo", "alpha", "charlie"])
+    }
 }
