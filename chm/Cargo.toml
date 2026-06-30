@@ -27,6 +27,7 @@ hypervisor = { path = "../hypervisor", default-features = false, features = [
   "kvm-snapshot",
 ] }
 libc = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

@@ -42,7 +42,8 @@ echo "e2e-microvm-loop: snapshot = $SNAP"
 echo "e2e-microvm-loop: running the boot → login → write → ls loop..."
 
 # The test copies and ad-hoc-signs the cargo-built `chm` itself, so no separate
-# signing step is needed here. `--ignored` opts the heavy test in; `--nocapture`
-# streams its progress.
+# signing step is needed here. `--ignored` opts the heavy tests in; `--nocapture`
+# streams their progress; `--test-threads=1` runs them serially so the two VMs
+# (boot loop, then suspend/resume) never contend for the single HVF slot.
 exec cargo test -p cloud-hypervisor-mac --test e2e_microvm_loop -- \
-    --ignored --nocapture --exact microvm_boots_logs_in_writes_and_lists_a_file
+    --ignored --nocapture --test-threads=1

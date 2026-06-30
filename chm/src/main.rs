@@ -29,6 +29,9 @@ mod imp;
 mod console_filter;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod checkpoint;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod console;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

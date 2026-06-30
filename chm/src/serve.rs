@@ -570,6 +570,7 @@ fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Resu
         &loaded.state_json,
         &overlay_dir,
         Some(&rvm.gic),
+        false,
     ) {
         eprintln!("chm serve: warning: virtio device model not wired: {e}");
     }
