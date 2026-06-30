@@ -11,8 +11,10 @@ struct SettingsView: View {
                 .tabItem { Label("Engine", systemImage: "cpu") }
             PathsSettingsTab()
                 .tabItem { Label("Runtime", systemImage: "folder") }
+            ControlPlaneSettingsTab()
+                .tabItem { Label("Control plane", systemImage: "cloud") }
         }
-        .frame(width: 500, height: 380)
+        .frame(width: 520, height: 400)
     }
 }
 
@@ -80,14 +82,6 @@ private struct PathsSettingsTab: View {
                 PathField(label: "Socket", text: $model.settings.socketPath, prompt: "/tmp/chm.sock")
             }
 
-            Section("Control plane") {
-                PathField(
-                    label: "Control plane URL",
-                    text: $model.settings.controlPlaneURL,
-                    prompt: "http://127.0.0.1:8080"
-                )
-            }
-
             Section {
                 Button {
                     Task { await model.refreshAll() }
@@ -96,12 +90,73 @@ private struct PathsSettingsTab: View {
                 }
                 .disabled(model.isRefreshing)
             } footer: {
-                Text("These point the app at the local runtime and the optional control plane.")
+                Text("These point the app at the local runtime.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
         }
         .formStyle(.grouped)
+    }
+}
+
+private struct ControlPlaneSettingsTab: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        Form {
+            Section("Connection") {
+                PathField(
+                    label: "Control plane URL",
+                    text: $model.settings.controlPlaneURL,
+                    prompt: "http://127.0.0.1:8080"
+                )
+                LabeledContent("Status") {
+                    HStack(spacing: 8) {
+                        StatusDot(color: cloudColor)
+                        Text(cloudLabel)
+                    }
+                }
+            }
+
+            Section("Overview") {
+                LabeledContent("Runners", value: count(model.cloud.runners))
+                LabeledContent("Snapshots", value: count(model.cloud.snapshots))
+                LabeledContent("Sandboxes", value: count(model.cloud.sandboxes))
+                LabeledContent("Cost", value: model.cloud.costSummary ?? "—")
+            }
+
+            Section {
+                Button {
+                    Task { await model.refreshAll() }
+                } label: {
+                    Label("Refresh", systemImage: "arrow.clockwise")
+                }
+                .disabled(model.isRefreshing)
+            } footer: {
+                Text("The control plane (gimbal-cloud-control) is optional. When connected it powers remote sandboxes and cost signals; the local engine works without it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .formStyle(.grouped)
+    }
+
+    private func count(_ value: Int?) -> String {
+        value.map(String.init) ?? "—"
+    }
+
+    private var cloudLabel: String {
+        switch model.cloud.state {
+        case .online: return "Online"
+        case let .offline(reason): return "Offline — \(reason)"
+        }
+    }
+
+    private var cloudColor: Color {
+        switch model.cloud.state {
+        case .online: return Theme.green
+        case .offline: return Theme.purple
+        }
     }
 }
 

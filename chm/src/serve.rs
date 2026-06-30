@@ -22,6 +22,7 @@ use std::{env, fs, thread};
 use hypervisor::hvf::rehydrate::rehydrate;
 use hypervisor::{VmExit, VmOps};
 
+use crate::console_filter::ConsoleFilter;
 use crate::imp::{build_vm_ops, its_lpi_guard, load_snapshot, wire_virtio};
 
 /// Cap the in-memory console ring so a long-lived guest cannot grow it without
@@ -577,6 +578,9 @@ fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Resu
     let mut last_output = Instant::now();
     let max = (opts.max_seconds > 0).then(|| Duration::from_secs(opts.max_seconds));
     let idle = (opts.idle_exit_secs > 0).then(|| Duration::from_secs(opts.idle_exit_secs));
+    // Drop the one documented cosmetic genirq line from the buffered console so
+    // the app's read-only stream matches the interactive session.
+    let mut console_filter = ConsoleFilter::new();
 
     let vcpu = rvm.vcpus[0].as_mut();
     // Publish a cross-thread interrupt handle so `stop` can force the vCPU out
@@ -593,10 +597,13 @@ fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Resu
             other => return Err(format!("unexpected guest exit: {other:?}")),
         }
 
-        let bytes = uart.take_output();
-        if !bytes.is_empty() {
-            append_console(inner, &bytes);
-            last_output = Instant::now();
+        let raw = uart.take_output();
+        if !raw.is_empty() {
+            let bytes = console_filter.feed(&raw);
+            if !bytes.is_empty() {
+                append_console(inner, &bytes);
+                last_output = Instant::now();
+            }
         }
 
         if let Some(max) = max

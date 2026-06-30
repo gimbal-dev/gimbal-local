@@ -94,4 +94,92 @@ final class GimbalLocalAppTests: XCTestCase {
         model.recentSandboxNames = ["ghost", "bravo"]
         XCTAssertEqual(model.recentSandboxes.map(\.name), ["bravo", "alpha", "charlie"])
     }
+
+    @MainActor
+    func testCreateSandboxFromSnapshotMakesUniqueNames() {
+        let model = AppModel()
+        model.snapshots = [SnapshotSummary(name: "ubuntu", path: "/u", vcpus: 1, ramMib: 1024)]
+
+        let first = model.createSandbox(fromSnapshotNamed: "ubuntu")
+        let second = model.createSandbox(fromSnapshotNamed: "ubuntu")
+
+        XCTAssertEqual(first?.name, "ubuntu")
+        XCTAssertEqual(second?.name, "ubuntu-2")
+        XCTAssertEqual(model.sandboxes.count, 2)
+        // Both instances share the same source image.
+        XCTAssertEqual(Set(model.sandboxes.map(\.snapshotName)), ["ubuntu"])
+        // A freshly created sandbox (not yet started) is stopped.
+        XCTAssertEqual(first.map { model.sandbox(id: $0.id)?.state }, .some(.stopped))
+    }
+
+    @MainActor
+    func testStartingSandboxIsNotRestartable() {
+        let model = AppModel()
+        model.snapshots = [SnapshotSummary(name: "ubuntu", path: "/u", vcpus: 1, ramMib: 1024)]
+        let s = model.createSandbox(fromSnapshotNamed: "ubuntu")!
+
+        // Mark a start in flight: the sandbox is "starting" and counts as live.
+        model.startingSandboxID = s.id
+        XCTAssertEqual(model.sandbox(id: s.id)?.state, .starting)
+        XCTAssertTrue(model.hasLiveLocalSandbox)
+    }
+
+    @MainActor
+    func testInteractiveSessionShowsRunningEvenWhenDaemonStopped() {
+        let model = AppModel()
+        model.snapshots = [SnapshotSummary(name: "ubuntu", path: "/u", vcpus: 1, ramMib: 1024)]
+        let s = model.createSandbox(fromSnapshotNamed: "ubuntu")!
+
+        // `chm connect` takes over the VM in its own process, so the daemon
+        // reports nothing running — but the sandbox must still read as running
+        // because the user is working inside it.
+        model.interactiveSandboxID = s.id
+        model.activeLocalSandboxID = s.id
+        model.status = SandboxStatus(state: .disconnected, name: nil, uptimeSeconds: nil, consoleBytes: nil, reason: nil, message: nil)
+
+        XCTAssertEqual(model.sandbox(id: s.id)?.state, .running)
+        XCTAssertTrue(model.hasInteractiveSession)
+    }
+
+    @MainActor
+    func testOnlyTheActiveSandboxReflectsRunningState() {
+        let model = AppModel()
+        model.snapshots = [SnapshotSummary(name: "ubuntu", path: "/u", vcpus: 1, ramMib: 1024)]
+        let a = model.createSandbox(fromSnapshotNamed: "ubuntu")!
+        let b = model.createSandbox(fromSnapshotNamed: "ubuntu")!
+
+        // Engine reports a running VM and `a` is the active instance.
+        model.activeLocalSandboxID = a.id
+        model.status = SandboxStatus(state: .running, name: "ubuntu", uptimeSeconds: 5, consoleBytes: 10, reason: nil, message: nil)
+
+        XCTAssertEqual(model.sandbox(id: a.id)?.state, .running)
+        XCTAssertEqual(model.sandbox(id: b.id)?.state, .stopped)
+        XCTAssertEqual(model.sandbox(id: a.id)?.uptimeSeconds, 5)
+
+        // A failed engine status surfaces on the active sandbox as `.failed`.
+        model.status = SandboxStatus(state: .stopped, name: "ubuntu", uptimeSeconds: nil, consoleBytes: nil, reason: "boom", message: nil)
+        XCTAssertEqual(model.sandbox(id: a.id)?.state, .failed)
+    }
+
+    func testInteractiveLivenessDecision() {
+        // Lock present + owner alive => session is still live.
+        XCTAssertFalse(InteractiveLiveness.sessionEnded(
+            lockExists: true, ownerAlive: true, lockSeen: true, pastStartDeadline: false))
+
+        // Lock present but the owning process is gone (stale SIGKILL lock) => ended.
+        XCTAssertTrue(InteractiveLiveness.sessionEnded(
+            lockExists: true, ownerAlive: false, lockSeen: true, pastStartDeadline: false))
+
+        // Lock removed after we had seen it (clean teardown / window close) => ended.
+        XCTAssertTrue(InteractiveLiveness.sessionEnded(
+            lockExists: false, ownerAlive: false, lockSeen: true, pastStartDeadline: false))
+
+        // Not seen yet and still within the start grace window => not ended (starting).
+        XCTAssertFalse(InteractiveLiveness.sessionEnded(
+            lockExists: false, ownerAlive: false, lockSeen: false, pastStartDeadline: false))
+
+        // Never appeared and the grace window elapsed => give up, treat as ended.
+        XCTAssertTrue(InteractiveLiveness.sessionEnded(
+            lockExists: false, ownerAlive: false, lockSeen: false, pastStartDeadline: true))
+    }
 }

@@ -7,7 +7,7 @@
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{self, ExitCode};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -15,6 +15,7 @@ use std::{env, fs, io, thread};
 
 use crate::cloud;
 use crate::console::{self, RawConsole};
+use crate::console_filter::ConsoleFilter;
 use crate::serve;
 
 use hypervisor::arch::aarch64::gic::Vgic;
@@ -357,6 +358,12 @@ struct Args {
     max_seconds: u64,
     idle_exit_secs: u64,
     quiet: bool,
+    /// Optional path to a session-liveness lock file. When set, the interactive
+    /// run writes its PID here on start and removes it on its (now always
+    /// graceful) teardown, so a supervising app can tell when the session ends —
+    /// including when the user simply closes the window. Set by `chm connect
+    /// --session-lock`; `None` for a plain `chm run`.
+    session_lock: Option<PathBuf>,
 }
 
 struct ConnectArgs {
@@ -455,6 +462,8 @@ fn usage() -> String {
          --socket <PATH>      For `connect`, stop any app/daemon-run VM on this\n                        \
          socket before taking the snapshot over interactively.\n    \
          --no-stop-daemon     For `connect`, do not stop a daemon-run VM first.\n    \
+         --session-lock <PATH> For `connect`, maintain a PID lock file at PATH\n                        \
+         for the life of the session (a supervising app watches it).\n    \
          -h, --help          Print this help.\n    \
          -V, --version       Print the version.\n\
      \n\
@@ -530,6 +539,7 @@ fn parse(raw: &[String]) -> Parsed {
             max_seconds,
             idle_exit_secs,
             quiet,
+            session_lock: None,
         }),
         None => Parsed::Error("missing <SNAPSHOT_DIR>".to_string()),
     }
@@ -542,6 +552,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
     let mut quiet = false;
     let mut socket_path = env::temp_dir().join("chm.sock");
     let mut no_stop_daemon = false;
+    let mut session_lock: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < raw.len() {
@@ -551,13 +562,14 @@ fn parse_connect(raw: &[String]) -> Parsed {
             "-V" | "--version" => return Parsed::Version,
             "--quiet" => quiet = true,
             "--no-stop-daemon" => no_stop_daemon = true,
-            "--socket" | "--max-seconds" | "--idle-exit" => {
+            "--socket" | "--max-seconds" | "--idle-exit" | "--session-lock" => {
                 i += 1;
                 let Some(v) = raw.get(i) else {
                     return Parsed::Error(format!("{a} requires a value"));
                 };
                 match a.as_str() {
                     "--socket" => socket_path = PathBuf::from(v),
+                    "--session-lock" => session_lock = Some(PathBuf::from(v)),
                     "--max-seconds" | "--idle-exit" => {
                         let Ok(n) = v.parse::<u64>() else {
                             return Parsed::Error(format!("{a}: `{v}` is not a number"));
@@ -591,6 +603,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
                 max_seconds,
                 idle_exit_secs,
                 quiet,
+                session_lock,
             },
             socket_path,
             no_stop_daemon,
@@ -695,6 +708,7 @@ fn run(args: &Args) -> Result<ExitCode, String> {
                  model). Use --idle-exit 0 to keep running."
             ),
             Outcome::ConsoleClosed => eprintln!("chm: console closed; stopping."),
+            Outcome::Interrupted => eprintln!("chm: session closed; VM shut down."),
         }
     }
 
@@ -706,6 +720,33 @@ enum Outcome {
     MaxSeconds,
     Idle(u64),
     ConsoleClosed,
+    Interrupted,
+}
+
+/// RAII guard for the interactive session-liveness lock file. Writes this
+/// process's PID on creation and removes the file on drop. Because every
+/// interactive exit path now returns through `resume_smp` (the `Ctrl-A x` escape
+/// and the terminating-signal handlers request a graceful shutdown rather than
+/// calling `process::exit`), this drop reliably runs, so the file's presence is
+/// an honest "session is live" signal for a supervising app. Only an uncatchable
+/// `SIGKILL` can leak it — which the PID lets the watcher detect as stale.
+struct SessionLock {
+    path: PathBuf,
+}
+
+impl SessionLock {
+    fn acquire(path: &Path) -> io::Result<Self> {
+        fs::write(path, format!("{}\n", process::id()))?;
+        Ok(Self {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+impl Drop for SessionLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
 }
 
 /// Three-state phase gate used to coordinate the SMP restore handshake between
@@ -1070,10 +1111,33 @@ fn resume_smp(
     // keystrokes into the guest's PL011 receive path, asserting the serial SPI
     // through the managed GIC. The guard restores the terminal on any exit path.
     let raw_console = RawConsole::enable();
+    // Install graceful-shutdown signal handlers now that the terminal is in raw
+    // mode: closing the window (SIGHUP) or any kill (SIGTERM/SIGINT) funnels into
+    // the same teardown as Ctrl-A x / power-off, so the HVF VM is always
+    // destroyed and the terminal restored.
+    console::install_signal_handlers(raw_console.handle());
+    // Publish a session-liveness lock (PID file) if asked. It is removed when
+    // this function returns — which now happens on EVERY interactive exit — so a
+    // supervising app can detect that the session ended, even on window close.
+    let _session_lock = args.session_lock.as_deref().and_then(|path| {
+        match SessionLock::acquire(path) {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                eprintln!(
+                    "chm: warning: could not write session lock {}: {e}",
+                    path.display()
+                );
+                None
+            }
+        }
+    });
     let serial_sink: Arc<dyn MsiSink> = Arc::new(GicMsiSink::new(prepared.gic.clone()));
     console::spawn_stdin_pump(uart.clone(), serial_sink, raw_console.handle());
     if !args.quiet {
-        eprintln!("chm: interactive console active (press Ctrl-A x to quit).\n");
+        eprintln!(
+            "chm: interactive console active — close this window or press Ctrl-A x \
+             to end the session (it shuts the VM down cleanly).\n"
+        );
     }
 
     // --- phase 4 go: release the vCPU threads to run the guest ---
@@ -1129,15 +1193,31 @@ fn run_console(
     let start = Instant::now();
     let mut last_output = Instant::now();
     let mut stdout = io::stdout();
+    let mut filter = ConsoleFilter::new();
 
     let max = (args.max_seconds > 0).then(|| Duration::from_secs(args.max_seconds));
     let idle = (args.idle_exit_secs > 0).then(|| Duration::from_secs(args.idle_exit_secs));
 
     while running.load(Ordering::Acquire) {
-        let bytes = uart.take_output();
-        if bytes.is_empty() {
+        // A terminating signal (window close / kill) or the Ctrl-A x escape asks
+        // the session to end: return so run() runs the graceful VM teardown.
+        if console::shutdown_requested() {
+            let tail = filter.flush();
+            if !tail.is_empty() {
+                let _ = stdout.write_all(&tail).and_then(|()| stdout.flush());
+            }
+            return Ok(Outcome::Interrupted);
+        }
+        let raw = uart.take_output();
+        if raw.is_empty() {
             thread::sleep(Duration::from_millis(5));
         } else {
+            // Drop the one documented cosmetic genirq line from the rendered
+            // console (see console_filter); everything else passes through.
+            let bytes = filter.feed(&raw);
+            if bytes.is_empty() {
+                continue;
+            }
             match stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
                 Ok(()) => last_output = Instant::now(),
                 // The console consumer went away (e.g. piped into `head`): stop
@@ -1160,7 +1240,12 @@ fn run_console(
             return Ok(Outcome::Idle(args.idle_exit_secs));
         }
     }
-    // A vCPU thread stopped the run; the caller surfaces the recorded outcome.
+    // A vCPU thread stopped the run; flush any withheld partial line and surface
+    // the recorded outcome.
+    let tail = filter.flush();
+    if !tail.is_empty() {
+        let _ = stdout.write_all(&tail).and_then(|()| stdout.flush());
+    }
     Ok(Outcome::PoweredOff)
 }
 
@@ -1171,4 +1256,40 @@ fn banner(dir: &Path, mem_ranges: &Path, num_vcpus: u32, total_ram: u64) {
     eprintln!("  memory:    {} ({mib} MiB)", mem_ranges.display());
     eprintln!("  vCPUs:     {num_vcpus}");
     eprintln!("  backend:   Apple Hypervisor.framework (managed GICv3)");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_connect_accepts_session_lock() {
+        let raw: Vec<String> = ["snap", "--session-lock", "/tmp/chm-test.lock"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        match parse_connect(&raw) {
+            Parsed::Connect(args) => {
+                assert_eq!(
+                    args.run.session_lock.as_deref(),
+                    Some(Path::new("/tmp/chm-test.lock"))
+                );
+                assert_eq!(args.run.snapshot_dir, PathBuf::from("snap"));
+            }
+            _ => panic!("expected Parsed::Connect with a session lock"),
+        }
+    }
+
+    #[test]
+    fn session_lock_writes_pid_and_removes_on_drop() {
+        let path =
+            env::temp_dir().join(format!("chm-session-lock-test-{}.lock", process::id()));
+        let _ = fs::remove_file(&path);
+        {
+            let _lock = SessionLock::acquire(&path).expect("acquire session lock");
+            let body = fs::read_to_string(&path).expect("read session lock");
+            assert_eq!(body.trim(), process::id().to_string());
+        }
+        assert!(!path.exists(), "lock file must be removed when the guard drops");
+    }
 }
