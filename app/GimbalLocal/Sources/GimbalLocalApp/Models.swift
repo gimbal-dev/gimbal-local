@@ -177,6 +177,34 @@ struct StoredSandbox: Codable, Hashable {
     var location: SandboxLocation
 }
 
+/// A committed revision (live checkpoint) read from a snapshot's
+/// `.chm-checkpoint/checkpoint.json` manifest. The lineage header is the spine
+/// of the fork model (see `docs/gimbal-local-fork-model.md`): each revision
+/// records the one it descends from, so suspends form a chain and forks (later)
+/// form branches. Only the header is decoded here — the heavy hardware state in
+/// the same file is ignored.
+struct Revision: Codable, Equatable, Hashable, Identifiable {
+    let id: String
+    let parent: String?
+    let baseImage: String
+    let createdAtMs: UInt64
+    let origin: String
+    let label: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, parent, origin, label
+        case baseImage = "base_image"
+        case createdAtMs = "created_at_ms"
+    }
+
+    var createdAt: Date { Date(timeIntervalSince1970: Double(createdAtMs) / 1000.0) }
+
+    /// A short, human-friendly id (the random suffix), e.g. `abcd`.
+    var shortId: String {
+        String(id.split(separator: "-").last ?? Substring(id))
+    }
+}
+
 /// Sidebar selection / primary navigation. The two `…Home` cases are the main
 /// pages; the others focus a specific instance or image.
 enum SidebarItem: Hashable {

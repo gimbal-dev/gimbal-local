@@ -507,6 +507,19 @@ final class AppModel: ObservableObject {
         snapshots.first { $0.name == name }
     }
 
+    /// The current saved revision (live checkpoint) for a snapshot image, read
+    /// from its `.chm-checkpoint/checkpoint.json` lineage manifest. `nil` when no
+    /// checkpoint exists (the sandbox has never been suspended). Cheap: the
+    /// manifest is a few KB (the RAM dump lives in a sibling file).
+    func revision(forSnapshotNamed name: String) -> Revision? {
+        guard let snapshot = snapshot(named: name) else { return nil }
+        let manifest = URL(fileURLWithPath: snapshot.path)
+            .appendingPathComponent(".chm-checkpoint")
+            .appendingPathComponent("checkpoint.json")
+        guard let data = try? Data(contentsOf: manifest) else { return nil }
+        return try? JSONDecoder().decode(Revision.self, from: data)
+    }
+
     /// Create a new sandbox instance from a snapshot image and focus it, without
     /// starting it. Names are made unique so several sandboxes can come from the
     /// same image. Returns the created sandbox (its live state is derived).

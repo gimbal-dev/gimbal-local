@@ -182,4 +182,31 @@ final class GimbalLocalAppTests: XCTestCase {
         XCTAssertTrue(InteractiveLiveness.sessionEnded(
             lockExists: false, ownerAlive: false, lockSeen: false, pastStartDeadline: true))
     }
+
+    func testRevisionDecodesLineageHeaderIgnoringHardwareState() throws {
+        // Matches what chm writes to .chm-checkpoint/checkpoint.json: a lineage
+        // header plus a heavy `state` object the app must ignore.
+        let json = """
+        {
+          "manifest_version": 1,
+          "id": "rev-0000000001234-ab12",
+          "parent": "rev-0000000001000-ab12",
+          "base_image": "ch-arm-v2m-demo",
+          "created_at_ms": 1234,
+          "origin": "daemon",
+          "label": null,
+          "state": {"version": 1, "vcpus": [], "gic_dist": [], "num_irq": 64}
+        }
+        """
+
+        let rev = try JSONDecoder().decode(Revision.self, from: Data(json.utf8))
+
+        XCTAssertEqual(rev.id, "rev-0000000001234-ab12")
+        XCTAssertEqual(rev.parent, "rev-0000000001000-ab12")
+        XCTAssertEqual(rev.baseImage, "ch-arm-v2m-demo")
+        XCTAssertEqual(rev.origin, "daemon")
+        XCTAssertNil(rev.label)
+        XCTAssertEqual(rev.shortId, "ab12")
+        XCTAssertEqual(rev.createdAt, Date(timeIntervalSince1970: 1.234))
+    }
 }

@@ -176,6 +176,8 @@ struct SnapshotDetailPage: View {
                     }
 
                     DerivedSandboxesCard(snapshotName: snapshot.name)
+
+                    LineageCard(snapshotName: snapshot.name)
                 }
                 .padding(28)
             }
@@ -219,5 +221,143 @@ private struct DerivedSandboxesCard: View {
                 }
             }
         }
+    }
+}
+
+// MARK: - Lineage
+
+/// The relationship between a snapshot image, its saved revisions (live
+/// checkpoints), and the sandboxes that run from it — rendered as an indented
+/// tree. Today a snapshot has at most one revision (HEAD); the layout is built
+/// for the fork future (see docs/gimbal-local-fork-model.md), where a revision
+/// branches into several child sandboxes/revisions.
+private struct LineageCard: View {
+    @EnvironmentObject private var model: AppModel
+    let snapshotName: String
+
+    private var derived: [Sandbox] {
+        model.sandboxes.filter { $0.snapshotName == snapshotName }
+    }
+
+    var body: some View {
+        GlassCard(
+            title: "Lineage",
+            subtitle: "image → revisions → sandboxes",
+            systemImage: "point.3.connected.trianglepath.dotted"
+        ) {
+            VStack(alignment: .leading, spacing: 0) {
+                LineageRow(
+                    depth: 0,
+                    symbol: "externaldrive.fill",
+                    color: Theme.purple,
+                    title: snapshotName,
+                    subtitle: "base image",
+                    badge: "image"
+                )
+
+                if let rev = model.revision(forSnapshotNamed: snapshotName) {
+                    LineageRow(
+                        depth: 1,
+                        symbol: "clock.arrow.circlepath",
+                        color: Theme.cyan,
+                        title: "revision \(rev.shortId)",
+                        subtitle: "saved \(Self.age(rev.createdAt)) · via \(rev.origin)"
+                            + (rev.parent == nil ? "" : " · has parent"),
+                        badge: "revision"
+                    )
+                    ForEach(derived) { sandbox in
+                        LineageRow(
+                            depth: 2,
+                            symbol: "shippingbox.fill",
+                            color: Theme.color(for: sandbox.state),
+                            title: sandbox.name,
+                            subtitle: sandbox.state.label.lowercased(),
+                            badge: sandbox.location.label
+                        )
+                    }
+                } else {
+                    ForEach(derived) { sandbox in
+                        LineageRow(
+                            depth: 1,
+                            symbol: "shippingbox.fill",
+                            color: Theme.color(for: sandbox.state),
+                            title: sandbox.name,
+                            subtitle: sandbox.state.label.lowercased(),
+                            badge: sandbox.location.label
+                        )
+                    }
+                    if derived.isEmpty {
+                        LineageRow(
+                            depth: 1,
+                            symbol: "circle.dashed",
+                            color: .secondary,
+                            title: "No revisions yet",
+                            subtitle: "stop a running sandbox to save its live state here",
+                            badge: nil
+                        )
+                    }
+                }
+            }
+
+            Divider().opacity(0.25)
+            Label(
+                "Forking a revision into independent sandboxes that share its memory and disk is coming next — the graph will branch here.",
+                systemImage: "arrow.triangle.branch"
+            )
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    /// A compact relative age like "2m ago" / "3h ago" / "just now".
+    static func age(_ date: Date) -> String {
+        let seconds = max(0, Date().timeIntervalSince(date))
+        switch seconds {
+        case ..<5: return "just now"
+        case ..<60: return "\(Int(seconds))s ago"
+        case ..<3600: return "\(Int(seconds / 60))m ago"
+        case ..<86400: return "\(Int(seconds / 3600))h ago"
+        default: return "\(Int(seconds / 86400))d ago"
+        }
+    }
+}
+
+/// One node in the lineage tree, indented by `depth` with a connector elbow.
+private struct LineageRow: View {
+    let depth: Int
+    let symbol: String
+    let color: Color
+    let title: String
+    let subtitle: String
+    let badge: String?
+
+    var body: some View {
+        HStack(alignment: .center, spacing: 8) {
+            if depth > 0 {
+                ForEach(0..<depth, id: \.self) { i in
+                    Text(i == depth - 1 ? "└─" : "  ")
+                        .font(.system(.body, design: .monospaced))
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            Image(systemName: symbol)
+                .foregroundStyle(color)
+                .frame(width: 18)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.callout.weight(.medium))
+                Text(subtitle).font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            if let badge {
+                Text(badge)
+                    .font(.caption2.weight(.semibold))
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 2)
+                    .background(Capsule().fill(color.opacity(0.16)))
+                    .foregroundStyle(color)
+            }
+        }
+        .padding(.vertical, 5)
     }
 }
