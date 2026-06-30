@@ -147,10 +147,9 @@ mod tests {
     #[test]
     fn drops_the_genirq_noise_line() {
         let mut f = ConsoleFilter::new();
-        let out = run(
-            &mut f,
-            &["[  183.434539] genirq: Setting trigger mode 1 for irq 12 failed (gic_set_type+0x0/0x200)\n"],
-        );
+        let line = "[  183.434539] genirq: Setting trigger mode 1 for irq 12 failed \
+                    (gic_set_type+0x0/0x200)\n";
+        let out = run(&mut f, &[line]);
         assert_eq!(out, "");
     }
 
