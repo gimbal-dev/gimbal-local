@@ -94,4 +94,41 @@ final class GimbalLocalAppTests: XCTestCase {
         model.recentSandboxNames = ["ghost", "bravo"]
         XCTAssertEqual(model.recentSandboxes.map(\.name), ["bravo", "alpha", "charlie"])
     }
+
+    @MainActor
+    func testNewSandboxFromSnapshotMakesUniqueNames() {
+        let model = AppModel()
+        model.snapshots = [SnapshotSummary(name: "ubuntu", path: "/u", vcpus: 1, ramMib: 1024)]
+
+        let first = model.newSandbox(fromSnapshotNamed: "ubuntu")
+        let second = model.newSandbox(fromSnapshotNamed: "ubuntu")
+
+        XCTAssertEqual(first?.name, "ubuntu")
+        XCTAssertEqual(second?.name, "ubuntu-2")
+        XCTAssertEqual(model.sandboxes.count, 2)
+        // Both instances share the same source image.
+        XCTAssertEqual(Set(model.sandboxes.map(\.snapshotName)), ["ubuntu"])
+        // A brand-new sandbox is stopped until started.
+        XCTAssertEqual(first.map { model.sandbox(id: $0.id)?.state }, .some(.stopped))
+    }
+
+    @MainActor
+    func testOnlyTheActiveSandboxReflectsRunningState() {
+        let model = AppModel()
+        model.snapshots = [SnapshotSummary(name: "ubuntu", path: "/u", vcpus: 1, ramMib: 1024)]
+        let a = model.newSandbox(fromSnapshotNamed: "ubuntu")!
+        let b = model.newSandbox(fromSnapshotNamed: "ubuntu")!
+
+        // Engine reports a running VM and `a` is the active instance.
+        model.activeLocalSandboxID = a.id
+        model.status = SandboxStatus(state: .running, name: "ubuntu", uptimeSeconds: 5, consoleBytes: 10, reason: nil, message: nil)
+
+        XCTAssertEqual(model.sandbox(id: a.id)?.state, .running)
+        XCTAssertEqual(model.sandbox(id: b.id)?.state, .stopped)
+        XCTAssertEqual(model.sandbox(id: a.id)?.uptimeSeconds, 5)
+
+        // A failed engine status surfaces on the active sandbox as `.failed`.
+        model.status = SandboxStatus(state: .stopped, name: "ubuntu", uptimeSeconds: nil, consoleBytes: nil, reason: "boom", message: nil)
+        XCTAssertEqual(model.sandbox(id: a.id)?.state, .failed)
+    }
 }

@@ -13,29 +13,32 @@ struct MenuBarView: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        let recents = Array(model.recentSandboxes.prefix(3))
+        let sandboxes = Array(model.sandboxes.prefix(4))
 
         Text("\(model.engineIndicator.label) · \(model.engineIndicator.detail)")
 
         Divider()
 
-        if recents.isEmpty {
+        if sandboxes.isEmpty {
             Text("No sandboxes yet")
         } else {
-            Section("Recent sandboxes") {
-                ForEach(recents) { snapshot in
+            Section("Sandboxes") {
+                ForEach(sandboxes) { sandbox in
                     Button {
-                        model.selectedSnapshot = snapshot
+                        model.selection = .sandbox(sandbox.id)
                         showMainApp()
                     } label: {
-                        Text("\(snapshot.name)  ·  \(snapshot.vcpus) vCPU, \(snapshot.ramMib) MiB")
+                        Text("\(sandbox.name)  ·  \(sandbox.state.label)")
                     }
                 }
             }
         }
 
-        if model.recentSandboxes.count > recents.count {
-            Button("See more…") { showMainApp() }
+        if model.sandboxes.count > sandboxes.count {
+            Button("See all…") {
+                model.selection = .sandboxesHome
+                showMainApp()
+            }
         }
 
         Divider()

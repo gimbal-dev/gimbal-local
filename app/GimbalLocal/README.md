@@ -36,28 +36,44 @@ open "$APP"
 The packaging script builds and signs `chm`, builds the SwiftUI executable, and
 creates `target/GimbalLocal.app`.
 
-## Current M23 surface
+## Current surface
 
-- Polished macOS dashboard with a glass-card layout, hero launch area, status
-  pills, premium sidebar, and terminal-styled console/activity panes.
+- Split navigation: a **Sandboxes** page and a **Snapshots** page, each with its
+  own sidebar section and main view. The app opens on Sandboxes.
+- **Sandboxes** are instances; **Snapshots** are the image templates you launch
+  them from. The UI is built around N sandboxes and N snapshots — you can launch
+  several sandboxes from the same image. Each sandbox carries a location badge
+  (Local today, Remote planned) so location stays an implementation detail.
+- The Sandboxes page leads with **New sandbox** when empty; each sandbox card and
+  detail view make **Open terminal** (work *inside* the sandbox) the primary
+  action. The read-only serial console is secondary — a collapsed expander in the
+  sandbox detail, not the main surface.
+- A dismissible welcome banner appears on first run and can be closed for good.
 - Auto-start `chm serve` on launch when the local daemon is not reachable, and
   create the configured snapshot library folder if needed.
-- Focus on creating and managing sandboxes; the local engine is background
-  plumbing surfaced only as an always-visible status bar at the bottom of the
-  window (a small colour icon for the engine and the optional control plane).
-- Move all engine tweaks into a dedicated Settings window (⌘,): configure `chm`,
-  snapshot library, socket, and control-plane URL, and start/restart/shut down
-  the local engine — including a one-click restart when it becomes unresponsive.
-- Menu bar extra so the app stays useful with the main window closed: lists the
-  three most recently active sandboxes with "See more", "Shut Down Engine", and
-  "Open Main App".
-- List local snapshot sandboxes from `chm ctl list --json`.
-- Start/stop a selected sandbox and follow its serial console as an explicit
-  read-only live stream. Keyboard input is not wired through the app yet; use
-  **Connect to session** to open Terminal.app with an interactive `chm run`
-  serial session for the selected sandbox.
-- Show local daemon/VM state from `chm ctl status --json`.
-- Surface immediate start failures, including unsupported ITS/LPI snapshots,
-  directly in the sandbox state and console panels.
-- Show optional cloud-control health, runner count, snapshot count, sandbox
-  count, and cost summary when `gimbal-cloud-control` is reachable.
+- The local engine is background plumbing surfaced only as an always-visible
+  status bar at the bottom of the window, which also carries the **only**
+  control-plane indicator. All engine and control-plane details live in the
+  Settings window (⌘,): Engine, Runtime paths, and Control plane tabs.
+- Menu bar extra so the app stays useful with the main window closed: lists
+  recent sandboxes, "See all…", "Shut Down Engine", and "Open Main App".
+- Start/stop sandboxes via `chm ctl`, and open an interactive session with
+  `chm connect`. Surfaces start failures (including unsupported ITS/LPI
+  snapshots) in the sandbox detail.
+- Shows optional cloud-control health, runner/snapshot/sandbox counts, and cost
+  summary in the Control plane settings tab when `gimbal-cloud-control` is
+  reachable.
+
+### Source layout
+
+| File | Responsibility |
+| --- | --- |
+| `GimbalLocalApp.swift` | App entry, windows, menus, menu-bar extra, Dock icon. |
+| `ContentView.swift` | Split-view shell: sidebar, detail router, bottom status bar. |
+| `SandboxesView.swift` | Sandboxes page, sandbox cards, and the work-inside detail. |
+| `SnapshotsView.swift` | Snapshots page, image cards, and snapshot detail. |
+| `SettingsView.swift` | Engine / Runtime / Control plane settings tabs. |
+| `DesignSystem.swift` | Theme, shared atoms, the rounded app-icon view, badges. |
+| `AppModel.swift` | State + orchestration over `chm`. |
+| `Models.swift` | `Sandbox`, `SnapshotSummary`, status/overview, navigation types. |
+| `ChmClient.swift` / `CloudControlClient.swift` | `chm` and control-plane I/O. |

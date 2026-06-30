@@ -127,6 +127,65 @@ struct SandboxStatus: Codable, Equatable {
     )
 }
 
+/// Where a sandbox runs. Local sandboxes are HVF guests on this Mac; remote is
+/// a planned location served by the control plane. The UI treats both uniformly
+/// so location stays an implementation detail the user rarely has to think about.
+enum SandboxLocation: String, Codable, Hashable {
+    case local
+    case remote
+
+    var label: String { self == .local ? "Local" : "Remote" }
+    var symbol: String { self == .local ? "desktopcomputer" : "cloud" }
+}
+
+/// A sandbox *instance* — distinct from the snapshot image it was created from.
+/// The UI is built around a list of these so a user can keep several sandboxes
+/// (even several from the same image) and run them as the engine allows.
+struct Sandbox: Identifiable, Hashable {
+    enum State: Hashable {
+        case running
+        case starting
+        case stopped
+        case failed
+
+        var label: String {
+            switch self {
+            case .running: return "Running"
+            case .starting: return "Starting"
+            case .stopped: return "Stopped"
+            case .failed: return "Failed"
+            }
+        }
+    }
+
+    let id: String
+    var name: String
+    var snapshotName: String
+    var location: SandboxLocation
+    var state: State
+    var uptimeSeconds: Int?
+    var consoleBytes: Int?
+    var reason: String?
+}
+
+/// The persisted shape of a sandbox (the live `state` is derived at runtime from
+/// the engine), stored in `UserDefaults` so a user's sandboxes survive launches.
+struct StoredSandbox: Codable, Hashable {
+    let id: String
+    var name: String
+    var snapshotName: String
+    var location: SandboxLocation
+}
+
+/// Sidebar selection / primary navigation. The two `…Home` cases are the main
+/// pages; the others focus a specific instance or image.
+enum SidebarItem: Hashable {
+    case sandboxesHome
+    case snapshotsHome
+    case sandbox(String)   // sandbox id
+    case snapshot(String)  // snapshot name
+}
+
 struct CloudOverview: Equatable {
     enum State: Equatable {
         case offline(String)

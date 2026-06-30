@@ -31,6 +31,12 @@ final class AppModel: ObservableObject {
     @Published var daemonPID: Int32?
     @Published var recentSandboxNames: [String] = []
 
+    // Sandbox-instance layer (the UI is built around N sandboxes / N snapshots).
+    @Published var selection: SidebarItem? = .sandboxesHome
+    @Published var storedSandboxes: [StoredSandbox] = []
+    @Published var activeLocalSandboxID: String?
+    @Published var welcomeDismissed = UserDefaults.standard.bool(forKey: "gimbal.welcomeDismissed")
+
     private let chm = ChmClient()
     private let controlPlane = CloudControlClient()
     private var daemonProcess: Process?
@@ -39,10 +45,13 @@ final class AppModel: ObservableObject {
     private let consoleLimit = 512 * 1024
 
     private let recentsDefaultsKey = "gimbal.recentSandboxNames"
+    private let sandboxesDefaultsKey = "gimbal.sandboxes"
+    private let welcomeDefaultsKey = "gimbal.welcomeDismissed"
     private let maxRecents = 8
 
     func bootstrap() async {
         loadRecents()
+        loadSandboxes()
         await refreshAll()
         guard status.state == .disconnected, !attemptedAutoStart else {
             return
@@ -325,6 +334,156 @@ final class AppModel: ObservableObject {
         guard !trimmed.isEmpty else { return }
         let timestamp = ISO8601DateFormatter().string(from: Date())
         activityLog.append("[\(timestamp)] \(trimmed)\n")
+    }
+
+    // MARK: - Sandbox instances
+
+    /// Live sandboxes, derived from the persisted instances plus the engine
+    /// status. Because the local engine runs one VM at a time, at most one
+    /// sandbox is `.running` (the one we last started); the rest are `.stopped`.
+    var sandboxes: [Sandbox] {
+        storedSandboxes.map { stored in
+            let isActive = stored.id == activeLocalSandboxID
+            let state: Sandbox.State
+            switch (isActive, status.state) {
+            case (true, .running):
+                state = .running
+            case (true, .stopped):
+                state = status.reason != nil ? .failed : .stopped
+            default:
+                state = .stopped
+            }
+            return Sandbox(
+                id: stored.id,
+                name: stored.name,
+                snapshotName: stored.snapshotName,
+                location: stored.location,
+                state: state,
+                uptimeSeconds: isActive ? status.uptimeSeconds : nil,
+                consoleBytes: isActive ? status.consoleBytes : nil,
+                reason: isActive ? status.reason : nil
+            )
+        }
+    }
+
+    func sandbox(id: String) -> Sandbox? {
+        sandboxes.first { $0.id == id }
+    }
+
+    func snapshot(named name: String) -> SnapshotSummary? {
+        snapshots.first { $0.name == name }
+    }
+
+    /// Create a new sandbox instance from a snapshot image and focus it. Names
+    /// are made unique so several sandboxes can come from the same image.
+    @discardableResult
+    func newSandbox(fromSnapshotNamed name: String) -> Sandbox? {
+        guard let snapshot = snapshot(named: name) else {
+            appendLog("cannot create sandbox: snapshot \(name) not in library")
+            return nil
+        }
+        let existing = Set(storedSandboxes.map(\.name))
+        var candidate = snapshot.name
+        var suffix = 2
+        while existing.contains(candidate) {
+            candidate = "\(snapshot.name)-\(suffix)"
+            suffix += 1
+        }
+        let stored = StoredSandbox(
+            id: UUID().uuidString,
+            name: candidate,
+            snapshotName: snapshot.name,
+            location: .local
+        )
+        storedSandboxes.append(stored)
+        saveSandboxes()
+        appendLog("created sandbox \(candidate) from \(snapshot.name)")
+        selection = .sandbox(stored.id)
+        return sandbox(id: stored.id)
+    }
+
+    func startSandbox(_ sandbox: Sandbox) {
+        activeLocalSandboxID = sandbox.id
+        consoleText = ""
+        recordRecentActivity(sandbox.snapshotName)
+        Task {
+            do {
+                let output = try await chm.startSnapshot(sandbox.snapshotName, settings: settings)
+                appendLog(output)
+                attachConsole(clear: true)
+                try? await Task.sleep(for: .milliseconds(900))
+                await refreshLocal()
+            } catch {
+                appendLog("start failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// Open an interactive terminal *inside* the sandbox — the primary way to
+    /// work in a sandbox (vs. only viewing its console).
+    func connect(to sandbox: Sandbox) {
+        guard let snapshot = snapshot(named: sandbox.snapshotName) else {
+            appendLog("cannot connect: snapshot \(sandbox.snapshotName) not in library")
+            return
+        }
+        activeLocalSandboxID = sandbox.id
+        Task {
+            do {
+                try openInteractiveTerminal(for: snapshot)
+                appendLog("opened interactive terminal for \(sandbox.name)")
+                try? await Task.sleep(for: .milliseconds(500))
+                await refreshLocal()
+            } catch {
+                appendLog("terminal connect failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    func stop(_ sandbox: Sandbox) {
+        Task {
+            do {
+                let output = try await chm.stop(settings: settings)
+                appendLog(output)
+            } catch {
+                appendLog("stop failed: \(error.localizedDescription)")
+            }
+            if activeLocalSandboxID == sandbox.id {
+                activeLocalSandboxID = nil
+            }
+            consoleProcess?.terminate()
+            consoleProcess = nil
+            await refreshLocal()
+        }
+    }
+
+    func deleteSandbox(_ sandbox: Sandbox) {
+        if activeLocalSandboxID == sandbox.id {
+            stop(sandbox)
+        }
+        storedSandboxes.removeAll { $0.id == sandbox.id }
+        saveSandboxes()
+        if case let .sandbox(id)? = selection, id == sandbox.id {
+            selection = .sandboxesHome
+        }
+        appendLog("removed sandbox \(sandbox.name)")
+    }
+
+    func dismissWelcome() {
+        welcomeDismissed = true
+        UserDefaults.standard.set(true, forKey: welcomeDefaultsKey)
+    }
+
+    func loadSandboxes() {
+        guard let data = UserDefaults.standard.data(forKey: sandboxesDefaultsKey),
+              let list = try? JSONDecoder().decode([StoredSandbox].self, from: data)
+        else { return }
+        storedSandboxes = list
+    }
+
+    private func saveSandboxes() {
+        if let data = try? JSONEncoder().encode(storedSandboxes) {
+            UserDefaults.standard.set(data, forKey: sandboxesDefaultsKey)
+        }
     }
 
     var engineIndicator: EngineIndicator {
