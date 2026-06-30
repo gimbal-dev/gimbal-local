@@ -119,6 +119,29 @@ pub fn capture_distributor(
     Ok(out)
 }
 
+/// Capture a full checkpoint from a set of paused vCPUs plus the GIC, all on the
+/// current thread. This is the single-threaded capture path (the daemon creates
+/// and runs its vCPUs on one thread); the SMP interactive path instead captures
+/// each vCPU on its own owning thread and assembles the result. Every vCPU MUST
+/// be paused before calling.
+pub fn capture_all(
+    vcpus: &mut [Box<dyn Vcpu>],
+    gic: &Arc<Mutex<dyn Vgic>>,
+    num_irq: u32,
+) -> anyhow::Result<CheckpointState> {
+    let mut out = Vec::with_capacity(vcpus.len());
+    for vcpu in vcpus.iter_mut() {
+        out.push(capture_vcpu(vcpu)?);
+    }
+    let gic_dist = capture_distributor(gic, num_irq)?;
+    Ok(CheckpointState {
+        version: CHECKPOINT_VERSION,
+        vcpus: out,
+        gic_dist,
+        num_irq,
+    })
+}
+
 /// Apply a captured distributor onto a fresh VM's GIC, skipping the active
 /// registers (same as the cold restore — the CPU-interface active-priority
 /// state restored via `set_state` performs the EOI priority drop instead).

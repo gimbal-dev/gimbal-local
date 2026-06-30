@@ -496,6 +496,30 @@ pub fn rehydrate(
     memory_ranges: &Path,
     vm_ops: &Arc<dyn VmOps>,
 ) -> Result<RehydratedVm, RehydrateError> {
+    rehydrate_inner(hv, snap, memory_ranges, vm_ops, None)
+}
+
+/// Rebuild a live HVF VM, restoring captured live state from `checkpoint`
+/// instead of the cold snapshot's registers/GIC (the single-threaded resume
+/// path used by the daemon). `memory_ranges` should point at the checkpoint's
+/// RAM dump; `snap` still supplies the memory-region layout and device wiring.
+pub fn rehydrate_resume(
+    hv: &dyn Hypervisor,
+    snap: &Snapshot,
+    memory_ranges: &Path,
+    vm_ops: &Arc<dyn VmOps>,
+    checkpoint: &crate::hvf::checkpoint::CheckpointState,
+) -> Result<RehydratedVm, RehydrateError> {
+    rehydrate_inner(hv, snap, memory_ranges, vm_ops, Some(checkpoint))
+}
+
+fn rehydrate_inner(
+    hv: &dyn Hypervisor,
+    snap: &Snapshot,
+    memory_ranges: &Path,
+    vm_ops: &Arc<dyn VmOps>,
+    resume_from: Option<&crate::hvf::checkpoint::CheckpointState>,
+) -> Result<RehydratedVm, RehydrateError> {
     // Map RAM + create the managed GIC shell (no vCPUs yet).
     let PreparedVm {
         vm,
@@ -516,10 +540,26 @@ pub fn rehydrate(
 
     // Global distributor restore, then per-vCPU register file + redistributor,
     // then enable Group1 SPI forwarding. (Single-thread path: every vCPU was
-    // created on this thread, so its register file may be restored here too.)
-    restore_distributor(&gic, snap)?;
-    for (id, vcpu) in vcpus.iter_mut().enumerate() {
-        restore_vcpu_state(vcpu, snap, id)?;
+    // created on this thread, so its register file may be restored here too.) A
+    // live checkpoint overrides the cold snapshot's vCPU/GIC state with the
+    // captured values.
+    match resume_from {
+        Some(cp) => {
+            crate::hvf::checkpoint::apply_distributor(&gic, &cp.gic_dist)?;
+            let reference = cp.reference_cntvct();
+            for (id, vcpu) in vcpus.iter_mut().enumerate() {
+                let vc = cp.vcpus.get(id).ok_or_else(|| {
+                    RehydrateError::Translate(format!("checkpoint missing vCPU {id}"))
+                })?;
+                crate::hvf::checkpoint::apply_vcpu(vcpu, vc, reference)?;
+            }
+        }
+        None => {
+            restore_distributor(&gic, snap)?;
+            for (id, vcpu) in vcpus.iter_mut().enumerate() {
+                restore_vcpu_state(vcpu, snap, id)?;
+            }
+        }
     }
     enable_group1_spi_forwarding(&gic)?;
 
