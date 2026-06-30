@@ -11,12 +11,16 @@
 //! into the [`Pl011`] and asserts the UART's interrupt line through the managed
 //! GIC, so the guest takes the receive interrupt and reads the byte.
 //!
-//! A `Ctrl-A x` escape (the QEMU convention) restores the terminal and exits,
-//! since raw mode otherwise routes `Ctrl-C` to the guest rather than `chm`.
+//! A `Ctrl-A x` escape (the QEMU convention) restores the terminal and ends the
+//! session, since raw mode otherwise routes `Ctrl-C` to the guest rather than
+//! `chm`. It, terminating signals (window close / `kill`), and a guest
+//! power-off all funnel through one graceful shutdown that tears the VM down.
 
 use std::io::{self, Read};
+use std::ptr;
 use std::sync::Arc;
-use std::{env, mem, process, thread};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
+use std::{env, mem, thread};
 
 use hypervisor::hvf::devices::Pl011;
 use hypervisor::hvf::virtio::pci::MsiSink;
@@ -123,14 +127,89 @@ impl Drop for RawConsole {
     }
 }
 
+/// Process-global shutdown request. Set by the terminal signal handlers
+/// ([`install_signal_handlers`]) and by the `Ctrl-A x` quit escape; polled by
+/// the interactive console loop. Every way of ending an interactive session —
+/// closing the window (`SIGHUP`), `Ctrl-C`/`kill` (`SIGINT`/`SIGTERM`),
+/// `Ctrl-A x`, or the guest powering off — funnels through the SAME graceful
+/// teardown that destroys the HVF VM (`hv_vm_destroy`) and restores the
+/// terminal, so a session never leaks the one-per-process VM nor leaves the
+/// shell in raw mode.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// `true` once a signal or the quit escape has asked the session to end.
+pub(crate) fn shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(Ordering::Acquire)
+}
+
+/// Ask the interactive session to shut down gracefully.
+pub(crate) fn request_shutdown() {
+    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+}
+
+/// Terminal-restore state captured for the async-signal-safe signal handler. A
+/// handler may run on any thread at any time and must not lock or allocate, so
+/// the fd lives in an atomic and the saved (cooked) termios is published once as
+/// a leaked `Box` whose pointer the handler only ever reads.
+static RESTORE_FD: AtomicI32 = AtomicI32::new(-1);
+static RESTORE_TERMIOS: AtomicPtr<libc::termios> = AtomicPtr::new(ptr::null_mut());
+
+/// Async-signal-safe handler for `SIGHUP`/`SIGINT`/`SIGTERM`: restore the
+/// terminal, then request graceful shutdown. It does NOT exit the process —
+/// that would skip the VM teardown — it lets the console loop return so `run()`
+/// kicks the vCPUs, joins their threads, and drops the VM (`hv_vm_destroy`).
+extern "C" fn handle_term_signal(_sig: libc::c_int) {
+    let fd = RESTORE_FD.load(Ordering::Acquire);
+    let termios = RESTORE_TERMIOS.load(Ordering::Acquire);
+    if fd >= 0 && !termios.is_null() {
+        // SAFETY: `termios` points at a leaked `Box<libc::termios>` filled by
+        // `tcgetattr` on this same fd and published before the handler was
+        // installed; it is only ever read. `tcsetattr` is async-signal-safe.
+        unsafe {
+            libc::tcsetattr(fd, libc::TCSANOW, termios);
+        }
+    }
+    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+}
+
+/// Install graceful-shutdown handlers for the controlling-process termination
+/// signals so closing the terminal window (`SIGHUP`) or any `kill`
+/// (`SIGTERM`/`SIGINT`) tears the VM down cleanly instead of dying mid-run with
+/// the HVF VM still mapped and the terminal stuck in raw mode.
+///
+/// In raw mode the tty does not synthesize `SIGINT` from `Ctrl-C` (it reaches
+/// the guest as a byte, which is what an interactive shell expects); the
+/// `SIGINT` handler therefore only matters for an external `kill -INT` or a
+/// non-tty run, where graceful teardown is still the right behavior.
+pub(crate) fn install_signal_handlers(restore: RestoreHandle) {
+    if restore.active {
+        let boxed = Box::into_raw(Box::new(restore.original));
+        RESTORE_TERMIOS.store(boxed, Ordering::Release);
+        RESTORE_FD.store(restore.fd, Ordering::Release);
+    }
+    for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM] {
+        // SAFETY: zero-initialized sigaction is valid; the handler is
+        // async-signal-safe; we install a process-wide disposition once.
+        unsafe {
+            let mut action: libc::sigaction = mem::zeroed();
+            action.sa_sigaction = handle_term_signal as *const () as libc::sighandler_t;
+            libc::sigemptyset(&mut action.sa_mask);
+            action.sa_flags = libc::SA_RESTART;
+            libc::sigaction(sig, &action, ptr::null_mut());
+        }
+    }
+}
+
 /// Spawn the host-input pump. Reads stdin and feeds each byte into `uart`,
 /// asserting the serial SPI through `sink` so the guest takes its receive
 /// interrupt. Watches for the `Ctrl-A x` escape, in which case it restores the
-/// terminal (via `restore`) and exits the process.
+/// terminal (via `restore`) and requests a graceful session shutdown.
 ///
 /// The thread is detached: it blocks on stdin for the life of the VM and the
-/// process tears it down on exit. `restore` puts the terminal back before
-/// `process::exit`, which would otherwise skip the guard's `Drop`.
+/// process tears it down on exit. The `Ctrl-A x` escape sets the shared
+/// shutdown flag rather than calling `process::exit`, so the run loop returns
+/// and `run()` destroys the HVF VM via `Drop` — the same path a terminating
+/// signal or a guest power-off takes.
 pub(crate) fn spawn_stdin_pump(
     uart: Arc<Pl011>,
     sink: Arc<dyn MsiSink>,
@@ -156,8 +235,16 @@ pub(crate) fn spawn_stdin_pump(
                     escape_pending = false;
                     match b {
                         b'x' => {
+                            // Funnel the quit escape through the same graceful
+                            // teardown as a signal or guest power-off: restore
+                            // the terminal, request shutdown, and end the pump.
+                            // run_console observes the request and returns, so
+                            // run() destroys the HVF VM via Drop. A bare
+                            // process::exit here would skip that and leak the
+                            // VM until the OS reaped the process.
                             restore.restore();
-                            process::exit(0);
+                            request_shutdown();
+                            return;
                         }
                         // Ctrl-A Ctrl-A sends a literal Ctrl-A to the guest.
                         CTRL_A => out.push(CTRL_A),
@@ -186,5 +273,35 @@ pub(crate) fn spawn_stdin_pump(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shutdown_flag_round_trips_and_handler_sets_it() {
+        // This is the only test that touches the process-global flag, so there
+        // is no cross-test race. Start from a known-clear state.
+        SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+        assert!(!shutdown_requested());
+
+        request_shutdown();
+        assert!(shutdown_requested(), "request_shutdown must be observable");
+
+        // The signal handler must also raise the flag — every terminating
+        // signal funnels into the same graceful teardown as Ctrl-A x. With no
+        // terminal published (fd == -1) it skips tcsetattr, so calling it
+        // directly here is safe and exercises the flag path.
+        SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+        handle_term_signal(libc::SIGTERM);
+        assert!(
+            shutdown_requested(),
+            "a terminating signal must request graceful shutdown"
+        );
+
+        // Leave it clear so nothing observes a stale request.
+        SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+    }
 }
 
