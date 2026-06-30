@@ -220,6 +220,10 @@ pub struct OverlayBackend {
     nsectors: u64,
     /// 1 bit per 512-byte sector: set when that sector lives in the overlay.
     written: Vec<u64>,
+    /// Sidecar path holding a serialized `written` bitmap, so the overlay's
+    /// contents can be reattached after a suspend/resume (see [`Self::resume`]).
+    /// `None` disables persistence (the default cold-boot overlay is ephemeral).
+    bitmap_path: Option<std::path::PathBuf>,
 }
 
 impl OverlayBackend {
@@ -240,7 +244,72 @@ impl OverlayBackend {
             .open(overlay_path)?;
         overlay.set_len(nsectors.saturating_mul(SECTOR_SIZE))?;
         let words = nsectors.div_ceil(64) as usize;
-        Ok(Self { base, overlay, nsectors, written: vec![0u64; words] })
+        // A fresh cold-boot overlay leaves no stale bitmap behind.
+        let _ = std::fs::remove_file(Self::bitmap_path_for(overlay_path));
+        Ok(Self {
+            base,
+            overlay,
+            nsectors,
+            written: vec![0u64; words],
+            bitmap_path: Some(Self::bitmap_path_for(overlay_path)),
+        })
+    }
+
+    /// Reattach an existing overlay produced by a prior run (suspend/resume):
+    /// the overlay file is kept (NOT truncated) and its written-sector bitmap is
+    /// reloaded from the sidecar, so disk writes made before the checkpoint are
+    /// visible again. Falls back to [`Self::open`] (fresh) if the sidecar is
+    /// missing or the wrong size for `nsectors`.
+    pub fn resume(
+        base_path: &std::path::Path,
+        overlay_path: &std::path::Path,
+        nsectors: u64,
+    ) -> io::Result<Self> {
+        let words = nsectors.div_ceil(64) as usize;
+        let bitmap_path = Self::bitmap_path_for(overlay_path);
+        let written = match std::fs::read(&bitmap_path) {
+            Ok(bytes) if bytes.len() == words * 8 => bytes
+                .chunks_exact(8)
+                .map(|c| u64::from_le_bytes(c.try_into().unwrap()))
+                .collect::<Vec<u64>>(),
+            _ => return Self::open(base_path, overlay_path, nsectors),
+        };
+        let base = std::fs::OpenOptions::new().read(true).open(base_path)?;
+        let overlay = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(overlay_path)?;
+        overlay.set_len(nsectors.saturating_mul(SECTOR_SIZE))?;
+        Ok(Self {
+            base,
+            overlay,
+            nsectors,
+            written,
+            bitmap_path: Some(bitmap_path),
+        })
+    }
+
+    /// The bitmap sidecar path for an overlay file (`<overlay>.bitmap`).
+    fn bitmap_path_for(overlay_path: &std::path::Path) -> std::path::PathBuf {
+        let mut p = overlay_path.as_os_str().to_os_string();
+        p.push(".bitmap");
+        std::path::PathBuf::from(p)
+    }
+
+    /// Persist the written-sector bitmap to its sidecar so a later [`Self::resume`]
+    /// can reattach this overlay's contents. Best-effort: a failure here only
+    /// means a subsequent resume falls back to a cold overlay.
+    fn persist_bitmap(&self) {
+        let Some(path) = &self.bitmap_path else {
+            return;
+        };
+        let mut bytes = Vec::with_capacity(self.written.len() * 8);
+        for word in &self.written {
+            bytes.extend_from_slice(&word.to_le_bytes());
+        }
+        let _ = std::fs::write(path, &bytes);
     }
 
     #[inline]
@@ -319,11 +388,23 @@ impl BlockBackend for OverlayBackend {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.overlay.sync_data()
+        self.overlay.sync_data()?;
+        // Keep the resume sidecar current with the durable overlay so a
+        // suspend/resume after a guest fsync sees the same disk.
+        self.persist_bitmap();
+        Ok(())
     }
 
     fn nsectors(&self) -> u64 {
         self.nsectors
+    }
+}
+
+impl Drop for OverlayBackend {
+    fn drop(&mut self) {
+        // Persist the bitmap on teardown so a graceful stop (which is the normal
+        // suspend path) leaves a reattachable overlay.
+        self.persist_bitmap();
     }
 }
 

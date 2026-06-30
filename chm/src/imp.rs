@@ -13,12 +13,14 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use std::{env, fs, io, thread};
 
+use crate::checkpoint;
 use crate::cloud;
 use crate::console::{self, RawConsole};
 use crate::console_filter::ConsoleFilter;
 use crate::serve;
 
 use hypervisor::arch::aarch64::gic::Vgic;
+use hypervisor::hvf::checkpoint::{self as hvf_checkpoint, CheckpointState};
 use hypervisor::hvf::devices::{MmioBus, Pl011};
 use hypervisor::hvf::gic::GicMsiSink;
 use hypervisor::hvf::rehydrate::{
@@ -269,6 +271,7 @@ pub(crate) fn wire_virtio(
     state_json: &str,
     overlay_dir: &Path,
     gic: Option<&Arc<Mutex<dyn Vgic>>>,
+    resume: bool,
 ) -> Result<Vec<String>, String> {
     let descs =
         devmgr::parse_devices(state_json).map_err(|e| format!("parse virtio devices: {e}"))?;
@@ -307,7 +310,7 @@ pub(crate) fn wire_virtio(
                 format!("virtio type {virtio_type} {}", desc.name)
             }
         };
-        let (base, size, dev) = devmgr::build_device(desc, guest_mem.clone(), overlay_dir)
+        let (base, size, dev) = devmgr::build_device(desc, guest_mem.clone(), overlay_dir, resume)
             .map_err(|e| format!("build device {}: {e}", desc.name))?;
         if !desc.vector_events.is_empty() {
             if let Some(its) = &its_engine {
@@ -364,6 +367,11 @@ struct Args {
     /// including when the user simply closes the window. Set by `chm connect
     /// --session-lock`; `None` for a plain `chm run`.
     session_lock: Option<PathBuf>,
+    /// Use live checkpoints (suspend/resume): resume from a saved checkpoint in
+    /// the snapshot dir if one exists, and capture a fresh checkpoint on a clean
+    /// stop so the next start continues where this one left off. Set by `chm
+    /// resume` and by `chm connect --checkpoint`; `false` cold-boots.
+    checkpoint: bool,
 }
 
 struct ConnectArgs {
@@ -444,6 +452,7 @@ fn usage() -> String {
      USAGE:\n    \
          chm run <SNAPSHOT_DIR> [OPTIONS]\n    \
          chm restore <SNAPSHOT_DIR> [OPTIONS]   (alias for run)\n    \
+         chm resume <SNAPSHOT_DIR> [OPTIONS]    (restore a saved checkpoint)\n    \
          chm connect <SNAPSHOT_DIR> [OPTIONS]   (interactive session)\n    \
          chm cloud <COMMAND> aws [OPTIONS]      (BYO cloud helpers)\n    \
          chm serve <LIBRARY_DIR> [OPTIONS]      (background daemon)\n    \
@@ -459,6 +468,10 @@ fn usage() -> String {
          --idle-exit <N>     Stop after N seconds with no console output\n                        \
          (0 = disabled; default 10).\n    \
          --quiet             Suppress the informational banner on stderr.\n    \
+         --checkpoint         Use live checkpoints: resume from a saved\n                        \
+         checkpoint in the snapshot dir if present, and capture a fresh one on\n                        \
+         a clean stop so the next start continues where this left off. Implied\n                        \
+         by `chm resume`.\n    \
          --socket <PATH>      For `connect`, stop any app/daemon-run VM on this\n                        \
          socket before taking the snapshot over interactively.\n    \
          --no-stop-daemon     For `connect`, do not stop a daemon-run VM first.\n    \
@@ -493,10 +506,15 @@ fn parse(raw: &[String]) -> Parsed {
     let mut max_seconds = 0u64;
     let mut idle_exit_secs = DEFAULT_IDLE_EXIT_SECS;
     let mut quiet = false;
+    let mut checkpoint = false;
 
     let mut i = 0;
-    // A leading `run`/`restore` subcommand is accepted but optional.
+    // A leading `run`/`restore` subcommand is accepted but optional; `resume`
+    // additionally enables live checkpoints (suspend/resume).
     if i < raw.len() && (raw[i] == "run" || raw[i] == "restore") {
+        i += 1;
+    } else if i < raw.len() && raw[i] == "resume" {
+        checkpoint = true;
         i += 1;
     }
 
@@ -506,6 +524,7 @@ fn parse(raw: &[String]) -> Parsed {
             "-h" | "--help" => return Parsed::Help,
             "-V" | "--version" => return Parsed::Version,
             "--quiet" => quiet = true,
+            "--checkpoint" => checkpoint = true,
             "--max-seconds" | "--idle-exit" => {
                 i += 1;
                 let Some(v) = raw.get(i) else {
@@ -540,6 +559,7 @@ fn parse(raw: &[String]) -> Parsed {
             idle_exit_secs,
             quiet,
             session_lock: None,
+            checkpoint,
         }),
         None => Parsed::Error("missing <SNAPSHOT_DIR>".to_string()),
     }
@@ -553,6 +573,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
     let mut socket_path = env::temp_dir().join("chm.sock");
     let mut no_stop_daemon = false;
     let mut session_lock: Option<PathBuf> = None;
+    let mut checkpoint = false;
 
     let mut i = 0;
     while i < raw.len() {
@@ -562,6 +583,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
             "-V" | "--version" => return Parsed::Version,
             "--quiet" => quiet = true,
             "--no-stop-daemon" => no_stop_daemon = true,
+            "--checkpoint" => checkpoint = true,
             "--socket" | "--max-seconds" | "--idle-exit" | "--session-lock" => {
                 i += 1;
                 let Some(v) = raw.get(i) else {
@@ -604,6 +626,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
                 idle_exit_secs,
                 quiet,
                 session_lock,
+                checkpoint,
             },
             socket_path,
             no_stop_daemon,
@@ -670,8 +693,34 @@ fn run(args: &Args) -> Result<ExitCode, String> {
 
     its_lpi_guard(&loaded.state_json)?;
 
+    // Resume from a live checkpoint when one exists and checkpoints are enabled;
+    // a malformed/incompatible checkpoint is discarded so we cold-boot cleanly.
+    let resume_state = if args.checkpoint && checkpoint::has_checkpoint(dir) {
+        match checkpoint::read_checkpoint(dir) {
+            Ok(state) => Some(Arc::new(state)),
+            Err(e) => {
+                eprintln!("chm: warning: ignoring checkpoint ({e}); cold-booting");
+                checkpoint::clear_checkpoint(dir);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let resuming = resume_state.is_some();
+    // On resume the guest RAM comes from the checkpoint's dump; otherwise from
+    // the parent snapshot's base memory-ranges.
+    let mem_ranges = if resuming {
+        checkpoint::memory_ranges_path(dir)
+    } else {
+        loaded.mem_ranges.clone()
+    };
+
     if !args.quiet {
-        banner(dir, &loaded.mem_ranges, loaded.num_vcpus, loaded.total_ram);
+        banner(dir, &mem_ranges, loaded.num_vcpus, loaded.total_ram);
+        if resuming {
+            eprintln!("chm: resuming from a saved checkpoint (restored, not cold-booted).");
+        }
     }
 
     // Device model: a bus with a real PL011 at the guest's serial base.
@@ -689,11 +738,15 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     // Map RAM + create the managed GIC shell (no vCPUs yet). Each vCPU is then
     // created, restored, and run on its OWN host thread (HVF binds a vCPU to its
     // creating thread), so the snapshot's secondary cores resume concurrently.
-    let prepared = prepare_vm(hv.as_ref(), &loaded.snap, &loaded.mem_ranges)
+    let prepared = prepare_vm(hv.as_ref(), &loaded.snap, &mem_ranges)
         .map_err(|e| format!("prepare VM: {e}"))?;
 
     let overlay_dir = dir.join(".chm-overlays");
-    let outcome = resume_smp(prepared, loaded, &bus, &uart, &vm_ops, &overlay_dir, args)?;
+    let ckpt = CheckpointMode {
+        resume_from: resume_state,
+        capture_to: args.checkpoint.then(|| dir.clone()),
+    };
+    let outcome = resume_smp(prepared, loaded, &bus, &uart, &vm_ops, &overlay_dir, args, ckpt)?;
 
     if !args.quiet {
         eprintln!();
@@ -721,6 +774,19 @@ enum Outcome {
     Idle(u64),
     ConsoleClosed,
     Interrupted,
+}
+
+/// How a run should treat live checkpoints (suspend/resume).
+///
+/// `resume_from` makes the run restore captured live state (vCPU + GIC + RAM)
+/// instead of cold-restoring from the parent snapshot; `capture_to` makes a
+/// clean external stop (suspend) write a fresh checkpoint to that snapshot dir.
+/// Both can be set: the app resumes a sandbox and re-checkpoints it on the next
+/// stop.
+#[derive(Default)]
+struct CheckpointMode {
+    resume_from: Option<Arc<CheckpointState>>,
+    capture_to: Option<PathBuf>,
 }
 
 /// RAII guard for the interactive session-liveness lock file. Writes this
@@ -856,14 +922,22 @@ fn resume_smp(
     vm_ops: &Arc<ChmVmOps>,
     overlay_dir: &Path,
     args: &Args,
+    ckpt: CheckpointMode,
 ) -> Result<Outcome, String> {
     let Loaded {
         snap, state_json, ..
     } = loaded;
     let n = snap.vcpus.len();
+    let num_irq = snap.num_irq;
     let snap = Arc::new(snap);
     let psci = PsciCoordinator::from_snapshot(&snap);
     vm_ops.set_psci_coordinator(psci.clone());
+
+    let CheckpointMode {
+        resume_from,
+        capture_to,
+    } = ckpt;
+    let capturing = capture_to.is_some();
 
     let running = Arc::new(AtomicBool::new(true));
     let dist_gate = Arc::new(PhaseGate::new());
@@ -872,6 +946,10 @@ fn resume_smp(
     let outcome: Arc<Mutex<Option<Result<Outcome, String>>>> = Arc::new(Mutex::new(None));
     let (created_tx, created_rx) = mpsc::channel::<Result<(), String>>();
     let (restored_tx, restored_rx) = mpsc::channel::<Result<(), String>>();
+    // Per-vCPU live-state captures, collected at suspend (each vCPU must be read
+    // on its own thread, so it sends its capture back here before it exits).
+    let (captured_tx, captured_rx) =
+        mpsc::channel::<(usize, Result<hvf_checkpoint::VcpuCheckpoint, String>)>();
     // Serialize vCPU creation in index order: the managed GIC associates each
     // redistributor with a vCPU at create time, so creating them out of order
     // (two threads racing `hv_vcpu_create`) can misassign a secondary's
@@ -893,6 +971,8 @@ fn resume_smp(
         let outcome = outcome.clone();
         let created_tx = created_tx.clone();
         let restored_tx = restored_tx.clone();
+        let captured_tx = captured_tx.clone();
+        let resume_from = resume_from.clone();
         let create_turn = create_turn.clone();
         let restore_turn = restore_turn.clone();
         let power_slot = psci.slot(id);
@@ -946,14 +1026,19 @@ fn resume_smp(
                         turn = cv.wait(turn).unwrap();
                     }
                 }
-                let restore_res = restore_vcpu_state(&mut vcpu, &snap, id);
+                let restore_res = match &resume_from {
+                    Some(cp) => hvf_checkpoint::apply_vcpu(&mut vcpu, &cp.vcpus[id], cp.reference_cntvct())
+                        .map_err(|e| format!("apply checkpoint vCPU {id}: {e}")),
+                    None => restore_vcpu_state(&mut vcpu, &snap, id)
+                        .map_err(|e| format!("restore vCPU {id}: {e}")),
+                };
                 {
                     let (lock, cv) = &*restore_turn;
                     *lock.lock().unwrap() = id + 1;
                     cv.notify_all();
                 }
                 if let Err(e) = restore_res {
-                    let _ = restored_tx.send(Err(format!("restore vCPU {id}: {e}")));
+                    let _ = restored_tx.send(Err(e));
                     let _ = go_gate.wait();
                     return;
                 }
@@ -1013,6 +1098,14 @@ fn resume_smp(
                         }
                     }
                 }
+                // Suspend: with the run loop stopped (this vCPU paused but the VM
+                // still alive), read this vCPU's live state back on its owning
+                // thread and hand it to the orchestrator. The orchestrator decides
+                // whether to persist it (only a clean external stop is suspended).
+                if capturing {
+                    let _ = captured_tx
+                        .send((id, hvf_checkpoint::capture_vcpu(&mut vcpu).map_err(|e| e.to_string())));
+                }
                 // `vcpu` drops here, on its owning thread (HVF requirement).
             })
             .map_err(|e| format!("spawn vCPU {id} thread: {e}"))?;
@@ -1020,6 +1113,7 @@ fn resume_smp(
     }
     drop(created_tx);
     drop(restored_tx);
+    drop(captured_tx);
 
     // --- phase 1 join: every vCPU created ---
     let mut first_err: Option<String> = None;
@@ -1043,12 +1137,18 @@ fn resume_smp(
     }
 
     // --- phase 2: restore the global distributor, then release the threads ---
-    if let Err(e) = restore_distributor(&prepared.gic, &snap) {
+    let dist_res = match &resume_from {
+        Some(cp) => hvf_checkpoint::apply_distributor(&prepared.gic, &cp.gic_dist)
+            .map_err(|e| format!("apply checkpoint distributor: {e}")),
+        None => restore_distributor(&prepared.gic, &snap)
+            .map_err(|e| format!("restore distributor: {e}")),
+    };
+    if let Err(e) = dist_res {
         dist_gate.set(Gate::Abort);
         for h in handles {
             let _ = h.join();
         }
-        return Err(format!("restore distributor: {e}"));
+        return Err(e);
     }
     dist_gate.set(Gate::Go);
 
@@ -1087,6 +1187,7 @@ fn resume_smp(
         &state_json,
         overlay_dir,
         Some(&prepared.gic),
+        resume_from.is_some(),
     ) {
         Ok(devs) if !devs.is_empty() => {
             if !args.quiet {
@@ -1148,6 +1249,7 @@ fn resume_smp(
 
     // Stop every vCPU thread: clear the run flag, force any in-flight `run()` to
     // return (hv_vcpus_exit), and join — each vCPU is destroyed on its thread.
+    // Each thread captures its live state (if suspending) before it returns.
     running.store(false, Ordering::Release);
     psci.wake_all();
     for sig in exits.lock().unwrap().iter() {
@@ -1157,6 +1259,37 @@ fn resume_smp(
         let _ = h.join();
     }
     drop(raw_console);
+
+    // Suspend: persist a checkpoint ONLY on a clean external stop (the console
+    // coordinator ended the session — window close / Ctrl-A x / idle / max-secs).
+    // A guest power-off or a vCPU error means the box is finished, so the next
+    // start should cold-boot: clear any stale checkpoint instead.
+    let vcpu_outcome = outcome.lock().unwrap().take();
+    let external_stop = vcpu_outcome.is_none()
+        && matches!(
+            coordinator,
+            Ok(Outcome::Interrupted | Outcome::ConsoleClosed | Outcome::Idle(_) | Outcome::MaxSeconds)
+        );
+    if let Some(dir) = &capture_to {
+        if external_stop {
+            match collect_checkpoint(&captured_rx, &prepared, &snap, num_irq, n) {
+                Ok(state) => {
+                    match checkpoint::write_checkpoint(dir, &state, &prepared.guest_mem, &snap.mem_mappings, "connect") {
+                        Ok(()) => {
+                            if !args.quiet {
+                                eprintln!("\nchm: suspended — checkpoint saved (resume to continue).");
+                            }
+                        }
+                        Err(e) => eprintln!("chm: warning: could not write checkpoint: {e}"),
+                    }
+                }
+                Err(e) => eprintln!("chm: warning: checkpoint capture failed ({e}); not suspending"),
+            }
+        } else {
+            // Powered off / errored: drop any prior checkpoint so we cold-boot.
+            checkpoint::clear_checkpoint(dir);
+        }
+    }
 
     // Tear the VM down now that every vCPU thread has joined: `hv_vm_destroy`
     // (inside this drop) must run only once all vCPUs are destroyed, which they
@@ -1175,10 +1308,48 @@ fn resume_smp(
 
     // A vCPU-reported terminal result (power-off / error) wins; otherwise the
     // coordinator's stop reason (max-seconds / idle / console-closed).
-    if let Some(res) = outcome.lock().unwrap().take() {
+    if let Some(res) = vcpu_outcome {
         return res;
     }
     coordinator
+}
+
+/// Gather the per-vCPU captures (in id order) plus the global GIC distributor
+/// into a [`CheckpointState`] ready to persist. Called at suspend, after every
+/// vCPU thread has sent its capture and joined, while the VM is still alive.
+fn collect_checkpoint(
+    captured_rx: &mpsc::Receiver<(usize, Result<hvf_checkpoint::VcpuCheckpoint, String>)>,
+    prepared: &PreparedVm,
+    snap: &Snapshot,
+    num_irq: u32,
+    n: usize,
+) -> Result<CheckpointState, String> {
+    let mut vcpus: Vec<Option<hvf_checkpoint::VcpuCheckpoint>> = (0..n).map(|_| None).collect();
+    for _ in 0..n {
+        let (id, res) = captured_rx
+            .recv()
+            .map_err(|_| "a vCPU thread exited before sending its capture".to_string())?;
+        let cp = res.map_err(|e| format!("vCPU {id}: {e}"))?;
+        *vcpus
+            .get_mut(id)
+            .ok_or_else(|| format!("captured out-of-range vCPU id {id}"))? = Some(cp);
+    }
+    let vcpus = vcpus
+        .into_iter()
+        .enumerate()
+        .map(|(id, c)| c.ok_or_else(|| format!("missing capture for vCPU {id}")))
+        .collect::<Result<Vec<_>, String>>()?;
+
+    let gic_dist = hvf_checkpoint::capture_distributor(&prepared.gic, num_irq)
+        .map_err(|e| format!("capture distributor: {e}"))?;
+
+    let _ = snap; // mem layout is read by the caller via snap.mem_mappings.
+    Ok(CheckpointState {
+        version: hvf_checkpoint::CHECKPOINT_VERSION,
+        vcpus,
+        gic_dist,
+        num_irq,
+    })
 }
 
 /// The orchestrator-thread console loop: drain the guest's shared PL011 output

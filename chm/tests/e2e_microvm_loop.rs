@@ -243,6 +243,165 @@ fn microvm_boots_logs_in_writes_and_lists_a_file() {
     );
 }
 
+/// Suspend/resume regression: write a marker that lives ONLY in guest RAM
+/// (`/dev/shm`, a tmpfs), suspend the microVM (which captures a live checkpoint),
+/// then resume it in a fresh `chm` process and prove the guest came back exactly
+/// where it left off — already logged in, with the RAM-only marker intact. A
+/// cold boot would show a fresh `login:` and an empty tmpfs, so this fails loudly
+/// if resume ever silently degrades into a reboot.
+#[test]
+#[ignore = "needs a local HVF-compatible snapshot; run via scripts/hvf/e2e-microvm-loop.sh"]
+fn microvm_suspends_and_resumes_live_state() {
+    let Some(snapshot) = snapshot_from_env() else {
+        eprintln!("skipping: set CHM_E2E_SNAPSHOT to a snapshot dir to run suspend/resume");
+        return;
+    };
+    assert!(
+        snapshot.join("state.json").is_file(),
+        "CHM_E2E_SNAPSHOT={} has no state.json",
+        snapshot.display()
+    );
+
+    // Start clean: no prior checkpoint, fresh overlays, so session 1 cold-boots.
+    let _ = fs::remove_dir_all(snapshot.join(".chm-checkpoint"));
+    let overlays = snapshot.join(".chm-overlays");
+    if overlays.is_dir() {
+        for entry in fs::read_dir(&overlays).into_iter().flatten().flatten() {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+
+    let shell = "@ch-snap:~$";
+    let uniq = format!("{}_{}", process::id(), nanos());
+    let marker = format!("GIMBAL_RESUME_OK_{uniq}");
+    let shmfile = format!("/dev/shm/gimbal_resume_{uniq}");
+    let snap_str = snapshot.to_str().unwrap().to_string();
+    let args = [
+        "connect",
+        &snap_str,
+        "--no-stop-daemon",
+        "--checkpoint",
+        "--idle-exit",
+        "0",
+        "--max-seconds",
+        "180",
+    ];
+
+    // --- session 1: cold boot, log in, write a RAM-only marker, suspend ------ //
+    let chm = signed_chm_binary();
+    let mut s1 = PtySession::spawn(&chm, &args);
+    let deadline = Instant::now() + OVERALL_BUDGET;
+    login_to_shell(&mut s1, shell, deadline);
+    s1.drain_for(Duration::from_secs(2));
+
+    // /dev/shm is tmpfs — pure RAM. A cold reboot wipes it; only a live memory
+    // resume brings it back. Build the command so the matched marker appears
+    // only in `cat` output, never in the echoed command line.
+    let write_cmd = format!(
+        "M={marker}; printf '%s\\n' \"$M\" > {shmfile}; sync; echo W1_{uniq}_done\n"
+    );
+    s1.send(&write_cmd);
+    if s1.wait_for(&[&format!("W1_{uniq}_done")], deadline).is_none() {
+        s1.fail("session 1: writing the RAM marker never completed");
+    }
+    // Let the guest settle back to an idle shell (serial output drained, the
+    // getty parked in its read) before snapshotting, so the checkpoint captures
+    // a quiescent state that resumes deterministically.
+    s1.drain_for(Duration::from_secs(2));
+    s1.suspend();
+
+    assert!(
+        snapshot.join(".chm-checkpoint/checkpoint.json").is_file()
+            && snapshot.join(".chm-checkpoint/memory-ranges").is_file(),
+        "suspend did not write a checkpoint (checkpoint.json + memory-ranges)"
+    );
+
+    // --- session 2: resume; must land logged-in with the marker intact ------- //
+    let chm2 = signed_chm_binary();
+    let mut s2 = PtySession::spawn(&chm2, &args);
+    let deadline2 = Instant::now() + OVERALL_BUDGET;
+
+    // Let the resume settle (mapping the full RAM dump + restoring vCPU/GIC takes
+    // a moment) so the prod below isn't sent before the guest is running.
+    s2.drain_for(Duration::from_secs(4));
+
+    // Prod the resumed shell. A live resume lands at the logged-in prompt (it
+    // doesn't reprint spontaneously, so nudge it with a newline and retry); a
+    // cold boot would instead show a fresh `login:` and the kernel boot sequence.
+    let mut at_shell = false;
+    for _ in 0..12 {
+        if Instant::now() >= deadline2 {
+            break;
+        }
+        s2.send("\n");
+        match s2.wait_for_or_abort(
+            &[shell, "login:"],
+            &DISK_ERRORS,
+            Instant::now() + Duration::from_secs(5),
+        ) {
+            WaitOutcome::Found(m) if m == "login:" => s2.fail(
+                "resume cold-booted (saw a fresh `login:`) instead of restoring the \
+                 logged-in session",
+            ),
+            WaitOutcome::Found(_) => {
+                at_shell = true;
+                break;
+            }
+            WaitOutcome::Aborted(e) => {
+                s2.fail(&format!("guest reported a disk error ({e:?}) on resume"))
+            }
+            WaitOutcome::TimedOut => continue,
+        }
+    }
+    if !at_shell {
+        s2.fail("resumed guest never produced a shell prompt");
+    }
+
+    let read_cmd = format!("echo R1_{uniq}; cat {shmfile} 2>&1; echo R2_{uniq}\n");
+    s2.send(&read_cmd);
+    if s2.wait_for(&[&format!("R2_{uniq}")], deadline2).is_none() {
+        s2.fail("session 2: reading the RAM marker never completed");
+    }
+    let transcript = s2.transcript();
+    s2.shutdown();
+
+    if let Some(log) = env::var_os("CHM_E2E_LOG") {
+        let _ = fs::write(&log, &transcript);
+    }
+    assert!(
+        transcript.contains(&marker),
+        "the RAM-only /dev/shm marker did not survive suspend/resume — live guest memory \
+         was not restored (a cold boot would clear tmpfs).\n--- console tail ---\n{}",
+        tail(&transcript)
+    );
+    eprintln!("e2e: suspend/resume preserved the logged-in shell and RAM marker {marker}");
+}
+
+/// Drive a `chm connect` session from spawn to a shell prompt, logging in with
+/// `ubuntu` / `ubuntu` if a getty prompt is shown (autologin is also accepted).
+fn login_to_shell(session: &mut PtySession, shell: &str, deadline: Instant) {
+    match session.wait_for_or_abort(&[shell, "login:"], &DISK_ERRORS, deadline) {
+        WaitOutcome::Found(m) if m == "login:" => {
+            session.send("ubuntu\n");
+            match session.wait_for(&["Password:", shell], deadline) {
+                Some(p) if p == "Password:" => {
+                    session.send("ubuntu\n");
+                    if session.wait_for(&[shell], deadline).is_none() {
+                        session.fail("did not reach a shell prompt after entering the password");
+                    }
+                }
+                Some(_) => {}
+                None => session.fail("no password prompt or shell after the login name"),
+            }
+        }
+        WaitOutcome::Found(_) => {}
+        WaitOutcome::Aborted(e) => session.fail(&format!(
+            "guest reported a disk error ({e:?}) during boot"
+        )),
+        WaitOutcome::TimedOut => session.fail("guest never reached a login or shell prompt"),
+    }
+}
+
 fn snapshot_from_env() -> Option<PathBuf> {
     let raw = env::var_os("CHM_E2E_SNAPSHOT")?;
     if raw.is_empty() {
@@ -472,6 +631,23 @@ impl PtySession {
             let _ = self.child.wait();
         }
         let _ = fs::remove_file(&self.binary);
+    }
+
+    /// Suspend the session: send the graceful quit escape (Ctrl-A x) and wait
+    /// for `chm` to exit, which captures a checkpoint. Unlike `shutdown`, the
+    /// signed binary is left in place so a second session can resume from it.
+    fn suspend(&mut self) {
+        self.send("\x01x");
+        let until = Instant::now() + Duration::from_secs(30);
+        while Instant::now() < until {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            self.pump();
+            sleep(Duration::from_millis(50));
+        }
+        let _ = self.child.kill();
+        let _ = self.child.wait();
     }
 
     /// Tear down and fail with the console tail for context.

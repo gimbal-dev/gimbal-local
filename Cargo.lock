@@ -488,6 +488,8 @@ version = "0.1.0"
 dependencies = [
  "hypervisor",
  "libc",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

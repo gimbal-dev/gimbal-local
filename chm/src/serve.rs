@@ -19,9 +19,11 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{env, fs, thread};
 
-use hypervisor::hvf::rehydrate::rehydrate;
+use hypervisor::hvf::checkpoint as hvf_checkpoint;
+use hypervisor::hvf::rehydrate::{rehydrate, rehydrate_resume};
 use hypervisor::{VmExit, VmOps};
 
+use crate::checkpoint;
 use crate::console_filter::ConsoleFilter;
 use crate::imp::{build_vm_ops, its_lpi_guard, load_snapshot, wire_virtio};
 
@@ -558,11 +560,37 @@ fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Resu
              (is the daemon code-signed with the hypervisor entitlement?)"
         )
     })?;
-    let mut rvm = rehydrate(hv.as_ref(), &loaded.snap, &loaded.mem_ranges, &vm_ops)
-        .map_err(|e| format!("rehydrate: {e}"))?;
+
+    // Resume from a saved checkpoint if one exists (restored, not cold-booted),
+    // so the app's Stop -> Start round-trips the sandbox's live state. A
+    // malformed checkpoint is discarded so we cold-boot cleanly.
+    let resume_state = if checkpoint::has_checkpoint(dir) {
+        match checkpoint::read_checkpoint(dir) {
+            Ok(state) => Some(state),
+            Err(e) => {
+                eprintln!("chm serve: warning: ignoring checkpoint ({e}); cold-booting");
+                checkpoint::clear_checkpoint(dir);
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let mem_ranges = if resume_state.is_some() {
+        checkpoint::memory_ranges_path(dir)
+    } else {
+        loaded.mem_ranges.clone()
+    };
+
+    let mut rvm = match &resume_state {
+        Some(state) => rehydrate_resume(hv.as_ref(), &loaded.snap, &mem_ranges, &vm_ops, state),
+        None => rehydrate(hv.as_ref(), &loaded.snap, &mem_ranges, &vm_ops),
+    }
+    .map_err(|e| format!("rehydrate: {e}"))?;
 
     // Reconstruct the virtio device model from the snapshot's device-manager
-    // state and install it onto the bus, sharing the just-mapped guest RAM.
+    // state and install it onto the bus, sharing the just-mapped guest RAM. On
+    // resume, reattach the disk overlays so writes made before the stop persist.
     let overlay_dir = dir.join(".chm-overlays");
     if let Err(e) = wire_virtio(
         &bus,
@@ -570,6 +598,7 @@ fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Resu
         &loaded.state_json,
         &overlay_dir,
         Some(&rvm.gic),
+        resume_state.is_some(),
     ) {
         eprintln!("chm serve: warning: virtio device model not wired: {e}");
     }
@@ -582,44 +611,80 @@ fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Resu
     // the app's read-only stream matches the interactive session.
     let mut console_filter = ConsoleFilter::new();
 
-    let vcpu = rvm.vcpus[0].as_mut();
-    // Publish a cross-thread interrupt handle so `stop` can force the vCPU out
-    // of `run()` even if the guest is busy-spinning without trapping.
-    inner.lock().unwrap().kick = vcpu.exit_signal();
-    loop {
-        if inner.lock().unwrap().stop_requested {
-            return Ok("stopped by request".to_string());
-        }
+    // Run the guest on vCPU0 until a stop condition fires; `outcome` records
+    // whether the stop was a clean external one (suspend-worthy) or a guest
+    // power-off / error (which should cold-boot next time).
+    let (reason, external_stop) = {
+        let vcpu = rvm.vcpus[0].as_mut();
+        // Publish a cross-thread interrupt handle so `stop` can force the vCPU out
+        // of `run()` even if the guest is busy-spinning without trapping.
+        inner.lock().unwrap().kick = vcpu.exit_signal();
+        loop {
+            if inner.lock().unwrap().stop_requested {
+                break (Ok("stopped by request".to_string()), true);
+            }
 
-        match vcpu.run().map_err(|e| format!("vCPU run: {e}"))? {
-            VmExit::Ignore => {}
-            VmExit::Shutdown | VmExit::Reset => return Ok("guest powered off".to_string()),
-            other => return Err(format!("unexpected guest exit: {other:?}")),
-        }
+            match vcpu.run() {
+                Ok(VmExit::Ignore) => {}
+                Ok(VmExit::Shutdown | VmExit::Reset) => {
+                    break (Ok("guest powered off".to_string()), false);
+                }
+                Ok(other) => break (Err(format!("unexpected guest exit: {other:?}")), false),
+                Err(e) => break (Err(format!("vCPU run: {e}")), false),
+            }
 
-        let raw = uart.take_output();
-        if !raw.is_empty() {
-            let bytes = console_filter.feed(&raw);
-            if !bytes.is_empty() {
-                append_console(inner, &bytes);
-                last_output = Instant::now();
+            let raw = uart.take_output();
+            if !raw.is_empty() {
+                let bytes = console_filter.feed(&raw);
+                if !bytes.is_empty() {
+                    append_console(inner, &bytes);
+                    last_output = Instant::now();
+                }
+            }
+
+            if let Some(max) = max
+                && start.elapsed() >= max
+            {
+                break (Ok("reached --max-seconds limit".to_string()), true);
+            }
+            if let Some(idle) = idle
+                && last_output.elapsed() >= idle
+            {
+                break (
+                    Ok(format!(
+                        "no console output for {}s (likely waiting on an unmodelled device)",
+                        opts.idle_exit_secs
+                    )),
+                    true,
+                );
             }
         }
+    };
 
-        if let Some(max) = max
-            && start.elapsed() >= max
-        {
-            return Ok("reached --max-seconds limit".to_string());
+    // Suspend on a clean external stop: capture the live state into a checkpoint
+    // so the next Start resumes here. A power-off / error clears any checkpoint
+    // so the next Start cold-boots. Capture happens here, on this thread, while
+    // the VM is still alive (every vCPU was created and is paused on it).
+    if external_stop {
+        match hvf_checkpoint::capture_all(&mut rvm.vcpus, &rvm.gic, loaded.snap.num_irq) {
+            Ok(state) => {
+                if let Err(e) = checkpoint::write_checkpoint(
+                    dir,
+                    &state,
+                    &rvm.guest_mem,
+                    &loaded.snap.mem_mappings,
+                    "daemon",
+                ) {
+                    eprintln!("chm serve: warning: could not write checkpoint: {e}");
+                }
+            }
+            Err(e) => eprintln!("chm serve: warning: checkpoint capture failed: {e}"),
         }
-        if let Some(idle) = idle
-            && last_output.elapsed() >= idle
-        {
-            return Ok(format!(
-                "no console output for {}s (likely waiting on an unmodelled device)",
-                opts.idle_exit_secs
-            ));
-        }
+    } else {
+        checkpoint::clear_checkpoint(dir);
     }
+
+    reason
 }
 
 /// Push guest serial output into the shared console ring, evicting from the

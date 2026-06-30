@@ -22,7 +22,7 @@
 use std::any::Any;
 use std::ffi::c_void;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::anyhow;
@@ -46,6 +46,7 @@ pub mod devices;
 #[cfg(feature = "kvm-snapshot")]
 pub mod rehydrate;
 pub mod translate;
+pub mod checkpoint;
 #[cfg(feature = "kvm-snapshot")]
 pub mod virtio;
 
@@ -259,6 +260,7 @@ impl Vm for HvfVm {
             exit,
             vm_ops,
             kick,
+            vtimer_offset: AtomicU64::new(0),
         }))
     }
 
@@ -423,6 +425,12 @@ pub struct HvfVcpu {
     /// device/IRQ thread that asserts an interrupt cross-thread calls
     /// `write()` (via a clone from `wake_handle()`) to wake it promptly.
     kick: EventFd,
+    /// The virtual-counter offset last programmed via [`Self::restore_vtimer_offset`]
+    /// (HVF defines `CNTVCT_EL0 = mach_absolute_time() - offset`). Tracked so a
+    /// checkpoint can read the live `CNTVCT_EL0` back — HVF does not expose it
+    /// reliably through `hv_vcpu_get_sys_reg` once the vCPU is forced out of
+    /// `run()`. Defaults to 0, matching a freshly created vCPU's counter.
+    vtimer_offset: AtomicU64,
 }
 
 // SAFETY: HVF requires a vCPU to be created and run on the same thread; the VMM
@@ -562,7 +570,19 @@ impl HvfVcpu {
                 ret as u32
             )));
         }
+        // Remember the offset so a later checkpoint can derive the live counter.
+        self.vtimer_offset.store(offset, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// The guest's current `CNTVCT_EL0`, derived as `mach_absolute_time() -
+    /// offset` (HVF's definition) from the offset we last programmed. Used at
+    /// checkpoint time because `hv_vcpu_get_sys_reg(CNTVCT_EL0)` is not reliably
+    /// readable once the vCPU has been forced out of `run()`.
+    pub fn current_cntvct(&self) -> u64 {
+        // SAFETY: FFI; reads the host monotonic tick.
+        let now = unsafe { mach_absolute_time() };
+        now.wrapping_sub(self.vtimer_offset.load(Ordering::Relaxed))
     }
 
     fn set_icc_reg(&self, reg: u16, val: u64) -> CpuResult<()> {
@@ -607,6 +627,26 @@ impl HvfVcpu {
             )));
         }
         Ok(())
+    }
+
+    /// Capture this vCPU's live state for a checkpoint. MUST run on the vCPU's
+    /// owning host thread. Reads the full architectural register file (via
+    /// [`Vcpu::state`]), appends a live `CNTVCT_EL0` read so the virtual timer
+    /// keeps continuity on resume (the cold path gets this from the KVM
+    /// snapshot), and reads the SGI-frame redistributor registers.
+    pub fn capture_checkpoint(&self) -> CpuResult<crate::hvf::checkpoint::VcpuCheckpoint> {
+        let CpuState::Hvf(mut state) = <Self as Vcpu>::state(self)?;
+        // CNTVCT_EL0 is derived from the tracked vtimer offset (HVF does not let
+        // us read it back via hv_vcpu_get_sys_reg here); appending it lets the
+        // resume re-seed the offset so the guest's virtual clock stays continuous.
+        state
+            .sysregs
+            .push((SYSREG_CNTVCT_EL0, self.current_cntvct()));
+        let mut rdist = Vec::new();
+        for off in crate::hvf::translate::gic_ingest::rdist_capture_offsets() {
+            rdist.push((off, self.redistributor_reg(off)?));
+        }
+        Ok(crate::hvf::checkpoint::VcpuCheckpoint { state, rdist })
     }
 
     /// Service a stage-2 data abort (MMIO) by decoding ESR and calling VmOps.

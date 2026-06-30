@@ -325,14 +325,18 @@ final class AppModel: ObservableObject {
     }
 
     private func openInteractiveTerminal(for snapshot: SnapshotSummary, lockPath: String? = nil) throws {
-        var connectCmd = "\(shellQuote(settings.chmPath)) connect \(shellQuote(snapshot.path)) --socket \(shellQuote(settings.socketPath)) --idle-exit 0"
+        // `--checkpoint` makes the session resume from a saved checkpoint if one
+        // exists and capture a fresh one when it ends cleanly — so closing the
+        // window suspends the sandbox and reconnecting brings it back where it
+        // was (live memory + disk), rather than cold-booting.
+        var connectCmd = "\(shellQuote(settings.chmPath)) connect \(shellQuote(snapshot.path)) --socket \(shellQuote(settings.socketPath)) --checkpoint --idle-exit 0"
         if let lockPath {
             connectCmd += " --session-lock \(shellQuote(lockPath))"
         }
         let command = [
             "cd \(shellQuote(FileManager.default.currentDirectoryPath))",
             "echo 'Gimbal Local interactive session: \(snapshot.name)'",
-            "echo 'Login with ubuntu / ubuntu if prompted. Close this window or press Ctrl-A x to end the session — it shuts the sandbox down cleanly.'",
+            "echo 'Login with ubuntu / ubuntu if prompted. Close this window or press Ctrl-A x to end the session — it suspends the sandbox (live state saved); reconnect to resume where you left off.'",
             connectCmd,
         ].joined(separator: " && ")
 
@@ -501,6 +505,19 @@ final class AppModel: ObservableObject {
 
     func snapshot(named name: String) -> SnapshotSummary? {
         snapshots.first { $0.name == name }
+    }
+
+    /// The current saved revision (live checkpoint) for a snapshot image, read
+    /// from its `.chm-checkpoint/checkpoint.json` lineage manifest. `nil` when no
+    /// checkpoint exists (the sandbox has never been suspended). Cheap: the
+    /// manifest is a few KB (the RAM dump lives in a sibling file).
+    func revision(forSnapshotNamed name: String) -> Revision? {
+        guard let snapshot = snapshot(named: name) else { return nil }
+        let manifest = URL(fileURLWithPath: snapshot.path)
+            .appendingPathComponent(".chm-checkpoint")
+            .appendingPathComponent("checkpoint.json")
+        guard let data = try? Data(contentsOf: manifest) else { return nil }
+        return try? JSONDecoder().decode(Revision.self, from: data)
     }
 
     /// Create a new sandbox instance from a snapshot image and focus it, without
