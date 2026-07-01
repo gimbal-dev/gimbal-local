@@ -50,28 +50,53 @@ struct ChmClient {
     /// branch in the lineage). Unlike the daemon commands this takes no socket,
     /// so it runs `chm fork` directly rather than through `run`.
     func fork(from src: String, to dst: String, settings: AppSettings) async throws -> String {
-        try await withCheckedThrowingContinuation { continuation in
+        let result = await runRaw(settings: settings, args: ["fork", src, dst])
+        guard result.status == 0 else {
+            throw ChmClientError.commandFailed(result.output, result.status)
+        }
+        return result.output
+    }
+
+    /// Drive the control-plane runner pipeline for one snapshot: register →
+    /// assign-run → verify checksums → mark-local-copy → run/resume, reporting
+    /// state to the plane. Runs `chm runner run` with **no** `--socket` (it talks
+    /// HTTP to the plane, not the local daemon). Returns the combined output +
+    /// exit status so the caller can surface the honest outcome.
+    func runnerRun(snapshotID: String, api: String, owner: String, settings: AppSettings) async -> CommandResult {
+        await runRaw(
+            settings: settings,
+            args: ["runner", "run", snapshotID, "--api", api, "--owner", owner]
+        )
+    }
+
+    /// Run `chm <args>` directly (no `--socket` appended), capturing combined
+    /// stdout+stderr. Used for one-shot commands (`fork`, `runner`) that talk to
+    /// the plane or filesystem rather than the local daemon. Never throws on a
+    /// non-zero exit — the status is returned so callers can report it honestly.
+    func runRaw(settings: AppSettings, args: [String]) async -> CommandResult {
+        await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: settings.chmPath)
+                process.arguments = args
+                let pipe = Pipe()
+                process.standardOutput = pipe
+                process.standardError = pipe
                 do {
-                    let process = Process()
-                    process.executableURL = URL(fileURLWithPath: settings.chmPath)
-                    process.arguments = ["fork", src, dst]
-                    let pipe = Pipe()
-                    process.standardOutput = pipe
-                    process.standardError = pipe
                     try process.run()
                     process.waitUntilExit()
                     let data = pipe.fileHandleForReading.readDataToEndOfFile()
                     let output = String(decoding: data, as: UTF8.self)
-                    if process.terminationStatus == 0 {
-                        continuation.resume(returning: output)
-                    } else {
-                        continuation.resume(
-                            throwing: ChmClientError.commandFailed(output, process.terminationStatus)
-                        )
-                    }
+                    continuation.resume(
+                        returning: CommandResult(output: output, status: process.terminationStatus)
+                    )
                 } catch {
-                    continuation.resume(throwing: error)
+                    continuation.resume(
+                        returning: CommandResult(
+                            output: "failed to launch chm: \(error.localizedDescription)",
+                            status: -1
+                        )
+                    )
                 }
             }
         }

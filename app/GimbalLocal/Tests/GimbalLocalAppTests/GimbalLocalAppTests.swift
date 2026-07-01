@@ -209,4 +209,75 @@ final class GimbalLocalAppTests: XCTestCase {
         XCTAssertEqual(rev.shortId, "ab12")
         XCTAssertEqual(rev.createdAt, Date(timeIntervalSince1970: 1.234))
     }
+
+    func testParsesCloudSnapshotsWithProvenanceAndLocalCopy() throws {
+        let json = """
+        [
+          {
+            "snapshot_id": "snap-cb2039b86703",
+            "status": "available",
+            "kind": "checkpoint",
+            "manifest": {
+              "source_kind": "cloud-runner",
+              "origin_substrate": "linux-kvm",
+              "gic_mode": "gicv2m-message-spi",
+              "vcpu_count": 1,
+              "memory_bytes": 1073741824,
+              "compatibility_status": "runnable"
+            },
+            "storage_locations": [
+              {"kind": "object-store", "verified": true},
+              {"kind": "local-runner", "verified": true}
+            ]
+          }
+        ]
+        """
+
+        let snaps = CloudControlClient.parseSnapshots(Data(json.utf8))
+        XCTAssertEqual(snaps.count, 1)
+        let s = try XCTUnwrap(snaps.first)
+        XCTAssertEqual(s.id, "snap-cb2039b86703")
+        XCTAssertEqual(s.kind, "checkpoint")
+        XCTAssertTrue(s.isCheckpoint)
+        XCTAssertEqual(s.sourceKind, "cloud-runner")
+        XCTAssertEqual(s.originSubstrate, "linux-kvm")
+        XCTAssertEqual(s.vcpus, 1)
+        XCTAssertEqual(s.ramMib, 1024)
+        XCTAssertTrue(s.hasLocalCopy)
+        XCTAssertTrue(s.restorableOnHVF)
+        XCTAssertEqual(s.originLabel, "ran in cloud · linux-kvm")
+    }
+
+    func testCloudSnapshotGicGateMarksItsLpiCloudOnly() throws {
+        let json = """
+        [
+          {
+            "snapshot_id": "snap-itslpi",
+            "status": "available",
+            "kind": "full",
+            "manifest": {
+              "source_kind": "local-lima",
+              "gic_mode": "its-lpi",
+              "vcpu_count": 2,
+              "memory_bytes": 2147483648,
+              "compatibility_status": "runnable"
+            },
+            "storage_locations": [{"kind": "object-store", "verified": true}]
+          }
+        ]
+        """
+
+        let s = try XCTUnwrap(CloudControlClient.parseSnapshots(Data(json.utf8)).first)
+        XCTAssertFalse(s.hasLocalCopy)
+        XCTAssertFalse(s.restorableOnHVF, "its-lpi is not HVF-restorable")
+        XCTAssertEqual(s.originLabel, "captured on Lima KVM")
+        XCTAssertEqual(s.ramMib, 2048)
+    }
+
+    func testParsesCloudSnapshotsIgnoresMalformedEntries() throws {
+        // Missing snapshot_id → dropped; empty array → empty result.
+        XCTAssertTrue(CloudControlClient.parseSnapshots(Data("[{}]".utf8)).isEmpty)
+        XCTAssertTrue(CloudControlClient.parseSnapshots(Data("[]".utf8)).isEmpty)
+        XCTAssertTrue(CloudControlClient.parseSnapshots(Data("not json".utf8)).isEmpty)
+    }
 }

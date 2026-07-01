@@ -59,6 +59,48 @@ struct CloudControlClient {
         }
     }
 
+    /// List the snapshots the plane knows about (`GET /snapshots`), with the
+    /// provenance + gic fields the Cloud Snapshots view needs. Returns `[]` when
+    /// the plane is unreachable — the app stays fully usable offline.
+    func listSnapshots(baseURL: String) async -> [CloudSnapshot] {
+        guard let root = URL(string: baseURL.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            return []
+        }
+        do {
+            let payload = try await data(from: root.appending(path: "snapshots"))
+            return Self.parseSnapshots(payload)
+        } catch {
+            return []
+        }
+    }
+
+    static func parseSnapshots(_ data: Data) -> [CloudSnapshot] {
+        guard let array = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else {
+            return []
+        }
+        return array.compactMap { obj in
+            guard let id = obj["snapshot_id"] as? String else { return nil }
+            let manifest = obj["manifest"] as? [String: Any] ?? [:]
+            let locations = obj["storage_locations"] as? [[String: Any]] ?? []
+            let hasLocalCopy = locations.contains {
+                ($0["kind"] as? String) == "local-runner" && (($0["verified"] as? Bool) ?? false)
+            }
+            let memoryBytes = (manifest["memory_bytes"] as? NSNumber)?.intValue ?? 0
+            return CloudSnapshot(
+                id: id,
+                status: obj["status"] as? String ?? "unknown",
+                kind: obj["kind"] as? String ?? "full",
+                sourceKind: manifest["source_kind"] as? String,
+                gicMode: manifest["gic_mode"] as? String,
+                originSubstrate: manifest["origin_substrate"] as? String,
+                vcpus: (manifest["vcpu_count"] as? NSNumber)?.intValue ?? 0,
+                ramMib: memoryBytes / (1024 * 1024),
+                compatibility: manifest["compatibility_status"] as? String ?? "unknown",
+                hasLocalCopy: hasLocalCopy
+            )
+        }
+    }
+
     private func data(from url: URL) async throws -> Data {
         let (data, response) = try await URLSession.shared.data(from: url)
         guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
