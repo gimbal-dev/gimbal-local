@@ -205,6 +205,34 @@ struct Revision: Codable, Equatable, Hashable, Identifiable {
     }
 }
 
+/// One entry in a snapshot's revision lineage, as reported by
+/// `chm revisions --json`. Unlike `Revision` (the single HEAD manifest decoded
+/// directly), this is the full store view: every archived revision plus HEAD,
+/// with whether it is still `resumable` (its live RAM is retained).
+struct RevisionSummary: Codable, Identifiable, Equatable, Hashable {
+    let id: String
+    let parent: String?
+    let baseImage: String
+    let createdAtMs: UInt64
+    let origin: String
+    let label: String?
+    let resumable: Bool
+    let isHead: Bool
+
+    enum CodingKeys: String, CodingKey {
+        case id, parent, origin, label, resumable
+        case baseImage = "base_image"
+        case createdAtMs = "created_at_ms"
+        case isHead = "is_head"
+    }
+
+    var createdAt: Date { Date(timeIntervalSince1970: Double(createdAtMs) / 1000.0) }
+
+    var shortId: String {
+        String(id.split(separator: "-").last ?? Substring(id))
+    }
+}
+
 /// Sidebar selection / primary navigation. The two `…Home` cases are the main
 /// pages; the others focus a specific instance or image.
 enum SidebarItem: Hashable {

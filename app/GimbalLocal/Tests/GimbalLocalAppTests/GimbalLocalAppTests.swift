@@ -281,6 +281,25 @@ final class GimbalLocalAppTests: XCTestCase {
         XCTAssertTrue(CloudControlClient.parseSnapshots(Data("not json".utf8)).isEmpty)
     }
 
+    func testDecodesRevisionSummariesFromChmRevisionsJSON() throws {
+        let json = """
+        [
+          {"id":"rev-1-aaaa","parent":null,"base_image":"demo","created_at_ms":1000,"origin":"connect","label":null,"resumable":true,"is_head":false},
+          {"id":"rev-2-bbbb","parent":"rev-1-aaaa","base_image":"demo","created_at_ms":2000,"origin":"rollback","label":null,"resumable":true,"is_head":true}
+        ]
+        """
+        let revs = try JSONDecoder().decode([RevisionSummary].self, from: Data(json.utf8))
+        XCTAssertEqual(revs.count, 2)
+        XCTAssertEqual(revs[0].id, "rev-1-aaaa")
+        XCTAssertNil(revs[0].parent)
+        XCTAssertFalse(revs[0].isHead)
+        XCTAssertEqual(revs[0].shortId, "aaaa")
+        XCTAssertEqual(revs[1].parent, "rev-1-aaaa")
+        XCTAssertEqual(revs[1].origin, "rollback")
+        XCTAssertTrue(revs[1].isHead)
+        XCTAssertTrue(revs[1].resumable)
+    }
+
     @MainActor
     func testCloudSandboxSurfacesWithRemoteOriginAndTrackedState() {
         let model = AppModel()
