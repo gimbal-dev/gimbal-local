@@ -84,6 +84,21 @@ private struct Sidebar: View {
                             .foregroundStyle(.secondary)
                     }
                 }
+
+                Section("Cloud") {
+                    SidebarPageRow(
+                        title: "Cloud snapshots",
+                        systemImage: "cloud.fill",
+                        count: model.cloudSnapshots.count
+                    )
+                    .tag(SidebarItem.cloudHome)
+
+                    if case .offline = model.cloud.state {
+                        Text("Control plane offline.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
             .scrollContentBackground(.hidden)
             .navigationTitle("Gimbal")
@@ -190,6 +205,8 @@ private struct Detail: View {
                 SandboxesPage()
             case .snapshotsHome:
                 SnapshotsPage()
+            case .cloudHome:
+                CloudSnapshotsPage()
             case let .sandbox(id):
                 SandboxDetailPage(sandboxID: id)
             case let .snapshot(name):

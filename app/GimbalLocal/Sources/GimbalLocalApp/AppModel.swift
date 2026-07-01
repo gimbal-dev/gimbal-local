@@ -52,6 +52,8 @@ final class AppModel: ObservableObject {
     @Published var snapshots: [SnapshotSummary] = []
     @Published var status = SandboxStatus.disconnected
     @Published var cloud = CloudOverview.offline
+    @Published var cloudSnapshots: [CloudSnapshot] = []
+    @Published var bringingDownID: String?
     @Published var consoleText = ""
     @Published var activityLog = ""
     @Published var selectedSnapshot: SnapshotSummary?
@@ -109,6 +111,7 @@ final class AppModel: ObservableObject {
 
         await refreshLocal()
         cloud = await controlPlane.overview(baseURL: settings.controlPlaneURL)
+        cloudSnapshots = await controlPlane.listSnapshots(baseURL: settings.controlPlaneURL)
     }
 
     func refreshLocal() async {
@@ -127,6 +130,38 @@ final class AppModel: ObservableObject {
             status = SandboxStatus.disconnected
             snapshots = []
             appendLog("local runtime: \(error.localizedDescription)")
+        }
+    }
+
+    /// Bring a snapshot down from the control plane and run it here: drives the
+    /// `chm runner` pipeline (assign-run → verify → mark-local-copy → run/resume)
+    /// and streams the honest outcome to the activity log. "Remote vs local" is
+    /// an implementation detail — the result lands as a local run either way.
+    func bringDownAndRun(_ snapshot: CloudSnapshot) {
+        guard bringingDownID == nil else { return }
+        guard snapshot.restorableOnHVF else {
+            appendLog("cloud: \(snapshot.id) is not HVF-restorable (gic \(snapshot.gicMode ?? "?")) — stays cloud-only")
+            return
+        }
+        bringingDownID = snapshot.id
+        let verb = snapshot.isCheckpoint ? "resume" : "run"
+        appendLog("cloud: bringing down \(snapshot.id) — assign-run → verify → \(verb)")
+        Task {
+            let result = await chm.runnerRun(
+                snapshotID: snapshot.id,
+                api: settings.controlPlaneURL,
+                owner: "gimbal-local",
+                settings: settings
+            )
+            let trimmed = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { appendLog(trimmed) }
+            if result.status == 0 {
+                appendLog("cloud: \(snapshot.id) ran to completion locally")
+            } else {
+                appendLog("cloud: \(snapshot.id) did not complete cleanly (exit \(result.status))")
+            }
+            bringingDownID = nil
+            await refreshAll()
         }
     }
 

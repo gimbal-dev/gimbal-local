@@ -210,8 +210,46 @@ struct Revision: Codable, Equatable, Hashable, Identifiable {
 enum SidebarItem: Hashable {
     case sandboxesHome
     case snapshotsHome
+    case cloudHome
     case sandbox(String)   // sandbox id
     case snapshot(String)  // snapshot name
+}
+
+/// A snapshot as the *control plane* sees it (`GET /snapshots`) — distinct from a
+/// local library image (`SnapshotSummary`). It carries provenance (where it was
+/// captured / ran) and the gic mode, so the UI can show where it came from and
+/// whether this Mac can rehydrate it.
+struct CloudSnapshot: Identifiable, Equatable, Hashable {
+    let id: String                // snapshot_id
+    let status: String            // available, capturing, …
+    let kind: String              // full | checkpoint
+    let sourceKind: String?       // local-lima | cloud-runner | container | …
+    let gicMode: String?          // gicv2m-message-spi | its-lpi
+    let originSubstrate: String?  // linux-kvm | apple-hvf
+    let vcpus: Int
+    let ramMib: Int
+    let compatibility: String     // runnable | incompatible | …
+    let hasLocalCopy: Bool
+
+    /// HVF (Apple's managed GIC) delivers message-based SPIs only, so only a
+    /// `gicv2m-message-spi` snapshot is restorable here — mirrors the runner's
+    /// local gic gate. Anything else stays cloud-only.
+    var restorableOnHVF: Bool {
+        compatibility == "runnable" && (gicMode == nil || gicMode == "gicv2m-message-spi")
+    }
+
+    var isCheckpoint: Bool { kind == "checkpoint" }
+
+    /// A short "where it came from" line, or nil for a plain local image.
+    var originLabel: String? {
+        switch sourceKind {
+        case "cloud-runner": return "ran in cloud" + (originSubstrate.map { " · \($0)" } ?? "")
+        case "local-lima": return "captured on Lima KVM"
+        case "container": return "from container image"
+        case let other?: return other
+        case nil: return nil
+        }
+    }
 }
 
 struct CloudOverview: Equatable {
