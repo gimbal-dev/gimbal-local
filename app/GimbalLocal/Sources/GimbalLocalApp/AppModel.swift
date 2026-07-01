@@ -59,6 +59,10 @@ final class AppModel: ObservableObject {
     // from `chm ctl status`).
     @Published var cloudSandboxStates: [String: Sandbox.State] = [:]
     @Published var cloudSandboxReasons: [String: String] = [:]
+    // Revision lineage per snapshot image (from `chm revisions --json`) + the
+    // snapshot currently being rolled back.
+    @Published var revisionsBySnapshot: [String: [RevisionSummary]] = [:]
+    @Published var rollingBackSnapshot: String?
     @Published var consoleText = ""
     @Published var activityLog = ""
     @Published var selectedSnapshot: SnapshotSummary?
@@ -609,6 +613,30 @@ final class AppModel: ObservableObject {
             .appendingPathComponent("checkpoint.json")
         guard let data = try? Data(contentsOf: manifest) else { return nil }
         return try? JSONDecoder().decode(Revision.self, from: data)
+    }
+
+    /// Load a snapshot's full revision lineage (`chm revisions --json`) into
+    /// `revisionsBySnapshot` for the history view.
+    func refreshRevisions(forSnapshotNamed name: String) {
+        guard let snapshot = snapshot(named: name) else { return }
+        Task {
+            revisionsBySnapshot[name] = await chm.revisions(path: snapshot.path, settings: settings)
+        }
+    }
+
+    /// Roll a snapshot back to an archived revision (appended as a fresh HEAD),
+    /// then refresh its lineage.
+    func rollback(snapshotNamed name: String, toRevision revID: String) {
+        guard let snapshot = snapshot(named: name), rollingBackSnapshot == nil else { return }
+        rollingBackSnapshot = name
+        appendLog("rolling \(name) back to \(revID)")
+        Task {
+            let result = await chm.rollback(path: snapshot.path, revID: revID, settings: settings)
+            let trimmed = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { appendLog(trimmed) }
+            rollingBackSnapshot = nil
+            refreshRevisions(forSnapshotNamed: name)
+        }
     }
 
     /// Fork a snapshot's current revision into a new branched snapshot in the

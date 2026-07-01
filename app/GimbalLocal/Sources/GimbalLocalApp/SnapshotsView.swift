@@ -177,6 +177,8 @@ struct SnapshotDetailPage: View {
 
                     DerivedSandboxesCard(snapshotName: snapshot.name)
 
+                    RevisionHistoryCard(snapshotName: snapshot.name)
+
                     LineageCard(snapshotName: snapshot.name)
                 }
                 .padding(28)
@@ -220,6 +222,95 @@ private struct DerivedSandboxesCard: View {
                     .padding(.vertical, 4)
                 }
             }
+        }
+    }
+}
+
+// MARK: - Revision history
+
+/// The snapshot's revision lineage (from `chm revisions`): each suspend / fork /
+/// rollback, newest first, with a roll-back action on resumable archived
+/// revisions. This is the local "branching filesystem" surfaced.
+private struct RevisionHistoryCard: View {
+    @EnvironmentObject private var model: AppModel
+    let snapshotName: String
+
+    private var revisions: [RevisionSummary] {
+        (model.revisionsBySnapshot[snapshotName] ?? []).reversed()
+    }
+
+    var body: some View {
+        GlassCard(
+            title: "Revision history",
+            subtitle: "suspend · fork · rollback lineage",
+            systemImage: "clock.arrow.circlepath"
+        ) {
+            if revisions.isEmpty {
+                Text("No saved revisions yet. Suspend a running sandbox (close its terminal, or Stop it) to save its live state as a revision here.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            } else {
+                ForEach(revisions) { rev in
+                    HStack(spacing: 10) {
+                        Image(systemName: rev.isHead ? "smallcircle.filled.circle.fill" : "circle")
+                            .font(.caption)
+                            .foregroundStyle(rev.isHead ? Theme.green : Theme.cyan)
+                        VStack(alignment: .leading, spacing: 1) {
+                            HStack(spacing: 6) {
+                                Text(rev.origin).font(.callout.weight(.medium))
+                                Text(rev.shortId)
+                                    .font(.caption2.monospaced())
+                                    .foregroundStyle(.tertiary)
+                            }
+                            Text(Self.age(rev.createdAt) + (rev.resumable ? "" : " · metadata-only"))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        if rev.isHead {
+                            Text("HEAD")
+                                .font(.caption2.weight(.bold))
+                                .foregroundStyle(Theme.green)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2)
+                                .background(Theme.green.opacity(0.16), in: Capsule())
+                        } else if rev.resumable {
+                            Button("Roll back") {
+                                model.rollback(snapshotNamed: snapshotName, toRevision: rev.id)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(model.rollingBackSnapshot != nil)
+                        }
+                    }
+                    .padding(.vertical, 4)
+                }
+
+                Divider().opacity(0.25)
+                Label(
+                    "Rolling back appends a new revision that restores an earlier live state — history is preserved, not rewound. Only the newest few revisions keep their full RAM (older ones stay in the graph as metadata).",
+                    systemImage: "info.circle"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .task(id: snapshotName) {
+            model.refreshRevisions(forSnapshotNamed: snapshotName)
+        }
+    }
+
+    /// A compact relative age like "2m ago" / "3h ago" / "just now".
+    static func age(_ date: Date) -> String {
+        let seconds = max(0, Date().timeIntervalSince(date))
+        switch seconds {
+        case ..<5: return "just now"
+        case ..<60: return "\(Int(seconds))s ago"
+        case ..<3600: return "\(Int(seconds / 60))m ago"
+        case ..<86400: return "\(Int(seconds / 3600))h ago"
+        default: return "\(Int(seconds / 86400))d ago"
         }
     }
 }

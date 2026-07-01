@@ -57,6 +57,22 @@ struct ChmClient {
         return result.output
     }
 
+    /// List a snapshot's revision lineage via `chm revisions <dir> --json`.
+    func revisions(path: String, settings: AppSettings) async -> [RevisionSummary] {
+        let result = await runRaw(settings: settings, args: ["revisions", path, "--json"])
+        guard result.status == 0, let data = result.output.data(using: .utf8),
+              let revs = try? JSONDecoder().decode([RevisionSummary].self, from: data)
+        else {
+            return []
+        }
+        return revs
+    }
+
+    /// Roll a snapshot back to an archived revision via `chm rollback`.
+    func rollback(path: String, revID: String, settings: AppSettings) async -> CommandResult {
+        await runRaw(settings: settings, args: ["rollback", path, revID])
+    }
+
     /// Drive the control-plane runner pipeline for one snapshot: register →
     /// assign-run → verify checksums → mark-local-copy → run/resume, reporting
     /// state to the plane. Runs `chm runner run` with **no** `--socket` (it talks
