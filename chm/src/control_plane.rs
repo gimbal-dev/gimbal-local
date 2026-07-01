@@ -350,6 +350,9 @@ fn capabilities() -> Value {
         "supports_gic_v2m": true,
         // `chm resume <DIR>` rehydrates a live checkpoint (Phase 1).
         "supports_resume": true,
+        // The execution substrate this runner restores on. The plane routes
+        // only `apple-hvf`-restorable checkpoints (message-SPI) to us.
+        "substrate": "apple-hvf",
     })
 }
 
@@ -358,6 +361,10 @@ struct RunOpts {
     snapshot_id: String,
     api: Option<String>,
     owner: String,
+    /// Resume/continue an existing plane sandbox (e.g. the one a cloud runner
+    /// suspended) instead of creating a fresh one. This is what makes the hero
+    /// loop *the same session* rather than a copy.
+    sandbox: Option<String>,
     /// Exercise the protocol through mark-local-copy but do NOT execute the
     /// workload (useful for the synthetic fixture / CI, which cannot restore a
     /// real VM). The sandbox is left `assigned` — honest, since nothing ran.
@@ -402,10 +409,12 @@ fn runner_usage() -> String {
      \n\
      USAGE:\n    \
          chm runner register [--api URL] [--owner WHO]\n    \
-         chm runner run <SNAPSHOT_ID> [--api URL] [--owner WHO] [--skip-run]\n\
+         chm runner run <SNAPSHOT_ID> [--api URL] [--owner WHO] [--sandbox ID] [--skip-run]\n\
      \n\
      The control plane base URL comes from --api, else $GCTL_API, else \
      http://127.0.0.1:8080.\n    \
+         --sandbox ID resume/continue an existing plane sandbox (the hero loop —\n                 \
+         same session) instead of creating a fresh one.\n    \
          --skip-run   exercise the protocol through mark-local-copy without\n                 \
          executing the workload (for the synthetic fixture / CI).\n"
         .to_string()
@@ -439,6 +448,7 @@ fn parse_run_opts(raw: &[String]) -> Result<RunOpts, String> {
     let mut snapshot_id = None;
     let mut api = None;
     let mut owner = default_owner();
+    let mut sandbox = None;
     let mut skip_run = false;
     let mut i = 0;
     while i < raw.len() {
@@ -450,6 +460,10 @@ fn parse_run_opts(raw: &[String]) -> Result<RunOpts, String> {
             "--owner" => {
                 i += 1;
                 owner = raw.get(i).ok_or("--owner needs a value")?.clone();
+            }
+            "--sandbox" => {
+                i += 1;
+                sandbox = Some(raw.get(i).ok_or("--sandbox needs a value")?.clone());
             }
             "--skip-run" => skip_run = true,
             other if other.starts_with('-') => return Err(format!("unknown flag `{other}`")),
@@ -466,6 +480,7 @@ fn parse_run_opts(raw: &[String]) -> Result<RunOpts, String> {
         snapshot_id: snapshot_id.ok_or("missing <SNAPSHOT_ID>")?,
         api,
         owner,
+        sandbox,
         skip_run,
     })
 }
@@ -536,10 +551,20 @@ fn cmd_run(opts: &RunOpts) -> Result<(), String> {
 }
 
 fn run_assignment(cp: &ControlPlane, runner_id: &str, opts: &RunOpts) -> Result<(), String> {
-    // 2. Create a sandbox so state reporting has something to drive.
-    let name = format!("chm-run-{}-{}", opts.snapshot_id, now_secs());
-    let sandbox_id = cp.create_sandbox(&opts.owner, &name)?;
-    eprintln!("chm runner: sandbox {sandbox_id}");
+    // 2. Resume an existing plane sandbox (the hero loop — same session) or
+    //    create a fresh one so state reporting has something to drive.
+    let sandbox_id = match &opts.sandbox {
+        Some(id) => {
+            eprintln!("chm runner: continuing existing sandbox {id}");
+            id.clone()
+        }
+        None => {
+            let name = format!("chm-run-{}-{}", opts.snapshot_id, now_secs());
+            let id = cp.create_sandbox(&opts.owner, &name)?;
+            eprintln!("chm runner: sandbox {id}");
+            id
+        }
+    };
 
     // 3. Ask for work. 422 ⇒ the gic_mode gate refused it (surfaced verbatim).
     let assign = cp.assign_run(
@@ -567,6 +592,34 @@ fn run_assignment(cp: &ControlPlane, runner_id: &str, opts: &RunOpts) -> Result<
         checksum_tree.len()
     );
 
+    // Resume-side provenance + gic gate. A cloud-origin checkpoint carries
+    // `manifest.origin_substrate` (where it ran) and `manifest.gic_mode`. HVF can
+    // only restore message-based-SPI (GICv2M) checkpoints, so re-verify the gate
+    // locally as defense in depth — the plane already gated on ingest, but we
+    // never restore a checkpoint the Mac cannot deliver interrupts for.
+    let manifest = assign.get("manifest").cloned().unwrap_or(Value::Null);
+    let gic_mode = manifest
+        .get("gic_mode")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let origin_substrate = manifest.get("origin_substrate").and_then(Value::as_str);
+    if kind == "resume" {
+        if let Some(os) = origin_substrate {
+            eprintln!(
+                "chm runner: cross-substrate resume — checkpoint ran on `{os}`, \
+                 resuming on `apple-hvf` (ran-in-cloud → resumed-local)"
+            );
+        }
+        if !gic_mode.is_empty() && !hvf_restorable(gic_mode) {
+            cp.report_state(&sandbox_id, "error").ok();
+            return Err(format!(
+                "checkpoint gic_mode `{gic_mode}` is not HVF-restorable — only \
+                 `gicv2m-message-spi` resumes on apple-hvf; this checkpoint stays \
+                 cloud-only (recapture with CH_GIC_V2M=1 to make it Mac-restorable)"
+            ));
+        }
+    }
+
     // 4. Pull + verify the bundle into a local runner cache.
     let src = download_uri_to_path(download_uri)?;
     let cache = runner_cache_dir(&opts.snapshot_id);
@@ -574,6 +627,22 @@ fn run_assignment(cp: &ControlPlane, runner_id: &str, opts: &RunOpts) -> Result<
     copy_bundle(&src, &cache)?;
     verify_checksums(&cache, &checksum_tree)?;
     eprintln!("chm runner: verified {} against manifest.checksum_tree", cache.display());
+
+    // Prove continuity: read the mid-flight marker the cloud session embedded
+    // (a `gimbal-marker.json` sidecar, or the `GIMBLMK1` frame at the head of
+    // `snapshot/memory-ranges`). It carries the state the cloud run reached, so a
+    // successful resume demonstrably continues *past* this point.
+    if let Some(marker) = read_flight_marker(&cache) {
+        let when = marker
+            .written_at
+            .map(|w| format!(" (written {w})"))
+            .unwrap_or_default();
+        eprintln!(
+            "chm runner: mid-flight marker from the cloud session: {:?}{when} — \
+             a resume continues the session beyond this point",
+            marker.value
+        );
+    }
 
     // 5. Confirm the verified local copy to the plane.
     cp.mark_local_copy(
@@ -594,6 +663,10 @@ fn run_assignment(cp: &ControlPlane, runner_id: &str, opts: &RunOpts) -> Result<
     let args = chm_command_args(chm_command, &cache)?;
     if kind == "resume" && args.first().map(String::as_str) != Some("resume") {
         eprintln!("chm runner: note: kind=resume but chm_command is `{chm_command}`");
+    }
+    if kind == "resume" {
+        // A resume drives the sandbox through `resuming` before it is live.
+        cp.report_state(&sandbox_id, "resuming")?;
     }
     cp.report_state(&sandbox_id, "running-local")?;
     eprintln!("chm runner: running-local — exec chm {}", args.join(" "));
@@ -635,6 +708,58 @@ fn run_chm(args: &[String]) -> Result<i32, String> {
         .status()
         .map_err(|e| format!("spawn chm: {e}"))?;
     Ok(status.code().unwrap_or(-1))
+}
+
+/// HVF (Apple's managed GIC) can only deliver message-based SPIs, so it can only
+/// restore checkpoints captured `gicv2m-message-spi`. Everything else (notably
+/// `its-lpi`) stays cloud-only.
+fn hvf_restorable(gic_mode: &str) -> bool {
+    gic_mode == "gicv2m-message-spi"
+}
+
+/// The mid-flight marker a cloud runner embeds to prove session continuity: the
+/// live state the cloud session had reached at checkpoint time.
+struct FlightMarker {
+    value: String,
+    written_at: Option<String>,
+}
+
+/// Read the mid-flight marker from a checkpoint bundle. Prefer the
+/// `gimbal-marker.json` sidecar; fall back to the `GIMBLMK1` frame at the head of
+/// `snapshot/memory-ranges`.
+fn read_flight_marker(dir: &Path) -> Option<FlightMarker> {
+    if let Ok(bytes) = fs::read(dir.join("gimbal-marker.json"))
+        && let Ok(v) = serde_json::from_slice::<Value>(&bytes)
+        && let Some(value) = v.get("value").and_then(Value::as_str)
+    {
+        return Some(FlightMarker {
+            value: value.to_string(),
+            written_at: v
+                .get("written_at")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        });
+    }
+    let mem = fs::read(dir.join("snapshot").join("memory-ranges")).ok()?;
+    parse_gimbl_marker(&mem).map(|value| FlightMarker {
+        value,
+        written_at: None,
+    })
+}
+
+/// Parse a `GIMBLMK1` + big-endian u32 length + UTF-8 payload frame from the head
+/// of a buffer. Returns the payload if the magic and length are well-formed.
+fn parse_gimbl_marker(bytes: &[u8]) -> Option<String> {
+    const MAGIC: &[u8] = b"GIMBLMK1";
+    if bytes.len() < 12 || &bytes[..8] != MAGIC {
+        return None;
+    }
+    let len = u32::from_be_bytes([bytes[8], bytes[9], bytes[10], bytes[11]]) as usize;
+    let end = 12usize.checked_add(len)?;
+    if end > bytes.len() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&bytes[12..end]).into_owned())
 }
 
 fn runner_cache_dir(snapshot_id: &str) -> PathBuf {
@@ -764,5 +889,60 @@ mod tests {
         assert_eq!(tree.get("state.json").map(String::as_str), Some("abc"));
         assert_eq!(tree.len(), 2);
         parse_checksum_tree(&json!({})).unwrap_err();
+    }
+
+    #[test]
+    fn only_message_spi_is_hvf_restorable() {
+        assert!(hvf_restorable("gicv2m-message-spi"));
+        assert!(!hvf_restorable("its-lpi"));
+        assert!(!hvf_restorable(""));
+    }
+
+    #[test]
+    fn advertises_apple_hvf_substrate() {
+        let caps = capabilities();
+        assert_eq!(caps.get("substrate").and_then(Value::as_str), Some("apple-hvf"));
+        assert_eq!(caps.get("supports_resume").and_then(Value::as_bool), Some(true));
+    }
+
+    #[test]
+    fn parses_gimbl_marker_frame() {
+        let mut buf = b"GIMBLMK1".to_vec();
+        let payload = b"cloud-run proof @ T0";
+        buf.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        buf.extend_from_slice(payload);
+        buf.extend_from_slice(&[0u8; 16]); // trailing RAM after the frame
+        assert_eq!(parse_gimbl_marker(&buf).as_deref(), Some("cloud-run proof @ T0"));
+        // Guards: wrong magic, truncated length.
+        assert_eq!(parse_gimbl_marker(b"NOPEMAGIC...."), None);
+        let mut bad = b"GIMBLMK1".to_vec();
+        bad.extend_from_slice(&999u32.to_be_bytes());
+        bad.extend_from_slice(b"short");
+        assert_eq!(parse_gimbl_marker(&bad), None);
+    }
+
+    #[test]
+    fn reads_flight_marker_sidecar_then_falls_back() {
+        let dir = env::temp_dir().join(format!("chm-cp-marker-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("snapshot")).unwrap();
+        // Sidecar wins.
+        fs::write(
+            dir.join("gimbal-marker.json"),
+            br#"{"value":"from-sidecar","written_at":"T1","origin_substrate":"linux-kvm"}"#,
+        )
+        .unwrap();
+        let m = read_flight_marker(&dir).unwrap();
+        assert_eq!(m.value, "from-sidecar");
+        assert_eq!(m.written_at.as_deref(), Some("T1"));
+        // Remove sidecar → fall back to the GIMBLMK1 frame in memory-ranges.
+        fs::remove_file(dir.join("gimbal-marker.json")).unwrap();
+        let mut mem = b"GIMBLMK1".to_vec();
+        let p = b"from-ram-head";
+        mem.extend_from_slice(&(p.len() as u32).to_be_bytes());
+        mem.extend_from_slice(p);
+        fs::write(dir.join("snapshot").join("memory-ranges"), &mem).unwrap();
+        assert_eq!(read_flight_marker(&dir).unwrap().value, "from-ram-head");
+        let _ = fs::remove_dir_all(&dir);
     }
 }
