@@ -15,9 +15,10 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, exit};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use std::{env, fs, thread};
+use std::{env, fs, mem, ptr, thread};
 
 use hypervisor::hvf::checkpoint as hvf_checkpoint;
 use hypervisor::hvf::rehydrate::{rehydrate, rehydrate_resume};
@@ -26,6 +27,43 @@ use hypervisor::{VmExit, VmOps};
 use crate::checkpoint;
 use crate::console_filter::ConsoleFilter;
 use crate::imp::{build_vm_ops, its_lpi_guard, load_snapshot, wire_virtio};
+
+/// Set by the daemon's termination-signal handlers so the accept loop exits and
+/// tears the running VM down gracefully (checkpoint + `hv_vm_destroy`) instead
+/// of the process dying mid-run with the VM leaked. Closing the app (which kills
+/// its `chm serve` child), `kill`, or Ctrl-C all funnel through this.
+static DAEMON_SHUTDOWN: AtomicBool = AtomicBool::new(false);
+
+/// How long a shutdown waits for the worker to finish capturing its checkpoint
+/// and destroying the VM. Longer than the `ctl stop` responsiveness window
+/// because a full RAM checkpoint dump can take a few seconds.
+const SHUTDOWN_DRAIN: Duration = Duration::from_secs(30);
+
+extern "C" fn handle_daemon_signal(_sig: libc::c_int) {
+    DAEMON_SHUTDOWN.store(true, Ordering::Release);
+}
+
+/// Install graceful-shutdown handlers for the daemon's termination signals.
+/// The handler only sets a flag; the accept loop polls it (std's `accept()`
+/// retries EINTR internally, so the loop runs the listener non-blocking rather
+/// than relying on a signal to interrupt a blocking accept).
+fn install_daemon_signal_handlers() {
+    for sig in [libc::SIGHUP, libc::SIGINT, libc::SIGTERM] {
+        // SAFETY: zero-initialized sigaction is valid; the handler is
+        // async-signal-safe (a single atomic store); installed once at startup.
+        unsafe {
+            let mut action: libc::sigaction = mem::zeroed();
+            action.sa_sigaction = handle_daemon_signal as *const () as libc::sighandler_t;
+            libc::sigemptyset(&mut action.sa_mask);
+            action.sa_flags = 0;
+            libc::sigaction(sig, &action, ptr::null_mut());
+        }
+    }
+}
+
+fn daemon_shutdown_requested() -> bool {
+    DAEMON_SHUTDOWN.load(Ordering::Acquire)
+}
 
 /// Cap the in-memory console ring so a long-lived guest cannot grow it without
 /// bound. Late `ctl console` attachers fast-forward past anything dropped.
@@ -247,16 +285,72 @@ fn serve(raw: &[String]) -> Result<(), String> {
         );
     }
 
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => {
+    // Tear the running VM down gracefully on a termination signal (the app
+    // killing its `chm serve` child, `kill`, or Ctrl-C): stop the VM (which
+    // captures a checkpoint) and destroy it, rather than leaking the one HVF
+    // slot. Std's blocking `accept()` retries EINTR internally, so a signal
+    // alone won't wake it; instead poll the listener non-blocking and check the
+    // shutdown flag between polls for a responsive, connection-independent exit.
+    install_daemon_signal_handlers();
+    listener
+        .set_nonblocking(true)
+        .map_err(|e| format!("set listener non-blocking: {e}"))?;
+
+    while !daemon_shutdown_requested() {
+        match listener.accept() {
+            Ok((stream, _addr)) => {
+                // Handle this connection in blocking mode.
+                let _ = stream.set_nonblocking(false);
                 let daemon = Arc::clone(&daemon);
                 thread::spawn(move || handle_conn(stream, &daemon));
             }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                thread::sleep(Duration::from_millis(100));
+            }
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
             Err(e) => eprintln!("chm serve: accept error: {e}"),
         }
     }
+
+    // Graceful shutdown path: stop any running VM (capturing its checkpoint and
+    // destroying it) before the process exits, so no HVF slot is leaked.
+    eprintln!("chm serve: shutting down — stopping any running sandbox…");
+    let _ = stop_vm_blocking(&daemon, SHUTDOWN_DRAIN);
+    let _ = fs::remove_file(&daemon.socket_path);
     Ok(())
+}
+
+/// Request the running VM to stop and wait up to `timeout` for the worker to
+/// finish (its checkpoint capture + `hv_vm_destroy` complete when the worker
+/// records `Stopped`). Used by the shutdown paths, which need to wait longer
+/// than `ctl stop`'s responsiveness window for a full RAM checkpoint to flush.
+fn stop_vm_blocking(daemon: &Daemon, timeout: Duration) -> Result<String, String> {
+    let (inner, name) = {
+        let guard = daemon.current.lock().unwrap();
+        match guard.as_ref() {
+            Some(vm) => (Arc::clone(&vm.inner), vm.name.clone()),
+            None => return Ok("no VM running".to_string()),
+        }
+    };
+    let kick = {
+        let mut g = inner.lock().unwrap();
+        if matches!(g.status, RunStatus::Stopped(_)) {
+            return Ok(format!("`{name}` already stopped"));
+        }
+        g.stop_requested = true;
+        g.kick.clone()
+    };
+    if let Some(kick) = kick {
+        kick();
+    }
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if matches!(inner.lock().unwrap().status, RunStatus::Stopped(_)) {
+            return Ok(format!("stopped `{name}`"));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    Ok(format!("stop requested for `{name}` (still draining)"))
 }
 
 fn handle_conn(stream: UnixStream, daemon: &Daemon) {
@@ -318,7 +412,9 @@ fn handle_conn(stream: UnixStream, daemon: &Daemon) {
             let _ = writer.write_all(resp.as_bytes());
         }
         "shutdown" => {
-            let _ = stop_vm(daemon);
+            // Wait longer than `ctl stop` so a full RAM checkpoint finishes
+            // flushing (and the VM is destroyed) before the process exits.
+            let _ = stop_vm_blocking(daemon, SHUTDOWN_DRAIN);
             let _ = writer.write_all(b"ok\tdaemon exiting\n");
             let _ = writer.flush();
             let _ = fs::remove_file(&daemon.socket_path);
