@@ -157,6 +157,8 @@ final class AppModel: ObservableObject {
             if !trimmed.isEmpty { appendLog(trimmed) }
             if result.status == 0 {
                 appendLog("cloud: \(snapshot.id) ran to completion locally")
+            } else if result.output.contains("protocol fixture") {
+                appendLog("cloud: \(snapshot.id) is a protocol fixture — it pulls + verifies, but needs a real snapshot to boot on HVF")
             } else {
                 appendLog("cloud: \(snapshot.id) did not complete cleanly (exit \(result.status))")
             }
