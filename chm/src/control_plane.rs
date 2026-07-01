@@ -659,6 +659,15 @@ fn run_assignment(cp: &ControlPlane, runner_id: &str, opts: &RunOpts) -> Result<
         return Ok(());
     }
 
+    // Pre-flight: only a real cloud-hypervisor snapshot can boot on HVF. A
+    // protocol fixture pulls + verifies but has no `snapshots` state, so fail it
+    // here with an honest, actionable message rather than exec'ing `chm` and
+    // surfacing a cryptic parser error.
+    if let Err(reason) = snapshot_is_bootable(&cache) {
+        cp.report_state(&sandbox_id, "error").ok();
+        return Err(reason);
+    }
+
     // 6. Run the workload and report state honestly.
     let args = chm_command_args(chm_command, &cache)?;
     if kind == "resume" && args.first().map(String::as_str) != Some("resume") {
@@ -715,6 +724,27 @@ fn run_chm(args: &[String]) -> Result<i32, String> {
 /// `its-lpi`) stays cloud-only.
 fn hvf_restorable(gic_mode: &str) -> bool {
     gic_mode == "gicv2m-message-spi"
+}
+
+/// A real cloud-hypervisor snapshot's `state.json` carries a top-level
+/// `snapshots` state tree (parsed by `hypervisor::hvf::rehydrate`). A protocol
+/// fixture verifies + pulls but lacks it, so it cannot boot. Check before exec so
+/// a fixture fails with an honest message instead of a cryptic parser error.
+fn snapshot_is_bootable(dir: &Path) -> Result<(), String> {
+    let state = dir.join("state.json");
+    let bytes =
+        fs::read(&state).map_err(|e| format!("read {}: {e}", state.display()))?;
+    let value: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("parse {}: {e}", state.display()))?;
+    let has_snapshots = value.get("snapshots").is_some_and(|s| !s.is_null());
+    if has_snapshots {
+        Ok(())
+    } else {
+        Err("pulled + verified OK, but state.json has no `snapshots` state — this is a \
+             protocol fixture, not a bootable cloud-hypervisor snapshot. It cannot run on \
+             HVF; a real-KVM capture is required to make it runnable here."
+            .to_string())
+    }
 }
 
 /// The mid-flight marker a cloud runner embeds to prove session continuity: the
@@ -896,6 +926,31 @@ mod tests {
         assert!(hvf_restorable("gicv2m-message-spi"));
         assert!(!hvf_restorable("its-lpi"));
         assert!(!hvf_restorable(""));
+    }
+
+    #[test]
+    fn bootable_gate_distinguishes_real_snapshot_from_fixture() {
+        let dir = env::temp_dir().join(format!("chm-cp-boot-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        // A protocol fixture: no `snapshots` state.
+        fs::write(
+            dir.join("state.json"),
+            br#"{"config":{},"devices":[],"interrupt_routing":"message-spi"}"#,
+        )
+        .unwrap();
+        snapshot_is_bootable(&dir).unwrap_err();
+        // A real snapshot: has a `snapshots` state tree.
+        fs::write(
+            dir.join("state.json"),
+            br#"{"snapshots":{"device-manager":{}},"snapshot_data":{}}"#,
+        )
+        .unwrap();
+        snapshot_is_bootable(&dir).unwrap();
+        // A null `snapshots` is treated as a fixture.
+        fs::write(dir.join("state.json"), br#"{"snapshots":null}"#).unwrap();
+        snapshot_is_bootable(&dir).unwrap_err();
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
