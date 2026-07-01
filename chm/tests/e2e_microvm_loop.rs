@@ -615,10 +615,15 @@ impl PtySession {
         String::from_utf8_lossy(&self.buf).to_string()
     }
 
-    /// Ask `chm` to quit (Ctrl-A x), then make sure the child is gone.
+    /// Ask `chm` to quit (Ctrl-A x) and wait for it to exit cleanly, then make
+    /// sure the child is gone. The grace period is generous because a
+    /// `--checkpoint` session captures a full RAM checkpoint on exit (seconds for
+    /// a 1 GB guest); a short timeout here would SIGKILL mid-capture, which skips
+    /// VM teardown and leaks the one HVF slot. The loop breaks as soon as the
+    /// child exits, so a non-checkpointing session still tears down fast.
     fn shutdown(&mut self) {
         self.send("\x01x");
-        let until = Instant::now() + Duration::from_secs(5);
+        let until = Instant::now() + Duration::from_secs(45);
         while Instant::now() < until {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
                 break;
@@ -627,6 +632,9 @@ impl PtySession {
             sleep(Duration::from_millis(50));
         }
         if matches!(self.child.try_wait(), Ok(None)) {
+            // Last resort: the graceful quit didn't land. SIGKILL may leak the
+            // HVF VM (it skips teardown), so this should effectively never fire.
+            eprintln!("e2e: WARNING — chm did not exit gracefully; forcing kill (may leak the HVF slot)");
             let _ = self.child.kill();
             let _ = self.child.wait();
         }
@@ -636,9 +644,11 @@ impl PtySession {
     /// Suspend the session: send the graceful quit escape (Ctrl-A x) and wait
     /// for `chm` to exit, which captures a checkpoint. Unlike `shutdown`, the
     /// signed binary is left in place so a second session can resume from it.
+    /// The generous grace matches a full RAM checkpoint capture; a SIGKILL here
+    /// would skip teardown and leak the HVF slot (and lose the checkpoint).
     fn suspend(&mut self) {
         self.send("\x01x");
-        let until = Instant::now() + Duration::from_secs(30);
+        let until = Instant::now() + Duration::from_secs(45);
         while Instant::now() < until {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
                 return;
@@ -646,6 +656,7 @@ impl PtySession {
             self.pump();
             sleep(Duration::from_millis(50));
         }
+        eprintln!("e2e: WARNING — chm did not suspend gracefully; forcing kill (may leak the HVF slot)");
         let _ = self.child.kill();
         let _ = self.child.wait();
     }
