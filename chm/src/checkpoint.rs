@@ -26,6 +26,7 @@
 //! values; the parent snapshot still supplies the memory-region layout and the
 //! virtio/serial device wiring.
 
+use std::env;
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -38,8 +39,15 @@ use hypervisor::hvf::virtio::GuestMemory;
 use serde::{Deserialize, Serialize};
 
 const CHECKPOINT_SUBDIR: &str = ".chm-checkpoint";
+const REVISIONS_SUBDIR: &str = ".chm-revisions";
 const MANIFEST: &str = "checkpoint.json";
 const MEMORY_RANGES: &str = "memory-ranges";
+
+/// How many revisions keep their full (resumable) guest-RAM dump. Older
+/// revisions are pruned to manifest-only so the lineage graph survives without
+/// the store growing by a full RAM image on every suspend. Overridable via
+/// `CHM_MAX_RESUMABLE_REVISIONS`.
+const DEFAULT_MAX_RESUMABLE_REVISIONS: usize = 5;
 
 /// On-disk manifest version for the lineage header (independent of the
 /// hardware [`CheckpointState`] version).
@@ -110,7 +118,13 @@ pub(crate) fn clear_checkpoint(snapshot_dir: &Path) {
 
 /// Read a revision's full manifest (lineage header + hardware state).
 pub(crate) fn read_revision(snapshot_dir: &Path) -> Result<Revision, String> {
-    let path = checkpoint_dir(snapshot_dir).join(MANIFEST);
+    read_revision_manifest(&checkpoint_dir(snapshot_dir))
+}
+
+/// Read a revision manifest from an arbitrary revision directory (the current
+/// checkpoint, or an archived one under `.chm-revisions/`).
+fn read_revision_manifest(rev_dir: &Path) -> Result<Revision, String> {
+    let path = rev_dir.join(MANIFEST);
     let body = fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let rev: Revision =
         serde_json::from_str(&body).map_err(|e| format!("parse {}: {e}", path.display()))?;
@@ -120,7 +134,7 @@ pub(crate) fn read_revision(snapshot_dir: &Path) -> Result<Revision, String> {
              (delete {} to cold-boot)",
             rev.state.version,
             CHECKPOINT_VERSION,
-            checkpoint_dir(snapshot_dir).display()
+            rev_dir.display()
         ));
     }
     Ok(rev)
@@ -179,10 +193,181 @@ pub(crate) fn write_checkpoint(
     fs::write(tmp.join(MANIFEST), json.as_bytes())
         .map_err(|e| format!("write {}: {e}", tmp.join(MANIFEST).display()))?;
 
-    // Swap the staged revision into place.
-    let _ = fs::remove_dir_all(&dir);
+    // Archive the current HEAD into the revision store (preserving history),
+    // then swap the staged revision into place as the new HEAD. The new
+    // revision's `parent` is exactly the current HEAD's id.
+    match revision.parent.as_deref() {
+        Some(head_id) => archive_head(snapshot_dir, head_id),
+        None => {
+            let _ = fs::remove_dir_all(&dir);
+        }
+    }
     fs::rename(&tmp, &dir)
         .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), dir.display()))?;
+    prune_revisions(snapshot_dir);
+    Ok(())
+}
+
+/// The revision store directory (archived past revisions) for a snapshot.
+fn revisions_dir(snapshot_dir: &Path) -> PathBuf {
+    snapshot_dir.join(REVISIONS_SUBDIR)
+}
+
+fn max_resumable_revisions() -> usize {
+    env::var("CHM_MAX_RESUMABLE_REVISIONS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_RESUMABLE_REVISIONS)
+}
+
+/// Move the current HEAD checkpoint into the revision store under its id, so it
+/// is preserved as a past revision instead of being overwritten.
+fn archive_head(snapshot_dir: &Path, head_id: &str) {
+    let store = revisions_dir(snapshot_dir);
+    if fs::create_dir_all(&store).is_err() {
+        let _ = fs::remove_dir_all(checkpoint_dir(snapshot_dir));
+        return;
+    }
+    let dest = store.join(head_id);
+    let _ = fs::remove_dir_all(&dest);
+    if fs::rename(checkpoint_dir(snapshot_dir), &dest).is_err() {
+        // If the move failed, don't leave a stale HEAD behind.
+        let _ = fs::remove_dir_all(checkpoint_dir(snapshot_dir));
+    }
+}
+
+/// A revision in a snapshot's lineage, with whether it can still be resumed /
+/// rolled back to (its guest-RAM dump is still present).
+pub(crate) struct RevisionInfo {
+    pub revision: Revision,
+    pub resumable: bool,
+    pub is_head: bool,
+}
+
+/// List a snapshot's revisions oldest-first: the archived ones in the store plus
+/// the current HEAD. A revision is `resumable` while its RAM dump is retained.
+pub(crate) fn list_revisions(snapshot_dir: &Path) -> Vec<RevisionInfo> {
+    let mut out = Vec::new();
+    if let Ok(entries) = fs::read_dir(revisions_dir(snapshot_dir)) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if let Ok(revision) = read_revision_manifest(&dir) {
+                let resumable = dir.join(MEMORY_RANGES).is_file();
+                out.push(RevisionInfo { revision, resumable, is_head: false });
+            }
+        }
+    }
+    if let Ok(revision) = read_revision(snapshot_dir) {
+        let resumable = memory_ranges_path(snapshot_dir).is_file();
+        out.push(RevisionInfo { revision, resumable, is_head: true });
+    }
+    out.sort_by(|a, b| a.revision.created_at_ms.cmp(&b.revision.created_at_ms));
+    out
+}
+
+/// A lightweight, serializable view of a revision for the CLI + app (without the
+/// heavy hardware state). `resumable` = its RAM dump is retained; `is_head` = it
+/// is the current live checkpoint.
+#[derive(Serialize)]
+pub(crate) struct RevisionSummary {
+    pub id: String,
+    pub parent: Option<String>,
+    pub base_image: String,
+    pub created_at_ms: u64,
+    pub origin: String,
+    pub label: Option<String>,
+    pub resumable: bool,
+    pub is_head: bool,
+}
+
+/// The snapshot's revisions as serializable summaries (oldest-first).
+pub(crate) fn revision_summaries(snapshot_dir: &Path) -> Vec<RevisionSummary> {
+    list_revisions(snapshot_dir)
+        .into_iter()
+        .map(|info| RevisionSummary {
+            id: info.revision.id,
+            parent: info.revision.parent,
+            base_image: info.revision.base_image,
+            created_at_ms: info.revision.created_at_ms,
+            origin: info.revision.origin,
+            label: info.revision.label,
+            resumable: info.resumable,
+            is_head: info.is_head,
+        })
+        .collect()
+}
+
+/// Keep the newest `max_resumable_revisions()` archived revisions fully
+/// resumable; drop older ones' RAM dumps (keeping their manifest so the lineage
+/// graph stays intact) to bound disk growth.
+fn prune_revisions(snapshot_dir: &Path) {
+    prune_revisions_keeping(snapshot_dir, max_resumable_revisions());
+}
+
+fn prune_revisions_keeping(snapshot_dir: &Path, max_resumable: usize) {
+    let store = revisions_dir(snapshot_dir);
+    let mut archived: Vec<(u64, PathBuf)> = match fs::read_dir(&store) {
+        Ok(entries) => entries
+            .flatten()
+            .filter_map(|e| {
+                let dir = e.path();
+                read_revision_manifest(&dir).ok().and_then(|r| {
+                    dir.join(MEMORY_RANGES)
+                        .is_file()
+                        .then_some((r.created_at_ms, dir))
+                })
+            })
+            .collect(),
+        Err(_) => return,
+    };
+    // The live HEAD counts as one resumable revision; keep that many archived.
+    let keep = max_resumable.saturating_sub(1);
+    if archived.len() <= keep {
+        return;
+    }
+    archived.sort_by(|a, b| a.0.cmp(&b.0));
+    let drop_count = archived.len() - keep;
+    for (_, dir) in archived.into_iter().take(drop_count) {
+        let _ = fs::remove_file(dir.join(MEMORY_RANGES));
+    }
+}
+
+/// Roll a snapshot back to an archived revision: it becomes a new HEAD that
+/// descends from the target (append-only — history is preserved, not rewound).
+/// The target must still be resumable (its RAM dump retained).
+pub(crate) fn rollback(snapshot_dir: &Path, rev_id: &str) -> Result<(), String> {
+    let target = revisions_dir(snapshot_dir).join(rev_id);
+    if !target.join(MANIFEST).is_file() {
+        return Err(format!("revision {rev_id} is not in the store"));
+    }
+    if !target.join(MEMORY_RANGES).is_file() {
+        return Err(format!(
+            "revision {rev_id} is metadata-only (its RAM was pruned) and cannot be resumed"
+        ));
+    }
+
+    // Archive the current HEAD so the rollback is non-destructive.
+    if let Ok(head) = read_revision(snapshot_dir) {
+        archive_head(snapshot_dir, &head.id);
+    } else {
+        clear_checkpoint(snapshot_dir);
+    }
+
+    // Restore the target as a fresh HEAD descending from it (rollback as a new
+    // revision, so the lineage stays append-only).
+    let dir = checkpoint_dir(snapshot_dir);
+    copy_tree(&target, &dir)?;
+    let mut rev = read_revision_manifest(&dir)?;
+    let created_at_ms = now_ms();
+    rev.parent = Some(rev.id.clone());
+    rev.id = mint_revision_id(created_at_ms);
+    rev.created_at_ms = created_at_ms;
+    rev.origin = "rollback".to_string();
+    let json = serde_json::to_string(&rev).map_err(|e| format!("serialize revision: {e}"))?;
+    fs::write(dir.join(MANIFEST), json.as_bytes())
+        .map_err(|e| format!("write rolled-back manifest: {e}"))?;
+    prune_revisions(snapshot_dir);
     Ok(())
 }
 
@@ -307,7 +492,7 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{env, process};
+    use std::process;
 
     #[test]
     fn checkpoint_paths_are_under_the_snapshot_dir() {
@@ -425,5 +610,93 @@ mod tests {
         assert!(fork_into(&root.join("nope"), &root.join("nope2")).is_err());
 
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Write a checkpoint with a given RAM marker + origin into `snapshot_dir`.
+    fn write_test_checkpoint(snapshot_dir: &Path, ram: &[u8], origin: &str) {
+        use hypervisor::hvf::checkpoint::{CHECKPOINT_VERSION, CheckpointState};
+        // Mirror write_checkpoint's archive-then-swap, without a live GuestMemory:
+        // archive the current HEAD, then stage a fresh HEAD directly.
+        let parent = read_revision(snapshot_dir).ok().map(|r| r.id);
+        match &parent {
+            Some(id) => archive_head(snapshot_dir, id),
+            None => clear_checkpoint(snapshot_dir),
+        }
+        let dir = checkpoint_dir(snapshot_dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join(MEMORY_RANGES), ram).unwrap();
+        let created_at_ms = now_ms() + ram.len() as u64; // keep ids ordered in-test
+        let rev = Revision {
+            manifest_version: REVISION_MANIFEST_VERSION,
+            id: mint_revision_id(created_at_ms),
+            parent,
+            base_image: "snap".into(),
+            created_at_ms,
+            origin: origin.into(),
+            label: None,
+            state: CheckpointState {
+                version: CHECKPOINT_VERSION,
+                ..Default::default()
+            },
+        };
+        fs::write(dir.join(MANIFEST), serde_json::to_string(&rev).unwrap()).unwrap();
+        prune_revisions(snapshot_dir);
+    }
+
+    #[test]
+    fn revision_store_keeps_history_and_rolls_back() {
+        let snap = env::temp_dir().join(format!("chm-revstore-{}-{}", process::id(), now_ms()));
+        let _ = fs::remove_dir_all(&snap);
+        fs::create_dir_all(&snap).unwrap();
+
+        // Two suspends: the first becomes an archived revision, the second HEAD.
+        write_test_checkpoint(&snap, b"ram-v1", "connect");
+        let v1 = read_revision(&snap).unwrap().id;
+        write_test_checkpoint(&snap, b"ram-v2", "connect");
+
+        let revs = revision_summaries(&snap);
+        assert_eq!(revs.len(), 2, "history is preserved, not overwritten");
+        assert!(revs[0].created_at_ms <= revs[1].created_at_ms, "oldest-first");
+        assert!(revs.iter().any(|r| r.id == v1 && !r.is_head && r.resumable));
+        assert!(revs.iter().filter(|r| r.is_head).count() == 1);
+        // HEAD is currently ram-v2.
+        assert_eq!(fs::read(memory_ranges_path(&snap)).unwrap(), b"ram-v2");
+
+        // Roll back to v1: appended as a fresh HEAD descending from v1.
+        rollback(&snap, &v1).unwrap();
+        assert_eq!(
+            fs::read(memory_ranges_path(&snap)).unwrap(),
+            b"ram-v1",
+            "rollback restores the target's live RAM"
+        );
+        let head = read_revision(&snap).unwrap();
+        assert_eq!(head.origin, "rollback");
+        assert_eq!(head.parent.as_deref(), Some(v1.as_str()));
+
+        // Rolling back to an unknown revision is refused.
+        rollback(&snap, "rev-nope").unwrap_err();
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    #[test]
+    fn prune_keeps_only_the_newest_ram_dumps() {
+        let snap = env::temp_dir().join(format!("chm-prune-{}-{}", process::id(), now_ms()));
+        let _ = fs::remove_dir_all(&snap);
+        fs::create_dir_all(&snap).unwrap();
+
+        for i in 0..4u8 {
+            write_test_checkpoint(&snap, &[b'r', b'0' + i], "connect");
+        }
+        // Bound resumable revisions to 2 (HEAD + one archived).
+        prune_revisions_keeping(&snap, 2);
+        let revs = revision_summaries(&snap);
+        // All 4 revisions are still in the lineage (manifests kept)…
+        assert_eq!(revs.len(), 4);
+        // …but only the newest 2 keep their RAM.
+        assert_eq!(revs.iter().filter(|r| r.resumable).count(), 2);
+        assert!(revs.last().unwrap().is_head && revs.last().unwrap().resumable);
+
+        let _ = fs::remove_dir_all(&snap);
     }
 }

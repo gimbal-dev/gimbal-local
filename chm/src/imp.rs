@@ -395,6 +395,20 @@ pub fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("revisions") => match revisions(&raw[1..]) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("chm revisions: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("rollback") => match rollback_cmd(&raw[1..]) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("chm rollback: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Some("connect") => match parse_connect(&raw[1..]) {
             Parsed::Connect(args) => match connect(&args) {
                 Ok(code) => code,
@@ -463,6 +477,8 @@ fn usage() -> String {
          chm restore <SNAPSHOT_DIR> [OPTIONS]   (alias for run)\n    \
          chm resume <SNAPSHOT_DIR> [OPTIONS]    (restore a saved checkpoint)\n    \
          chm fork <SRC_DIR> <DST_DIR>           (branch a saved revision)\n    \
+         chm revisions <SNAPSHOT_DIR> [--json]  (list the lineage)\n    \
+         chm rollback <SNAPSHOT_DIR> <REV_ID>   (roll back to a revision)\n    \
          chm connect <SNAPSHOT_DIR> [OPTIONS]   (interactive session)\n    \
          chm cloud <COMMAND> aws [OPTIONS]      (BYO cloud helpers)\n    \
          chm serve <LIBRARY_DIR> [OPTIONS]      (background daemon)\n    \
@@ -676,6 +692,79 @@ fn fork(raw: &[String]) -> Result<ExitCode, String> {
         src.display(),
         dst.display(),
         dst.display()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `chm revisions <SNAPSHOT_DIR> [--json]` — list a snapshot's saved revisions
+/// (its suspend/fork/rollback lineage), oldest first.
+fn revisions(raw: &[String]) -> Result<ExitCode, String> {
+    let json = raw.iter().any(|a| a == "--json");
+    let positionals: Vec<&String> = raw.iter().filter(|a| !a.starts_with('-')).collect();
+    if raw.iter().any(|a| a == "-h" || a == "--help") || positionals.len() != 1 {
+        eprintln!(
+            "usage: chm revisions <SNAPSHOT_DIR> [--json]\n\
+             \n\
+             List the snapshot's saved revisions (its lineage), oldest first.\n\
+             `resumable` marks revisions whose live RAM is still retained; older\n\
+             ones are kept as metadata so the lineage graph survives."
+        );
+        return if positionals.len() == 1 {
+            Ok(ExitCode::SUCCESS)
+        } else {
+            Err("expected one directory argument".to_string())
+        };
+    }
+    let dir = PathBuf::from(positionals[0]);
+    let summaries = checkpoint::revision_summaries(&dir);
+    if json {
+        let out = serde_json::to_string(&summaries)
+            .map_err(|e| format!("serialize revisions: {e}"))?;
+        println!("{out}");
+    } else if summaries.is_empty() {
+        eprintln!(
+            "chm: no saved revisions for {} (run and suspend it first)",
+            dir.display()
+        );
+    } else {
+        for r in &summaries {
+            let head = if r.is_head { " (HEAD)" } else { "" };
+            let resumable = if r.resumable { "resumable" } else { "metadata-only" };
+            let parent = r.parent.as_deref().unwrap_or("—");
+            println!(
+                "{}{head}  {}  parent={parent}  {resumable}",
+                r.id, r.origin
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `chm rollback <SNAPSHOT_DIR> <REVISION_ID>` — roll a snapshot back to an
+/// archived revision (appended as a fresh HEAD; history is preserved).
+fn rollback_cmd(raw: &[String]) -> Result<ExitCode, String> {
+    let positionals: Vec<&String> = raw.iter().filter(|a| !a.starts_with('-')).collect();
+    if raw.iter().any(|a| a == "-h" || a == "--help") || positionals.len() != 2 {
+        eprintln!(
+            "usage: chm rollback <SNAPSHOT_DIR> <REVISION_ID>\n\
+             \n\
+             Roll the snapshot back to an archived revision: it becomes a fresh\n\
+             HEAD descending from the target (history is preserved, not rewound).\n\
+             The target must still be `resumable`. Then `chm resume <DIR>`."
+        );
+        return if positionals.len() == 2 {
+            Ok(ExitCode::SUCCESS)
+        } else {
+            Err("expected a snapshot directory and a revision id".to_string())
+        };
+    }
+    let dir = PathBuf::from(positionals[0]);
+    let rev_id = positionals[1];
+    checkpoint::rollback(&dir, rev_id)?;
+    eprintln!(
+        "chm: rolled {} back to {rev_id} (resume it with `chm resume {}`)",
+        dir.display(),
+        dir.display()
     );
     Ok(ExitCode::SUCCESS)
 }
