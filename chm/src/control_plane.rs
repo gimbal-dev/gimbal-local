@@ -226,18 +226,15 @@ fn http_error_message(body: &Value) -> String {
     )
 }
 
-/// Resolve an assignment's `download_uri` to a local directory path. On this Mac
-/// the object store is local, so the URI is a `file://` path we read directly.
-/// A non-`file://` locator is unsupported here (would need a real download).
+/// Resolve a `file://` `download_uri` to a local directory path. On this Mac the
+/// object store is local, so the URI is a `file://` path we read directly.
+/// Networked (`http(s)://`) stores are handled separately by `http_download`.
 fn download_uri_to_path(uri: &str) -> Result<PathBuf, String> {
     if let Some(rest) = uri.strip_prefix("file://") {
         // file:///abs/path → /abs/path (three slashes ⇒ empty host).
         Ok(PathBuf::from(rest))
     } else {
-        Err(format!(
-            "download_uri {uri} is not a local file:// locator; \
-             networked object stores are not supported by this runner yet"
-        ))
+        Err(format!("download_uri {uri} is not a local file:// locator"))
     }
 }
 
@@ -272,22 +269,119 @@ fn chm_command_args(chm_command: &str, snapshot_dir: &Path) -> Result<Vec<String
     Ok(args)
 }
 
-/// Verify every file in `checksum_tree` exists under `dir` with a matching
-/// sha256. Keys are bundle-relative paths; values are lowercase hex digests.
-fn verify_checksums(dir: &Path, checksum_tree: &BTreeMap<String, String>) -> Result<(), String> {
+/// Materialize a snapshot bundle into `cache` from the assignment's
+/// `download_uri`, verifying every file against `checksum_tree`. Files are stored
+/// **content-addressed** in a shared CAS (keyed by sha256, a sibling of the
+/// per-snapshot cache dirs) and hard-linked into the cache, so a base layer
+/// shared across snapshots — e.g. a checkpoint and its parent's multi-GiB disk —
+/// is fetched and stored **once**. Returns the count served from the cache
+/// (deduped) rather than fetched.
+///
+/// `download_uri` may be a local `file://` object store (a copy) or a networked
+/// `http(s)://` one (streamed via curl). Each object is fetched from
+/// `<download_uri>/<relpath>` and verified before it enters the CAS; CAS hits are
+/// trusted (the blob's name is its verified digest).
+fn materialize_bundle(
+    download_uri: &str,
+    checksum_tree: &BTreeMap<String, String>,
+    cache: &Path,
+    token: Option<&str>,
+) -> Result<usize, String> {
     if checksum_tree.is_empty() {
         return Err("manifest.checksum_tree is empty; refusing to trust the bundle".to_string());
     }
+    let cas = cas_dir_for(cache);
+    fs::create_dir_all(&cas).map_err(|e| format!("create CAS {}: {e}", cas.display()))?;
+    let mut deduped = 0usize;
     for (rel, want) in checksum_tree {
-        let path = dir.join(rel);
-        let got = sha256_file(&path)?;
-        if !got.eq_ignore_ascii_case(want) {
-            return Err(format!(
-                "checksum mismatch for {rel}: expected {want}, got {got}"
-            ));
+        let want = want.to_lowercase();
+        let dest = cache.join(rel);
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
         }
+        let blob = cas.join(&want);
+        if blob.is_file() {
+            // Dedup hit: content-addressed blob already local (verified on
+            // ingest) — link it in without re-fetching or re-hashing.
+            link_or_copy(&blob, &dest)?;
+            deduped += 1;
+            continue;
+        }
+        // Miss: fetch the object, verify it, then promote it into the CAS.
+        fetch_object(download_uri, rel, &dest, token)?;
+        let got = sha256_file(&dest)?;
+        if !got.eq_ignore_ascii_case(&want) {
+            let _ = fs::remove_file(&dest);
+            return Err(format!("checksum mismatch for {rel}: expected {want}, got {got}"));
+        }
+        let _ = fs::hard_link(&dest, &blob).or_else(|_| fs::copy(&dest, &blob).map(|_| ()));
     }
-    Ok(())
+    Ok(deduped)
+}
+
+/// The content-addressed store (sha256 → blob) for a given snapshot cache: a
+/// `.cas` sibling of the per-snapshot cache dirs, so it is shared across pulls.
+fn cas_dir_for(cache: &Path) -> PathBuf {
+    cache.parent().unwrap_or(cache).join(".cas")
+}
+
+/// Fetch one bundle object (`<download_uri>/<relpath>`) into `dest`. Supports a
+/// local `file://` object store (a copy) and a networked `http(s)://` store
+/// (streamed via curl, with an optional bearer token).
+fn fetch_object(
+    download_uri: &str,
+    relpath: &str,
+    dest: &Path,
+    token: Option<&str>,
+) -> Result<(), String> {
+    if download_uri.starts_with("file://") {
+        let src = download_uri_to_path(download_uri)?.join(relpath);
+        fs::copy(&src, dest)
+            .map(|_| ())
+            .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dest.display()))
+    } else if download_uri.starts_with("http://") || download_uri.starts_with("https://") {
+        http_download(&object_url(download_uri, relpath), dest, token)
+    } else {
+        Err(format!(
+            "unsupported download_uri scheme: {download_uri} (expected file:// or http(s)://)"
+        ))
+    }
+}
+
+/// Join a bundle base URL and a bundle-relative path into an object URL.
+fn object_url(base: &str, relpath: &str) -> String {
+    format!("{}/{}", base.trim_end_matches('/'), relpath.trim_start_matches('/'))
+}
+
+/// Stream an object over HTTP(S) into `dest` via curl (`-f` fails on 4xx/5xx;
+/// `-o` streams straight to disk so a multi-GiB image is never buffered in RAM).
+fn http_download(url: &str, dest: &Path, token: Option<&str>) -> Result<(), String> {
+    let mut cmd = Command::new("curl");
+    cmd.args(["-fsS", "--max-time", "1200"]);
+    if let Some(tok) = token {
+        cmd.arg("-H").arg(format!("authorization: Bearer {tok}"));
+    }
+    cmd.arg("-o").arg(dest).arg(url);
+    let status = cmd.status().map_err(|e| format!("spawn curl: {e}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        let _ = fs::remove_file(dest);
+        Err(format!(
+            "curl failed (exit {}) fetching {url}",
+            status.code().unwrap_or(-1)
+        ))
+    }
+}
+
+/// Link `src` into `dest`, falling back to a copy across filesystems.
+fn link_or_copy(src: &Path, dest: &Path) -> Result<(), String> {
+    if dest.exists() {
+        let _ = fs::remove_file(dest);
+    }
+    fs::hard_link(src, dest)
+        .or_else(|_| fs::copy(src, dest).map(|_| ()))
+        .map_err(|e| format!("link {} -> {}: {e}", src.display(), dest.display()))
 }
 
 /// sha256 a file via `shasum -a 256` (always present on macOS), returning the
@@ -312,27 +406,6 @@ fn sha256_file(path: &Path) -> Result<String, String> {
 /// Parse `<hex>  <path>` (shasum format) into the digest.
 fn parse_shasum_output(out: &str) -> Option<String> {
     out.split_whitespace().next().map(|s| s.to_lowercase())
-}
-
-/// Copy a snapshot bundle tree from `src` into `dst` (the local runner cache),
-/// so the runner holds a verified local copy independent of the object store.
-fn copy_bundle(src: &Path, dst: &Path) -> Result<(), String> {
-    fs::create_dir_all(dst).map_err(|e| format!("create {}: {e}", dst.display()))?;
-    for entry in fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))? {
-        let entry = entry.map_err(|e| format!("read {}: {e}", src.display()))?;
-        let from = entry.path();
-        let to = dst.join(entry.file_name());
-        let ft = entry
-            .file_type()
-            .map_err(|e| format!("stat {}: {e}", from.display()))?;
-        if ft.is_dir() {
-            copy_bundle(&from, &to)?;
-        } else {
-            fs::copy(&from, &to)
-                .map_err(|e| format!("copy {} -> {}: {e}", from.display(), to.display()))?;
-        }
-    }
-    Ok(())
 }
 
 fn now_secs() -> u64 {
@@ -620,13 +693,26 @@ fn run_assignment(cp: &ControlPlane, runner_id: &str, opts: &RunOpts) -> Result<
         }
     }
 
-    // 4. Pull + verify the bundle into a local runner cache.
-    let src = download_uri_to_path(download_uri)?;
+    // 4. Materialize + verify the bundle into a local runner cache. Content-
+    //    addressed: base layers shared across snapshots (e.g. a big base disk)
+    //    are fetched + stored once. `download_uri` may be file:// or http(s)://.
     let cache = runner_cache_dir(&opts.snapshot_id);
     let _ = fs::remove_dir_all(&cache);
-    copy_bundle(&src, &cache)?;
-    verify_checksums(&cache, &checksum_tree)?;
-    eprintln!("chm runner: verified {} against manifest.checksum_tree", cache.display());
+    let token = assign.get("capability_token").and_then(Value::as_str);
+    let deduped = materialize_bundle(download_uri, &checksum_tree, &cache, token)?;
+    if deduped > 0 {
+        eprintln!(
+            "chm runner: materialized + verified {} file(s) ({deduped} shared from cache) at {}",
+            checksum_tree.len(),
+            cache.display()
+        );
+    } else {
+        eprintln!(
+            "chm runner: materialized + verified {} file(s) at {}",
+            checksum_tree.len(),
+            cache.display()
+        );
+    }
 
     // Prove continuity: read the mid-flight marker the cloud session embedded
     // (a `gimbal-marker.json` sidecar, or the `GIMBLMK1` frame at the head of
@@ -885,12 +971,28 @@ mod tests {
     }
 
     #[test]
-    fn verify_checksums_matches_real_files() {
-        let dir = env::temp_dir().join(format!("chm-cp-test-{}", process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(dir.join("snapshot")).unwrap();
-        fs::write(dir.join("state.json"), b"hello").unwrap();
-        fs::write(dir.join("snapshot/mem"), b"world").unwrap();
+    fn object_url_joins_base_and_relpath() {
+        assert_eq!(
+            object_url("https://cdn.example/snap", "snapshot/mem"),
+            "https://cdn.example/snap/snapshot/mem"
+        );
+        // Redundant slashes are normalised at the join.
+        assert_eq!(
+            object_url("https://cdn.example/snap/", "/state.json"),
+            "https://cdn.example/snap/state.json"
+        );
+    }
+
+    #[test]
+    fn materialize_verifies_and_dedups_shared_blobs() {
+        let root = env::temp_dir().join(format!("chm-cp-mat-{}", process::id()));
+        let _ = fs::remove_dir_all(&root);
+        // A local file:// object store with two files.
+        let store = root.join("store");
+        fs::create_dir_all(store.join("snapshot")).unwrap();
+        fs::write(store.join("state.json"), b"hello").unwrap();
+        fs::write(store.join("snapshot/mem"), b"world").unwrap();
+        let uri = format!("file://{}", store.display());
         // sha256("hello"), sha256("world")
         let mut tree = BTreeMap::new();
         tree.insert(
@@ -901,13 +1003,30 @@ mod tests {
             "snapshot/mem".to_string(),
             "486ea46224d1bb4fb680f34f7c9ad96a8f24ec88be73ea8e5a6c65260e9cb8a7".to_string(),
         );
-        verify_checksums(&dir, &tree).unwrap();
-        // A wrong digest fails.
-        tree.insert("state.json".to_string(), "00".repeat(32));
-        verify_checksums(&dir, &tree).unwrap_err();
-        // An empty tree is refused.
-        verify_checksums(&dir, &BTreeMap::new()).unwrap_err();
-        let _ = fs::remove_dir_all(&dir);
+
+        // First snapshot: everything fetched (0 deduped), bytes correct.
+        let cache_a = root.join("snap-a");
+        assert_eq!(materialize_bundle(&uri, &tree, &cache_a, None).unwrap(), 0);
+        assert_eq!(fs::read(cache_a.join("state.json")).unwrap(), b"hello");
+        assert_eq!(fs::read(cache_a.join("snapshot/mem")).unwrap(), b"world");
+
+        // Second snapshot sharing the same blobs: fully served from the CAS.
+        let cache_b = root.join("snap-b");
+        assert_eq!(
+            materialize_bundle(&uri, &tree, &cache_b, None).unwrap(),
+            tree.len()
+        );
+        assert_eq!(fs::read(cache_b.join("state.json")).unwrap(), b"hello");
+
+        // A wrong digest is rejected; an empty tree is refused.
+        let mut bad = tree.clone();
+        bad.insert("state.json".to_string(), "00".repeat(32));
+        materialize_bundle(&uri, &bad, &root.join("snap-c"), None).unwrap_err();
+        materialize_bundle(&uri, &BTreeMap::new(), &root.join("snap-d"), None).unwrap_err();
+        // An unsupported scheme is refused.
+        fetch_object("ftp://x/y", "z", &root.join("z"), None).unwrap_err();
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

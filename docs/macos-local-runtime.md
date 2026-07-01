@@ -150,9 +150,26 @@ never owns cloud lifecycle.
   `chm resume`) → report `stopped` or `error` → idempotent `push-artifacts`. A
   background thread heartbeats well within the plane's 90s window.
 - The API base is `GCTL_API` (default `http://127.0.0.1:8080`), overridable with
-  `--api`; `--owner` sets the sandbox owner; `--skip-run` exercises the protocol
-  through `mark-local-copy` without executing (honest for a synthetic fixture
-  that is not a real Cloud Hypervisor snapshot).
+  `--api`; `--owner` sets the sandbox owner; `--sandbox <id>` continues an
+  existing plane sandbox (the cross-substrate resume path); `--skip-run`
+  exercises the protocol through `mark-local-copy` without executing.
+
+**Content-addressed cache.** The bundle is materialized into a per-snapshot cache
+whose files are stored in a shared content-addressed store (`.cas`, keyed by
+sha256) and hard-linked in. A base layer shared across snapshots — e.g. a
+checkpoint and its parent's multi-GiB disk, or the two identical `state.json`
+copies inside one bundle — is fetched, verified, and stored **once**; a repeat
+pull is served entirely from the CAS (no re-copy). The `download_uri` may be a
+local `file://` object store (a copy) or a networked `http(s)://` one (streamed
+via curl, with an optional bearer token); each object is fetched from
+`<download_uri>/<relpath>` and verified before it enters the CAS.
+
+**Cross-substrate resume.** A checkpoint whose `manifest.origin_substrate` is
+`linux-kvm` (it ran on a cloud runner) resumes here on `apple-hvf`: the runner
+advertises `capabilities.substrate = "apple-hvf"`, re-verifies the `gic_mode`
+gate locally (only `gicv2m-message-spi` is HVF-restorable), reads the mid-flight
+marker (`gimbal-marker.json` / `GIMBLMK1` frame) to prove continuity, and
+`chm resume`s past the point the cloud session reached.
 
 **Hard rule — the `gic_mode` gate.** If `assign-run` returns HTTP 422
 (its-lpi / unknown snapshot), `chm` surfaces "recapture with `CH_GIC_V2M=1`" and
