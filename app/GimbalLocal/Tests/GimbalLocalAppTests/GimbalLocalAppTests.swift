@@ -280,4 +280,25 @@ final class GimbalLocalAppTests: XCTestCase {
         XCTAssertTrue(CloudControlClient.parseSnapshots(Data("[]".utf8)).isEmpty)
         XCTAssertTrue(CloudControlClient.parseSnapshots(Data("not json".utf8)).isEmpty)
     }
+
+    @MainActor
+    func testCloudSandboxSurfacesWithRemoteOriginAndTrackedState() {
+        let model = AppModel()
+        model.storedSandboxes = [
+            StoredSandbox(id: "local-1", name: "local", snapshotName: "ubuntu", location: .local),
+            StoredSandbox(id: "cloud-snap-x", name: "cloud x", snapshotName: "snap-x", location: .remote),
+        ]
+        // A cloud sandbox tracks its own run state, independent of the daemon.
+        model.cloudSandboxStates["cloud-snap-x"] = .running
+        XCTAssertEqual(model.sandbox(id: "cloud-snap-x")?.location, .remote)
+        XCTAssertEqual(model.sandbox(id: "cloud-snap-x")?.state, .running)
+        // The local sandbox is stopped (no active daemon sandbox).
+        XCTAssertEqual(model.sandbox(id: "local-1")?.location, .local)
+        XCTAssertEqual(model.sandbox(id: "local-1")?.state, .stopped)
+        // A failed cloud run surfaces its own reason, not the daemon status.
+        model.cloudSandboxStates["cloud-snap-x"] = .failed
+        model.cloudSandboxReasons["cloud-snap-x"] = "Protocol fixture — needs a real snapshot."
+        XCTAssertEqual(model.sandbox(id: "cloud-snap-x")?.state, .failed)
+        XCTAssertEqual(model.sandbox(id: "cloud-snap-x")?.reason, "Protocol fixture — needs a real snapshot.")
+    }
 }

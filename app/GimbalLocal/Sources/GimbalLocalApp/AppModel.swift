@@ -54,6 +54,11 @@ final class AppModel: ObservableObject {
     @Published var cloud = CloudOverview.offline
     @Published var cloudSnapshots: [CloudSnapshot] = []
     @Published var bringingDownID: String?
+    // Live state for cloud-origin sandboxes (they run via the one-shot `chm
+    // runner`, not the daemon, so their state is tracked here rather than derived
+    // from `chm ctl status`).
+    @Published var cloudSandboxStates: [String: Sandbox.State] = [:]
+    @Published var cloudSandboxReasons: [String: String] = [:]
     @Published var consoleText = ""
     @Published var activityLog = ""
     @Published var selectedSnapshot: SnapshotSummary?
@@ -133,22 +138,51 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Bring a snapshot down from the control plane and run it here: drives the
-    /// `chm runner` pipeline (assign-run → verify → mark-local-copy → run/resume)
-    /// and streams the honest outcome to the activity log. "Remote vs local" is
-    /// an implementation detail — the result lands as a local run either way.
+    /// Bring a snapshot down from the control plane and run it here as a
+    /// first-class **cloud-origin sandbox**: drives the `chm runner` pipeline
+    /// (assign-run → verify → mark-local-copy → run/resume) and tracks the run as
+    /// a sandbox that appears in the unified list alongside local ones, marked
+    /// with a cloud badge. "Remote vs local" stays an implementation detail.
     func bringDownAndRun(_ snapshot: CloudSnapshot) {
         guard bringingDownID == nil else { return }
         guard snapshot.restorableOnHVF else {
             appendLog("cloud: \(snapshot.id) is not HVF-restorable (gic \(snapshot.gicMode ?? "?")) — stays cloud-only")
             return
         }
-        bringingDownID = snapshot.id
-        let verb = snapshot.isCheckpoint ? "resume" : "run"
-        appendLog("cloud: bringing down \(snapshot.id) — assign-run → verify → \(verb)")
+        // One cloud sandbox per cloud snapshot: reuse it on re-run so the list
+        // stays clean, create it the first time.
+        let sandboxID = "cloud-\(snapshot.id)"
+        if !storedSandboxes.contains(where: { $0.id == sandboxID }) {
+            storedSandboxes.append(
+                StoredSandbox(
+                    id: sandboxID,
+                    name: cloudSandboxName(snapshot.id),
+                    snapshotName: snapshot.id,
+                    location: .remote
+                )
+            )
+            saveSandboxes()
+        }
+        selection = .sandbox(sandboxID)
+        runCloudSandbox(sandboxID: sandboxID, snapshotID: snapshot.id, isCheckpoint: snapshot.isCheckpoint)
+    }
+
+    /// Re-run an existing cloud-origin sandbox (bring its snapshot down again).
+    func rerunCloudSandbox(_ sandbox: Sandbox) {
+        guard sandbox.location == .remote, bringingDownID == nil else { return }
+        let isCheckpoint = cloudSnapshots.first { $0.id == sandbox.snapshotName }?.isCheckpoint ?? true
+        runCloudSandbox(sandboxID: sandbox.id, snapshotID: sandbox.snapshotName, isCheckpoint: isCheckpoint)
+    }
+
+    private func runCloudSandbox(sandboxID: String, snapshotID: String, isCheckpoint: Bool) {
+        bringingDownID = snapshotID
+        cloudSandboxStates[sandboxID] = .starting
+        cloudSandboxReasons[sandboxID] = nil
+        let verb = isCheckpoint ? "resume" : "run"
+        appendLog("cloud: bringing down \(snapshotID) — assign-run → verify → \(verb)")
         Task {
             let result = await chm.runnerRun(
-                snapshotID: snapshot.id,
+                snapshotID: snapshotID,
                 api: settings.controlPlaneURL,
                 owner: "gimbal-local",
                 settings: settings
@@ -156,15 +190,25 @@ final class AppModel: ObservableObject {
             let trimmed = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty { appendLog(trimmed) }
             if result.status == 0 {
-                appendLog("cloud: \(snapshot.id) ran to completion locally")
+                cloudSandboxStates[sandboxID] = .stopped
+                appendLog("cloud: \(snapshotID) ran to completion locally")
             } else if result.output.contains("protocol fixture") {
-                appendLog("cloud: \(snapshot.id) is a protocol fixture — it pulls + verifies, but needs a real snapshot to boot on HVF")
+                cloudSandboxStates[sandboxID] = .failed
+                cloudSandboxReasons[sandboxID] = "Protocol fixture — pulls + verifies, but needs a real snapshot to boot on HVF."
+                appendLog("cloud: \(snapshotID) is a protocol fixture — needs a real snapshot to boot on HVF")
             } else {
-                appendLog("cloud: \(snapshot.id) did not complete cleanly (exit \(result.status))")
+                cloudSandboxStates[sandboxID] = .failed
+                cloudSandboxReasons[sandboxID] = "Run exited \(result.status). See the activity log for details."
+                appendLog("cloud: \(snapshotID) did not complete cleanly (exit \(result.status))")
             }
             bringingDownID = nil
             await refreshAll()
         }
+    }
+
+    private func cloudSandboxName(_ snapshotID: String) -> String {
+        let short = snapshotID.replacingOccurrences(of: "snap-", with: "").prefix(8)
+        return "cloud \(short)"
     }
 
     func startDaemon() {
@@ -498,6 +542,12 @@ final class AppModel: ObservableObject {
         storedSandboxes.map { stored in
             let state = liveState(for: stored.id)
             let isActive = stored.id == activeLocalSandboxID
+            let reason: String?
+            if stored.location == .remote {
+                reason = (state == .failed) ? cloudSandboxReasons[stored.id] : nil
+            } else {
+                reason = (isActive && state == .failed) ? status.reason : nil
+            }
             return Sandbox(
                 id: stored.id,
                 name: stored.name,
@@ -506,12 +556,16 @@ final class AppModel: ObservableObject {
                 state: state,
                 uptimeSeconds: isActive ? status.uptimeSeconds : nil,
                 consoleBytes: isActive ? status.consoleBytes : nil,
-                reason: (isActive && state == .failed) ? status.reason : nil
+                reason: reason
             )
         }
     }
 
     private func liveState(for id: String) -> Sandbox.State {
+        // Cloud-origin sandboxes track their own run state.
+        if let cloudState = cloudSandboxStates[id] {
+            return cloudState
+        }
         if id == interactiveSandboxID {
             return .running
         }
@@ -710,6 +764,8 @@ final class AppModel: ObservableObject {
             stop(sandbox)
         }
         storedSandboxes.removeAll { $0.id == sandbox.id }
+        cloudSandboxStates[sandbox.id] = nil
+        cloudSandboxReasons[sandbox.id] = nil
         saveSandboxes()
         if case let .sandbox(id)? = selection, id == sandbox.id {
             selection = .sandboxesHome
