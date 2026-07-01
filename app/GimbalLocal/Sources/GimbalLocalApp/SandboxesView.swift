@@ -20,7 +20,7 @@ struct SandboxesPage: View {
 
                 PageHeader(
                     title: "Sandboxes",
-                    subtitle: "Run and work inside local sandboxes."
+                    subtitle: "Run and work inside your sandboxes — local or brought down from the cloud."
                 ) {
                     NewSandboxMenu(prominent: true)
                 }
@@ -153,47 +153,10 @@ private struct SandboxCard: View {
                 LocationBadge(location: sandbox.location)
             }
 
-            HStack(spacing: 10) {
-                Button {
-                    model.connect(to: sandbox)
-                } label: {
-                    Label("Open terminal", systemImage: "terminal.fill")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-
-                Menu {
-                    Button {
-                        model.startSandbox(sandbox)
-                    } label: {
-                        Label("Start", systemImage: "play.fill")
-                    }
-                    .disabled(isLive)
-
-                    Button {
-                        model.stop(sandbox)
-                    } label: {
-                        Label("Stop", systemImage: "stop.fill")
-                    }
-                    .disabled(!isLive)
-
-                    Button {
-                        model.selection = .sandbox(sandbox.id)
-                    } label: {
-                        Label("Open details", systemImage: "info.circle")
-                    }
-                    Divider()
-                    Button(role: .destructive) {
-                        model.deleteSandbox(sandbox)
-                    } label: {
-                        Label("Remove sandbox", systemImage: "trash")
-                    }
-                } label: {
-                    Image(systemName: "ellipsis.circle")
-                }
-                .menuStyle(.button)
-                .buttonStyle(.bordered)
-                .fixedSize()
+            if sandbox.location == .remote {
+                RemoteSandboxActions(sandbox: sandbox)
+            } else {
+                LocalSandboxActions(sandbox: sandbox)
             }
         }
         .padding(18)
@@ -209,9 +172,106 @@ private struct SandboxCard: View {
         .contentShape(Rectangle())
         .onTapGesture { model.selection = .sandbox(sandbox.id) }
     }
+}
 
-    private var isLive: Bool {
-        sandbox.state == .running || sandbox.state == .starting
+/// Actions for a local (daemon-backed) sandbox: open a terminal, start/stop.
+private struct LocalSandboxActions: View {
+    @EnvironmentObject private var model: AppModel
+    let sandbox: Sandbox
+
+    private var isLive: Bool { sandbox.state == .running || sandbox.state == .starting }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button {
+                model.connect(to: sandbox)
+            } label: {
+                Label("Open terminal", systemImage: "terminal.fill")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+
+            Menu {
+                Button {
+                    model.startSandbox(sandbox)
+                } label: {
+                    Label("Start", systemImage: "play.fill")
+                }
+                .disabled(isLive)
+
+                Button {
+                    model.stop(sandbox)
+                } label: {
+                    Label("Stop", systemImage: "stop.fill")
+                }
+                .disabled(!isLive)
+
+                Button {
+                    model.selection = .sandbox(sandbox.id)
+                } label: {
+                    Label("Open details", systemImage: "info.circle")
+                }
+                Divider()
+                Button(role: .destructive) {
+                    model.deleteSandbox(sandbox)
+                } label: {
+                    Label("Remove sandbox", systemImage: "trash")
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .menuStyle(.button)
+            .buttonStyle(.bordered)
+            .fixedSize()
+        }
+    }
+}
+
+/// Actions for a cloud-origin sandbox: it runs one-shot through `chm runner`, so
+/// the primary action is to bring it down again rather than attach a terminal.
+private struct RemoteSandboxActions: View {
+    @EnvironmentObject private var model: AppModel
+    let sandbox: Sandbox
+
+    private var isBusy: Bool { model.bringingDownID == sandbox.snapshotName }
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button {
+                model.rerunCloudSandbox(sandbox)
+            } label: {
+                HStack(spacing: 8) {
+                    if isBusy {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Image(systemName: "arrow.down.circle.fill")
+                    }
+                    Text(isBusy ? "Bringing down…" : "Bring down again")
+                        .frame(maxWidth: .infinity)
+                }
+            }
+            .buttonStyle(.borderedProminent)
+            .disabled(model.bringingDownID != nil)
+
+            Menu {
+                Button {
+                    model.selection = .sandbox(sandbox.id)
+                } label: {
+                    Label("Open details", systemImage: "info.circle")
+                }
+                Divider()
+                Button(role: .destructive) {
+                    model.deleteSandbox(sandbox)
+                } label: {
+                    Label("Remove sandbox", systemImage: "trash")
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .menuStyle(.button)
+            .buttonStyle(.bordered)
+            .fixedSize()
+        }
     }
 }
 
@@ -232,11 +292,13 @@ struct SandboxDetailPage: View {
                         }
                     }
 
-                    WorkInsideCard(sandbox: sandbox)
-
-                    SandboxControlsCard(sandbox: sandbox)
-
-                    ConsoleExpander()
+                    if sandbox.location == .remote {
+                        RemoteSandboxCard(sandbox: sandbox)
+                    } else {
+                        WorkInsideCard(sandbox: sandbox)
+                        SandboxControlsCard(sandbox: sandbox)
+                        ConsoleExpander()
+                    }
                 }
                 .padding(28)
             }
@@ -246,6 +308,62 @@ struct SandboxDetailPage: View {
                 systemImage: "shippingbox",
                 description: Text("It may have been removed.")
             )
+        }
+    }
+}
+
+/// Detail for a cloud-origin sandbox: provenance + a bring-down control. It runs
+/// one-shot through `chm runner`, so there is no persistent daemon session to
+/// attach a terminal to (yet) — bringing it down resumes/runs it on HVF.
+private struct RemoteSandboxCard: View {
+    @EnvironmentObject private var model: AppModel
+    let sandbox: Sandbox
+
+    private var cloudSnapshot: CloudSnapshot? {
+        model.cloudSnapshots.first { $0.id == sandbox.snapshotName }
+    }
+    private var isBusy: Bool { model.bringingDownID == sandbox.snapshotName }
+
+    var body: some View {
+        GlassCard(title: "Cloud sandbox", subtitle: "brought down from the control plane", systemImage: "cloud.fill") {
+            Text("This sandbox comes from a control-plane snapshot. Bringing it down drives the runner pipeline — assign-run → verify → \(cloudSnapshot?.isCheckpoint == true ? "resume" : "run") — and rehydrates it locally on Apple HVF.")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            MetricRow(label: "Snapshot", value: sandbox.snapshotName)
+            if let snap = cloudSnapshot {
+                MetricRow(label: "Kind", value: snap.kind)
+                if let origin = snap.originLabel {
+                    MetricRow(label: "Origin", value: origin)
+                }
+                MetricRow(label: "Shape", value: "\(snap.vcpus) vCPU · \(snap.ramMib) MiB")
+            }
+
+            if sandbox.state == .failed, let reason = sandbox.reason {
+                FailureBanner(reason: reason)
+            }
+
+            Button {
+                model.rerunCloudSandbox(sandbox)
+            } label: {
+                HStack(spacing: 8) {
+                    if isBusy { ProgressView().controlSize(.small) }
+                    Label(isBusy ? "Bringing down…" : "Bring down & run", systemImage: "arrow.down.circle.fill")
+                        .font(.headline)
+                }
+                .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            .disabled(model.bringingDownID != nil || cloudSnapshot?.restorableOnHVF == false)
+
+            Button(role: .destructive) {
+                model.deleteSandbox(sandbox)
+            } label: {
+                Label("Remove sandbox", systemImage: "trash").frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
         }
     }
 }
