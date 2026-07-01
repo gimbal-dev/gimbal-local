@@ -131,7 +131,42 @@ virtio devices (block/net/console over PCI) a guest needs to run open-endedly.
   uploads return artifacts, and `cleanup` wraps the tag-scoped destructive
   cleanup script.
 
-## Gimbal Local desktop app
+## chm runner: driving snapshots through the control plane
+
+`chm runner` makes `chm` a *runner* for a `gimbal-cloud-control` (`gctl`)
+control plane instead of a one-off local launcher. The plane is the source of
+truth for leases, cost, cleanup, snapshot provenance, the `gic_mode` gate, and
+audit; `chm` never sources a snapshot out of band, never overrides the gate, and
+never owns cloud lifecycle.
+
+- `chm runner register` announces this Mac to the plane: `POST /runners` with
+  `arch: arm64`, the chm version, and an honest capabilities object
+  (`supports_gic_v2m`, `supports_resume`).
+- `chm runner run <snapshot-id>` performs the full runner protocol against the
+  plane: register → create a sandbox → `assign-run` → pull the assigned bundle
+  from its `download_uri` → **verify the bytes against `manifest.checksum_tree`**
+  → `mark-local-copy {verified:true}` → report `running-local` → execute the
+  plane's `chm_command` (branching on `kind`: `cold` → `chm run`, `resume` →
+  `chm resume`) → report `stopped` or `error` → idempotent `push-artifacts`. A
+  background thread heartbeats well within the plane's 90s window.
+- The API base is `GCTL_API` (default `http://127.0.0.1:8080`), overridable with
+  `--api`; `--owner` sets the sandbox owner; `--skip-run` exercises the protocol
+  through `mark-local-copy` without executing (honest for a synthetic fixture
+  that is not a real Cloud Hypervisor snapshot).
+
+**Hard rule — the `gic_mode` gate.** If `assign-run` returns HTTP 422
+(its-lpi / unknown snapshot), `chm` surfaces "recapture with `CH_GIC_V2M=1`" and
+stops. It never retries as-is and never self-declares a rejected snapshot
+runnable — this is the same GICv2M/message-SPI capture obligation the local
+`its_lpi_guard` enforces (see *Interrupt controller* above), now enforced at the
+control-plane boundary too.
+
+The client is a thin `curl` + `serde_json` wrapper (matching `chm cloud`'s
+shell-out-to-`aws`/`ssh` convention) rather than a heavyweight async HTTP stack,
+so it stays dependency-light and easy to audit. See the normative contract in
+`gimbal-cloud-control:docs/runner-contract.md`.
+
+
 
 `app/GimbalLocal` is the M23 native macOS app. It deliberately stays outside the
 Rust runtime and treats `chm` as the local worker contract:
