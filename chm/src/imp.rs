@@ -17,6 +17,7 @@ use crate::checkpoint;
 use crate::cloud;
 use crate::console::{self, RawConsole};
 use crate::console_filter::ConsoleFilter;
+use crate::control_plane;
 use crate::serve;
 
 use hypervisor::arch::aarch64::gic::Vgic;
@@ -384,6 +385,7 @@ pub fn main() -> ExitCode {
     let raw: Vec<String> = env::args().skip(1).collect();
     match raw.first().map(String::as_str) {
         Some("cloud") => cloud::cloud_main(&raw[1..]),
+        Some("runner") => control_plane::runner_main(&raw[1..]),
         Some("serve") => serve::serve_main(&raw[1..]),
         Some("ctl") => serve::ctl_main(&raw[1..]),
         Some("fork") => match fork(&raw[1..]) {
