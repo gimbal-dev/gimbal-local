@@ -19,6 +19,7 @@ use crate::console::{self, RawConsole};
 use crate::console_filter::ConsoleFilter;
 use crate::control_plane;
 use crate::serve;
+use crate::state_cdn;
 
 use hypervisor::arch::aarch64::gic::Vgic;
 use hypervisor::hvf::checkpoint::{self as hvf_checkpoint, CheckpointState};
@@ -415,6 +416,7 @@ pub fn main() -> ExitCode {
         Some("push") => control_plane::push_main(&raw[1..]),
         Some("pull") => control_plane::pull_main(&raw[1..]),
         Some("branches") => control_plane::branches_main(&raw[1..]),
+        Some("state-cdn") => state_cdn::state_cdn_main(&raw[1..]),
         Some("serve") => serve::serve_main(&raw[1..]),
         Some("ctl") => serve::ctl_main(&raw[1..]),
         Some("fork") => match fork(&raw[1..]) {
@@ -519,6 +521,7 @@ fn usage() -> String {
          chm connect <SNAPSHOT_DIR> [OPTIONS]   (interactive session)\n    \
          chm push <CHECKPOINT_DIR> --branch N   (commit a revision to the plane)\n    \
          chm pull --branch N --to DIR           (rehydrate a branch head)\n    \
+         chm state-cdn reconstruct [OPTIONS]    (pull memory from the state CDN)\n    \
          chm cloud <COMMAND> aws [OPTIONS]      (BYO cloud helpers)\n    \
          chm serve <LIBRARY_DIR> [OPTIONS]      (background daemon)\n    \
          chm ctl <COMMAND> [ARG] [--socket P]   (talk to a daemon)\n\

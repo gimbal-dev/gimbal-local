@@ -188,9 +188,14 @@ Pillar ②'s deep, plane-coupled half:
   branch head (or explicit revision) back to a local resume. Proven live on the
   `:8080` dev plane: a re-commit of already-present content stored **0 bytes**.
   Follow-ups: peer-cache node, page-range ACLs, branch/merge review in the app.
-- **Postcopy memory plane** (#5): run the offload daemon beside `chm`, launch with
-  shared-memfd + `memory_mode=postcopy` on resume, demand-fault memory pages from
-  the state CDN (the control-plane side is shipped).
+- **Postcopy memory plane** (#5) — **consumer shipped; demand-fault deferred.**
+  `chm state-cdn reconstruct` pulls a checkpoint's encrypted, content-addressed
+  RAM chunks from the state CDN, decrypts them (AES-256-GCM per-tenant), and
+  reassembles the memory image — proven live decrypting real tenant chunks. It
+  advertises `supports_offload_daemon`. True *demand-fault* postcopy (fetch only
+  the touched working set) needs HVF stage-2 fault interception (no `userfaultfd`
+  on macOS) and is the tracked next step — see
+  [`state-cdn-memory-plane.md`](state-cdn-memory-plane.md).
 - **Disk plane**: lazy blocks over the same content-addressed store.
 
 Back-compat means Gimbal Local always degrades to the M25 file-backed path, so it

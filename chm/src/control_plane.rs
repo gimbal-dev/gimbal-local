@@ -501,6 +501,13 @@ fn capabilities() -> Value {
         // `chm push` commits a local checkpoint as a content-addressed revision
         // and `chm pull` rehydrates a branch head back to a resume (Phase 4).
         "supports_commit": true,
+        // `chm state-cdn reconstruct` consumes the state-CDN memory plane: it
+        // pulls a checkpoint's encrypted, content-addressed RAM chunks and
+        // reassembles the image before resume (Phase 2, CDN-backed resume).
+        // NOTE: not `supports_postcopy` — chm reconstructs the working set
+        // eagerly and does not yet demand-fault only touched pages (that needs
+        // HVF stage-2 fault interception; see docs/state-cdn-memory-plane.md).
+        "supports_offload_daemon": true,
     })
 }
 
