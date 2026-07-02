@@ -13,6 +13,7 @@ Gimbal Local app — these are the docs you want:
 | Doc | What it covers |
 | --- | --- |
 | [`roadmap.md`](roadmap.md) | Milestones to date and what remains, mapped to the four-pillar product vision. |
+| [`security-model.md`](security-model.md) | Threat model, security invariants, and the M30 hardening plan — how untrusted snapshots and hostile guest workloads are confined. |
 | [`macos-local-runtime.md`](macos-local-runtime.md) | Architecture of the HVF port: how a KVM snapshot is translated and rehydrated onto Apple Hypervisor.framework. |
 | [`hvf-compatible-snapshots.md`](hvf-compatible-snapshots.md) | The snapshot contract: GICv2M/message-SPI interrupt mode, why ITS/LPI snapshots are unsupported, and the disk + copy-on-write requirement. |
 | [`aws-byo-setup.md`](aws-byo-setup.md) | Bring-your-own-AWS setup for the remote→local→remote capture loop (`chm cloud …`). |

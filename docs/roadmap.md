@@ -114,6 +114,7 @@ from cache in 0.077 s).
 | Milestone | Pillar | Status | Issues |
 | --- | --- | --- | --- |
 | **M25 · Live local lifecycle** | ① | **Complete** (one perf ceiling: runtime memfd page-sharing) | #4, #6 |
+| **M30 · Security hardening** | trust/isolation | **Immediate priority — precedes M27** | #33–#39 |
 | **M27 · Plane-native edge** | ② | Waits on gctl (memory plane shipped; disk plane + fork/commit building) | #5, #7 |
 | **M28 · Consistent controls** | ③ | Waits on the gctl policy contract | #20 |
 | **M29 · Observability & cost** | ④ | Waits on the gctl telemetry contract | — |
@@ -146,6 +147,33 @@ is complete:
   suspend. Sharing live pages between *concurrently running* VMs via a private
   memfd is a deeper HVF memory-management optimisation — a documented perf
   ceiling, tracked for later; correctness and isolation are complete without it.
+
+### M30 · Security hardening — hostile-agent readiness
+
+**The immediate priority — it precedes M27.** Gimbal Local runs *untrusted*
+compute (increasingly an autonomous coding agent) from an *untrusted* snapshot
+bundle, on a personal Mac. A first security review found real gaps; M30 closes
+them. Full model + plan: [`security-model.md`](security-model.md).
+
+- **M30.1 (#33, P0)** — bundle file isolation: reject symlinks, canonicalise
+  bundle paths under the root, no-follow opens, and move writable overlays into a
+  private `0700` dir `chm` owns (out of the attacker-supplied bundle).
+- **M30.2 (#34, P0)** — daemon socket hardening: private `0700` dir, `0600` perms,
+  and a peer-credential (`getpeereid`) check before start/stop/console/shutdown.
+- **M30.3 (#35, P0)** — app command safety: launch `chm` via `Process` argv, not
+  shell strings (the snapshot-name vector is already removed; this finishes it).
+- **M30.4 (#36, P1)** — signed snapshot manifest + verification, and one trust
+  root (app trusts the cloud key; gctl signs; local verifies before "Run").
+  Cross-repo — tracks the gctl signing contract.
+- **M30.5 (#37, P1)** — make the **no host-FS-passthrough** invariant explicit +
+  CI-guarded so it cannot silently regress.
+- **M30.6 (#38, P2)** — per-sandbox resource limits (vCPU/mem/disk).
+- **M30.7 (#39)** — the threat model + hardening checklist (this doc set).
+
+M30 is the *trust + isolation* layer beneath the feature pillars: even with **no**
+policy, a bundle must not escape the host and the daemon must not be hijackable.
+Its network item converges with M28's firewall enforcement (same datapath); its
+signing item makes M26's displayed provenance cryptographically verified.
 
 ### M27 · Plane-native edge — branching filesystem + lazy load
 
@@ -200,6 +228,7 @@ cost/health panel; the rest waits on the gctl telemetry/cost event contract.
 
 Progress lives in the
 [GitHub milestones](https://github.com/gimbal-dev/gimbal-local/milestones)
-`M25`–`M29`, one per remaining capability, with the cross-repo handoff issues
-above. The four pillars are the V0 capability contract (issue #21); each pillar is
+`M25`–`M30`, one per remaining capability, with the cross-repo handoff issues
+above. **M30 (security hardening) is the immediate priority and precedes M27.**
+The four pillars are the V0 capability contract (issue #21); each pillar is
 only "done" when it is enforced identically on both substrates.
