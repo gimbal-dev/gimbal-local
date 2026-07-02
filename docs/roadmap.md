@@ -72,7 +72,7 @@ then the cloud-integration work that followed. Grouped by theme:
 | M22 | The bring-your-own-AWS capture loop (`chm cloud …`) — local-managed slice. |
 | M23 | **Gimbal Local**, the native SwiftUI desktop app over `chm serve`/`ctl`. |
 
-### Live local lifecycle primitives
+### Live local lifecycle primitives (M25) ✅
 
 - **Suspend / resume** — `chm resume` restores a live checkpoint; a suspend
   captures a memory + device + fs checkpoint on idle and on graceful stop
@@ -80,6 +80,11 @@ then the cloud-integration work that followed. Grouped by theme:
 - **Fork lineage** — `chm fork` branches a revision (Image → Revision → Sandbox,
   where *suspend = commit* and *fork = branch*); see
   [`gimbal-local-fork-model.md`](gimbal-local-fork-model.md).
+- **Revision store + rollback** — `.chm-revisions/` keeps the lineage (RAM-pruned
+  to the newest N); `chm revisions` / `chm rollback`, surfaced as a Revision
+  history card in the app.
+- **Per-sandbox workspaces** — `chm workspace <image> <ws>` shares an image's
+  read-only base but isolates each sandbox's overlays + checkpoints.
 
 ### The control-plane runner + M26 — faithful cloud rehydration ✅
 
@@ -108,23 +113,40 @@ from cache in 0.077 s).
 
 | Milestone | Pillar | Status | Issues |
 | --- | --- | --- | --- |
-| **M25 · Live local lifecycle** | ① | Core shipped; app/engine polish advanceable now | #4, #6 |
+| **M25 · Live local lifecycle** | ① | **Engine complete**; residuals are follow-ups (below) | #4, #6 |
 | **M27 · Plane-native edge** | ② | Waits on gctl (memory plane shipped; disk plane + fork/commit building) | #5, #7 |
 | **M28 · Consistent controls** | ③ | Waits on the gctl policy contract | #20 |
 | **M29 · Observability & cost** | ④ | Waits on the gctl telemetry contract | — |
 
 ### M25 · Live local lifecycle — suspend · resume · fork
 
-The Mac runs, suspends, resumes, and forks microVMs entirely locally. The
-primitives are shipped (see above); the remaining work is product polish, all
-advanceable **now with zero plane changes**:
+The Mac runs, suspends, resumes, and forks microVMs entirely locally. The engine
+is complete:
 
-- Per-sandbox workspaces so **N concurrent forks** run truly isolated.
-- The **fork-tree / lineage view** in the app (the model exists; the UI does not).
-- A local **revision store + rollback** (history under `.chm-revisions/`).
-- A private **memfd overlay** for true copy-on-write base RAM.
-- Drive `suspended` / `resuming` states and push `kind:"checkpoint"` artifacts;
-  advertise `supports_fork` / `supports_cow_overlay`.
+- **Suspend / resume** live checkpoints, and **checkpoint-everywhere** (idle,
+  graceful stop, daemon stop).
+- **`chm fork`** branches a revision (shared read-only base + copied live state).
+- **Local revision store + rollback** — `.chm-revisions/` keeps the suspend /
+  fork / rollback lineage (RAM-pruned to the newest N so the graph survives),
+  `chm revisions` / `chm rollback`, and a Revision history card in the app.
+- **`chm workspace <image> <ws>`** — a per-sandbox workspace that shares an
+  image's read-only base but keeps its own overlays + checkpoints, so N sandboxes
+  from one image diverge independently.
+- The runner advertises `supports_fork` / `supports_cow_overlay`.
+
+**Residuals (deliberate follow-ups, each with a reason):**
+
+- **App adoption of workspaces.** The `chm workspace` primitive exists; routing
+  the *app's* two run paths (interactive `connect` + the daemon `start`/console)
+  through per-sandbox workspaces coherently needs a small daemon change (it
+  serves the library by name), so it is tracked rather than half-wired.
+- **Private memfd overlay for true CoW base RAM** — an optimization (fork copies
+  live RAM today); a deeper HVF memory-management change.
+- **Drive `suspended` states + push `kind:"checkpoint"` artifacts** — plane-gated:
+  the runner honours the plane's `chm_command`, which does not request a
+  checkpoint-on-exit, so this lights up when the plane asks for it.
+- **True concurrent N** VMs is bounded by HVF's one-VM-per-process model (the
+  daemon runs one guest at a time); workspaces give *state* isolation now.
 
 ### M27 · Plane-native edge — branching filesystem + lazy load
 
