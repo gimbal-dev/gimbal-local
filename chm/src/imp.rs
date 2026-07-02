@@ -266,6 +266,33 @@ pub(crate) fn its_lpi_guard(state_json: &str) -> Result<(), String> {
     ))
 }
 
+/// Create the per-run overlay directory as a private `0700` dir that `chm`
+/// owns, refusing to reuse a symlink shipped in an (untrusted) snapshot bundle.
+///
+/// Guest disk writes land in copy-on-write overlays under this directory; if a
+/// malicious bundle shipped `.chm-overlays` as a symlink to a host location,
+/// those overlays (and their bitmaps) would be written there. Reject a
+/// pre-existing symlink and create the directory `0700`, so overlays stay
+/// confined to a directory the runner created (M30.1, invariant I3).
+fn ensure_private_overlay_dir(overlay_dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    match fs::symlink_metadata(overlay_dir) {
+        Ok(md) if md.file_type().is_symlink() => {
+            return Err(format!(
+                "refusing overlay dir {}: it is a symlink (possible tampered bundle)",
+                overlay_dir.display()
+            ));
+        }
+        Ok(_) => return Ok(()),
+        Err(_) => {}
+    }
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(overlay_dir)
+        .map_err(|e| format!("create overlay dir {}: {e}", overlay_dir.display()))
+}
+
 pub(crate) fn wire_virtio(
     bus: &MmioBus,
     guest_mem: &Arc<GuestMemory>,
@@ -279,8 +306,7 @@ pub(crate) fn wire_virtio(
     if descs.is_empty() {
         return Ok(Vec::new());
     }
-    fs::create_dir_all(overlay_dir)
-        .map_err(|e| format!("create overlay dir {}: {e}", overlay_dir.display()))?;
+    ensure_private_overlay_dir(overlay_dir)?;
 
     let mut summary = Vec::with_capacity(descs.len());
     // Devices whose in-flight queues should be drained once on resume (only the

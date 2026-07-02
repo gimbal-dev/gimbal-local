@@ -294,8 +294,11 @@ fn materialize_bundle(
     fs::create_dir_all(&cas).map_err(|e| format!("create CAS {}: {e}", cas.display()))?;
     let mut deduped = 0usize;
     for (rel, want) in checksum_tree {
+        // The manifest is not yet signed (M30.4), so its relpaths are untrusted:
+        // confine every one under the cache root before writing, or a crafted
+        // key like `../../../etc/...` would escape the bundle on ingest (M30.1).
+        let dest = confined_join(cache, rel)?;
         let want = want.to_lowercase();
-        let dest = cache.join(rel);
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
         }
@@ -323,6 +326,38 @@ fn materialize_bundle(
 /// `.cas` sibling of the per-snapshot cache dirs, so it is shared across pulls.
 fn cas_dir_for(cache: &Path) -> PathBuf {
     cache.parent().unwrap_or(cache).join(".cas")
+}
+
+/// Join an untrusted bundle-relative path onto `root`, refusing to let it escape.
+///
+/// Bundle manifests are not yet signed (M30.4), so a `checksum_tree` key is
+/// attacker-influenced input. Reject absolute paths, Windows prefixes, root/
+/// current-dir components, and any `..` (parent) component, so a crafted key
+/// (`../../../etc/cron.d/x`) cannot make `chm` write outside the cache on ingest
+/// (M30.1, invariant I2). Only plain relative path segments are allowed.
+fn confined_join(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    use std::path::Component;
+    let relp = Path::new(rel);
+    let mut out = root.to_path_buf();
+    let mut any = false;
+    for comp in relp.components() {
+        match comp {
+            Component::Normal(seg) => {
+                out.push(seg);
+                any = true;
+            }
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "refusing bundle path {rel:?}: it escapes the bundle root (possible tampered manifest)"
+                ));
+            }
+        }
+    }
+    if !any {
+        return Err(format!("refusing empty bundle path {rel:?}"));
+    }
+    Ok(out)
 }
 
 /// Fetch one bundle object (`<download_uri>/<relpath>`) into `dest`. Supports a
@@ -933,6 +968,36 @@ mod tests {
         let resp = parse_http_response(raw).unwrap();
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body["runner_id"], "r1");
+    }
+
+    #[test]
+    fn confined_join_accepts_plain_relative_paths() {
+        let root = Path::new("/tmp/cache");
+        assert_eq!(
+            confined_join(root, "snapshot/memory-ranges").unwrap(),
+            root.join("snapshot/memory-ranges")
+        );
+        assert_eq!(
+            confined_join(root, "./disks/_disk0.raw").unwrap(),
+            root.join("disks/_disk0.raw")
+        );
+    }
+
+    #[test]
+    fn confined_join_rejects_traversal_and_absolute() {
+        let root = Path::new("/tmp/cache");
+        // Zip-slip: a `..`-escaping manifest key must not write outside the cache.
+        for bad in [
+            "../../../etc/cron.d/x",
+            "snapshot/../../escape",
+            "/etc/passwd",
+            "",
+        ] {
+            assert!(
+                confined_join(root, bad).is_err(),
+                "must reject bundle path {bad:?}"
+            );
+        }
     }
 
     #[test]

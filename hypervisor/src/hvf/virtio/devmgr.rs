@@ -15,6 +15,7 @@ use serde_json::Value;
 
 use super::block::{BlockBackend, BlockDevice, FileBackend, OverlayBackend};
 use super::net::{EchoResponder, NetDevice};
+use super::pathsafe;
 use super::pci::{Backend, RestoreParams, VirtioPciDevice, CAPABILITY_BAR_SIZE};
 use super::queue::Queue;
 use super::rng::{RngDevice, UrandomSource};
@@ -502,7 +503,7 @@ pub(crate) fn resolve_block_backend(
     nsectors: u64,
     resume: bool,
 ) -> Result<(Box<dyn BlockBackend>, BlockBacking), DevMgrError> {
-    match shipped_backing(overlay_dir, dev_name) {
+    match shipped_backing(overlay_dir, dev_name)? {
         Some(base) => {
             let overlay = overlay_dir.join(sanitize(&format!("{dev_name}-cow.raw")));
             // On resume, reattach the overlay from the prior run (so disk writes
@@ -538,29 +539,55 @@ pub(crate) fn resolve_block_backend(
 /// `<snapshot>/disks/<device-name>.raw` (the device name is the snapshot's own
 /// node name, e.g. `_disk0`). Returns the path only when the file exists, so the
 /// caller falls back to a sparse overlay for snapshots packaged without disks.
-fn shipped_backing(overlay_dir: &std::path::Path, dev_name: &str) -> Option<std::path::PathBuf> {
-    let disks = overlay_dir.parent()?.join("disks");
+///
+/// Security (M30.1): a candidate that exists but is a **symlink** is rejected
+/// loudly rather than followed — a malicious bundle could otherwise ship
+/// `disks/_disk0.raw -> /etc/passwd` and hand the guest a host file as its disk.
+/// The enclosing `disks/` directory may itself be a symlink (the trusted
+/// read-only base in the workspace model); only the disk *file* is constrained.
+/// `dev_name` is sanitized, so the candidate cannot traverse out of `disks/`.
+fn shipped_backing(
+    overlay_dir: &std::path::Path,
+    dev_name: &str,
+) -> Result<Option<std::path::PathBuf>, DevMgrError> {
+    let Some(disks) = overlay_dir.parent().map(|p| p.join("disks")) else {
+        return Ok(None);
+    };
     for ext in ["raw", "img"] {
         let cand = disks.join(format!("{}.{ext}", sanitize(dev_name)));
-        if cand.is_file() {
-            return Some(cand);
+        match std::fs::symlink_metadata(&cand) {
+            Ok(md) if md.file_type().is_symlink() => {
+                return Err(DevMgrError::Io(format!(
+                    "refusing shipped disk {}: it is a symlink (possible tampered bundle)",
+                    cand.display()
+                )));
+            }
+            Ok(md) if md.file_type().is_file() => return Ok(Some(cand)),
+            _ => continue,
         }
     }
-    None
+    Ok(None)
 }
 
 /// Create `path` as a sparse file of `nsectors * 512` bytes if it does not yet
 /// exist (reads of unwritten regions return zeroes; writes persist).
+///
+/// Security (M30.1): rejects a pre-existing symlink and creates with
+/// `O_NOFOLLOW`, so a bundle-planted overlay link cannot redirect the zero
+/// overlay onto a host file.
 fn ensure_overlay(path: &std::path::Path, nsectors: u64) -> Result<(), DevMgrError> {
-    if path.exists() {
-        return Ok(());
+    match std::fs::symlink_metadata(path) {
+        Ok(md) if md.file_type().is_symlink() => {
+            return Err(DevMgrError::Io(format!(
+                "refusing overlay {}: it is a symlink (possible tampered bundle)",
+                path.display()
+            )));
+        }
+        // Already a regular file: leave its sparse contents in place.
+        Ok(_) => return Ok(()),
+        Err(_) => {}
     }
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)
+    let file = pathsafe::open_rw_create_nofollow(path, false)
         .map_err(|e| DevMgrError::Io(format!("create {}: {e}", path.display())))?;
     file.set_len(nsectors.saturating_mul(512))
         .map_err(|e| DevMgrError::Io(format!("size {}: {e}", path.display())))?;
@@ -775,6 +802,84 @@ mod tests {
         assert_eq!(zkind, BlockBacking::ZeroOverlay, "absent disk falls back to zero overlay");
         zero.read_at(0, &mut buf).unwrap();
         assert!(buf.iter().all(|&b| b == 0), "zero-overlay reads return zero");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Security (M30.1): a shipped disk that is actually a symlink must be
+    /// rejected, not followed — otherwise a malicious bundle shipping
+    /// `disks/_disk0.raw -> /etc/passwd` would hand the guest a host file as its
+    /// read-only disk base (host file disclosure).
+    #[test]
+    fn resolve_block_backend_rejects_symlinked_shipped_disk() {
+        use std::io::Write;
+        use std::os::unix::fs::symlink;
+
+        let root = std::env::temp_dir().join(format!("chm-resolve-symlink-{}", std::process::id()));
+        let overlay_dir = root.join(".chm-overlays");
+        let disks_dir = root.join("disks");
+        std::fs::create_dir_all(&overlay_dir).unwrap();
+        std::fs::create_dir_all(&disks_dir).unwrap();
+
+        // A host "secret" the malicious bundle wants the guest to read as a disk.
+        let secret = root.join("host-secret.txt");
+        std::fs::File::create(&secret)
+            .unwrap()
+            .write_all(b"TOP SECRET HOST DATA")
+            .unwrap();
+        // The bundle ships disks/_disk0.raw as a symlink to that host file.
+        symlink(&secret, disks_dir.join("_disk0.raw")).unwrap();
+
+        let err = match resolve_block_backend(&overlay_dir, "_disk0", "/capture/guest.raw", 2, false)
+        {
+            Ok(_) => panic!("a symlinked shipped disk must be rejected, not followed"),
+            Err(e) => e,
+        };
+        assert!(
+            format!("{err:?}").contains("symlink"),
+            "error should name the symlink rejection: {err:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Security (M30.1): a pre-planted overlay symlink must be rejected, so guest
+    /// disk writes cannot be redirected (via O_NOFOLLOW) onto a host file.
+    #[test]
+    fn resolve_block_backend_rejects_symlinked_overlay() {
+        use std::io::Write;
+        use std::os::unix::fs::symlink;
+
+        let root =
+            std::env::temp_dir().join(format!("chm-resolve-ovl-symlink-{}", std::process::id()));
+        let overlay_dir = root.join(".chm-overlays");
+        let disks_dir = root.join("disks");
+        std::fs::create_dir_all(&overlay_dir).unwrap();
+        std::fs::create_dir_all(&disks_dir).unwrap();
+
+        // A legit shipped base disk (so we reach the COW overlay open).
+        std::fs::File::create(disks_dir.join("_disk0.raw"))
+            .unwrap()
+            .write_all(&[0u8; 1024])
+            .unwrap();
+        // A host file the guest's writes must NOT be redirected onto.
+        let victim = root.join("host-victim.txt");
+        std::fs::File::create(&victim)
+            .unwrap()
+            .write_all(b"do not overwrite")
+            .unwrap();
+        // Pre-plant the per-run overlay as a symlink to the victim.
+        symlink(&victim, overlay_dir.join("_disk0-cow.raw")).unwrap();
+
+        assert!(
+            resolve_block_backend(&overlay_dir, "_disk0", "/capture/guest.raw", 2, false).is_err(),
+            "a symlinked overlay must be rejected"
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            b"do not overwrite",
+            "the host victim file must be untouched"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

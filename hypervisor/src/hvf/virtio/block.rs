@@ -175,8 +175,11 @@ pub struct FileBackend {
 
 impl FileBackend {
     /// Open `path` read/write as a backend of `nsectors` 512-byte sectors.
+    ///
+    /// Uses a no-follow open: a snapshot bundle cannot substitute a symlink for
+    /// the overlay to redirect guest writes onto a host file (M30.1).
     pub fn open(path: &std::path::Path, nsectors: u64) -> io::Result<Self> {
-        let file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+        let file = super::pathsafe::open_rw_create_nofollow(path, false)?;
         Ok(Self { file, nsectors })
     }
 }
@@ -235,13 +238,8 @@ impl OverlayBackend {
         overlay_path: &std::path::Path,
         nsectors: u64,
     ) -> io::Result<Self> {
-        let base = std::fs::OpenOptions::new().read(true).open(base_path)?;
-        let overlay = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(overlay_path)?;
+        let base = super::pathsafe::open_ro_nofollow(base_path)?;
+        let overlay = super::pathsafe::open_rw_create_nofollow(overlay_path, true)?;
         overlay.set_len(nsectors.saturating_mul(SECTOR_SIZE))?;
         let words = nsectors.div_ceil(64) as usize;
         // A fresh cold-boot overlay leaves no stale bitmap behind.
@@ -274,13 +272,8 @@ impl OverlayBackend {
                 .collect::<Vec<u64>>(),
             _ => return Self::open(base_path, overlay_path, nsectors),
         };
-        let base = std::fs::OpenOptions::new().read(true).open(base_path)?;
-        let overlay = std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(overlay_path)?;
+        let base = super::pathsafe::open_ro_nofollow(base_path)?;
+        let overlay = super::pathsafe::open_rw_create_nofollow(overlay_path, false)?;
         overlay.set_len(nsectors.saturating_mul(SECTOR_SIZE))?;
         Ok(Self {
             base,
