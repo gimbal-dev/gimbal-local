@@ -20,10 +20,14 @@
 //! the runner advertises `supports_offload_daemon` (it can consume the CDN) but
 //! not `supports_postcopy` (it does not demand-fault).
 
-use std::fs::OpenOptions;
+use std::env;
+use std::fs::{self, OpenOptions};
+use std::io::{self, BufRead, BufReader, Write};
+use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::FileExt;
-use std::path::Path;
-use std::process::{Command, ExitCode, Stdio};
+use std::path::{Path, PathBuf};
+use std::process::{self, Command, ExitCode, Stdio};
+use std::thread;
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use serde::Deserialize;
@@ -79,6 +83,7 @@ pub(crate) fn reconstruct(
     token: &str,
     tenant_key: Option<&[u8; 32]>,
     out: &Path,
+    cache_dir: Option<&Path>,
 ) -> Result<ReconstructStats, String> {
     let map = fetch_page_map(endpoint, memory_ref, token)?;
     // Prefer the record's declared size; fall back to the page map's extent so a
@@ -115,6 +120,11 @@ pub(crate) fn reconstruct(
             continue;
         }
         let raw = fetch_chunk(endpoint, memory_ref, &page.store_key, token)?;
+        // Persist the raw ciphertext chunk so this node can serve it to LAN
+        // peers as a peer cache (opaque without the tenant key — see `serve`).
+        if let Some(cache) = cache_dir {
+            write_cached_chunk(cache, memory_ref, &page.store_key, &raw)?;
+        }
         let plain = if page.encrypted {
             let key = tenant_key.ok_or_else(|| {
                 "page is encrypted but no tenant key was provided (daemon.tenant_key_b64)"
@@ -272,16 +282,178 @@ fn url_encode(s: &str) -> String {
     out
 }
 
+/// Decode a percent-encoded query value (inverse of [`url_encode`]).
+fn url_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        if b[i] == b'%'
+            && i + 2 < b.len()
+            && let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16)
+        {
+            out.push(v);
+            i += 3;
+            continue;
+        }
+        out.push(b[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Map a `ref` + `store_key` to a cache file path. Sanitized so a content
+/// address (`sha256:…`) is a safe single filename segment.
+fn cache_path(cache: &Path, memory_ref: &str, key: &str) -> PathBuf {
+    cache.join(sanitize(memory_ref)).join(sanitize(key))
+}
+
+/// Reduce a ref/key to a filesystem-safe segment (keep alnum/`-`/`.`, else `_`).
+fn sanitize(s: &str) -> String {
+    s.chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
+        .collect()
+}
+
+/// Write a raw (still-encrypted) chunk into the peer cache.
+fn write_cached_chunk(cache: &Path, memory_ref: &str, key: &str, bytes: &[u8]) -> Result<(), String> {
+    let path = cache_path(cache, memory_ref, key);
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|e| format!("create cache dir {}: {e}", parent.display()))?;
+    }
+    fs::write(&path, bytes).map_err(|e| format!("cache chunk {}: {e}", path.display()))
+}
+
+// --- Peer cache: serve cached chunks to LAN peers -------------------------
+//
+// A puller in the same locality is routed here by the plane's
+// `GET /state-cdn/source`. We serve only the **ciphertext** chunks we hold — a
+// peer without the tenant key (delivered separately by a legit resume) cannot
+// read them, so peer serving is an optimization, never an authorization bypass.
+
+/// Parse a `k1=v1&k2=v2` query string into decoded pairs.
+fn parse_query(query: &str) -> Vec<(String, String)> {
+    query
+        .split('&')
+        .filter(|s| !s.is_empty())
+        .map(|pair| {
+            let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+            (url_decode(k), url_decode(v))
+        })
+        .collect()
+}
+
+/// Route one peer-cache HTTP request to `(status, content_type, body)`. Pure
+/// (only reads the cache), so it is unit-tested without a socket.
+fn route_peer_request(method: &str, target: &str, cache: &Path) -> (u16, &'static str, Vec<u8>) {
+    if method != "GET" {
+        return (405, "text/plain", b"method not allowed\n".to_vec());
+    }
+    let (path, query) = target.split_once('?').unwrap_or((target, ""));
+    match path {
+        "/healthz" => (200, "text/plain", b"ok\n".to_vec()),
+        "/state-cdn/chunk" => {
+            let params = parse_query(query);
+            let get = |k: &str| params.iter().find(|(pk, _)| pk == k).map(|(_, v)| v.as_str());
+            let (Some(memory_ref), Some(key)) = (get("ref"), get("key")) else {
+                return (400, "text/plain", b"missing ref or key\n".to_vec());
+            };
+            match fs::read(cache_path(cache, memory_ref, key)) {
+                Ok(bytes) => (200, "application/octet-stream", bytes),
+                Err(_) => (404, "text/plain", b"chunk not in this peer cache\n".to_vec()),
+            }
+        }
+        _ => (404, "text/plain", b"not found\n".to_vec()),
+    }
+}
+
+/// Read one request off `stream`, route it, and write the response.
+fn handle_peer_conn(stream: &mut TcpStream, cache: &Path) -> io::Result<()> {
+    let mut reader = BufReader::new(stream.try_clone()?);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line)?;
+    // Drain the remaining request headers (a GET carries no body).
+    loop {
+        let mut line = String::new();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 || line == "\r\n" || line == "\n" {
+            break;
+        }
+    }
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or("");
+    let target = parts.next().unwrap_or("");
+    let (code, ctype, body) = route_peer_request(method, target, cache);
+    let reason = match code {
+        200 => "OK",
+        400 => "Bad Request",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        _ => "OK",
+    };
+    let header = format!(
+        "HTTP/1.1 {code} {reason}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(header.as_bytes())?;
+    stream.write_all(&body)?;
+    stream.flush()
+}
+
+/// Run the peer-cache HTTP server on `addr`, serving chunks from `cache`.
+fn serve_peer_cache(cache: &Path, addr: &str) -> Result<(), String> {
+    let listener =
+        TcpListener::bind(addr).map_err(|e| format!("bind peer cache on {addr}: {e}"))?;
+    let bound = listener
+        .local_addr()
+        .map_or_else(|_| addr.to_string(), |a| a.to_string());
+    eprintln!(
+        "chm state-cdn serve: peer cache on http://{bound} serving chunks from {}",
+        cache.display()
+    );
+    for stream in listener.incoming() {
+        let Ok(mut stream) = stream else { continue };
+        let cache = cache.to_path_buf();
+        thread::spawn(move || {
+            let _ = handle_peer_conn(&mut stream, &cache);
+        });
+    }
+    Ok(())
+}
+
+/// POST a JSON body to `url` via curl, returning the response bytes.
+fn curl_post_json(url: &str, body: &str) -> Result<Vec<u8>, String> {
+    let out = Command::new("curl")
+        .args(["-fsS", "--max-time", "60", "-X", "POST"])
+        .args(["-H", "content-type: application/json"])
+        .args(["--data-binary", body])
+        .arg(url)
+        .output()
+        .map_err(|e| format!("spawn curl: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "POST {url} failed (curl exit {}): {}",
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    Ok(out.stdout)
+}
+
 /// `chm state-cdn <subcommand>` — the offload-daemon consumer CLI.
 pub fn state_cdn_main(raw: &[String]) -> ExitCode {
+    let run = |r: Result<(), String>, ctx: &str| match r {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("chm state-cdn {ctx}: {e}");
+            ExitCode::FAILURE
+        }
+    };
     match raw.first().map(String::as_str) {
-        Some("reconstruct") => match cmd_reconstruct(&raw[1..]) {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(e) => {
-                eprintln!("chm state-cdn reconstruct: {e}");
-                ExitCode::FAILURE
-            }
-        },
+        Some("reconstruct") => run(cmd_reconstruct(&raw[1..]), "reconstruct"),
+        Some("serve") => run(cmd_serve(&raw[1..]), "serve"),
+        Some("register-peer") => run(cmd_register_peer(&raw[1..]), "register-peer"),
         Some("-h") | Some("--help") | None => {
             print!("{}", state_cdn_usage());
             ExitCode::SUCCESS
@@ -294,17 +466,26 @@ pub fn state_cdn_main(raw: &[String]) -> ExitCode {
 }
 
 fn state_cdn_usage() -> String {
-    "chm state-cdn — consume the control plane's memory plane (Phase 2)\n\
+    "chm state-cdn — consume + peer-serve the control plane's memory plane (Phase 2)\n\
      \n\
      USAGE:\n    \
          chm state-cdn reconstruct --endpoint URL --ref REF --token TOK \\\n                                 \
-         --out FILE [--tenant-key-b64 KEY]\n\
+         --out FILE [--tenant-key-b64 KEY] [--cache DIR]\n    \
+         chm state-cdn serve --cache DIR [--addr HOST:PORT]\n    \
+         chm state-cdn register-peer --api URL --endpoint URL --locality LOC \\\n                                    \
+         [--ref REF]... [--owner WHO]\n\
      \n\
-     Fetches a memory ref's page map, pulls + decrypts each non-zero page from\n    \
-     the state CDN, and reassembles the flat memory-ranges image at FILE. The\n    \
-     endpoint/ref/token/tenant-key come from a postcopy resume assignment's CDN\n    \
-     fields. This is CDN-backed resume by reconstruction; it does not yet\n    \
-     demand-fault only the touched working set (see docs/state-cdn-memory-plane.md).\n"
+     reconstruct  fetch a ref's page map, pull + decrypt each non-zero page, and\n                 \
+         reassemble the flat memory-ranges image at FILE. --cache also keeps the\n                 \
+         raw ciphertext chunks so this node can peer-serve them.\n    \
+     serve        run a peer-cache HTTP server over --cache: GET /state-cdn/chunk\n                 \
+         returns a held (opaque ciphertext) chunk, else 404.\n    \
+     register-peer  advertise this node as a peer cache to the plane, so LAN\n                 \
+         pullers in --locality are routed here for the refs it holds.\n\
+     \n\
+     endpoint/ref/token/tenant-key come from a postcopy resume assignment. This is\n    \
+     CDN-backed resume by reconstruction; it does not yet demand-fault only the\n    \
+     touched working set (see docs/state-cdn-memory-plane.md).\n"
         .to_string()
 }
 
@@ -314,6 +495,7 @@ fn cmd_reconstruct(raw: &[String]) -> Result<(), String> {
     let mut token = None;
     let mut out = None;
     let mut tenant_key_b64: Option<String> = None;
+    let mut cache: Option<String> = None;
     let mut i = 0;
     while i < raw.len() {
         let take = |i: &mut usize, flag: &str| -> Result<String, String> {
@@ -326,6 +508,7 @@ fn cmd_reconstruct(raw: &[String]) -> Result<(), String> {
             "--token" => token = Some(take(&mut i, "--token")?),
             "--out" => out = Some(take(&mut i, "--out")?),
             "--tenant-key-b64" => tenant_key_b64 = Some(take(&mut i, "--tenant-key-b64")?),
+            "--cache" => cache = Some(take(&mut i, "--cache")?),
             other => return Err(format!("unknown flag `{other}`")),
         }
         i += 1;
@@ -347,18 +530,100 @@ fn cmd_reconstruct(raw: &[String]) -> Result<(), String> {
         None => None,
     };
 
+    let cache_path = cache.as_ref().map(PathBuf::from);
     let stats = reconstruct(
         &endpoint,
         &memory_ref,
         &token,
         tenant_key.as_ref(),
         Path::new(&out),
+        cache_path.as_deref(),
     )?;
     println!(
         "reconstructed {} bytes to {out}\n  \
          pages    {} ({} fetched, {} zero-elided)\n  \
-         decrypt  {} page(s) AES-256-GCM",
-        stats.total_bytes, stats.pages, stats.fetched_pages, stats.zero_pages, stats.decrypted_pages
+         decrypt  {} page(s) AES-256-GCM{}",
+        stats.total_bytes,
+        stats.pages,
+        stats.fetched_pages,
+        stats.zero_pages,
+        stats.decrypted_pages,
+        cache.map(|c| format!("\n  cache    {} chunk(s) kept in {c}", stats.fetched_pages)).unwrap_or_default()
+    );
+    Ok(())
+}
+
+fn cmd_serve(raw: &[String]) -> Result<(), String> {
+    let mut cache = None;
+    let mut addr = "127.0.0.1:9700".to_string();
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i].as_str() {
+            "--cache" => {
+                i += 1;
+                cache = Some(raw.get(i).cloned().ok_or("--cache needs a value")?);
+            }
+            "--addr" => {
+                i += 1;
+                addr = raw.get(i).cloned().ok_or("--addr needs a value")?;
+            }
+            other => return Err(format!("unknown flag `{other}`")),
+        }
+        i += 1;
+    }
+    let cache = cache.ok_or("--cache DIR is required")?;
+    serve_peer_cache(Path::new(&cache), &addr)
+}
+
+fn cmd_register_peer(raw: &[String]) -> Result<(), String> {
+    let mut api = None;
+    let mut endpoint = None;
+    let mut locality = None;
+    let mut owner = None;
+    let mut refs: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < raw.len() {
+        let take = |i: &mut usize, flag: &str| -> Result<String, String> {
+            *i += 1;
+            raw.get(*i).cloned().ok_or_else(|| format!("{flag} needs a value"))
+        };
+        match raw[i].as_str() {
+            "--api" => api = Some(take(&mut i, "--api")?),
+            "--endpoint" => endpoint = Some(take(&mut i, "--endpoint")?),
+            "--locality" => locality = Some(take(&mut i, "--locality")?),
+            "--owner" => owner = Some(take(&mut i, "--owner")?),
+            "--ref" => refs.push(take(&mut i, "--ref")?),
+            other => return Err(format!("unknown flag `{other}`")),
+        }
+        i += 1;
+    }
+    let api = api
+        .or_else(|| env::var("GCTL_API").ok())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
+    let endpoint = endpoint.ok_or("--endpoint URL is required")?;
+    let locality = locality.ok_or("--locality is required")?;
+
+    let mut body = serde_json::json!({
+        "endpoint": endpoint,
+        "locality": locality,
+        "refs": refs,
+        "requested_by": "chm-state-cdn",
+    });
+    if let Some(o) = owner {
+        body["owner"] = serde_json::json!(o);
+    }
+    let url = format!("{}/peer-caches", api.trim_end_matches('/'));
+    let resp = curl_post_json(&url, &serde_json::to_string(&body).unwrap())?;
+    let parsed: serde_json::Value = serde_json::from_slice(&resp).unwrap_or(serde_json::Value::Null);
+    let peer_id = parsed
+        .pointer("/peer_cache/peer_id")
+        .or_else(|| parsed.get("peer_id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("(registered)");
+    println!(
+        "registered peer cache {peer_id} at {endpoint} (locality {locality}, {} ref(s))",
+        refs.len()
     );
     Ok(())
 }
@@ -418,5 +683,48 @@ mod tests {
     fn url_encode_escapes_ref_and_token_specials() {
         assert_eq!(url_encode("sha256:abc+/="), "sha256%3Aabc%2B%2F%3D");
         assert_eq!(url_encode("plain-ref_1.0~"), "plain-ref_1.0~");
+    }
+
+    #[test]
+    fn url_decode_inverts_encode() {
+        for s in ["sha256:abc+/=", "plain", "a b&c=d"] {
+            assert_eq!(url_decode(&url_encode(s)), s);
+        }
+    }
+
+    #[test]
+    fn cache_path_sanitizes_content_addresses() {
+        let p = cache_path(Path::new("/cache"), "sha256:aa/bb", "sha256:cc");
+        assert_eq!(p, Path::new("/cache/sha256_aa_bb/sha256_cc"));
+    }
+
+    #[test]
+    fn peer_cache_serves_held_chunks_and_404s_misses() {
+        let cache = env::temp_dir().join(format!("chm-peer-{}", process::id()));
+        let _ = fs::remove_dir_all(&cache);
+        let memory_ref = "sha256:deadbeef";
+        let key = "sha256:cafe";
+        write_cached_chunk(&cache, memory_ref, key, b"ciphertext-bytes").unwrap();
+
+        // A held chunk is served verbatim (opaque ciphertext).
+        let target = format!(
+            "/state-cdn/chunk?ref={}&key={}",
+            url_encode(memory_ref),
+            url_encode(key)
+        );
+        let (code, ctype, body) = route_peer_request("GET", &target, &cache);
+        assert_eq!(code, 200);
+        assert_eq!(ctype, "application/octet-stream");
+        assert_eq!(body, b"ciphertext-bytes");
+
+        // A miss is 404 (the puller falls back to origin), a POST is 405, and a
+        // missing param is 400 — never a 500.
+        let miss = format!("/state-cdn/chunk?ref={}&key=sha256:absent", url_encode(memory_ref));
+        assert_eq!(route_peer_request("GET", &miss, &cache).0, 404);
+        assert_eq!(route_peer_request("POST", &target, &cache).0, 405);
+        assert_eq!(route_peer_request("GET", "/state-cdn/chunk?ref=x", &cache).0, 400);
+        assert_eq!(route_peer_request("GET", "/healthz", &cache).0, 200);
+
+        let _ = fs::remove_dir_all(&cache);
     }
 }
