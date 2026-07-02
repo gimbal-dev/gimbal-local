@@ -53,6 +53,7 @@ final class AppModel: ObservableObject {
     @Published var status = SandboxStatus.disconnected
     @Published var cloud = CloudOverview.offline
     @Published var cloudSnapshots: [CloudSnapshot] = []
+    @Published var branches: [PlaneBranch] = []
     @Published var bringingDownID: String?
     // Live state for cloud-origin sandboxes (they run via the one-shot `chm
     // runner`, not the daemon, so their state is tracked here rather than derived
@@ -121,6 +122,7 @@ final class AppModel: ObservableObject {
         await refreshLocal()
         cloud = await controlPlane.overview(baseURL: settings.controlPlaneURL)
         cloudSnapshots = await controlPlane.listSnapshots(baseURL: settings.controlPlaneURL)
+        branches = await chm.branches(api: settings.controlPlaneURL, settings: settings)
     }
 
     func refreshLocal() async {

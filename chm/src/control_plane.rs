@@ -501,6 +501,13 @@ fn capabilities() -> Value {
         // `chm push` commits a local checkpoint as a content-addressed revision
         // and `chm pull` rehydrates a branch head back to a resume (Phase 4).
         "supports_commit": true,
+        // `chm state-cdn reconstruct` consumes the state-CDN memory plane: it
+        // pulls a checkpoint's encrypted, content-addressed RAM chunks and
+        // reassembles the image before resume (Phase 2, CDN-backed resume).
+        // NOTE: not `supports_postcopy` — chm reconstructs the working set
+        // eagerly and does not yet demand-fault only touched pages (that needs
+        // HVF stage-2 fault interception; see docs/state-cdn-memory-plane.md).
+        "supports_offload_daemon": true,
     })
 }
 
@@ -932,6 +939,106 @@ pub fn push_main(raw: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+pub fn branches_main(raw: &[String]) -> ExitCode {
+    let mut api = None;
+    let mut owner: Option<String> = None;
+    let mut as_json = false;
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i].as_str() {
+            "-h" | "--help" => {
+                print!(
+                    "chm branches — list revision branches on the control plane\n\
+                     \n\
+                     USAGE:\n    chm branches [--json] [--owner WHO] [--api URL]\n"
+                );
+                return ExitCode::SUCCESS;
+            }
+            "--json" => as_json = true,
+            "--owner" => match take_value(raw, &mut i, "--owner") {
+                Ok(v) => owner = Some(v),
+                Err(e) => {
+                    eprintln!("chm branches: {e}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            "--api" => match take_value(raw, &mut i, "--api") {
+                Ok(v) => api = Some(v),
+                Err(e) => {
+                    eprintln!("chm branches: {e}");
+                    return ExitCode::FAILURE;
+                }
+            },
+            other => {
+                eprintln!("chm branches: unknown argument `{other}`");
+                return ExitCode::FAILURE;
+            }
+        }
+        i += 1;
+    }
+    match cmd_branches(api, owner.as_deref(), as_json) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("chm branches: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_branches(api: Option<String>, owner: Option<&str>, as_json: bool) -> Result<(), String> {
+    let cp = ControlPlane::from_env_or(api);
+    let body = cp.list_branches()?;
+    let mut branches = body
+        .get("branches")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(owner) = owner {
+        branches.retain(|b| b.get("owner").and_then(Value::as_str) == Some(owner));
+    }
+    if as_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({ "branches": branches }))
+                .map_err(|e| format!("encode json: {e}"))?
+        );
+    } else {
+        print!("{}", format_branches_table(&branches));
+    }
+    Ok(())
+}
+
+/// Render a branch list as an aligned table: name, review status, head revision,
+/// ACL count, owner. Pure for testability.
+fn format_branches_table(branches: &[Value]) -> String {
+    if branches.is_empty() {
+        return "(no branches)\n".to_string();
+    }
+    let mut out = String::from("BRANCH                REVIEW     HEAD                 ACLS  OWNER\n");
+    for b in branches {
+        let name = b.get("name").and_then(Value::as_str).unwrap_or("?");
+        let review = b
+            .get("review_status")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("-");
+        let head = b
+            .get("head_snapshot_id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("(empty)");
+        let acls = b
+            .get("page_acls")
+            .and_then(Value::as_array)
+            .map_or(0, Vec::len);
+        let owner = b.get("owner").and_then(Value::as_str).unwrap_or("?");
+        out.push_str(&format!(
+            "{name:<21} {review:<10} {head:<20} {acls:<5} {owner}\n"
+        ));
+    }
+    out
 }
 
 pub fn pull_main(raw: &[String]) -> ExitCode {
@@ -1430,6 +1537,26 @@ mod tests {
     #[test]
     fn capabilities_advertise_commit() {
         assert_eq!(capabilities()["supports_commit"], json!(true));
+    }
+
+    #[test]
+    fn format_branches_table_renders_rows_and_empty() {
+        assert_eq!(format_branches_table(&[]), "(no branches)\n");
+        let branches = json!([
+            { "name": "laptop-main", "review_status": "pending",
+              "head_snapshot_id": "snap-6150377c50aa", "owner": "dev" },
+            { "name": "acl-demo", "head_snapshot_id": "snap-d9a9a1529717",
+              "owner": "dev", "page_acls": [ { "audience": "r1" } ] }
+        ]);
+        let out = format_branches_table(branches.as_array().unwrap());
+        assert!(out.contains("BRANCH"), "{out}");
+        assert!(out.contains("laptop-main"), "{out}");
+        assert!(out.contains("pending"), "{out}");
+        assert!(out.contains("snap-6150377c50aa"), "{out}");
+        // acl-demo has no review status (shows '-') and 1 acl.
+        let acl_line = out.lines().find(|l| l.contains("acl-demo")).unwrap();
+        assert!(acl_line.contains(" - "), "no-review shows dash: {acl_line}");
+        assert!(acl_line.contains(" 1 "), "acl count shown: {acl_line}");
     }
 
     #[test]

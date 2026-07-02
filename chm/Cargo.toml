@@ -27,6 +27,11 @@ hypervisor = { path = "../hypervisor", default-features = false, features = [
   "kvm-snapshot",
 ] }
 libc = { workspace = true }
+# AES-256-GCM to decrypt the state-CDN memory plane's per-tenant chunks. `ring`
+# is already vendored in the workspace tree (via rustls); this is a direct use of
+# it, not a new crate, and there is no adequate std/CLI alternative for
+# authenticated GCM decryption.
+ring = "0.17.14"
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 
