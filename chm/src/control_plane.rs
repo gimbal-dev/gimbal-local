@@ -175,6 +175,39 @@ impl ControlPlane {
         let resp = self.request("POST", &path, Some(req))?;
         ok_or_http_err(resp, "push-artifacts").map(|_| ())
     }
+
+    /// Commit a local checkpoint as a new content-addressed revision on `branch`
+    /// (Phase 4). The plane ingests `bundle_dir` into its CAS, dedups against
+    /// existing chunks, and advances the branch head. Returns the
+    /// `CommitRevisionResponse` (branch, revision, dedup stats).
+    fn commit_revision(&self, req: &Value) -> Result<Value, String> {
+        let resp = self.request("POST", "/revisions/commit", Some(req))?;
+        ok_or_http_err(resp, "revisions/commit")
+    }
+
+    /// List branches (their heads + review status). Used to resolve a branch
+    /// *name* to its id for the id-addressed pull endpoint.
+    fn list_branches(&self) -> Result<Value, String> {
+        let resp = self.request("GET", "/branches", None)?;
+        ok_or_http_err(resp, "branches")
+    }
+
+    /// Pull a branch head (or an explicit revision) back to a resume assignment
+    /// (Phase 4). The response's `assignment` is a standard `AssignRunResponse`,
+    /// so the bundle materializes through the same path a normal resume uses.
+    fn pull_branch(&self, branch_id: &str, req: &Value) -> Result<Value, String> {
+        let path = format!("/branches/{branch_id}/pull");
+        let resp = self.request("POST", &path, Some(req))?;
+        if resp.status == 422 {
+            return Err(format!(
+                "control plane refused this revision as not runnable (HTTP 422): {}.\n\
+                 The gic_mode gate is preserved end-to-end — an its-lpi lineage is \
+                 refused exactly as on a normal resume.",
+                http_error_message(&resp.body)
+            ));
+        }
+        ok_or_http_err(resp, "branches/pull")
+    }
 }
 
 /// Split curl's `body\n__CHM_HTTP_STATUS__:<code>` output into a parsed body and
@@ -465,6 +498,9 @@ fn capabilities() -> Value {
         // overlays over a shared read-only base.
         "supports_fork": true,
         "supports_cow_overlay": true,
+        // `chm push` commits a local checkpoint as a content-addressed revision
+        // and `chm pull` rehydrates a branch head back to a resume (Phase 4).
+        "supports_commit": true,
     })
 }
 
@@ -853,6 +889,366 @@ fn run_chm(args: &[String]) -> Result<i32, String> {
     Ok(status.code().unwrap_or(-1))
 }
 
+// ---------------------------------------------------------------------------
+// Phase 4 — commit / push / pull ("git for live compute")
+//
+// `chm push` commits a local checkpoint as a content-addressed revision on a
+// branch (the plane dedups it into its CAS and advances the branch head);
+// `chm pull` resolves a branch head back to a resume assignment and materializes
+// it, so a session committed on one machine rehydrates on any other.
+// ---------------------------------------------------------------------------
+
+/// Options for `chm push`.
+struct PushOpts {
+    checkpoint: PathBuf,
+    branch: String,
+    api: Option<String>,
+    owner: String,
+    message: Option<String>,
+    sandbox: Option<String>,
+    parent: Option<String>,
+}
+
+/// Options for `chm pull`.
+struct PullOpts {
+    branch: String,
+    to: PathBuf,
+    api: Option<String>,
+    owner: String,
+    revision: Option<String>,
+    locality: Option<String>,
+    resume: bool,
+}
+
+pub fn push_main(raw: &[String]) -> ExitCode {
+    if matches!(raw.first().map(String::as_str), Some("-h") | Some("--help")) {
+        print!("{}", push_usage());
+        return ExitCode::SUCCESS;
+    }
+    match parse_push_opts(raw).and_then(|o| cmd_push(&o)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("chm push: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+pub fn pull_main(raw: &[String]) -> ExitCode {
+    if matches!(raw.first().map(String::as_str), Some("-h") | Some("--help")) {
+        print!("{}", pull_usage());
+        return ExitCode::SUCCESS;
+    }
+    match parse_pull_opts(raw).and_then(|o| cmd_pull(&o)) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("chm pull: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn push_usage() -> String {
+    "chm push — commit a local checkpoint as a revision on a branch (Phase 4)\n\
+     \n\
+     USAGE:\n    \
+         chm push <CHECKPOINT_DIR> --branch NAME [--message M] [--api URL]\n                     \
+         [--owner WHO] [--sandbox ID] [--parent SNAPSHOT_ID]\n\
+     \n\
+     CHECKPOINT_DIR is a chm snapshot/checkpoint directory (has state.json). The\n    \
+     control plane ingests it into its content-addressed store, dedups against\n    \
+     existing chunks, and advances the branch head. URL: --api, else $GCTL_API,\n    \
+     else http://127.0.0.1:8080.\n"
+        .to_string()
+}
+
+fn pull_usage() -> String {
+    "chm pull — rehydrate a branch head (or revision) to a local resume (Phase 4)\n\
+     \n\
+     USAGE:\n    \
+         chm pull --branch NAME --to DIR [--revision SNAPSHOT_ID] [--resume]\n                     \
+         [--api URL] [--owner WHO] [--locality LOC]\n\
+     \n\
+     Resolves the branch head (or --revision) to a resume assignment and\n    \
+     materializes the verified bundle into DIR. With --resume it then runs\n    \
+     `chm resume DIR`; otherwise it prints DIR so you can resume when ready.\n"
+        .to_string()
+}
+
+fn parse_push_opts(raw: &[String]) -> Result<PushOpts, String> {
+    let mut checkpoint = None;
+    let mut branch = None;
+    let mut api = None;
+    let mut owner = default_owner();
+    let mut message = None;
+    let mut sandbox = None;
+    let mut parent = None;
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i].as_str() {
+            "--branch" => branch = Some(take_value(raw, &mut i, "--branch")?),
+            "--api" => api = Some(take_value(raw, &mut i, "--api")?),
+            "--owner" => owner = take_value(raw, &mut i, "--owner")?,
+            "--message" | "-m" => message = Some(take_value(raw, &mut i, "--message")?),
+            "--sandbox" => sandbox = Some(take_value(raw, &mut i, "--sandbox")?),
+            "--parent" => parent = Some(take_value(raw, &mut i, "--parent")?),
+            other if other.starts_with('-') => return Err(format!("unknown flag `{other}`")),
+            pos => {
+                if checkpoint.is_some() {
+                    return Err(format!("unexpected argument `{pos}`"));
+                }
+                checkpoint = Some(PathBuf::from(pos));
+            }
+        }
+        i += 1;
+    }
+    Ok(PushOpts {
+        checkpoint: checkpoint.ok_or("a CHECKPOINT_DIR is required")?,
+        branch: branch.ok_or("--branch NAME is required")?,
+        api,
+        owner,
+        message,
+        sandbox,
+        parent,
+    })
+}
+
+fn parse_pull_opts(raw: &[String]) -> Result<PullOpts, String> {
+    let mut branch = None;
+    let mut to = None;
+    let mut api = None;
+    let mut owner = default_owner();
+    let mut revision = None;
+    let mut locality = None;
+    let mut resume = false;
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i].as_str() {
+            "--branch" => branch = Some(take_value(raw, &mut i, "--branch")?),
+            "--to" => to = Some(PathBuf::from(take_value(raw, &mut i, "--to")?)),
+            "--api" => api = Some(take_value(raw, &mut i, "--api")?),
+            "--owner" => owner = take_value(raw, &mut i, "--owner")?,
+            "--revision" => revision = Some(take_value(raw, &mut i, "--revision")?),
+            "--locality" => locality = Some(take_value(raw, &mut i, "--locality")?),
+            "--resume" => resume = true,
+            other => return Err(format!("unknown argument `{other}`")),
+        }
+        i += 1;
+    }
+    Ok(PullOpts {
+        branch: branch.ok_or("--branch NAME is required")?,
+        to: to.ok_or("--to DIR is required")?,
+        api,
+        owner,
+        revision,
+        locality,
+        resume,
+    })
+}
+
+/// Advance `i` and return the value following a flag, erroring if absent.
+fn take_value(raw: &[String], i: &mut usize, flag: &str) -> Result<String, String> {
+    *i += 1;
+    raw.get(*i)
+        .cloned()
+        .ok_or_else(|| format!("{flag} needs a value"))
+}
+
+fn cmd_push(opts: &PushOpts) -> Result<(), String> {
+    let cp = ControlPlane::from_env_or(opts.api.clone());
+    eprintln!("chm push: control plane {}", cp.api);
+
+    // The plane ingests the bundle from this path on its own host, so make it
+    // absolute — a co-located dev plane (:8080 on this Mac) resolves it directly.
+    let bundle_dir = fs::canonicalize(&opts.checkpoint)
+        .map_err(|e| format!("checkpoint dir {}: {e}", opts.checkpoint.display()))?;
+    if !bundle_dir.join("state.json").is_file() {
+        return Err(format!(
+            "{} is not a chm snapshot/checkpoint (no state.json)",
+            bundle_dir.display()
+        ));
+    }
+
+    let mut req = json!({
+        "branch": opts.branch,
+        "owner": opts.owner,
+        "bundle_dir": bundle_dir.display().to_string(),
+        "requested_by": "chm-push",
+        "idempotency_key": format!("push-{}-{}", opts.branch, now_secs()),
+    });
+    if let Some(m) = &opts.message {
+        req["message"] = json!(m);
+    }
+    if let Some(s) = &opts.sandbox {
+        req["sandbox_id"] = json!(s);
+    }
+    if let Some(p) = &opts.parent {
+        req["parent_snapshot_id"] = json!(p);
+    }
+
+    let resp = cp.commit_revision(&req)?;
+    println!("{}", format_commit_result(&opts.branch, &resp));
+    Ok(())
+}
+
+fn cmd_pull(opts: &PullOpts) -> Result<(), String> {
+    let cp = ControlPlane::from_env_or(opts.api.clone());
+    eprintln!("chm pull: control plane {}", cp.api);
+
+    let runner_id = do_register(&cp, &opts.owner)?;
+    let branch_id = resolve_branch_id(&cp, &opts.owner, &opts.branch)?;
+
+    let mut req = json!({
+        "owner": opts.owner,
+        "runner_id": runner_id,
+        "requested_by": "chm-pull",
+        "idempotency_key": format!("pull-{}-{}", opts.branch, now_secs()),
+    });
+    if let Some(rev) = &opts.revision {
+        req["snapshot_id"] = json!(rev);
+    }
+    if let Some(loc) = &opts.locality {
+        req["locality"] = json!(loc);
+    }
+
+    let resp = cp.pull_branch(&branch_id, &req)?;
+    let snapshot_id = resp.get("snapshot_id").and_then(Value::as_str).unwrap_or("?");
+    let acl = resp.get("acl_applied").and_then(Value::as_bool).unwrap_or(false);
+    eprintln!(
+        "chm pull: branch `{}` → revision {snapshot_id}{}",
+        opts.branch,
+        if acl { " (page-ACL scoped token)" } else { "" }
+    );
+    if let Some(src) = resp.get("chunk_source").and_then(|s| s.get("source")).and_then(Value::as_str)
+    {
+        eprintln!("chm pull: chunk source: {src}");
+    }
+
+    let assign = resp
+        .get("assignment")
+        .filter(|a| !a.is_null())
+        .ok_or("pull: response carried no resume assignment")?;
+    materialize_assignment_to(assign, &opts.to)?;
+
+    if opts.resume {
+        eprintln!("chm pull: resuming — exec chm resume {}", opts.to.display());
+        let code = run_chm(&["resume".to_string(), opts.to.display().to_string()])?;
+        if code != 0 {
+            return Err(format!("chm resume exited {code}"));
+        }
+    } else {
+        println!("{}", opts.to.display());
+        eprintln!(
+            "chm pull: ready — resume it with:  chm resume {}",
+            opts.to.display()
+        );
+    }
+    Ok(())
+}
+
+/// Resolve a branch *name* to its id via the branch list. If several branches
+/// share the name, the one owned by `owner` wins; a unique name matches
+/// regardless of owner.
+fn resolve_branch_id(cp: &ControlPlane, owner: &str, name: &str) -> Result<String, String> {
+    let body = cp.list_branches()?;
+    let branches = body
+        .get("branches")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    branch_id_by_name(&branches, owner, name).ok_or_else(|| {
+        format!("no branch named `{name}` on the control plane (commit to it first with `chm push`)")
+    })
+}
+
+/// Pick a branch id by name: a unique name matches outright; ambiguous names are
+/// disambiguated by `owner`.
+fn branch_id_by_name(branches: &[Value], owner: &str, name: &str) -> Option<String> {
+    let named: Vec<&Value> = branches
+        .iter()
+        .filter(|b| b.get("name").and_then(Value::as_str) == Some(name))
+        .collect();
+    let chosen = match named.as_slice() {
+        [] => return None,
+        [only] => *only,
+        many => *many
+            .iter()
+            .find(|b| b.get("owner").and_then(Value::as_str) == Some(owner))
+            .unwrap_or(&many[0]),
+    };
+    chosen
+        .get("branch_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Materialize a pull's resume assignment into `dest`: re-verify the gic gate
+/// (defense in depth — its-lpi never restores on HVF), then content-address the
+/// bundle through the same CAS path a normal resume uses.
+fn materialize_assignment_to(assign: &Value, dest: &Path) -> Result<(), String> {
+    let download_uri = assign
+        .get("download_uri")
+        .and_then(Value::as_str)
+        .ok_or("pull assignment: no download_uri")?;
+    let checksum_tree = parse_checksum_tree(assign)?;
+
+    let manifest = assign.get("manifest").cloned().unwrap_or(Value::Null);
+    let gic_mode = manifest
+        .get("gic_mode")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if !gic_mode.is_empty() && !hvf_restorable(gic_mode) {
+        return Err(format!(
+            "revision gic_mode `{gic_mode}` is not HVF-restorable — only \
+             `gicv2m-message-spi` resumes on apple-hvf (recapture with CH_GIC_V2M=1)"
+        ));
+    }
+
+    let _ = fs::remove_dir_all(dest);
+    let token = assign.get("capability_token").and_then(Value::as_str);
+    let deduped = materialize_bundle(download_uri, &checksum_tree, dest, token)?;
+    eprintln!(
+        "chm pull: materialized + verified {} file(s){} at {}",
+        checksum_tree.len(),
+        if deduped > 0 {
+            format!(" ({deduped} shared from cache)")
+        } else {
+            String::new()
+        },
+        dest.display()
+    );
+    Ok(())
+}
+
+/// Format a `CommitRevisionResponse` into a human summary (branch head, new
+/// revision id, and the content-addressed dedup stats).
+fn format_commit_result(branch_name: &str, resp: &Value) -> String {
+    let head = resp
+        .pointer("/branch/head_snapshot_id")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let rev = resp
+        .pointer("/revision/snapshot_id")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    let stats = resp.get("stats").cloned().unwrap_or(Value::Null);
+    let stored = stats.get("stored_bytes").and_then(Value::as_i64).unwrap_or(0);
+    let total = stats.get("total_bytes").and_then(Value::as_i64).unwrap_or(0);
+    let deduped = stats.get("deduped_pages").and_then(Value::as_i64).unwrap_or(0);
+    let zero = stats.get("zero_pages").and_then(Value::as_i64).unwrap_or(0);
+    let ratio = stats
+        .get("working_set_ratio")
+        .and_then(Value::as_f64)
+        .unwrap_or(0.0);
+    format!(
+        "committed revision {rev} on branch `{branch_name}`\n  \
+         head    {head}\n  \
+         stored  {stored} / {total} bytes ({:.1}% working set)\n  \
+         dedup   {deduped} page(s) deduped, {zero} zero page(s)",
+        ratio * 100.0
+    )
+}
+
 /// HVF (Apple's managed GIC) can only deliver message-based SPIs, so it can only
 /// restore checkpoints captured `gicv2m-message-spi`. Everything else (notably
 /// `its-lpi`) stays cloud-only.
@@ -961,6 +1357,80 @@ fn parse_checksum_tree(assign: &Value) -> Result<BTreeMap<String, String>, Strin
 mod tests {
     use super::*;
     use std::process;
+
+    /// Build an owned `Vec<String>` args list from string literals.
+    fn s(args: &[&str]) -> Vec<String> {
+        args.iter().map(|a| a.to_string()).collect()
+    }
+
+    #[test]
+    fn branch_id_resolves_unique_name_and_disambiguates_by_owner() {
+        let branches = json!([
+            { "branch_id": "b-1", "name": "laptop-main", "owner": "dev" },
+            { "branch_id": "b-2", "name": "feature", "owner": "dev" },
+            { "branch_id": "b-3", "name": "feature", "owner": "alice" }
+        ]);
+        let list = branches.as_array().unwrap();
+        // A unique name matches regardless of the requesting owner.
+        assert_eq!(
+            branch_id_by_name(list, "someone-else", "laptop-main").as_deref(),
+            Some("b-1")
+        );
+        // An ambiguous name is disambiguated by owner.
+        assert_eq!(branch_id_by_name(list, "alice", "feature").as_deref(), Some("b-3"));
+        assert_eq!(branch_id_by_name(list, "dev", "feature").as_deref(), Some("b-2"));
+        // No match returns None.
+        assert_eq!(branch_id_by_name(list, "dev", "nope"), None);
+    }
+
+    #[test]
+    fn format_commit_result_reports_dedup_stats() {
+        // Mirrors the live 0-byte re-commit: identical content stores nothing.
+        let resp = json!({
+            "branch": { "head_snapshot_id": "snap-head" },
+            "revision": { "snapshot_id": "snap-rev" },
+            "stats": {
+                "total_bytes": 2097152, "stored_bytes": 0,
+                "deduped_pages": 4, "zero_pages": 4, "working_set_ratio": 0.0
+            }
+        });
+        let out = format_commit_result("laptop-main", &resp);
+        assert!(out.contains("revision snap-rev on branch `laptop-main`"), "{out}");
+        assert!(out.contains("head    snap-head"), "{out}");
+        assert!(out.contains("stored  0 / 2097152 bytes (0.0% working set)"), "{out}");
+        assert!(out.contains("4 page(s) deduped, 4 zero page(s)"), "{out}");
+    }
+
+    #[test]
+    fn parse_push_opts_requires_dir_and_branch() {
+        let opts = parse_push_opts(&s(&[
+            "/tmp/ckpt", "--branch", "laptop-main", "--message", "hi", "--parent", "snap-p",
+        ]))
+        .unwrap();
+        assert_eq!(opts.checkpoint, PathBuf::from("/tmp/ckpt"));
+        assert_eq!(opts.branch, "laptop-main");
+        assert_eq!(opts.message.as_deref(), Some("hi"));
+        assert_eq!(opts.parent.as_deref(), Some("snap-p"));
+        // Missing --branch is an error; a stray second positional is rejected.
+        assert!(parse_push_opts(&s(&["/tmp/ckpt"])).is_err());
+        assert!(parse_push_opts(&s(&["/tmp/a", "/tmp/b", "--branch", "x"])).is_err());
+    }
+
+    #[test]
+    fn parse_pull_opts_requires_branch_and_to() {
+        let opts =
+            parse_pull_opts(&s(&["--branch", "feature", "--to", "/tmp/out", "--resume"])).unwrap();
+        assert_eq!(opts.branch, "feature");
+        assert_eq!(opts.to, PathBuf::from("/tmp/out"));
+        assert!(opts.resume);
+        assert!(parse_pull_opts(&s(&["--branch", "feature"])).is_err());
+        assert!(parse_pull_opts(&s(&["--to", "/tmp/out"])).is_err());
+    }
+
+    #[test]
+    fn capabilities_advertise_commit() {
+        assert_eq!(capabilities()["supports_commit"], json!(true));
+    }
 
     #[test]
     fn parses_status_and_body() {

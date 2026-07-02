@@ -412,6 +412,8 @@ pub fn main() -> ExitCode {
     match raw.first().map(String::as_str) {
         Some("cloud") => cloud::cloud_main(&raw[1..]),
         Some("runner") => control_plane::runner_main(&raw[1..]),
+        Some("push") => control_plane::push_main(&raw[1..]),
+        Some("pull") => control_plane::pull_main(&raw[1..]),
         Some("serve") => serve::serve_main(&raw[1..]),
         Some("ctl") => serve::ctl_main(&raw[1..]),
         Some("fork") => match fork(&raw[1..]) {
@@ -514,6 +516,8 @@ fn usage() -> String {
          chm revisions <SNAPSHOT_DIR> [--json]  (list the lineage)\n    \
          chm rollback <SNAPSHOT_DIR> <REV_ID>   (roll back to a revision)\n    \
          chm connect <SNAPSHOT_DIR> [OPTIONS]   (interactive session)\n    \
+         chm push <CHECKPOINT_DIR> --branch N   (commit a revision to the plane)\n    \
+         chm pull --branch N --to DIR           (rehydrate a branch head)\n    \
          chm cloud <COMMAND> aws [OPTIONS]      (BYO cloud helpers)\n    \
          chm serve <LIBRARY_DIR> [OPTIONS]      (background daemon)\n    \
          chm ctl <COMMAND> [ARG] [--socket P]   (talk to a daemon)\n\
