@@ -398,21 +398,24 @@ final class AppModel: ObservableObject {
         // was (live memory + disk), rather than cold-booting. `runPath` is the
         // sandbox's isolated workspace so its state stays separate from other
         // sandboxes launched from the same image.
-        var connectCmd = "\(shellQuote(settings.chmPath)) connect \(shellQuote(runPath)) --socket \(shellQuote(settings.socketPath)) --checkpoint --idle-exit 0"
-        if let lockPath {
-            connectCmd += " --session-lock \(shellQuote(lockPath))"
-        }
-        let command = [
-            "cd \(shellQuote(FileManager.default.currentDirectoryPath))",
-            "echo 'Gimbal Local interactive session'",
-            "echo 'Login with ubuntu / ubuntu if prompted. Close this window or press Ctrl-A x to end the session — it suspends the sandbox (live state saved); reconnect to resume where you left off.'",
-            connectCmd,
-        ].joined(separator: " && ")
+        //
+        // Terminal.app's `do script` runs a command *string*, so we cannot hand
+        // it a raw argv. Instead every interpolated value is single-quoted and
+        // control-character-validated by `InteractiveTerminalCommand` (M30.3),
+        // then the whole command is escaped once more for the AppleScript string
+        // literal — so a path can never break out into host shell code.
+        let command = try InteractiveTerminalCommand.shellCommand(
+            chmPath: settings.chmPath,
+            runPath: runPath,
+            socketPath: settings.socketPath,
+            lockPath: lockPath,
+            workdir: FileManager.default.currentDirectoryPath
+        )
 
         let script = """
         tell application "Terminal"
             activate
-            do script \(appleScriptString(command))
+            do script \(InteractiveTerminalCommand.appleScriptString(command))
         end tell
         """
 
@@ -435,10 +438,6 @@ final class AppModel: ObservableObject {
                 userInfo: [NSLocalizedDescriptionKey: output.trimmingCharacters(in: .whitespacesAndNewlines)]
             )
         }
-    }
-
-    private func shellQuote(_ value: String) -> String {
-        "'\(value.replacingOccurrences(of: "'", with: "'\\''"))'"
     }
 
     /// Reconcile an open interactive session against its PID lock file, clearing
@@ -504,10 +503,6 @@ final class AppModel: ObservableObject {
         interactiveLockPath = nil
         interactiveLockSeen = false
         interactiveDeadline = nil
-    }
-
-    private func appleScriptString(_ value: String) -> String {
-        "\"\(value.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\""))\""
     }
 
     func appendLog(_ text: String) {
