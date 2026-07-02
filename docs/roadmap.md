@@ -115,7 +115,7 @@ from cache in 0.077 s).
 | --- | --- | --- | --- |
 | **M25 · Live local lifecycle** | ① | **Complete** (one perf ceiling: runtime memfd page-sharing) | #4, #6 |
 | **M30 · Security hardening** | trust/isolation | **P0 + no-FS guard shipped** (#33–#35, #37); signing + limits next (#36, #38) | #33–#39 |
-| **M27 · Plane-native edge** | ② | Waits on gctl (memory plane shipped; disk plane + fork/commit building) | #5, #7 |
+| **M27 · Plane-native edge** | ② | **push/pull shipped** (#7 core); postcopy memory + disk plane next (#5) | #5, #7 |
 | **M28 · Consistent controls** | ③ | Waits on the gctl policy contract | #20 |
 | **M29 · Observability & cost** | ④ | Waits on the gctl telemetry contract | — |
 
@@ -182,15 +182,19 @@ signing item makes M26's displayed provenance cryptographically verified.
 
 Pillar ②'s deep, plane-coupled half:
 
+- **`chm commit` / `push` / `pull`** (#7) — **shipped (core loop).** `chm push`
+  commits a local checkpoint as a content-addressed revision on a branch (the
+  plane dedups it into its CAS and advances the head); `chm pull` rehydrates a
+  branch head (or explicit revision) back to a local resume. Proven live on the
+  `:8080` dev plane: a re-commit of already-present content stored **0 bytes**.
+  Follow-ups: peer-cache node, page-range ACLs, branch/merge review in the app.
 - **Postcopy memory plane** (#5): run the offload daemon beside `chm`, launch with
   shared-memfd + `memory_mode=postcopy` on resume, demand-fault memory pages from
   the state CDN (the control-plane side is shipped).
 - **Disk plane**: lazy blocks over the same content-addressed store.
-- **`chm commit` / `push` / `pull`** (#7): a local overlay becomes a new content-
-  addressed revision/branch pushed to the CDN, plus peer-cache serving.
 
 Back-compat means Gimbal Local always degrades to the M25 file-backed path, so it
-is never *stuck* — just not yet demand-faulting or pushing revisions.
+is never *stuck* — just not yet demand-faulting the working set.
 
 ### M28 · Consistent sandbox controls — filesystem + network/firewall
 
