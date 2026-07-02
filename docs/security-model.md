@@ -88,10 +88,10 @@ test/guard so a regression is caught, not discovered.
 | # | Invariant | Enforced by | Status |
 | --- | --- | --- | --- |
 | I1 | **No host filesystem passthrough.** A guest never gets a virtiofs/9p/shared-folder mount of a host directory. The only guest storage is virtio-blk over a bundle-owned image + a private overlay. | Device model ships only block/rng/net; a CI guard fails if virtiofs/9p/shared-folder appears without review. | **Holds today**; guard is M30.5 |
-| I2 | **Bundles are confined.** Every file `chm` opens for a bundle resolves to a real path **under the bundle root** — no symlink is followed out, no `..` escapes. | `symlink_metadata` rejection + canonicalisation + no-follow opens. | **Being hardened** (M30.1) |
-| I3 | **Overlays are private.** Writable overlays/checkpoints are created by `chm` in a fresh `0700` runtime dir it owns, never in an attacker-supplied bundle directory. | Overlay root moved out of the bundle into a per-run private dir. | **Being hardened** (M30.1) |
-| I4 | **The daemon is local-and-owner-only.** Only the same-uid user can drive the control socket; the socket lives in a private `0700` dir with `0600` perms and validates peer credentials. | Private socket dir + `getpeereid`/`LOCAL_PEERCRED` check. | **Being hardened** (M30.2) |
-| I5 | **The app never builds host shell code from data.** Snapshot/sandbox names and paths never become shell tokens. | Launch `chm` via `Process` argument vectors; adversarial-input test. | **Partially** (name vector removed; M30.3 finishes) |
+| I2 | **Bundles are confined.** Every file `chm` opens for a bundle resolves to a real path **under the bundle root** — no symlink is followed out, no `..` escapes. | `symlink_metadata` rejection + path confinement + `O_NOFOLLOW` opens. | **Holds today** (M30.1) |
+| I3 | **Overlays are private.** Writable overlays/checkpoints are created by `chm` in a fresh `0700` dir it owns, refusing a symlinked overlay/dir shipped in the bundle. | Private `0700` overlay dir + no-follow overlay opens. | **Holds today** (M30.1) |
+| I4 | **The daemon is local-and-owner-only.** Only the same-uid user can drive the control socket; the socket lives in a private `0700` dir with `0600` perms and validates peer credentials. | Private socket dir + `0600` perms + `getpeereid` peer-uid check. | **Holds today** (M30.2) |
+| I5 | **The app never builds host shell code from data.** Snapshot/sandbox names and paths never become shell tokens. | Centralised single-quote builder + control-char rejection; adversarial-input tests. | **Holds today** (M30.3) |
 | I6 | **Only verified, provenance-known snapshots run.** A bundle is checksum-verified **and** signature-verified against a trusted key before import or run; provenance is recorded. | Signed manifest + verification against the cloud trust root. | **Not yet** (M30.4) |
 | I7 | **Undeliverable snapshots are refused, not mis-run.** ITS/LPI snapshots fail loudly at the load guard and the `assign-run` 422 gate. | `its_lpi_guard` + plane gate. | **Holds today** |
 
@@ -104,6 +104,10 @@ The review graded eight areas. Each maps to an M30 issue, prioritised P0
 (defence-in-depth).
 
 ### M30.1 · Bundle file isolation — symlinks & path traversal  **[P0, engine]**
+
+**Status: shipped.** Symlinked disk bases and overlays are rejected, disk +
+overlay opens use `O_NOFOLLOW`, the overlay dir is created private `0700`, and
+`materialize_bundle` confines every manifest relpath under the cache root.
 
 **Finding.** Host file isolation is breakable via symlinks in `disks/` /
 `.chm-overlays/`, because the run path tests `Path::exists()` / `is_file()`
@@ -136,6 +140,11 @@ must still run.
 
 ### M30.2 · Daemon control hardening — socket auth  **[P0, daemon]**
 
+**Status: shipped.** The socket is bound `0600` in a private `0700`
+`<tmp>/gimbal-local/` dir, and `handle_conn` rejects any peer whose uid is not
+the daemon's own (`getpeereid`). Proven live: dir `drwx------`, socket
+`srw-------`, same-uid `ctl` admitted.
+
 **Finding.** The control daemon is not hardened: a predictable socket, no auth,
 no peer check.
 
@@ -158,6 +167,10 @@ honouring `start` / `stop` / `console` / `shutdown`.
 perms are `0600` in a private dir.
 
 ### M30.3 · App command safety — no shell strings  **[P0, app]**
+
+**Status: shipped.** Terminal command building moved to a pure
+`InteractiveTerminalCommand` builder that single-quotes every interpolated value
+and rejects control characters, with adversarial-input tests.
 
 **Finding.** Host command injection via the snapshot name in the Terminal
 command.
@@ -228,11 +241,12 @@ per-area plan, and is the acceptance surface for M30. The checklist below is the
 
 ## 4. Hardening checklist (the "hostile-agent ready" bar)
 
-- [ ] **File boundary** — bundles confined (symlink-reject, canonicalise, no-
-      follow), overlays in a private `0700` dir (M30.1).
-- [ ] **Daemon auth** — private `0600` socket in a `0700` dir, peer-cred check
-      (M30.2).
-- [ ] **No shell strings** in the app; argv-only launch (M30.3).
+- [x] **File boundary** — bundles confined (symlink-reject, path-confine,
+      `O_NOFOLLOW`), overlays in a private `0700` dir (M30.1, shipped).
+- [x] **Daemon auth** — private `0600` socket in a `0700` dir, peer-cred check
+      (M30.2, shipped).
+- [x] **No shell strings** built from data in the app; centralised quoting +
+      control-char rejection (M30.3, shipped).
 - [ ] **Snapshot signing** — signed manifest, verified against a trusted key,
       provenance recorded (M30.4).
 - [ ] **Trust root** — one root: app trusts the cloud/capture public keys; cloud
