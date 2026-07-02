@@ -59,10 +59,10 @@ final class AppModel: ObservableObject {
     // from `chm ctl status`).
     @Published var cloudSandboxStates: [String: Sandbox.State] = [:]
     @Published var cloudSandboxReasons: [String: String] = [:]
-    // Revision lineage per snapshot image (from `chm revisions --json`) + the
-    // snapshot currently being rolled back.
-    @Published var revisionsBySnapshot: [String: [RevisionSummary]] = [:]
-    @Published var rollingBackSnapshot: String?
+    // Revision lineage per directory (sandbox workspace or image), from
+    // `chm revisions --json`, + the directory currently being rolled back.
+    @Published var revisionsByPath: [String: [RevisionSummary]] = [:]
+    @Published var rollingBackPath: String?
     @Published var consoleText = ""
     @Published var activityLog = ""
     @Published var selectedSnapshot: SnapshotSummary?
@@ -332,24 +332,6 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func connectToSelectedSnapshot() {
-        guard let snapshot = selectedSnapshot else {
-            appendLog("select a snapshot first")
-            return
-        }
-
-        Task {
-            do {
-                try openInteractiveTerminal(for: snapshot)
-                appendLog("opened interactive terminal for \(snapshot.name)")
-                try? await Task.sleep(for: .milliseconds(500))
-                await refreshLocal()
-            } catch {
-                appendLog("terminal connect failed: \(error.localizedDescription)")
-            }
-        }
-    }
-
     func stopSandbox() {
         Task {
             do {
@@ -409,18 +391,20 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func openInteractiveTerminal(for snapshot: SnapshotSummary, lockPath: String? = nil) throws {
+    private func openInteractiveTerminal(runPath: String, lockPath: String? = nil) throws {
         // `--checkpoint` makes the session resume from a saved checkpoint if one
         // exists and capture a fresh one when it ends cleanly — so closing the
         // window suspends the sandbox and reconnecting brings it back where it
-        // was (live memory + disk), rather than cold-booting.
-        var connectCmd = "\(shellQuote(settings.chmPath)) connect \(shellQuote(snapshot.path)) --socket \(shellQuote(settings.socketPath)) --checkpoint --idle-exit 0"
+        // was (live memory + disk), rather than cold-booting. `runPath` is the
+        // sandbox's isolated workspace so its state stays separate from other
+        // sandboxes launched from the same image.
+        var connectCmd = "\(shellQuote(settings.chmPath)) connect \(shellQuote(runPath)) --socket \(shellQuote(settings.socketPath)) --checkpoint --idle-exit 0"
         if let lockPath {
             connectCmd += " --session-lock \(shellQuote(lockPath))"
         }
         let command = [
             "cd \(shellQuote(FileManager.default.currentDirectoryPath))",
-            "echo 'Gimbal Local interactive session: \(snapshot.name)'",
+            "echo 'Gimbal Local interactive session'",
             "echo 'Login with ubuntu / ubuntu if prompted. Close this window or press Ctrl-A x to end the session — it suspends the sandbox (live state saved); reconnect to resume where you left off.'",
             connectCmd,
         ].joined(separator: " && ")
@@ -560,7 +544,8 @@ final class AppModel: ObservableObject {
                 state: state,
                 uptimeSeconds: isActive ? status.uptimeSeconds : nil,
                 consoleBytes: isActive ? status.consoleBytes : nil,
-                reason: reason
+                reason: reason,
+                workspacePath: stored.workspacePath
             )
         }
     }
@@ -602,6 +587,49 @@ final class AppModel: ObservableObject {
         snapshots.first { $0.name == name }
     }
 
+    /// The per-sandbox workspace directory for a sandbox id (a sibling of the
+    /// library so it never appears in the daemon's image scan).
+    private func workspacePath(for sandboxID: String) -> String {
+        URL(fileURLWithPath: settings.libraryPath)
+            .deletingLastPathComponent()
+            .appendingPathComponent(".chm-workspaces")
+            .appendingPathComponent(sandboxID)
+            .path
+    }
+
+    /// Ensure a sandbox has its own isolated workspace, creating it from the
+    /// image on first use. Returns the path to run from — the workspace on
+    /// success, or the shared image path as a safe fallback if creation fails
+    /// (so a sandbox always runs, matching the pre-workspace behaviour).
+    func ensureWorkspace(sandboxID: String) async -> String? {
+        guard let idx = storedSandboxes.firstIndex(where: { $0.id == sandboxID }) else { return nil }
+        let stored = storedSandboxes[idx]
+        guard let image = snapshot(named: stored.snapshotName) else {
+            appendLog("cannot prepare workspace: image \(stored.snapshotName) not in library")
+            return nil
+        }
+        let fm = FileManager.default
+        let ws = stored.workspacePath ?? workspacePath(for: sandboxID)
+        if fm.fileExists(atPath: ws + "/state.json") {
+            if storedSandboxes[idx].workspacePath == nil {
+                storedSandboxes[idx].workspacePath = ws
+                saveSandboxes()
+            }
+            return ws
+        }
+        // Fresh (or partial) — (re)create the workspace from the image.
+        try? fm.removeItem(atPath: ws)
+        let result = await chm.createWorkspace(image: image.path, workspace: ws, settings: settings)
+        guard result.status == 0, fm.fileExists(atPath: ws + "/state.json") else {
+            appendLog("workspace setup failed for \(stored.name); running from the shared image instead")
+            return image.path
+        }
+        storedSandboxes[idx].workspacePath = ws
+        saveSandboxes()
+        appendLog("prepared isolated workspace for \(stored.name)")
+        return ws
+    }
+
     /// The current saved revision (live checkpoint) for a snapshot image, read
     /// from its `.chm-checkpoint/checkpoint.json` lineage manifest. `nil` when no
     /// checkpoint exists (the sandbox has never been suspended). Cheap: the
@@ -615,27 +643,27 @@ final class AppModel: ObservableObject {
         return try? JSONDecoder().decode(Revision.self, from: data)
     }
 
-    /// Load a snapshot's full revision lineage (`chm revisions --json`) into
-    /// `revisionsBySnapshot` for the history view.
-    func refreshRevisions(forSnapshotNamed name: String) {
-        guard let snapshot = snapshot(named: name) else { return }
+    /// Load the revision lineage (`chm revisions --json`) for a directory (a
+    /// sandbox workspace or an image) into `revisionsByPath` for the history view.
+    func refreshRevisions(path: String) {
+        guard !path.isEmpty else { return }
         Task {
-            revisionsBySnapshot[name] = await chm.revisions(path: snapshot.path, settings: settings)
+            revisionsByPath[path] = await chm.revisions(path: path, settings: settings)
         }
     }
 
-    /// Roll a snapshot back to an archived revision (appended as a fresh HEAD),
+    /// Roll a directory back to an archived revision (appended as a fresh HEAD),
     /// then refresh its lineage.
-    func rollback(snapshotNamed name: String, toRevision revID: String) {
-        guard let snapshot = snapshot(named: name), rollingBackSnapshot == nil else { return }
-        rollingBackSnapshot = name
-        appendLog("rolling \(name) back to \(revID)")
+    func rollback(path: String, toRevision revID: String) {
+        guard !path.isEmpty, rollingBackPath == nil else { return }
+        rollingBackPath = path
+        appendLog("rolling back to \(revID)")
         Task {
-            let result = await chm.rollback(path: snapshot.path, revID: revID, settings: settings)
+            let result = await chm.rollback(path: path, revID: revID, settings: settings)
             let trimmed = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty { appendLog(trimmed) }
-            rollingBackSnapshot = nil
-            refreshRevisions(forSnapshotNamed: name)
+            rollingBackPath = nil
+            refreshRevisions(path: path)
         }
     }
 
@@ -720,8 +748,9 @@ final class AppModel: ObservableObject {
         consoleText = ""
         recordRecentActivity(sandbox.snapshotName)
         Task {
+            let runPath = await ensureWorkspace(sandboxID: sandbox.id) ?? sandbox.snapshotName
             do {
-                let output = try await chm.startSnapshot(sandbox.snapshotName, settings: settings)
+                let output = try await chm.startSnapshot(runPath, settings: settings)
                 appendLog(output)
                 attachConsole(clear: true)
                 try? await Task.sleep(for: .milliseconds(900))
@@ -758,8 +787,9 @@ final class AppModel: ObservableObject {
         consoleProcess?.terminate()
         consoleProcess = nil
         Task {
+            let runPath = await ensureWorkspace(sandboxID: sandbox.id) ?? snapshot.path
             do {
-                try openInteractiveTerminal(for: snapshot, lockPath: lockPath)
+                try openInteractiveTerminal(runPath: runPath, lockPath: lockPath)
                 appendLog("opened interactive terminal for \(sandbox.name)")
             } catch {
                 appendLog("terminal connect failed: \(error.localizedDescription)")
@@ -790,6 +820,11 @@ final class AppModel: ObservableObject {
     func deleteSandbox(_ sandbox: Sandbox) {
         if activeLocalSandboxID == sandbox.id || interactiveSandboxID == sandbox.id {
             stop(sandbox)
+        }
+        // Remove the per-sandbox workspace (overlays + checkpoints); the shared
+        // image base is only symlinked, so this never touches the library.
+        if let ws = storedSandboxes.first(where: { $0.id == sandbox.id })?.workspacePath {
+            try? FileManager.default.removeItem(atPath: ws)
         }
         storedSandboxes.removeAll { $0.id == sandbox.id }
         cloudSandboxStates[sandbox.id] = nil

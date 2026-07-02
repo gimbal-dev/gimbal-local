@@ -771,26 +771,35 @@ fn run_assignment(cp: &ControlPlane, runner_id: &str, opts: &RunOpts) -> Result<
     eprintln!("chm runner: running-local — exec chm {}", args.join(" "));
 
     let exec = run_chm(&args);
-    let (final_state, note) = match &exec {
-        Ok(code) if *code == 0 => ("stopped", "workload exited 0".to_string()),
-        Ok(code) => ("error", format!("workload exited {code}")),
-        Err(e) => ("error", format!("failed to launch workload: {e}")),
+    // A clean exit that left a checkpoint behind is a *suspend*, not a plain
+    // stop: report `suspended` and push the checkpoint (the plane opens a
+    // resumable child). Otherwise it stopped or errored.
+    let suspended = matches!(&exec, Ok(0)) && checkpoint_present(&cache);
+    let (final_state, artifact_kind, note) = if suspended {
+        ("suspended", "checkpoint", "suspended — checkpoint saved".to_string())
+    } else {
+        match &exec {
+            Ok(code) if *code == 0 => ("stopped", "run-output", "workload exited 0".to_string()),
+            Ok(code) => ("error", "run-output", format!("workload exited {code}")),
+            Err(e) => ("error", "run-output", format!("failed to launch workload: {e}")),
+        }
     };
     cp.report_state(&sandbox_id, final_state)?;
     eprintln!("chm runner: reported {final_state} ({note})");
 
-    // 7. Push run artifacts (idempotent).
+    // 7. Push artifacts (idempotent). A saved checkpoint is pushed as a
+    //    `checkpoint` artifact so the plane can resume from it later.
     cp.push_artifacts(
         &sandbox_id,
         &json!({
             "runner_id": runner_id,
             "local_path": cache.display().to_string(),
-            "kind": "run-output",
+            "kind": artifact_kind,
             "requested_by": "chm-runner",
-            "idempotency_key": format!("{sandbox_id}-run-output"),
+            "idempotency_key": format!("{sandbox_id}-{artifact_kind}"),
         }),
     )?;
-    eprintln!("chm runner: pushed artifacts");
+    eprintln!("chm runner: pushed artifacts (kind={artifact_kind})");
 
     if final_state == "error" {
         return Err(format!("workload did not complete cleanly: {note}"));
@@ -814,6 +823,12 @@ fn run_chm(args: &[String]) -> Result<i32, String> {
 /// `its-lpi`) stays cloud-only.
 fn hvf_restorable(gic_mode: &str) -> bool {
     gic_mode == "gicv2m-message-spi"
+}
+
+/// Whether a run left a resumable checkpoint in the workspace (the `chm`
+/// checkpoint manifest). Used to report a `suspended` state vs a plain `stopped`.
+fn checkpoint_present(dir: &Path) -> bool {
+    dir.join(".chm-checkpoint").join("checkpoint.json").is_file()
 }
 
 /// A real cloud-hypervisor snapshot's `state.json` carries a top-level
@@ -1049,6 +1064,18 @@ mod tests {
         assert!(hvf_restorable("gicv2m-message-spi"));
         assert!(!hvf_restorable("its-lpi"));
         assert!(!hvf_restorable(""));
+    }
+
+    #[test]
+    fn checkpoint_present_detects_a_saved_checkpoint() {
+        let dir = env::temp_dir().join(format!("chm-cp-ckpt-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        assert!(!checkpoint_present(&dir), "no checkpoint yet");
+        fs::create_dir_all(dir.join(".chm-checkpoint")).unwrap();
+        fs::write(dir.join(".chm-checkpoint").join("checkpoint.json"), b"{}").unwrap();
+        assert!(checkpoint_present(&dir), "a run that suspended left a checkpoint");
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

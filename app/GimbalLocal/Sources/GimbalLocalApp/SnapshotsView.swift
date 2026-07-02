@@ -177,7 +177,7 @@ struct SnapshotDetailPage: View {
 
                     DerivedSandboxesCard(snapshotName: snapshot.name)
 
-                    RevisionHistoryCard(snapshotName: snapshot.name)
+                    RevisionHistoryCard(dirPath: snapshot.path)
 
                     LineageCard(snapshotName: snapshot.name)
                 }
@@ -228,15 +228,19 @@ private struct DerivedSandboxesCard: View {
 
 // MARK: - Revision history
 
-/// The snapshot's revision lineage (from `chm revisions`): each suspend / fork /
-/// rollback, newest first, with a roll-back action on resumable archived
-/// revisions. This is the local "branching filesystem" surfaced.
-private struct RevisionHistoryCard: View {
+/// The revision lineage (from `chm revisions`) for a directory — a sandbox
+/// workspace or a snapshot image: each suspend / fork / rollback, newest first,
+/// with a roll-back action on resumable archived revisions.
+struct RevisionHistoryCard: View {
     @EnvironmentObject private var model: AppModel
-    let snapshotName: String
+    /// The directory whose revisions to show (a sandbox workspace, or an image).
+    /// `nil` when the sandbox has not run yet (no workspace).
+    let dirPath: String?
+    var emptyHint = "No saved revisions yet. Suspend a running sandbox (close its terminal, or Stop it) to save its live state as a revision here."
 
     private var revisions: [RevisionSummary] {
-        (model.revisionsBySnapshot[snapshotName] ?? []).reversed()
+        guard let dirPath else { return [] }
+        return (model.revisionsByPath[dirPath] ?? []).reversed()
     }
 
     var body: some View {
@@ -246,7 +250,7 @@ private struct RevisionHistoryCard: View {
             systemImage: "clock.arrow.circlepath"
         ) {
             if revisions.isEmpty {
-                Text("No saved revisions yet. Suspend a running sandbox (close its terminal, or Stop it) to save its live state as a revision here.")
+                Text(emptyHint)
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -275,13 +279,13 @@ private struct RevisionHistoryCard: View {
                                 .padding(.horizontal, 7)
                                 .padding(.vertical, 2)
                                 .background(Theme.green.opacity(0.16), in: Capsule())
-                        } else if rev.resumable {
+                        } else if rev.resumable, let dirPath {
                             Button("Roll back") {
-                                model.rollback(snapshotNamed: snapshotName, toRevision: rev.id)
+                                model.rollback(path: dirPath, toRevision: rev.id)
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
-                            .disabled(model.rollingBackSnapshot != nil)
+                            .disabled(model.rollingBackPath != nil)
                         }
                     }
                     .padding(.vertical, 4)
@@ -297,8 +301,8 @@ private struct RevisionHistoryCard: View {
                 .fixedSize(horizontal: false, vertical: true)
             }
         }
-        .task(id: snapshotName) {
-            model.refreshRevisions(forSnapshotNamed: snapshotName)
+        .task(id: dirPath) {
+            if let dirPath { model.refreshRevisions(path: dirPath) }
         }
     }
 

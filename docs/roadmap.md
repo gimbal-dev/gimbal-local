@@ -113,7 +113,7 @@ from cache in 0.077 s).
 
 | Milestone | Pillar | Status | Issues |
 | --- | --- | --- | --- |
-| **M25 · Live local lifecycle** | ① | **Engine complete**; residuals are follow-ups (below) | #4, #6 |
+| **M25 · Live local lifecycle** | ① | **Complete** (one perf ceiling: runtime memfd page-sharing) | #4, #6 |
 | **M27 · Plane-native edge** | ② | Waits on gctl (memory plane shipped; disk plane + fork/commit building) | #5, #7 |
 | **M28 · Consistent controls** | ③ | Waits on the gctl policy contract | #20 |
 | **M29 · Observability & cost** | ④ | Waits on the gctl telemetry contract | — |
@@ -133,20 +133,19 @@ is complete:
   image's read-only base but keeps its own overlays + checkpoints, so N sandboxes
   from one image diverge independently.
 - The runner advertises `supports_fork` / `supports_cow_overlay`.
+- **Per-sandbox workspaces are wired through the app** — each sandbox runs in its
+  own workspace (shared read-only base, isolated overlays + checkpoints) via both
+  the interactive terminal and the daemon; several run concurrently (one VM per
+  process). `chm fork` shares the base RAM read-only (file-level CoW). The runner
+  reports `suspended` + pushes a `checkpoint` artifact when a run leaves one.
 
-**Residuals (deliberate follow-ups, each with a reason):**
+**Residual (one deferred perf optimisation, not dangling work):**
 
-- **App adoption of workspaces.** The `chm workspace` primitive exists; routing
-  the *app's* two run paths (interactive `connect` + the daemon `start`/console)
-  through per-sandbox workspaces coherently needs a small daemon change (it
-  serves the library by name), so it is tracked rather than half-wired.
-- **Private memfd overlay for true CoW base RAM** — an optimization (fork copies
-  live RAM today); a deeper HVF memory-management change.
-- **Drive `suspended` states + push `kind:"checkpoint"` artifacts** — plane-gated:
-  the runner honours the plane's `chm_command`, which does not request a
-  checkpoint-on-exit, so this lights up when the plane asks for it.
-- **True concurrent N** VMs is bounded by HVF's one-VM-per-process model (the
-  daemon runs one guest at a time); workspaces give *state* isolation now.
+- **Runtime memory page-sharing (memfd CoW).** Fork already shares the base RAM
+  *file* read-only (copy-on-write at the file level) and diverges on the next
+  suspend. Sharing live pages between *concurrently running* VMs via a private
+  memfd is a deeper HVF memory-management optimisation — a documented perf
+  ceiling, tracked for later; correctness and isolation are complete without it.
 
 ### M27 · Plane-native edge — branching filesystem + lazy load
 
