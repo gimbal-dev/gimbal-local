@@ -514,11 +514,25 @@ fn start_vm(daemon: &Daemon, name: &str) -> Result<String, String> {
     if name.is_empty() {
         return Err("start requires a snapshot name (see `chm ctl list`)".to_string());
     }
-    let entry = daemon
-        .library
-        .iter()
-        .find(|e| e.name == name)
-        .ok_or_else(|| format!("no snapshot named `{name}` in the library"))?;
+    // A per-sandbox workspace is started by absolute path (it lives outside the
+    // library); a library image is started by name.
+    let (display_name, dir) = if name.starts_with('/') {
+        let path = PathBuf::from(name);
+        if !path.join("state.json").exists() {
+            return Err(format!("no snapshot at path `{name}` (missing state.json)"));
+        }
+        let display = path
+            .file_name()
+            .map_or_else(|| name.to_string(), |s| s.to_string_lossy().into_owned());
+        (display, path)
+    } else {
+        let entry = daemon
+            .library
+            .iter()
+            .find(|e| e.name == name)
+            .ok_or_else(|| format!("no snapshot named `{name}` in the library"))?;
+        (entry.name.clone(), entry.dir.clone())
+    };
 
     let mut guard = daemon.current.lock().unwrap();
     if let Some(vm) = guard.as_ref()
@@ -538,7 +552,6 @@ fn start_vm(daemon: &Daemon, name: &str) -> Result<String, String> {
         kick: None,
     }));
 
-    let dir = entry.dir.clone();
     let opts = EngineOpts {
         idle_exit_secs: daemon.idle_exit_secs,
         max_seconds: daemon.max_seconds,
@@ -553,11 +566,11 @@ fn start_vm(daemon: &Daemon, name: &str) -> Result<String, String> {
     });
 
     *guard = Some(Vm {
-        name: name.to_string(),
+        name: display_name.clone(),
         started: Instant::now(),
         inner,
     });
-    Ok(format!("started `{name}`"))
+    Ok(format!("started `{display_name}`"))
 }
 
 fn stop_vm(daemon: &Daemon) -> Result<String, String> {

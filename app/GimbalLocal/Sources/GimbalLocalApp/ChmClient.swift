@@ -73,6 +73,11 @@ struct ChmClient {
         await runRaw(settings: settings, args: ["rollback", path, revID])
     }
 
+    /// Create an isolated per-sandbox workspace (`chm workspace <image> <ws>`).
+    func createWorkspace(image: String, workspace: String, settings: AppSettings) async -> CommandResult {
+        await runRaw(settings: settings, args: ["workspace", image, workspace])
+    }
+
     /// Drive the control-plane runner pipeline for one snapshot: register →
     /// assign-run → verify checksums → mark-local-copy → run/resume, reporting
     /// state to the plane. Runs `chm runner run` with **no** `--socket` (it talks

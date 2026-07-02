@@ -281,6 +281,22 @@ final class GimbalLocalAppTests: XCTestCase {
         XCTAssertTrue(CloudControlClient.parseSnapshots(Data("not json".utf8)).isEmpty)
     }
 
+    func testStoredSandboxDecodesLegacyDataWithoutWorkspacePath() throws {
+        // Sandboxes persisted before per-sandbox workspaces have no workspacePath.
+        let legacy = """
+        {"id":"s1","name":"box","snapshotName":"ubuntu","location":"local"}
+        """
+        let s = try JSONDecoder().decode(StoredSandbox.self, from: Data(legacy.utf8))
+        XCTAssertEqual(s.id, "s1")
+        XCTAssertEqual(s.location, .local)
+        XCTAssertNil(s.workspacePath)
+        // A round-trip with a workspace path is preserved.
+        var withWS = s
+        withWS.workspacePath = "/tmp/ws/s1"
+        let back = try JSONDecoder().decode(StoredSandbox.self, from: JSONEncoder().encode(withWS))
+        XCTAssertEqual(back.workspacePath, "/tmp/ws/s1")
+    }
+
     func testDecodesRevisionSummariesFromChmRevisionsJSON() throws {
         let json = """
         [

@@ -166,6 +166,7 @@ struct Sandbox: Identifiable, Hashable {
     var uptimeSeconds: Int?
     var consoleBytes: Int?
     var reason: String?
+    var workspacePath: String?
 }
 
 /// The persisted shape of a sandbox (the live `state` is derived at runtime from
@@ -175,6 +176,14 @@ struct StoredSandbox: Codable, Hashable {
     var name: String
     var snapshotName: String
     var location: SandboxLocation
+    /// The per-sandbox workspace directory (shares the image's read-only base but
+    /// keeps its own disk overlays + checkpoint/revision store). `nil` until first
+    /// run; created lazily so sandboxes from the same image stay isolated.
+    var workspacePath: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, snapshotName, location, workspacePath
+    }
 }
 
 /// A committed revision (live checkpoint) read from a snapshot's
