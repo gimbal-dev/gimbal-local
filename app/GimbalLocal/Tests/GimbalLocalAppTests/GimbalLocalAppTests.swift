@@ -399,6 +399,45 @@ final class GimbalLocalAppTests: XCTestCase {
 
     // MARK: - Branch surfacing (M27 Phase 4)
 
+    func testCloudSnapshotFlagsFixturesWithoutDiskImages() {
+        let base = { (hasDisk: Bool) in
+            CloudSnapshot(
+                id: "snap-x", status: "available", kind: "full",
+                sourceKind: "local-lima", gicMode: "gicv2m-message-spi",
+                originSubstrate: nil, vcpus: 1, ramMib: 1024,
+                compatibility: "runnable", hasLocalCopy: false, hasDiskImage: hasDisk
+            )
+        }
+        // A real snapshot (ships a disk) is bootable.
+        let real = base(true)
+        XCTAssertTrue(real.likelyBootable)
+        XCTAssertNil(real.notBootableReason)
+        // A fixture (runnable + gicv2m, but no disk image) is caught pre-flight.
+        let fixture = base(false)
+        XCTAssertFalse(fixture.likelyBootable)
+        XCTAssertEqual(fixture.notBootableReason,
+                       "No disk image — a protocol fixture, not a bootable snapshot")
+    }
+
+    func testParsesDiskImagePresenceFromManifestChecksumTree() {
+        let json = """
+        [{"snapshot_id":"snap-real","status":"available","kind":"full",
+          "manifest":{"gic_mode":"gicv2m-message-spi","compatibility_status":"runnable",
+            "memory_bytes":1073741824,"vcpu_count":1,
+            "checksum_tree":{"state.json":"a","snapshot/memory-ranges":"b","disks/_disk0.raw":"c"}}},
+         {"snapshot_id":"snap-fixture","status":"available","kind":"full",
+          "manifest":{"gic_mode":"gicv2m-message-spi","compatibility_status":"runnable",
+            "memory_bytes":1073741824,"vcpu_count":1,
+            "checksum_tree":{"state.json":"a","snapshot/memory-ranges":"b"}}}]
+        """
+        let snaps = CloudControlClient.parseSnapshots(Data(json.utf8))
+        XCTAssertEqual(snaps.count, 2)
+        XCTAssertTrue(snaps.first { $0.id == "snap-real" }!.hasDiskImage)
+        XCTAssertTrue(snaps.first { $0.id == "snap-real" }!.likelyBootable)
+        XCTAssertFalse(snaps.first { $0.id == "snap-fixture" }!.hasDiskImage)
+        XCTAssertFalse(snaps.first { $0.id == "snap-fixture" }!.likelyBootable)
+    }
+
     func testDecodesPlaneBranchesFromChmBranchesJSON() throws {
         let json = """
         {"branches":[

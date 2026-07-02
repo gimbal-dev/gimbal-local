@@ -86,6 +86,12 @@ struct CloudControlClient {
                 ($0["kind"] as? String) == "local-runner" && (($0["verified"] as? Bool) ?? false)
             }
             let memoryBytes = (manifest["memory_bytes"] as? NSNumber)?.intValue ?? 0
+            // A real captured snapshot ships its disk image(s); a protocol
+            // fixture carries only state.json + memory-ranges. The manifest's
+            // checksum_tree (file → sha) is the pre-flight signal for "has a
+            // bootable rootfs" without downloading the bundle.
+            let checksumTree = manifest["checksum_tree"] as? [String: Any] ?? [:]
+            let hasDiskImage = checksumTree.keys.contains { $0.hasPrefix("disks/") }
             return CloudSnapshot(
                 id: id,
                 status: obj["status"] as? String ?? "unknown",
@@ -96,7 +102,8 @@ struct CloudControlClient {
                 vcpus: (manifest["vcpu_count"] as? NSNumber)?.intValue ?? 0,
                 ramMib: memoryBytes / (1024 * 1024),
                 compatibility: manifest["compatibility_status"] as? String ?? "unknown",
-                hasLocalCopy: hasLocalCopy
+                hasLocalCopy: hasLocalCopy,
+                hasDiskImage: hasDiskImage
             )
         }
     }
