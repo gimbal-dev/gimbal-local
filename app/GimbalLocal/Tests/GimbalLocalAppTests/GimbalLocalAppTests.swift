@@ -396,4 +396,29 @@ final class GimbalLocalAppTests: XCTestCase {
             #""a\"b\\c""#
         )
     }
+
+    // MARK: - Branch surfacing (M27 Phase 4)
+
+    func testDecodesPlaneBranchesFromChmBranchesJSON() throws {
+        let json = """
+        {"branches":[
+          {"branch_id":"branch-1","owner":"dev","name":"laptop-main",
+           "head_snapshot_id":"snap-6150377c50aa","review_status":"pending"},
+          {"branch_id":"branch-2","owner":"dev","name":"acl-demo",
+           "head_snapshot_id":"snap-d9a9a1529717",
+           "page_acls":[{"audience":"runner-x"}]}
+        ]}
+        """
+        let list = try JSONDecoder().decode(PlaneBranchList.self, from: Data(json.utf8))
+        XCTAssertEqual(list.branches.count, 2)
+        let main = list.branches[0]
+        XCTAssertEqual(main.name, "laptop-main")
+        XCTAssertEqual(main.shortHead, "6150377c50aa")
+        XCTAssertEqual(main.reviewLabel, "pending")
+        XCTAssertEqual(main.aclCount, 0)
+        // A branch with no review gate reads as "open"; ACLs are counted.
+        let acl = list.branches[1]
+        XCTAssertEqual(acl.reviewLabel, "open")
+        XCTAssertEqual(acl.aclCount, 1)
+    }
 }

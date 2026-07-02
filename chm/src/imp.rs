@@ -414,6 +414,7 @@ pub fn main() -> ExitCode {
         Some("runner") => control_plane::runner_main(&raw[1..]),
         Some("push") => control_plane::push_main(&raw[1..]),
         Some("pull") => control_plane::pull_main(&raw[1..]),
+        Some("branches") => control_plane::branches_main(&raw[1..]),
         Some("serve") => serve::serve_main(&raw[1..]),
         Some("ctl") => serve::ctl_main(&raw[1..]),
         Some("fork") => match fork(&raw[1..]) {

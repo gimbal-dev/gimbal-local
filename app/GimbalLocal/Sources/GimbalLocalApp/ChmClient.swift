@@ -73,6 +73,20 @@ struct ChmClient {
         await runRaw(settings: settings, args: ["rollback", path, revID])
     }
 
+    /// List the control plane's revision branches (`chm branches --json`). Talks
+    /// HTTP to the plane, not the daemon, so it uses `--api` and no `--socket`.
+    /// Returns [] on any failure (offline plane, decode error) so the UI degrades
+    /// quietly rather than throwing.
+    func branches(api: String, settings: AppSettings) async -> [PlaneBranch] {
+        let result = await runRaw(settings: settings, args: ["branches", "--json", "--api", api])
+        guard result.status == 0, let data = result.output.data(using: .utf8),
+              let list = try? JSONDecoder().decode(PlaneBranchList.self, from: data)
+        else {
+            return []
+        }
+        return list.branches
+    }
+
     /// Create an isolated per-sandbox workspace (`chm workspace <image> <ws>`).
     func createWorkspace(image: String, workspace: String, settings: AppSettings) async -> CommandResult {
         await runRaw(settings: settings, args: ["workspace", image, workspace])

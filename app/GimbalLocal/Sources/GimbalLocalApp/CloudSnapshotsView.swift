@@ -44,6 +44,10 @@ struct CloudSnapshotsPage: View {
                     }
                 }
 
+                if !model.branches.isEmpty {
+                    BranchesSection(branches: model.branches)
+                }
+
                 if !model.activityLog.isEmpty {
                     VStack(alignment: .leading, spacing: 8) {
                         Text("Activity")
@@ -56,6 +60,85 @@ struct CloudSnapshotsPage: View {
             }
             .padding(28)
         }
+    }
+}
+
+// MARK: - Branches (Phase 4 — git for live compute)
+
+/// Read-only surface of the plane's revision branches: what a session was
+/// committed onto, its head revision, review gate, and any per-page ACLs. This
+/// is the human-facing version-control view over the push/pull revision graph.
+private struct BranchesSection: View {
+    let branches: [PlaneBranch]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 8) {
+                Image(systemName: "arrow.triangle.branch")
+                    .foregroundStyle(.white.opacity(0.8))
+                Text("Branches")
+                    .font(.title3.bold())
+                    .foregroundStyle(.white)
+                Text("\(branches.count)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.white.opacity(0.6))
+            }
+            Text("Revision branches on the control plane — commit with `chm push`, rehydrate with `chm pull`.")
+                .font(.caption)
+                .foregroundStyle(.white.opacity(0.55))
+
+            VStack(spacing: 0) {
+                ForEach(branches) { branch in
+                    BranchRow(branch: branch)
+                    if branch.id != branches.last?.id {
+                        Divider().overlay(Color.white.opacity(0.08))
+                    }
+                }
+            }
+            .background(Color.white.opacity(0.04))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        }
+    }
+}
+
+private struct BranchRow: View {
+    let branch: PlaneBranch
+
+    private var reviewColor: Color {
+        switch branch.reviewStatus {
+        case "approved": return .green
+        case "pending": return .orange
+        case "rejected": return .red
+        default: return .secondary
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(branch.name)
+                    .font(.callout.weight(.semibold))
+                    .foregroundStyle(.white)
+                Text("head \(branch.shortHead) · \(branch.owner)")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.white.opacity(0.5))
+            }
+            Spacer()
+            if branch.aclCount > 0 {
+                Label("\(branch.aclCount) ACL", systemImage: "lock.shield")
+                    .font(.caption2)
+                    .foregroundStyle(.white.opacity(0.6))
+            }
+            Text(branch.reviewLabel)
+                .font(.caption2.weight(.medium))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(reviewColor.opacity(0.18))
+                .foregroundStyle(reviewColor)
+                .clipShape(Capsule())
+        }
+        .padding(.horizontal, 14)
+        .padding(.vertical, 10)
     }
 }
 

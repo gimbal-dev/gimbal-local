@@ -252,6 +252,52 @@ enum SidebarItem: Hashable {
     case snapshot(String)  // snapshot name
 }
 
+/// A revision branch as the control plane tracks it (`chm branches --json`,
+/// `GET /branches`). A branch is a movable, human-named pointer at a revision;
+/// Phase 4's "git for live compute" surface. Read-only in the app for now.
+struct PlaneBranch: Codable, Identifiable, Equatable, Hashable {
+    let branchId: String
+    let name: String
+    let owner: String
+    let headSnapshotId: String?
+    let reviewStatus: String?
+    let baseBranch: String?
+    let pageACLs: [PlaneBranchACL]?
+
+    var id: String { branchId }
+
+    enum CodingKeys: String, CodingKey {
+        case branchId = "branch_id"
+        case name, owner
+        case headSnapshotId = "head_snapshot_id"
+        case reviewStatus = "review_status"
+        case baseBranch = "base_branch"
+        case pageACLs = "page_acls"
+    }
+
+    var aclCount: Int { pageACLs?.count ?? 0 }
+
+    /// The head revision's short id (last `-` segment), or "empty" if unset.
+    var shortHead: String {
+        guard let head = headSnapshotId, !head.isEmpty else { return "empty" }
+        return String(head.split(separator: "-").last ?? Substring(head))
+    }
+
+    /// Review status for display; a branch with no gate shows "open".
+    var reviewLabel: String {
+        guard let s = reviewStatus, !s.isEmpty else { return "open" }
+        return s
+    }
+}
+
+struct PlaneBranchACL: Codable, Equatable, Hashable {
+    let audience: String?
+}
+
+struct PlaneBranchList: Codable, Equatable {
+    let branches: [PlaneBranch]
+}
+
 /// A snapshot as the *control plane* sees it (`GET /snapshots`) — distinct from a
 /// local library image (`SnapshotSummary`). It carries provenance (where it was
 /// captured / ran) and the gic mode, so the UI can show where it came from and
