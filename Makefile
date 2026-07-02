@@ -5,7 +5,7 @@
 # VM; `scripts/build-chm.sh` does the build + sign and prints the path.
 
 CHM_BIN := target/debug/chm
-SOCKET  ?= $${TMPDIR:-/tmp}/chm.sock
+SOCKET  ?= $${TMPDIR:-/tmp}/gimbal-local/chm.sock
 
 .PHONY: help chm chm-run chm-serve clippy fmt test-hvf
 

@@ -336,4 +336,64 @@ final class GimbalLocalAppTests: XCTestCase {
         XCTAssertEqual(model.sandbox(id: "cloud-snap-x")?.state, .failed)
         XCTAssertEqual(model.sandbox(id: "cloud-snap-x")?.reason, "Protocol fixture — needs a real snapshot.")
     }
+
+    // MARK: - Interactive terminal command safety (M30.3)
+
+    func testInteractiveCommandSingleQuotesAdversarialPaths() throws {
+        // A run path laden with shell metacharacters must be neutralized, not
+        // executed: it appears exactly once, wrapped in single quotes, and the
+        // dangerous substring never appears unquoted as host shell code.
+        let evil = "/tmp/ws'; touch /tmp/pwned; echo $(whoami) `id`"
+        let command = try InteractiveTerminalCommand.shellCommand(
+            chmPath: "/usr/local/bin/chm",
+            runPath: evil,
+            socketPath: "/tmp/chm.sock",
+            lockPath: nil,
+            workdir: "/work"
+        )
+        // The connect invocation carries the path single-quoted (embedded quote
+        // becomes the `'\''` close/escape/reopen sequence).
+        XCTAssertTrue(
+            command.contains("connect '/tmp/ws'\\''; touch /tmp/pwned; echo $(whoami) `id`'"),
+            "the adversarial path must be single-quoted as one argument: \(command)"
+        )
+        // The injection never appears at a top-level (unquoted) command
+        // position — it would only run if it were `&&`/`;`-joined outside the
+        // quotes, which correct single-quoting prevents.
+        XCTAssertFalse(
+            command.contains("&& touch /tmp/pwned"),
+            "the payload must not reach an unquoted command position"
+        )
+        XCTAssertEqual(
+            command.components(separatedBy: "touch /tmp/pwned").count - 1, 1,
+            "the payload appears exactly once (inside the quoted argument)"
+        )
+    }
+
+    func testInteractiveCommandRejectsControlCharacters() {
+        // A newline in a path breaks single-quote + AppleScript-literal
+        // composition, so it is refused rather than quoted.
+        XCTAssertThrowsError(
+            try InteractiveTerminalCommand.shellCommand(
+                chmPath: "/usr/local/bin/chm",
+                runPath: "/tmp/ws\nactivate\ndo script \"rm -rf ~\"",
+                socketPath: "/tmp/chm.sock",
+                lockPath: nil,
+                workdir: "/work"
+            )
+        ) { error in
+            guard case InteractiveTerminalCommand.BuildError.invalidPath = error else {
+                return XCTFail("expected invalidPath, got \(error)")
+            }
+        }
+    }
+
+    func testAppleScriptStringEscapesQuotesAndBackslashes() {
+        // The AppleScript literal wrapper must escape backslash then quote, so a
+        // crafted command string cannot terminate the `do script "…"` literal.
+        XCTAssertEqual(
+            InteractiveTerminalCommand.appleScriptString(#"a"b\c"#),
+            #""a\"b\\c""#
+        )
+    }
 }

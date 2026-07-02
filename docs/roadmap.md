@@ -114,7 +114,7 @@ from cache in 0.077 s).
 | Milestone | Pillar | Status | Issues |
 | --- | --- | --- | --- |
 | **M25 · Live local lifecycle** | ① | **Complete** (one perf ceiling: runtime memfd page-sharing) | #4, #6 |
-| **M30 · Security hardening** | trust/isolation | **Immediate priority — precedes M27** | #33–#39 |
+| **M30 · Security hardening** | trust/isolation | **P0 fixes shipped** (#33–#35); signing + guards next (#36–#39) | #33–#39 |
 | **M27 · Plane-native edge** | ② | Waits on gctl (memory plane shipped; disk plane + fork/commit building) | #5, #7 |
 | **M28 · Consistent controls** | ③ | Waits on the gctl policy contract | #20 |
 | **M29 · Observability & cost** | ④ | Waits on the gctl telemetry contract | — |
@@ -155,13 +155,15 @@ compute (increasingly an autonomous coding agent) from an *untrusted* snapshot
 bundle, on a personal Mac. A first security review found real gaps; M30 closes
 them. Full model + plan: [`security-model.md`](security-model.md).
 
-- **M30.1 (#33, P0)** — bundle file isolation: reject symlinks, canonicalise
-  bundle paths under the root, no-follow opens, and move writable overlays into a
-  private `0700` dir `chm` owns (out of the attacker-supplied bundle).
-- **M30.2 (#34, P0)** — daemon socket hardening: private `0700` dir, `0600` perms,
-  and a peer-credential (`getpeereid`) check before start/stop/console/shutdown.
-- **M30.3 (#35, P0)** — app command safety: launch `chm` via `Process` argv, not
-  shell strings (the snapshot-name vector is already removed; this finishes it).
+- **M30.1 (#33, P0) — shipped.** Bundle file isolation: reject symlinked disk
+  bases + overlays, `O_NOFOLLOW` opens, a private `0700` overlay dir, and
+  manifest relpath confinement in `materialize_bundle`.
+- **M30.2 (#34, P0) — shipped.** Daemon socket hardening: private `0700` dir,
+  `0600` socket, and a peer-uid (`getpeereid`) check before
+  start/stop/console/shutdown.
+- **M30.3 (#35, P0) — shipped.** App command safety: a pure, single-quoting
+  `InteractiveTerminalCommand` builder that rejects control characters (the
+  snapshot-name vector was already removed).
 - **M30.4 (#36, P1)** — signed snapshot manifest + verification, and one trust
   root (app trusts the cloud key; gctl signs; local verifies before "Run").
   Cross-repo — tracks the gctl signing contract.

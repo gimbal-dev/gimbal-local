@@ -30,6 +30,7 @@ pub mod block;
 pub mod devmgr;
 pub mod its;
 pub mod net;
+pub(crate) mod pathsafe;
 pub mod pci;
 pub mod queue;
 pub mod rng;
