@@ -13,7 +13,7 @@ struct AppSettings {
     static let defaults = AppSettings(
         chmPath: defaultChmPath(),
         libraryPath: defaultLibraryPath(),
-        socketPath: "\(NSTemporaryDirectory())chm.sock",
+        socketPath: "\(NSTemporaryDirectory())gimbal-local/chm.sock",
         controlPlaneURL: "http://127.0.0.1:8080"
     )
 

@@ -79,7 +79,7 @@ private struct PathsSettingsTab: View {
             Section("Runtime paths") {
                 PathField(label: "chm binary", text: $model.settings.chmPath, prompt: "target/debug/chm")
                 PathField(label: "Snapshot library", text: $model.settings.libraryPath, prompt: "snapshots")
-                PathField(label: "Socket", text: $model.settings.socketPath, prompt: "/tmp/chm.sock")
+                PathField(label: "Socket", text: $model.settings.socketPath, prompt: "/tmp/gimbal-local/chm.sock")
             }
 
             Section {

@@ -122,8 +122,73 @@ struct ServeArgs {
     max_seconds: u64,
 }
 
-fn default_socket() -> PathBuf {
-    env::temp_dir().join("chm.sock")
+/// The daemon control socket lives in a private, per-user `0700` runtime
+/// directory (created + owner-checked by [`ensure_private_runtime_dir`]) rather
+/// than loose in a shared temp dir, and is bound `0600` with a peer-uid check
+/// (M30.2). Shared with the `chm ctl`/`connect` client so both agree on the
+/// default when no `--socket` is passed.
+pub(crate) fn default_socket() -> PathBuf {
+    runtime_dir().join("chm.sock")
+}
+
+/// The private per-user runtime directory for daemon sockets.
+pub(crate) fn runtime_dir() -> PathBuf {
+    env::temp_dir().join("gimbal-local")
+}
+
+/// Create `dir` as a private `0700` directory the current user owns, refusing to
+/// follow a pre-existing symlink planted at that path (M30.2). Returns `Ok` if
+/// it already exists as a real directory.
+fn ensure_private_runtime_dir(dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt;
+    match fs::symlink_metadata(dir) {
+        Ok(md) if md.file_type().is_symlink() => {
+            return Err(format!(
+                "refusing runtime dir {}: it is a symlink",
+                dir.display()
+            ));
+        }
+        Ok(md) if md.is_dir() => return Ok(()),
+        Ok(_) => return Err(format!("runtime dir {} exists but is not a directory", dir.display())),
+        Err(_) => {}
+    }
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| format!("create runtime dir {}: {e}", dir.display()))
+}
+
+/// Remove a stale control socket from a prior run before re-binding — but only
+/// when the path is actually a socket or a symlink, never a regular file. This
+/// avoids clobbering a real file a misconfigured `--socket` points at, and
+/// unlinks a planted symlink rather than following it (M30.2).
+fn remove_stale_socket(path: &Path) {
+    use std::os::unix::fs::FileTypeExt;
+    if let Ok(md) = fs::symlink_metadata(path) {
+        let ft = md.file_type();
+        if ft.is_symlink() || ft.is_socket() {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
+/// The effective uid of the process on the other end of `stream`, via
+/// `getpeereid(2)`. Used to reject any client that is not the daemon's own user
+/// before honoring a control command (M30.2).
+fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
+    use std::os::unix::io::AsRawFd;
+    let mut euid: libc::uid_t = 0;
+    let mut egid: libc::gid_t = 0;
+    // SAFETY: `stream` owns a valid, connected socket fd for the duration of the
+    // call; getpeereid reads that fd and writes only the two out-params, which
+    // are valid local variables. A non-zero return means it wrote nothing.
+    let rc = unsafe { libc::getpeereid(stream.as_raw_fd(), &mut euid, &mut egid) };
+    if rc == 0 {
+        Ok(euid)
+    } else {
+        Err(io::Error::last_os_error())
+    }
 }
 
 /// Parse the shared `--socket PATH` flag out of an argument list, returning the
@@ -258,10 +323,22 @@ fn serve(raw: &[String]) -> Result<(), String> {
     let args = parse_serve(raw)?;
     let library = scan_library(&args.library_dir)?;
 
-    // Remove any stale socket from a previous run before binding.
-    let _ = fs::remove_file(&args.socket_path);
+    // Bind the control socket inside a private 0700 runtime dir, then restrict
+    // the socket itself to 0600 so only this user can connect (M30.2). Remove a
+    // stale socket only if it is actually a socket/symlink, never a regular file.
+    if let Some(parent) = args.socket_path.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        ensure_private_runtime_dir(parent)?;
+    }
+    remove_stale_socket(&args.socket_path);
     let listener = UnixListener::bind(&args.socket_path)
         .map_err(|e| format!("bind {}: {e}", args.socket_path.display()))?;
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&args.socket_path, fs::Permissions::from_mode(0o600))
+            .map_err(|e| format!("chmod 0600 {}: {e}", args.socket_path.display()))?;
+    }
 
     let daemon = Arc::new(Daemon {
         library,
@@ -354,6 +431,22 @@ fn stop_vm_blocking(daemon: &Daemon, timeout: Duration) -> Result<String, String
 }
 
 fn handle_conn(stream: UnixStream, daemon: &Daemon) {
+    // Only accept commands from the daemon's own user: a co-tenant process must
+    // not be able to drive start/stop/console/shutdown even if it can reach the
+    // socket (M30.2). SAFETY: geteuid() is a pure syscall with no preconditions.
+    let me = unsafe { libc::geteuid() };
+    match peer_uid(&stream) {
+        Ok(uid) if uid == me => {}
+        Ok(uid) => {
+            eprintln!("chm serve: rejecting connection from uid {uid} (daemon uid {me})");
+            return;
+        }
+        Err(e) => {
+            eprintln!("chm serve: cannot verify peer credentials ({e}); rejecting connection");
+            return;
+        }
+    }
+
     let mut reader = BufReader::new(match stream.try_clone() {
         Ok(s) => s,
         Err(_) => return,
@@ -878,6 +971,8 @@ fn ctl_command(rest: &[String]) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::symlink;
+    use std::process;
 
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| arg.to_string()).collect()
@@ -899,5 +994,80 @@ mod tests {
             json_escape("vm\"one\\two\n"),
             "vm\\\"one\\\\two\\n".to_string()
         );
+    }
+
+    #[test]
+    fn default_socket_lives_in_a_private_namespaced_dir() {
+        // The default is namespaced under a `gimbal-local` dir (not loose in the
+        // shared temp root), so it can be created 0700 (M30.2).
+        let sock = default_socket();
+        assert_eq!(sock.file_name().unwrap(), "chm.sock");
+        assert_eq!(sock.parent().unwrap(), runtime_dir());
+        assert_eq!(runtime_dir().file_name().unwrap(), "gimbal-local");
+    }
+
+    #[test]
+    fn ensure_private_runtime_dir_creates_0700_and_rejects_symlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let base = env::temp_dir().join(format!("chm-rtdir-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let dir = base.join("run");
+
+        ensure_private_runtime_dir(&dir).unwrap();
+        let mode = fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "runtime dir must be private 0700");
+        // Idempotent on an existing real dir.
+        ensure_private_runtime_dir(&dir).unwrap();
+
+        // A symlink planted at the runtime-dir path is refused, not followed.
+        let link = base.join("link");
+        symlink(&dir, &link).unwrap();
+        assert!(ensure_private_runtime_dir(&link).is_err());
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn remove_stale_socket_spares_regular_files_but_clears_sockets() {
+        let base = env::temp_dir().join(format!("chm-stale-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+
+        // A regular file at the socket path is NOT clobbered (a misconfigured
+        // --socket pointing at real data must be surfaced, not deleted).
+        let regular = base.join("not-a-socket");
+        fs::write(&regular, b"important").unwrap();
+        remove_stale_socket(&regular);
+        assert!(regular.exists(), "a regular file must be left intact");
+
+        // An actual stale socket IS removed so the daemon can re-bind.
+        let sock = base.join("chm.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        drop(listener);
+        assert!(sock.exists());
+        remove_stale_socket(&sock);
+        assert!(!sock.exists(), "a stale socket must be removed before re-bind");
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn peer_uid_matches_this_user_over_a_local_socket() {
+        // The peer-credential plumbing must report the connecting process's uid,
+        // so the daemon can admit its own user and reject others (M30.2).
+        let base = env::temp_dir().join(format!("chm-peer-{}", process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        let sock = base.join("chm.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let client = UnixStream::connect(&sock).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        // SAFETY: geteuid() is a pure syscall.
+        let me = unsafe { libc::geteuid() };
+        assert_eq!(peer_uid(&server).unwrap(), me);
+        assert_eq!(peer_uid(&client).unwrap(), me);
+
+        let _ = fs::remove_dir_all(&base);
     }
 }

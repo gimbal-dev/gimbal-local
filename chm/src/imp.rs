@@ -630,7 +630,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
     let mut max_seconds = 0u64;
     let mut idle_exit_secs = 0u64;
     let mut quiet = false;
-    let mut socket_path = env::temp_dir().join("chm.sock");
+    let mut socket_path = serve::default_socket();
     let mut no_stop_daemon = false;
     let mut session_lock: Option<PathBuf> = None;
     let mut checkpoint = false;
