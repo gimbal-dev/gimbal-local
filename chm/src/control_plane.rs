@@ -508,6 +508,8 @@ fn capabilities() -> Value {
         // eagerly and does not yet demand-fault only touched pages (that needs
         // HVF stage-2 fault interception; see docs/state-cdn-memory-plane.md).
         "supports_offload_daemon": true,
+        // `chm state-cdn serve` serves held (ciphertext) chunks to LAN peers.
+        "supports_peer_cache": true,
     })
 }
 

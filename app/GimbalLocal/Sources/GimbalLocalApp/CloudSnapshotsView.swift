@@ -187,6 +187,13 @@ private struct CloudSnapshotCard: View {
                     color: snapshot.restorableOnHVF ? Theme.green : Theme.orange,
                     systemImage: snapshot.restorableOnHVF ? "checkmark.seal.fill" : "exclamationmark.triangle.fill"
                 )
+                if snapshot.restorableOnHVF && !snapshot.hasDiskImage {
+                    CloudTag(
+                        text: "fixture · no disk",
+                        color: Theme.orange,
+                        systemImage: "questionmark.folder.fill"
+                    )
+                }
             }
 
             Button {
@@ -203,10 +210,10 @@ private struct CloudSnapshotCard: View {
                 }
             }
             .buttonStyle(.borderedProminent)
-            .disabled(!snapshot.restorableOnHVF || anyBusy)
+            .disabled(!snapshot.likelyBootable || anyBusy)
 
-            if !snapshot.restorableOnHVF {
-                Text("Not restorable on this Mac — HVF delivers message-SPI only. Stays cloud-only; recapture with CH_GIC_V2M=1 to bring it here.")
+            if let reason = snapshot.notBootableReason {
+                Text(bootBlockedHelp(reason))
                     .font(.caption2)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -227,6 +234,17 @@ private struct CloudSnapshotCard: View {
     private var bringDownLabel: String {
         if isBusy { return "Bringing down…" }
         return snapshot.isCheckpoint ? "Bring down & resume" : "Bring down & run"
+    }
+
+    /// Fuller guidance for why the bring-down button is disabled.
+    private func bootBlockedHelp(_ reason: String) -> String {
+        if !snapshot.restorableOnHVF {
+            return "Not restorable on this Mac — HVF delivers message-SPI only. "
+                + "Stays cloud-only; recapture with CH_GIC_V2M=1 to bring it here."
+        }
+        // No disk image: a protocol fixture, not a bootable capture.
+        return "\(reason). Pick a snapshot captured from a real host — it ships a "
+            + "disk image and boots here."
     }
 }
 

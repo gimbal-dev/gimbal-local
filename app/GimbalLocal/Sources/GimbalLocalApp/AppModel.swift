@@ -151,8 +151,8 @@ final class AppModel: ObservableObject {
     /// with a cloud badge. "Remote vs local" stays an implementation detail.
     func bringDownAndRun(_ snapshot: CloudSnapshot) {
         guard bringingDownID == nil else { return }
-        guard snapshot.restorableOnHVF else {
-            appendLog("cloud: \(snapshot.id) is not HVF-restorable (gic \(snapshot.gicMode ?? "?")) — stays cloud-only")
+        if let reason = snapshot.notBootableReason {
+            appendLog("cloud: \(snapshot.id) can't run here — \(reason)")
             return
         }
         // One cloud sandbox per cloud snapshot: reuse it on re-run so the list

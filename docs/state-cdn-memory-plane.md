@@ -108,6 +108,24 @@ lands, `chm` stays honest: CDN consumption is real; the touched-working-set
 
 ---
 
+## Peer cache — LAN-local chunk sourcing
+
+`reconstruct --cache DIR` also keeps each fetched **ciphertext** chunk, and
+`chm state-cdn serve --cache DIR` runs a small HTTP server exposing
+`GET /state-cdn/chunk?ref=&key=` over them. `chm state-cdn register-peer` then
+advertises the node to the plane (`POST /peer-caches`) with its endpoint +
+locality, so `GET /state-cdn/source` routes a same-locality puller here instead
+of the origin.
+
+Serving is safe without any token check: the chunks are **opaque ciphertext**, so
+only a puller that already holds the tenant key (from its own legit resume) can
+decrypt them — peer sourcing is a locality optimization, never an authorization
+bypass. Proven live: a peer served byte-identical chunks (the served bytes'
+`sha256` equals the content-address `store_key`), and a different locality fell
+back to origin.
+
+---
+
 ## Where this sits
 
 - **Pillar ②** (branching filesystem + lazy load): the memory plane is the

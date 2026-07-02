@@ -313,12 +313,34 @@ struct CloudSnapshot: Identifiable, Equatable, Hashable {
     let ramMib: Int
     let compatibility: String     // runnable | incompatible | …
     let hasLocalCopy: Bool
+    /// True when the manifest ships a disk image (`disks/…`). A real captured
+    /// snapshot does; a protocol fixture (state.json + memory-ranges only) does
+    /// not — so this is a pre-flight "is this actually bootable" hint that
+    /// mirrors the runner's authoritative `snapshots`-state check.
+    var hasDiskImage: Bool = true
 
     /// HVF (Apple's managed GIC) delivers message-based SPIs only, so only a
     /// `gicv2m-message-spi` snapshot is restorable here — mirrors the runner's
     /// local gic gate. Anything else stays cloud-only.
     var restorableOnHVF: Bool {
         compatibility == "runnable" && (gicMode == nil || gicMode == "gicv2m-message-spi")
+    }
+
+    /// Best pre-flight guess at whether bringing this down will actually boot:
+    /// HVF-restorable **and** it ships a disk image. A snapshot missing its disk
+    /// is a fixture / not bootable, so the UI can steer the user to a real one
+    /// instead of a confusing post-download failure.
+    var likelyBootable: Bool { restorableOnHVF && hasDiskImage }
+
+    /// A short reason this snapshot cannot be brought down to run, or nil.
+    var notBootableReason: String? {
+        if !restorableOnHVF {
+            return "Not HVF-restorable (needs gicv2m-message-spi)"
+        }
+        if !hasDiskImage {
+            return "No disk image — a protocol fixture, not a bootable snapshot"
+        }
+        return nil
     }
 
     var isCheckpoint: Bool { kind == "checkpoint" }
