@@ -426,6 +426,10 @@ fn capabilities() -> Value {
         // The execution substrate this runner restores on. The plane routes
         // only `apple-hvf`-restorable checkpoints (message-SPI) to us.
         "substrate": "apple-hvf",
+        // `chm fork` branches a revision; block devices run on copy-on-write
+        // overlays over a shared read-only base.
+        "supports_fork": true,
+        "supports_cow_overlay": true,
     })
 }
 
@@ -1077,6 +1081,11 @@ mod tests {
         let caps = capabilities();
         assert_eq!(caps.get("substrate").and_then(Value::as_str), Some("apple-hvf"));
         assert_eq!(caps.get("supports_resume").and_then(Value::as_bool), Some(true));
+        assert_eq!(caps.get("supports_fork").and_then(Value::as_bool), Some(true));
+        assert_eq!(
+            caps.get("supports_cow_overlay").and_then(Value::as_bool),
+            Some(true)
+        );
     }
 
     #[test]

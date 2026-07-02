@@ -416,8 +416,6 @@ fn dump_guest_ram(
 /// `chm resume <dst>` then runs the fork; the source and the fork now have
 /// independent state, both descended from the same revision.
 pub(crate) fn fork_into(src_dir: &Path, dst_dir: &Path) -> Result<(), String> {
-    use std::os::unix::fs::symlink;
-
     if !has_checkpoint(src_dir) {
         return Err(format!(
             "{} has no saved revision to fork (run and suspend it first)",
@@ -429,18 +427,9 @@ pub(crate) fn fork_into(src_dir: &Path, dst_dir: &Path) -> Result<(), String> {
     }
     fs::create_dir_all(dst_dir).map_err(|e| format!("create {}: {e}", dst_dir.display()))?;
 
-    // Reference the immutable base read-only. Symlinks avoid copying a large
-    // base RAM image / disks; the base is never written, so sharing is safe.
-    for item in ["state.json", "snapshot", "disks"] {
-        let from = src_dir.join(item);
-        if from.exists() {
-            let from_abs = from
-                .canonicalize()
-                .map_err(|e| format!("resolve {}: {e}", from.display()))?;
-            symlink(&from_abs, dst_dir.join(item))
-                .map_err(|e| format!("link {item} into the fork: {e}"))?;
-        }
-    }
+    // Reference the immutable base read-only (symlinks avoid copying a large
+    // base RAM image / disks; the base is never written, so sharing is safe).
+    symlink_base(src_dir, dst_dir)?;
 
     // Copy the mutable state the fork diverges from: the checkpoint (live RAM +
     // hardware state) and the disk overlays.
@@ -466,6 +455,40 @@ pub(crate) fn fork_into(src_dir: &Path, dst_dir: &Path) -> Result<(), String> {
     let json = serde_json::to_string(&rev).map_err(|e| format!("serialize revision: {e}"))?;
     fs::write(checkpoint_dir(dst_dir).join(MANIFEST), json.as_bytes())
         .map_err(|e| format!("write forked manifest: {e}"))?;
+    Ok(())
+}
+
+/// Create an isolated per-sandbox workspace that references an image's read-only
+/// base (`state.json`, `snapshot/`, `disks/` are symlinked) but keeps its own
+/// mutable state — disk overlays and the checkpoint/revision store live under
+/// `ws_dir`, not the shared image. So N sandboxes launched from the same image
+/// diverge independently instead of clobbering each other's disk + checkpoints.
+///
+/// Unlike [`fork_into`], it needs no saved revision — the workspace starts cold
+/// from the image (`chm run <ws_dir>` cold-boots; a later suspend saves a
+/// checkpoint inside the workspace).
+pub(crate) fn workspace_from_image(image_dir: &Path, ws_dir: &Path) -> Result<(), String> {
+    if ws_dir.exists() {
+        return Err(format!("workspace {} already exists", ws_dir.display()));
+    }
+    fs::create_dir_all(ws_dir).map_err(|e| format!("create {}: {e}", ws_dir.display()))?;
+    symlink_base(image_dir, ws_dir)
+}
+
+/// Symlink an image's immutable base (`state.json`, `snapshot/`, `disks/`) into a
+/// destination dir so it is shared read-only rather than copied.
+fn symlink_base(image_dir: &Path, dst_dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::symlink;
+    for item in ["state.json", "snapshot", "disks"] {
+        let from = image_dir.join(item);
+        if from.exists() {
+            let from_abs = from
+                .canonicalize()
+                .map_err(|e| format!("resolve {}: {e}", from.display()))?;
+            symlink(&from_abs, dst_dir.join(item))
+                .map_err(|e| format!("link {item} into the workspace: {e}"))?;
+        }
+    }
     Ok(())
 }
 
@@ -677,6 +700,37 @@ mod tests {
         rollback(&snap, "rev-nope").unwrap_err();
 
         let _ = fs::remove_dir_all(&snap);
+    }
+
+    #[test]
+    fn workspace_shares_base_readonly_and_isolates_mutable_state() {
+        let root = env::temp_dir().join(format!("chm-ws-test-{}-{}", process::id(), now_ms()));
+        let image = root.join("image");
+        let ws = root.join("ws");
+        let _ = fs::remove_dir_all(&root);
+
+        // A minimal cold image (base only, no checkpoint).
+        fs::create_dir_all(image.join("snapshot")).unwrap();
+        fs::create_dir_all(image.join("disks")).unwrap();
+        fs::write(image.join("state.json"), b"{}").unwrap();
+        fs::write(image.join("snapshot/memory-ranges"), b"base-ram").unwrap();
+
+        workspace_from_image(&image, &ws).expect("create workspace");
+
+        // The base is symlinked (shared read-only), not copied.
+        for item in ["state.json", "snapshot", "disks"] {
+            assert!(
+                fs::symlink_metadata(ws.join(item)).unwrap().file_type().is_symlink(),
+                "{item} should be a symlink to the image"
+            );
+        }
+        // The base is reachable through the workspace, and it starts cold.
+        assert_eq!(fs::read(ws.join("snapshot/memory-ranges")).unwrap(), b"base-ram");
+        assert!(!has_checkpoint(&ws));
+        // Re-creating over an existing workspace is refused.
+        workspace_from_image(&image, &ws).unwrap_err();
+
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]
