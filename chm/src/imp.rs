@@ -402,6 +402,13 @@ pub fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("workspace") => match workspace(&raw[1..]) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("chm workspace: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Some("rollback") => match rollback_cmd(&raw[1..]) {
             Ok(code) => code,
             Err(e) => {
@@ -477,6 +484,7 @@ fn usage() -> String {
          chm restore <SNAPSHOT_DIR> [OPTIONS]   (alias for run)\n    \
          chm resume <SNAPSHOT_DIR> [OPTIONS]    (restore a saved checkpoint)\n    \
          chm fork <SRC_DIR> <DST_DIR>           (branch a saved revision)\n    \
+         chm workspace <IMAGE_DIR> <WS_DIR>     (isolated sandbox workspace)\n    \
          chm revisions <SNAPSHOT_DIR> [--json]  (list the lineage)\n    \
          chm rollback <SNAPSHOT_DIR> <REV_ID>   (roll back to a revision)\n    \
          chm connect <SNAPSHOT_DIR> [OPTIONS]   (interactive session)\n    \
@@ -692,6 +700,40 @@ fn fork(raw: &[String]) -> Result<ExitCode, String> {
         src.display(),
         dst.display(),
         dst.display()
+    );
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `chm workspace <IMAGE_DIR> <WORKSPACE_DIR>` — create an isolated per-sandbox
+/// workspace that shares the image's read-only base but keeps its own overlays
+/// and checkpoints, so N sandboxes from one image don't clobber each other.
+fn workspace(raw: &[String]) -> Result<ExitCode, String> {
+    let positionals: Vec<&String> = raw.iter().filter(|a| !a.starts_with('-')).collect();
+    if raw.iter().any(|a| a == "-h" || a == "--help") || positionals.len() != 2 {
+        eprintln!(
+            "usage: chm workspace <IMAGE_DIR> <WORKSPACE_DIR>\n\
+             \n\
+             Create an isolated sandbox workspace: it shares IMAGE_DIR's\n\
+             read-only base (state.json, snapshot/, disks/ are symlinked) but\n\
+             keeps its own disk overlays + checkpoint/revision store, so several\n\
+             sandboxes from one image diverge independently. Run it with\n\
+             `chm run <WORKSPACE_DIR>` (cold) — a later suspend saves a\n\
+             checkpoint inside the workspace."
+        );
+        return if positionals.len() == 2 {
+            Ok(ExitCode::SUCCESS)
+        } else {
+            Err("expected an image directory and a workspace directory".to_string())
+        };
+    }
+    let image = PathBuf::from(positionals[0]);
+    let ws = PathBuf::from(positionals[1]);
+    checkpoint::workspace_from_image(&image, &ws)?;
+    eprintln!(
+        "chm: created workspace {} from {} (run it with `chm run {}`)",
+        ws.display(),
+        image.display(),
+        ws.display()
     );
     Ok(ExitCode::SUCCESS)
 }
