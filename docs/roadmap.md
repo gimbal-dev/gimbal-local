@@ -114,7 +114,7 @@ from cache in 0.077 s).
 | Milestone | Pillar | Status | Issues |
 | --- | --- | --- | --- |
 | **M25 · Live local lifecycle** | ① | **Complete** (one perf ceiling: runtime memfd page-sharing) | #4, #6 |
-| **M30 · Security hardening** | trust/isolation | **P0 fixes shipped** (#33–#35); signing + guards next (#36–#39) | #33–#39 |
+| **M30 · Security hardening** | trust/isolation | **P0 + no-FS guard shipped** (#33–#35, #37); signing + limits next (#36, #38) | #33–#39 |
 | **M27 · Plane-native edge** | ② | Waits on gctl (memory plane shipped; disk plane + fork/commit building) | #5, #7 |
 | **M28 · Consistent controls** | ③ | Waits on the gctl policy contract | #20 |
 | **M29 · Observability & cost** | ④ | Waits on the gctl telemetry contract | — |
@@ -167,8 +167,9 @@ them. Full model + plan: [`security-model.md`](security-model.md).
 - **M30.4 (#36, P1)** — signed snapshot manifest + verification, and one trust
   root (app trusts the cloud key; gctl signs; local verifies before "Run").
   Cross-repo — tracks the gctl signing contract.
-- **M30.5 (#37, P1)** — make the **no host-FS-passthrough** invariant explicit +
-  CI-guarded so it cannot silently regress.
+- **M30.5 (#37, P1) — shipped.** The **no host-FS-passthrough** invariant is
+  explicit: a behavioural test proves virtio-fs/9p classify as `Unsupported`,
+  and `make security-check` fails if host-FS wiring appears without review.
 - **M30.6 (#38, P2)** — per-sandbox resource limits (vCPU/mem/disk).
 - **M30.7 (#39)** — the threat model + hardening checklist (this doc set).
 

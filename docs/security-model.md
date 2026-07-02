@@ -87,7 +87,7 @@ test/guard so a regression is caught, not discovered.
 
 | # | Invariant | Enforced by | Status |
 | --- | --- | --- | --- |
-| I1 | **No host filesystem passthrough.** A guest never gets a virtiofs/9p/shared-folder mount of a host directory. The only guest storage is virtio-blk over a bundle-owned image + a private overlay. | Device model ships only block/rng/net; a CI guard fails if virtiofs/9p/shared-folder appears without review. | **Holds today**; guard is M30.5 |
+| I1 | **No host filesystem passthrough.** A guest never gets a virtiofs/9p/shared-folder mount of a host directory. The only guest storage is virtio-blk over a bundle-owned image + a private overlay. | Device model wires only block/net/rng (virtio-fs/9p classify as `Unsupported`); a behavioural test + `make security-check` guard fail if that regresses. | **Holds today** (M30.5) |
 | I2 | **Bundles are confined.** Every file `chm` opens for a bundle resolves to a real path **under the bundle root** — no symlink is followed out, no `..` escapes. | `symlink_metadata` rejection + path confinement + `O_NOFOLLOW` opens. | **Holds today** (M30.1) |
 | I3 | **Overlays are private.** Writable overlays/checkpoints are created by `chm` in a fresh `0700` dir it owns, refusing a symlinked overlay/dir shipped in the bundle. | Private `0700` overlay dir + no-follow overlay opens. | **Holds today** (M30.1) |
 | I4 | **The daemon is local-and-owner-only.** Only the same-uid user can drive the control socket; the socket lives in a private `0700` dir with `0600` perms and validates peer credentials. | Private socket dir + `0600` perms + `getpeereid` peer-uid check. | **Holds today** (M30.2) |
@@ -212,12 +212,18 @@ cloud). A tampered bundle with a matching recomputed `checksum_tree` passes.
 
 ### M30.5 · No-host-FS-passthrough invariant + CI guard  **[P1, docs + test]**
 
+**Status: shipped.** The device model already turns virtio-fs/9p into
+`Unsupported` (refused at build); a behavioural test asserts that, and
+`scripts/security/no-host-fs-passthrough.sh` (`make security-check`) fails if
+host-FS wiring tokens appear without a `SECURITY-REVIEWED-FS-SHARE` marker.
+
 **Finding.** "No ordinary host FS sharing" is true by design but implicit.
 
-**Plan.** Make I1 **explicit**: document it here (done) and add a repo guard (a
-test / CI grep) that **fails** if `virtiofs`, `9p`, `virtio-fs`, or a
-shared-folder / host-mount device path appears in the device model without a
-paired security review. So the invariant can't silently regress.
+**Plan (done).** Make I1 **explicit**: document it here, add a behavioural test
+(`host_fs_passthrough_device_types_are_unsupported`), and add a repo guard that
+**fails** if `virtiofs`/`9p`/shared-folder/host-mount wiring appears in the HVF
+device model without a paired security review — so the invariant can't silently
+regress.
 
 ### M30.6 · Per-sandbox resource limits  **[P2, engine]**
 
@@ -251,7 +257,8 @@ per-area plan, and is the acceptance surface for M30. The checklist below is the
       provenance recorded (M30.4).
 - [ ] **Trust root** — one root: app trusts the cloud/capture public keys; cloud
       signs; local verifies before exposing "Run" (M30.4).
-- [ ] **No host FS passthrough** — invariant documented + CI-guarded (M30.5).
+- [x] **No host FS passthrough** — invariant documented, behavioural test +
+      `make security-check` guard (M30.5, shipped).
 - [ ] **Resource limits** — per-sandbox vCPU/mem/disk ceilings (M30.6).
 - [ ] **Network policy** — egress allow/deny enforced on the local datapath
       (converges with **M28**; the firewall half of pillar ③).
