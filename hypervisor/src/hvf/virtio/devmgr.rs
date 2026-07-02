@@ -698,6 +698,33 @@ mod tests {
         );
     }
 
+    /// Security invariant I1 (M30.5): no host-filesystem passthrough. A snapshot
+    /// carrying a virtio-fs (type 26, PCI `0x105A`) or virtio-9p (type 9, PCI
+    /// `0x1049`) device must classify as `Unsupported` — the device model only
+    /// ever wires block/net/rng, never a host directory mount — so such a device
+    /// is refused at build time rather than exposing the host filesystem. If a
+    /// future change adds host-FS support it will break this test, forcing a
+    /// deliberate security review (see also `scripts/security/`).
+    #[test]
+    fn host_fs_passthrough_device_types_are_unsupported() {
+        // virtio-fs: PCI Device ID 0x105A -> virtio type 26.
+        let fs = parse_devices(&one_device_tree("_fs0", 0x105A, serde_json::json!({})))
+            .expect("parse virtio-fs");
+        assert!(
+            matches!(fs[0].backend, BackendKind::Unsupported { virtio_type: 26 }),
+            "virtio-fs must be Unsupported (no host FS passthrough), got {:?}",
+            fs[0].backend
+        );
+        // virtio-9p: PCI Device ID 0x1049 -> virtio type 9.
+        let p9 = parse_devices(&one_device_tree("_9p0", 0x1049, serde_json::json!({})))
+            .expect("parse virtio-9p");
+        assert!(
+            matches!(p9[0].backend, BackendKind::Unsupported { virtio_type: 9 }),
+            "virtio-9p must be Unsupported (no host FS passthrough), got {:?}",
+            p9[0].backend
+        );
+    }
+
     #[test]
     fn parses_block_and_rng_devices() {
         let devs = parse_devices(FIXTURE).expect("parse");

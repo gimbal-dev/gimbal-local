@@ -7,7 +7,7 @@
 CHM_BIN := target/debug/chm
 SOCKET  ?= $${TMPDIR:-/tmp}/gimbal-local/chm.sock
 
-.PHONY: help chm chm-run chm-serve clippy fmt test-hvf
+.PHONY: help chm chm-run chm-serve clippy fmt test-hvf security-check
 
 help:
 	@echo "Cloud Hypervisor for macOS — make targets:"
@@ -15,6 +15,7 @@ help:
 	@echo "  make chm-run DIR=<snapshot>   Resume a snapshot, stream console"
 	@echo "  make chm-serve DIR=<library>  Run the daemon over a snapshot library"
 	@echo "  make clippy                   Lint chm + hvf hypervisor configs"
+	@echo "  make security-check           Enforce the no-host-FS-passthrough guard"
 	@echo "  make fmt                      Format (nightly rustfmt)"
 	@echo "  make test-hvf                 Build hvf_boot integration tests (no-run)"
 
@@ -33,6 +34,11 @@ chm-serve: chm
 clippy:
 	cargo clippy -p cloud-hypervisor-mac --bin chm
 	cargo clippy -p hypervisor --no-default-features --features hvf,kvm-snapshot
+
+# Security invariant I1 (docs/security-model.md): fail if host-filesystem
+# passthrough (virtiofs/9p/shared-folder) appears in the device model.
+security-check:
+	@./scripts/security/no-host-fs-passthrough.sh
 
 fmt:
 	cargo +nightly fmt --all
