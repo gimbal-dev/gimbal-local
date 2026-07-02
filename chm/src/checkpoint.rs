@@ -431,9 +431,12 @@ pub(crate) fn fork_into(src_dir: &Path, dst_dir: &Path) -> Result<(), String> {
     // base RAM image / disks; the base is never written, so sharing is safe).
     symlink_base(src_dir, dst_dir)?;
 
-    // Copy the mutable state the fork diverges from: the checkpoint (live RAM +
-    // hardware state) and the disk overlays.
-    copy_tree(&checkpoint_dir(src_dir), &checkpoint_dir(dst_dir))?;
+    // Copy the mutable state the fork diverges from. The checkpoint's big RAM
+    // dump is write-once (never mutated in place — a new suspend stages+renames a
+    // fresh file), so it is hard-linked to share the base RAM read-only until the
+    // fork diverges (copy-on-write at the file level). Disk overlays *are* written
+    // in place during a run, so they must be copied so the fork's disk diverges.
+    clone_checkpoint(&checkpoint_dir(src_dir), &checkpoint_dir(dst_dir))?;
     let overlays = src_dir.join(".chm-overlays");
     if overlays.is_dir() {
         copy_tree(&overlays, &dst_dir.join(".chm-overlays"))?;
@@ -487,6 +490,28 @@ fn symlink_base(image_dir: &Path, dst_dir: &Path) -> Result<(), String> {
                 .map_err(|e| format!("resolve {}: {e}", from.display()))?;
             symlink(&from_abs, dst_dir.join(item))
                 .map_err(|e| format!("link {item} into the workspace: {e}"))?;
+        }
+    }
+    Ok(())
+}
+
+/// Clone a checkpoint dir for a fork: hard-link the write-once RAM dump (shared
+/// read-only until the fork diverges to a fresh checkpoint) and copy the small
+/// manifest (it is rewritten by re-parenting, so it must be private). Falls back
+/// to a copy if hard-linking fails (e.g. across filesystems).
+fn clone_checkpoint(from: &Path, to: &Path) -> Result<(), String> {
+    fs::create_dir_all(to).map_err(|e| format!("create {}: {e}", to.display()))?;
+    for entry in fs::read_dir(from).map_err(|e| format!("read {}: {e}", from.display()))? {
+        let entry = entry.map_err(|e| format!("read {}: {e}", from.display()))?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if entry.file_name() == MEMORY_RANGES {
+            fs::hard_link(&src, &dst)
+                .or_else(|_| fs::copy(&src, &dst).map(|_| ()))
+                .map_err(|e| format!("share {} -> {}: {e}", src.display(), dst.display()))?;
+        } else {
+            fs::copy(&src, &dst)
+                .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
         }
     }
     Ok(())
@@ -614,8 +639,16 @@ mod tests {
         assert_eq!(
             fs::read(memory_ranges_path(&dst)).unwrap(),
             b"live-ram",
-            "the fork copies the live RAM to diverge from"
+            "the fork sees the live RAM to diverge from"
         );
+        // The RAM dump is *shared* read-only (hard-linked), not copied — file-
+        // level CoW until the fork's next suspend writes a fresh checkpoint.
+        {
+            use std::os::unix::fs::MetadataExt;
+            let src_ino = fs::metadata(memory_ranges_path(&src)).unwrap().ino();
+            let dst_ino = fs::metadata(memory_ranges_path(&dst)).unwrap().ino();
+            assert_eq!(src_ino, dst_ino, "fork shares the base RAM via a hard link");
+        }
         assert_eq!(
             fs::read(dst.join(".chm-overlays/d-cow.raw")).unwrap(),
             b"overlay-bytes",
