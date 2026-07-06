@@ -27,6 +27,7 @@ use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::process::{self, Command, ExitCode, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
@@ -70,6 +71,9 @@ pub(crate) struct ReconstructStats {
     pub fetched_pages: usize,
     pub zero_pages: usize,
     pub decrypted_pages: usize,
+    /// Pages the scoped capability token was not granted (per-page-range ACL);
+    /// skipped and left zero, so the puller sees only the pages it may (M27 #7).
+    pub acl_denied_pages: usize,
 }
 
 /// Reconstruct a memory ref's flat RAM image from the state CDN into `out`.
@@ -119,7 +123,15 @@ pub(crate) fn reconstruct(
             stats.zero_pages += 1;
             continue;
         }
-        let raw = fetch_chunk(endpoint, memory_ref, &page.store_key, token)?;
+        let raw = match fetch_chunk(endpoint, memory_ref, &page.store_key, token)? {
+            ChunkFetch::Fetched(raw) => raw,
+            ChunkFetch::OutOfScope => {
+                // Per-page-range ACL: the scoped token does not grant this page.
+                // Honor the grant — leave it zero and keep going.
+                stats.acl_denied_pages += 1;
+                continue;
+            }
+        };
         // Persist the raw ciphertext chunk so this node can serve it to LAN
         // peers as a peer cache (opaque without the tenant key — see `serve`).
         if let Some(cache) = cache_dir {
@@ -181,7 +193,13 @@ fn fetch_page_map(endpoint: &str, memory_ref: &str, token: &str) -> Result<Memor
         url_encode(memory_ref),
         url_encode(token)
     );
-    let out = curl_get(&url)?;
+    let (status, out) = http_get(&url)?;
+    if status != 200 {
+        return Err(format!(
+            "state-cdn memory-ref map HTTP {status}: {}",
+            String::from_utf8_lossy(&out).trim()
+        ));
+    }
     // `MemoryRefMapResponse` names the record field `ref`; alias it to `ref_`.
     let mut value: serde_json::Value =
         serde_json::from_slice(&out).map_err(|e| format!("parse memory-ref map: {e}"))?;
@@ -193,8 +211,22 @@ fn fetch_page_map(endpoint: &str, memory_ref: &str, token: &str) -> Result<Memor
     serde_json::from_value(value).map_err(|e| format!("decode memory-ref map: {e}"))
 }
 
-/// Fetch one raw chunk (`GET /state-cdn/chunk`), returning its bytes.
-fn fetch_chunk(endpoint: &str, memory_ref: &str, key: &str, token: &str) -> Result<Vec<u8>, String> {
+/// The result of fetching a chunk: its bytes, or a denial because the scoped
+/// capability token does not grant this page (per-page-range ACL — M27 #7).
+enum ChunkFetch {
+    Fetched(Vec<u8>),
+    OutOfScope,
+}
+
+/// Fetch one raw chunk (`GET /state-cdn/chunk`). A `403` means the token is
+/// scoped to a page-range ACL that excludes this page — surfaced as `OutOfScope`
+/// so the caller can honor the grant (skip the page) rather than fail the run.
+fn fetch_chunk(
+    endpoint: &str,
+    memory_ref: &str,
+    key: &str,
+    token: &str,
+) -> Result<ChunkFetch, String> {
     let url = format!(
         "{}/state-cdn/chunk?ref={}&key={}&token={}",
         endpoint.trim_end_matches('/'),
@@ -202,26 +234,47 @@ fn fetch_chunk(endpoint: &str, memory_ref: &str, key: &str, token: &str) -> Resu
         url_encode(key),
         url_encode(token)
     );
-    curl_get(&url)
+    let (status, body) = http_get(&url)?;
+    match status {
+        200 => Ok(ChunkFetch::Fetched(body)),
+        403 => Ok(ChunkFetch::OutOfScope),
+        c => Err(format!(
+            "state-cdn chunk fetch HTTP {c}: {}",
+            String::from_utf8_lossy(&body).trim()
+        )),
+    }
 }
 
-/// GET `url` with curl, returning the raw body bytes (fails on 4xx/5xx via `-f`).
-fn curl_get(url: &str) -> Result<Vec<u8>, String> {
+static FETCH_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// GET `url`, returning `(http_status, body)`. The body streams to a temp file
+/// (so a binary chunk is never corrupted by mixing it with the status), and
+/// `-w` prints only the status code to stdout. A non-2xx is *not* an error here
+/// — callers branch on the status (e.g. 403 → out-of-scope).
+fn http_get(url: &str) -> Result<(u16, Vec<u8>), String> {
+    let seq = FETCH_SEQ.fetch_add(1, Ordering::Relaxed);
+    let tmp = env::temp_dir().join(format!("chm-cdn-{}-{seq}.part", process::id()));
     let out = Command::new("curl")
-        .args(["-fsS", "--max-time", "1200"])
+        .args(["-sS", "--max-time", "1200", "-o"])
+        .arg(&tmp)
+        .args(["-w", "%{http_code}"])
         .arg(url)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
         .map_err(|e| format!("spawn curl: {e}"))?;
     if !out.status.success() {
+        let _ = fs::remove_file(&tmp);
         return Err(format!(
-            "state-cdn fetch failed (curl exit {}): {}",
+            "state-cdn fetch transport error (curl exit {}): {}",
             out.status.code().unwrap_or(-1),
             String::from_utf8_lossy(&out.stderr).trim()
         ));
     }
-    Ok(out.stdout)
+    let status: u16 = String::from_utf8_lossy(&out.stdout).trim().parse().unwrap_or(0);
+    let body = fs::read(&tmp).unwrap_or_default();
+    let _ = fs::remove_file(&tmp);
+    Ok((status, body))
 }
 
 /// Decode a base64 (standard alphabet, `=`-padded) string — the tenant key is
@@ -541,15 +594,27 @@ fn cmd_reconstruct(raw: &[String]) -> Result<(), String> {
     )?;
     println!(
         "reconstructed {} bytes to {out}\n  \
-         pages    {} ({} fetched, {} zero-elided)\n  \
+         pages    {} ({} fetched, {} zero-elided{})\n  \
          decrypt  {} page(s) AES-256-GCM{}",
         stats.total_bytes,
         stats.pages,
         stats.fetched_pages,
         stats.zero_pages,
+        if stats.acl_denied_pages > 0 {
+            format!(", {} ACL-denied", stats.acl_denied_pages)
+        } else {
+            String::new()
+        },
         stats.decrypted_pages,
         cache.map(|c| format!("\n  cache    {} chunk(s) kept in {c}", stats.fetched_pages)).unwrap_or_default()
     );
+    if stats.acl_denied_pages > 0 {
+        eprintln!(
+            "chm state-cdn: note: {} page(s) were outside this token's page-range ACL \
+             and left zero (least-privilege reconstruction).",
+            stats.acl_denied_pages
+        );
+    }
     Ok(())
 }
 

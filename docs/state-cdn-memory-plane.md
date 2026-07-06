@@ -59,6 +59,16 @@ It:
 So a checkpoint's RAM travels as encrypted, deduped, content-addressed chunks and
 is rebuilt on the Mac. The runner advertises **`supports_offload_daemon`**.
 
+### Per-page-range ACL honoring
+
+A branch can grant a runner only a **subset of pages** (`page_acls`). On such a
+pull the plane mints a **scoped** capability token (`acl_applied: true`); the
+token still reads the whole page map, but an out-of-scope chunk fetch is refused
+**403**. `reconstruct` honors the grant: a 403 marks the page **ACL-denied** and
+leaves it zero (a least-privilege image), rather than failing the run. Proven
+live: a page-0-only token reconstructs 1 fetched + **3 ACL-denied** pages; a full
+token fetches all 4.
+
 ### Proven live (`$0`, local `:8080` plane)
 
 Against a real tenant-encrypted ref (`sha256:b2b6576f…`, 8 pages / 2 MiB):
@@ -68,6 +78,7 @@ Against a real tenant-encrypted ref (`sha256:b2b6576f…`, 8 pages / 2 MiB):
 | Reconstruct | 2 097 152 bytes, **4 pages fetched + AES-256-GCM-decrypted, 4 zero-elided** |
 | Determinism | two runs → identical `sha256` (`e0def239…`) |
 | Auth | a wrong tenant key → **`AES-256-GCM authentication failed`**, not silent garbage |
+| ACL | a page-0-only scoped token → **1 fetched, 3 ACL-denied**, run still succeeds |
 
 Unit tests seal a page exactly as the plane does and prove `chm` decrypts it
 byte-for-byte, plus base64/hex/URL-encoding vectors.
@@ -117,10 +128,19 @@ advertises the node to the plane (`POST /peer-caches`) with its endpoint +
 locality, so `GET /state-cdn/source` routes a same-locality puller here instead
 of the origin.
 
-Serving is safe without any token check: the chunks are **opaque ciphertext**, so
-only a puller that already holds the tenant key (from its own legit resume) can
-decrypt them — peer sourcing is a locality optimization, never an authorization
-bypass. Proven live: a peer served byte-identical chunks (the served bytes'
+Serving is safe without a token check **for full-access refs**: the chunks are
+opaque ciphertext, so only a puller that already holds the tenant key (from its
+own legit resume) can decrypt them.
+
+**Honest boundary — page-range ACLs + peers.** A peer serves any chunk it holds,
+so it does not itself enforce a *page-range ACL*: a puller scoped to a subset of
+pages that reached this peer directly could fetch an out-of-scope chunk it would
+be refused (403) at origin. So an **ACL-restricted ref must be sourced from
+origin**, where the scope is enforced — which is exactly what `reconstruct` does
+(it fetches from the assignment's `state_cdn_endpoint`, never a peer). Making
+peers enforce scopes too needs a plane-defined peer-token contract (local
+public-key verification, or forward-validation to origin) and is a tracked
+follow-up. Proven live: a peer served byte-identical chunks (the served bytes'
 `sha256` equals the content-address `store_key`), and a different locality fell
 back to origin.
 
