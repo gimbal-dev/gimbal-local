@@ -180,6 +180,40 @@ final class AppModel: ObservableObject {
         runCloudSandbox(sandboxID: sandbox.id, snapshotID: sandbox.snapshotName, isCheckpoint: isCheckpoint)
     }
 
+    /// Set a branch's review gate (`pending` / `approved` / `rejected`) via
+    /// `chm branches review`, then refresh so the UI reflects the new status.
+    func setBranchReview(_ name: String, status: String) {
+        Task {
+            let result = await chm.reviewBranch(
+                name, status: status, api: settings.controlPlaneURL, settings: settings
+            )
+            let trimmed = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            appendLog(
+                result.status == 0
+                    ? "branch \(name): review → \(status)"
+                    : "branch \(name): review failed — \(trimmed)"
+            )
+            await refreshAll()
+        }
+    }
+
+    /// Merge `from` into `target` via `chm branches merge` (review-gated on the
+    /// plane), then refresh.
+    func mergeBranches(target: String, from: String) {
+        Task {
+            let result = await chm.mergeBranch(
+                target: target, from: from, api: settings.controlPlaneURL, settings: settings
+            )
+            let trimmed = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            appendLog(
+                result.status == 0
+                    ? "merged \(from) → \(target)"
+                    : "merge \(from) → \(target) failed — \(trimmed)"
+            )
+            await refreshAll()
+        }
+    }
+
     private func runCloudSandbox(sandboxID: String, snapshotID: String, isCheckpoint: Bool) {
         bringingDownID = snapshotID
         cloudSandboxStates[sandboxID] = .starting

@@ -87,6 +87,16 @@ struct ChmClient {
         return list.branches
     }
 
+    /// Set a branch's review status (`pending` / `approved` / `rejected`).
+    func reviewBranch(_ name: String, status: String, api: String, settings: AppSettings) async -> CommandResult {
+        await runRaw(settings: settings, args: ["branches", "review", "--branch", name, "--status", status, "--api", api])
+    }
+
+    /// Merge the `from` branch's head into `target` (review-gated on the plane).
+    func mergeBranch(target: String, from: String, api: String, settings: AppSettings) async -> CommandResult {
+        await runRaw(settings: settings, args: ["branches", "merge", "--target", target, "--from", from, "--api", api])
+    }
+
     /// Create an isolated per-sandbox workspace (`chm workspace <image> <ws>`).
     func createWorkspace(image: String, workspace: String, settings: AppSettings) async -> CommandResult {
         await runRaw(settings: settings, args: ["workspace", image, workspace])

@@ -187,13 +187,21 @@ Pillar ②'s deep, plane-coupled half:
   plane dedups it into its CAS and advances the head); `chm pull` rehydrates a
   branch head (or explicit revision) back to a local resume. Proven live on the
   `:8080` dev plane: a re-commit of already-present content stored **0 bytes**.
-  Follow-ups: page-range ACLs, branch/merge review in the app.
+- **Branch review + merge** (#7) — **shipped.** `chm branches review`/`merge`
+  drive the plane's review gate (an unapproved source into a review-required
+  target is refused; approve → merge); the app's Branches section has a review
+  picker + a merge menu. Proven live: gate refused then merged after approval.
+- **Page-range ACL honoring** (#7) — **shipped.** A scoped pull's out-of-scope
+  chunk 403s; `chm state-cdn reconstruct` skips those pages (least-privilege
+  image) rather than failing. Proven live: a page-0-only token → 1 fetched, 3
+  ACL-denied.
 - **Peer cache** (#7) — **shipped.** `chm state-cdn serve` runs a peer-cache HTTP
   server over the reconstructed (ciphertext) chunks and `register-peer` advertises
   it; the plane routes same-locality pullers here. Proven live: a peer served
-  byte-identical chunks and a different locality fell back to origin. Serving
-  opaque ciphertext needs no token (only a legit puller with the tenant key can
-  decrypt), so it is an optimization, never an authorization bypass.
+  byte-identical chunks and a different locality fell back to origin. A peer
+  serves opaque ciphertext without a token check, so ACL-restricted refs are
+  sourced from origin (where the scope is enforced); peer scope-enforcement is a
+  documented follow-up.
 - **Postcopy memory plane** (#5) — **consumer shipped; demand-fault deferred.**
   `chm state-cdn reconstruct` pulls a checkpoint's encrypted, content-addressed
   RAM chunks from the state CDN, decrypts them (AES-256-GCM per-tenant), and

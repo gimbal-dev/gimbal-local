@@ -89,7 +89,7 @@ private struct BranchesSection: View {
 
             VStack(spacing: 0) {
                 ForEach(branches) { branch in
-                    BranchRow(branch: branch)
+                    BranchRow(branch: branch, allBranches: branches)
                     if branch.id != branches.last?.id {
                         Divider().overlay(Color.white.opacity(0.08))
                     }
@@ -102,7 +102,9 @@ private struct BranchesSection: View {
 }
 
 private struct BranchRow: View {
+    @EnvironmentObject private var model: AppModel
     let branch: PlaneBranch
+    let allBranches: [PlaneBranch]
 
     private var reviewColor: Color {
         switch branch.reviewStatus {
@@ -111,6 +113,11 @@ private struct BranchRow: View {
         case "rejected": return .red
         default: return .secondary
         }
+    }
+
+    /// Other branches whose head can be merged into this one.
+    private var mergeSources: [PlaneBranch] {
+        allBranches.filter { $0.id != branch.id }
     }
 
     var body: some View {
@@ -129,13 +136,47 @@ private struct BranchRow: View {
                     .font(.caption2)
                     .foregroundStyle(.white.opacity(0.6))
             }
-            Text(branch.reviewLabel)
-                .font(.caption2.weight(.medium))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 3)
-                .background(reviewColor.opacity(0.18))
-                .foregroundStyle(reviewColor)
-                .clipShape(Capsule())
+
+            // Review gate — a menu to set pending / approved / rejected.
+            Menu {
+                ForEach(["approved", "pending", "rejected"], id: \.self) { status in
+                    Button {
+                        model.setBranchReview(branch.name, status: status)
+                    } label: {
+                        Label(status.capitalized, systemImage: branch.reviewStatus == status ? "checkmark" : "")
+                    }
+                }
+            } label: {
+                Text(branch.reviewLabel)
+                    .font(.caption2.weight(.medium))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(reviewColor.opacity(0.18))
+                    .foregroundStyle(reviewColor)
+                    .clipShape(Capsule())
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+
+            // Merge another branch's head into this one (review-gated on the plane).
+            Menu {
+                if mergeSources.isEmpty {
+                    Text("No other branches")
+                } else {
+                    ForEach(mergeSources) { source in
+                        Button("Merge \(source.name) → \(branch.name)") {
+                            model.mergeBranches(target: branch.name, from: source.name)
+                        }
+                    }
+                }
+            } label: {
+                Image(systemName: "arrow.triangle.merge")
+                    .font(.caption)
+                    .foregroundStyle(.white.opacity(0.7))
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .disabled(mergeSources.isEmpty)
         }
         .padding(.horizontal, 14)
         .padding(.vertical, 10)
