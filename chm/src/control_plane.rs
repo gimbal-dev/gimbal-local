@@ -192,6 +192,29 @@ impl ControlPlane {
         ok_or_http_err(resp, "branches")
     }
 
+    /// Merge the `from` branch's head into the target branch (review-gated:
+    /// merging an unapproved source into a review-required target is refused).
+    fn merge_branch(&self, target_id: &str, req: &Value) -> Result<Value, String> {
+        let path = format!("/branches/{target_id}/merge");
+        let resp = self.request("POST", &path, Some(req))?;
+        if resp.status == 400 {
+            return Err(format!(
+                "merge refused (HTTP 400): {}. A review-required target only accepts \
+                 an approved source — set the source `approved` first with \
+                 `chm branches review`.",
+                http_error_message(&resp.body)
+            ));
+        }
+        ok_or_http_err(resp, "branches/merge")
+    }
+
+    /// Set a branch's review status (`pending` / `approved` / `rejected`).
+    fn review_branch(&self, branch_id: &str, req: &Value) -> Result<Value, String> {
+        let path = format!("/branches/{branch_id}/review");
+        let resp = self.request("POST", &path, Some(req))?;
+        ok_or_http_err(resp, "branches/review")
+    }
+
     /// Pull a branch head (or an explicit revision) back to a resume assignment
     /// (Phase 4). The response's `assignment` is a standard `AssignRunResponse`,
     /// so the bundle materializes through the same path a normal resume uses.
@@ -944,6 +967,28 @@ pub fn push_main(raw: &[String]) -> ExitCode {
 }
 
 pub fn branches_main(raw: &[String]) -> ExitCode {
+    // `chm branches [merge|review] …`; with no subcommand it lists.
+    match raw.first().map(String::as_str) {
+        Some("merge") => {
+            return match cmd_branch_merge(&raw[1..]) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("chm branches merge: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        Some("review") => {
+            return match cmd_branch_review(&raw[1..]) {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("chm branches review: {e}");
+                    ExitCode::FAILURE
+                }
+            };
+        }
+        _ => {}
+    }
     let mut api = None;
     let mut owner: Option<String> = None;
     let mut as_json = false;
@@ -952,9 +997,15 @@ pub fn branches_main(raw: &[String]) -> ExitCode {
         match raw[i].as_str() {
             "-h" | "--help" => {
                 print!(
-                    "chm branches — list revision branches on the control plane\n\
+                    "chm branches — list + drive revision branches on the control plane\n\
                      \n\
-                     USAGE:\n    chm branches [--json] [--owner WHO] [--api URL]\n"
+                     USAGE:\n    \
+                         chm branches [--json] [--owner WHO] [--api URL]\n    \
+                         chm branches review --branch NAME --status STATUS [--owner WHO]\n    \
+                         chm branches merge --target NAME --from NAME [--owner WHO]\n\
+                     \n\
+                     STATUS is pending | approved | rejected. A merge into a review-\n    \
+                     required target needs the source approved first.\n"
                 );
                 return ExitCode::SUCCESS;
             }
@@ -987,6 +1038,73 @@ pub fn branches_main(raw: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+fn cmd_branch_review(raw: &[String]) -> Result<(), String> {
+    let mut api = None;
+    let mut branch = None;
+    let mut status = None;
+    let mut owner = default_owner();
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i].as_str() {
+            "--api" => api = Some(take_value(raw, &mut i, "--api")?),
+            "--branch" => branch = Some(take_value(raw, &mut i, "--branch")?),
+            "--status" => status = Some(take_value(raw, &mut i, "--status")?),
+            "--owner" => owner = take_value(raw, &mut i, "--owner")?,
+            other => return Err(format!("unknown flag `{other}`")),
+        }
+        i += 1;
+    }
+    let branch = branch.ok_or("--branch NAME is required")?;
+    let status = status.ok_or("--status STATUS is required (pending|approved|rejected)")?;
+    if !matches!(status.as_str(), "pending" | "approved" | "rejected") {
+        return Err(format!("invalid --status `{status}` (pending|approved|rejected)"));
+    }
+    let cp = ControlPlane::from_env_or(api);
+    let branch_id = resolve_branch_id(&cp, &owner, &branch)?;
+    cp.review_branch(
+        &branch_id,
+        &json!({ "status": status, "requested_by": "chm-branches" }),
+    )?;
+    println!("branch `{branch}` review status set to `{status}`");
+    Ok(())
+}
+
+fn cmd_branch_merge(raw: &[String]) -> Result<(), String> {
+    let mut api = None;
+    let mut target = None;
+    let mut from = None;
+    let mut owner = default_owner();
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i].as_str() {
+            "--api" => api = Some(take_value(raw, &mut i, "--api")?),
+            "--target" => target = Some(take_value(raw, &mut i, "--target")?),
+            "--from" | "--source" => from = Some(take_value(raw, &mut i, "--from")?),
+            "--owner" => owner = take_value(raw, &mut i, "--owner")?,
+            other => return Err(format!("unknown flag `{other}`")),
+        }
+        i += 1;
+    }
+    let target = target.ok_or("--target NAME is required")?;
+    let from = from.ok_or("--from NAME is required")?;
+    let cp = ControlPlane::from_env_or(api);
+    let target_id = resolve_branch_id(&cp, &owner, &target)?;
+    let resp = cp.merge_branch(
+        &target_id,
+        &json!({ "owner": owner, "from": from, "requested_by": "chm-branches" }),
+    )?;
+    let ff = resp.get("fast_forward").and_then(Value::as_bool).unwrap_or(false);
+    let new_head = resp
+        .get("new_head_snapshot_id")
+        .and_then(Value::as_str)
+        .unwrap_or("?");
+    println!(
+        "merged `{from}` into `{target}` ({}) — new head {new_head}",
+        if ff { "fast-forward" } else { "adopted source head" }
+    );
+    Ok(())
 }
 
 fn cmd_branches(api: Option<String>, owner: Option<&str>, as_json: bool) -> Result<(), String> {
