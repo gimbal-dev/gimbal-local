@@ -116,7 +116,7 @@ from cache in 0.077 s).
 | **M25 · Live local lifecycle** | ① | **Complete** (one perf ceiling: runtime memfd page-sharing) | #4, #6 |
 | **M30 · Security hardening** | trust/isolation | **P0 + no-FS guard shipped** (#33–#35, #37); signing + limits next (#36, #38) | #33–#39 |
 | **M27 · Plane-native edge** | ② | **push/pull shipped** (#7 core); postcopy memory + disk plane next (#5) | #5, #7 |
-| **M28 · Consistent controls** | ③ | Waits on the gctl policy contract | #20 |
+| **M28 · Consistent controls** | ③ | **Planned** ([network-policy-plan.md](network-policy-plan.md)) — userspace-NAT egress enforcement; #49–#53 | #20 |
 | **M29 · Observability & cost** | ④ | Waits on the gctl telemetry contract | — |
 
 ### M25 · Live local lifecycle — suspend · resume · fork
@@ -217,15 +217,28 @@ is never *stuck* — just not yet demand-faulting the working set.
 
 ### M28 · Consistent sandbox controls — filesystem + network/firewall
 
-Pillar ③ (#20). The plane authors a per-sandbox `SandboxPolicy` (egress
-allow/deny + filesystem read/write scopes + declared mounts), versioned and
-content-addressed so it teleports *with* the session; every `assign-run` / resume
-carries `policy` + `policy_digest`. Gimbal Local is **one of the two enforcers**:
-it applies egress and fs-scoping on the Mac network + block path and reports
-allowed/denied decisions as audit events. MVP is deliberately small — a
-destination allow/deny list and read-only vs read-write path scopes — not full
-role management or per-page ACLs. This needs the canonical policy contract from
-gctl before it can be built.
+Pillar ③ (#20) — **the product must-have, now planned:
+[`network-policy-plan.md`](network-policy-plan.md).** The plane authors a
+per-sandbox `SandboxPolicy` (egress allow/deny + fs read/write scopes + mounts),
+content-addressed so it teleports *with* the session; every `assign-run`/resume
+carries the compiled `enforcement.chm_profile` + `policy_digest`. Gimbal Local is
+**one of the two enforcers**.
+
+**The key realisation:** `chm` already mediates 100% of the guest's network (one
+`NetResponder` seam; no tap/bridge/host route). Replacing the current echo stub
+with a **userspace NAT** — a TCP/IP stack that relays the guest's flows through
+host sockets `chm` opens — makes networking *real* **and** makes enforcement
+*authoritative* in one stroke: because `chm` is the process that dials,
+default-deny is literally "don't open the socket," and the guest has no path
+around us. Same model as gVisor/slirp/passt.
+
+Staged: **M28.1** policy plumbing + digest teleport (#49, no datapath change) →
+**M28.2** userspace egress NAT (#50, the hard engine work) → **M28.3** the
+allow-list gate at DNS + TCP-connect (#51) → **M28.4** the demo + teleport proof
+(#52) → **M28.5** fs scopes (#53, modest — no host-FS passthrough exists, so this
+scopes overlays/mounts). The demo it must land: the plane sets *allow-list only
+for sandbox N*, it follows the sandbox down, and the guest **provably can't get
+out** except to the allow-list.
 
 ### M29 · Observability & cost — logging, insights, both sides
 
