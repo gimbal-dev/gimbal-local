@@ -922,9 +922,11 @@ fn workspace(raw: &[String]) -> Result<ExitCode, String> {
              Create an isolated sandbox workspace: it shares IMAGE_DIR's\n\
              read-only base (state.json, snapshot/, disks/ are symlinked) but\n\
              keeps its own disk overlays + checkpoint/revision store, so several\n\
-             sandboxes from one image diverge independently. Run it with\n\
-             `chm run <WORKSPACE_DIR>` (cold) — a later suspend saves a\n\
-             checkpoint inside the workspace."
+             sandboxes from one image diverge independently. If the image ships\n\
+             a golden checkpoint the workspace is seeded from it and resumes\n\
+             that settled state (`chm connect <WORKSPACE_DIR> --checkpoint`);\n\
+             otherwise `chm run <WORKSPACE_DIR>` cold-boots it. Either way a\n\
+             later suspend saves a checkpoint inside the workspace."
         );
         return if positionals.len() == 2 {
             Ok(ExitCode::SUCCESS)
