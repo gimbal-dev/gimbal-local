@@ -147,21 +147,36 @@ capture in the corpus was taken without `--net`, so the capture path must add a
 virtio-net device (guest configured `192.168.249.2/24`, gw `.1`) before the
 end-to-end demo can run on real HVF.**
 
-### M28.3 · The egress gate — allow-list enforcement  **[small, given M28.2]**
+### M28.3 · The egress gate — allow-list enforcement  **[small, given M28.2 — SHIPPED]**
 
-Insert the `chm_profile` egress decision at the two authoritative points the NAT
-already owns:
+Inserted the `chm_profile` egress decision at the two authoritative points the
+NAT already owns:
 
-- **DNS resolve**: answer only names permitted by the allow-list; refuse the rest
-  (defeats "resolve elsewhere").
-- **TCP connect**: before `chm` dials, match the destination (resolved IP + the
-  originating name, host + port) against `egress` (author order, first match
-  wins) falling back to `default`. Allow → dial; deny → refuse the guest's
-  connection **and** `report-policy-decision`.
-- Dual name+IP checks defeat the hardcoded-IP bypass.
+- **DNS resolve**: only names permitted by the allow-list are resolved through
+  the host; the rest are answered `REFUSED`, so the guest never learns the
+  address (defeats "resolve elsewhere").
+- **TCP connect**: before `chm` dials, the destination (resolved IP, plus the
+  originating name via a resolve cache, host + port) is matched against `egress`
+  (deny rules first, then allow, then `default`). Allow → arm the smoltcp
+  listener + dial the host socket; deny → no listener is armed, so smoltcp RSTs
+  the SYN and `chm` never opens a socket.
+- Dual name+IP checks defeat the hardcoded-IP bypass: a raw-IP connect the guest
+  never resolved through us matches no hostname rule and falls to `default`
+  (deny under a locked-down policy).
+- Each denial is logged to the console once per unique target
+  (`chm: [egress] DENY …`) — the visible enforcement proof.
 
-*Acceptance:* under `default: deny, allow: [api.github.com:443]`, the guest reaches
-api.github.com and **fails every other destination**, each denial audited.
+**How the profile reaches the datapath:** the runner (`run_assignment`) verifies
+the digest (M28.1), then hands the compiled egress profile to the `chm run`
+subprocess that boots the VM via the `CHM_EGRESS_POLICY` env var; `wire_virtio`
+parses it into an `EgressPolicy` and threads it into the net device's NAT.
+
+*Proven:* an in-CI relay test builds a NAT under `default: deny, allow:
+[127.0.0.1:<echo>]` — the allow-listed destination connects and echoes, an
+unlisted one is refused with a recorded denial. `chm` unit tests cover the
+`CHM_EGRESS_POLICY` parse. *Deferred to M28.4:* reporting per-flow denials to the
+plane's audit log (cross-process), and the live guest demo (needs a net-enabled
+snapshot).
 
 ### M28.4 · The demo + provenance proof  **[the product acceptance]**
 

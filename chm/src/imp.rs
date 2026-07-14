@@ -30,6 +30,7 @@ use hypervisor::hvf::rehydrate::{
     restore_vcpu_state,
 };
 use hypervisor::hvf::virtio::GuestMemory;
+use hypervisor::hvf::virtio::nat::EgressPolicy;
 use hypervisor::hvf::virtio::pci::{MsiSink, MsiSpiInjector, VirtioPciDevice};
 use hypervisor::hvf::virtio::{devmgr, its};
 use hypervisor::{HypervisorVmError, StandardRegisters, Vcpu, VmExit, VmOps};
@@ -331,6 +332,12 @@ pub(crate) fn wire_virtio(
     let msi_sink: Option<Arc<dyn MsiSink>> =
         gic.map(|g| Arc::new(GicMsiSink::new(g.clone())) as Arc<dyn MsiSink>);
 
+    // The control-plane egress policy for this sandbox, if the runner bound one
+    // (M28.3). It rides in through `CHM_EGRESS_POLICY` — a process boundary,
+    // since the runner re-execs `chm run` to boot the VM — and is enforced by
+    // the net device's userspace NAT at the DNS resolve + host connect.
+    let mut net_policy = load_egress_policy();
+
     for desc in &descs {
         let kind = match &desc.backend {
             devmgr::BackendKind::Block { nsectors, .. } => {
@@ -342,8 +349,11 @@ pub(crate) fn wire_virtio(
                 format!("virtio type {virtio_type} {}", desc.name)
             }
         };
-        let (base, size, dev) = devmgr::build_device(desc, guest_mem.clone(), overlay_dir, resume)
-            .map_err(|e| format!("build device {}: {e}", desc.name))?;
+        let is_net = matches!(desc.backend, devmgr::BackendKind::Net);
+        let policy = if is_net { net_policy.take() } else { None };
+        let (base, size, dev) =
+            devmgr::build_device(desc, guest_mem.clone(), overlay_dir, resume, policy)
+                .map_err(|e| format!("build device {}: {e}", desc.name))?;
         if !desc.vector_events.is_empty() {
             if let Some(its) = &its_engine {
                 // LPI-routed (bypass mode): resolve to the guest's real LPI and
@@ -385,6 +395,54 @@ pub(crate) fn wire_virtio(
         summary,
         net_devices,
     })
+}
+
+/// Load the control-plane egress policy the runner bound for this sandbox from
+/// the `CHM_EGRESS_POLICY` environment variable (set by `run_assignment` before
+/// it re-execs `chm run`). The value is a compact JSON object:
+///
+/// ```json
+/// {"digest":"sha256:…","default":"deny","allow":["api.github.com:443"],"deny":[]}
+/// ```
+///
+/// Returns `None` when unset or unparseable (the guest then gets unrestricted
+/// egress) — a malformed policy is logged but must not silently *tighten* or
+/// crash the boot; the runner already verified the digest before setting it.
+fn load_egress_policy() -> Option<EgressPolicy> {
+    let raw = env::var("CHM_EGRESS_POLICY").ok()?;
+    parse_egress_policy(&raw)
+}
+
+/// Parse a `CHM_EGRESS_POLICY` JSON document into an [`EgressPolicy`]. Returns
+/// `None` when the document is not valid JSON — a malformed policy is logged but
+/// must not silently *tighten* or crash the boot; the runner already verified
+/// the digest before setting it.
+fn parse_egress_policy(raw: &str) -> Option<EgressPolicy> {
+    let v: serde_json::Value = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("chm: warning: ignoring malformed CHM_EGRESS_POLICY ({e})");
+            return None;
+        }
+    };
+    let default = v.get("default").and_then(|d| d.as_str()).unwrap_or("allow");
+    let strings = |key: &str| -> Vec<String> {
+        v.get(key)
+            .and_then(|a| a.as_array())
+            .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
+            .unwrap_or_default()
+    };
+    let label = v
+        .get("digest")
+        .and_then(|d| d.as_str())
+        .unwrap_or("control-plane")
+        .to_string();
+    Some(EgressPolicy::from_profile(
+        default,
+        &strings("allow"),
+        &strings("deny"),
+        label,
+    ))
 }
 
 /// The result of wiring the virtio device tree: a human summary plus the net
@@ -1713,6 +1771,30 @@ fn banner(dir: &Path, mem_ranges: &Path, num_vcpus: u32, total_ram: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_egress_policy_builds_a_restrictive_allow_list() {
+        let raw = r#"{"digest":"sha256:abc","default":"deny",
+            "allow":["api.github.com:443"],"deny":["blocked.test"]}"#;
+        let p = parse_egress_policy(raw).expect("parse");
+        assert!(p.is_restrictive());
+        assert_eq!(p.label(), "sha256:abc");
+        assert!(p.decide_dns("api.github.com").is_allow());
+        assert!(!p.decide_dns("evil.test").is_allow(), "unlisted name denied");
+        assert!(!p.decide_dns("blocked.test").is_allow(), "deny rule wins");
+    }
+
+    #[test]
+    fn parse_egress_policy_defaults_to_allow_when_unspecified() {
+        let p = parse_egress_policy(r#"{"digest":"sha256:x"}"#).expect("parse");
+        assert!(!p.is_restrictive(), "no default/deny => allow-all");
+        assert!(p.decide_dns("anything.test").is_allow());
+    }
+
+    #[test]
+    fn parse_egress_policy_rejects_malformed_json() {
+        assert!(parse_egress_policy("not json").is_none());
+    }
 
     #[test]
     fn parse_connect_accepts_session_lock() {

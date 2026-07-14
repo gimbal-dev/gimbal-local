@@ -109,25 +109,15 @@ fn pump(guest: &mut Guest, nat: &mut NatResponder) {
     }
 }
 
-#[test]
-fn relays_guest_tcp_to_a_host_echo_server() {
-    let port = spawn_echo_server();
-    let mut nat = NatResponder::new(
-        [192, 168, 249, 1],
-        [0x02, 0, 0, 0, 0, 1],
-        EgressPolicy::allow_all(),
-    );
+/// Drive a fresh guest connecting to `dst` through `nat`, sending `payload` once
+/// connected and collecting the echoed reply. Returns the bytes received.
+fn drive_echo(nat: &mut NatResponder, dst: SocketAddrV4, payload: &[u8]) -> Vec<u8> {
     let mut guest = Guest::new();
-    let dst = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port);
     guest.connect(dst);
-
-    let payload = b"hello nat";
     let mut sent = false;
     let mut received: Vec<u8> = Vec::new();
-
     for _ in 0..4000 {
-        pump(&mut guest, &mut nat);
-
+        pump(&mut guest, nat);
         let s = guest.sockets.get_mut::<tcp::Socket>(guest.sock);
         if !sent && s.can_send() {
             s.send_slice(payload).expect("guest send");
@@ -144,9 +134,45 @@ fn relays_guest_tcp_to_a_host_echo_server() {
         }
         std::thread::sleep(std::time::Duration::from_millis(1));
     }
+    received
+}
 
+/// Drive a fresh guest connecting to `dst` through `nat` and report whether the
+/// connection was refused (never established) and whether a denied tcp egress
+/// event was recorded.
+fn drive_expect_refused(nat: &mut NatResponder, dst: SocketAddrV4) -> (bool, bool) {
+    let mut guest = Guest::new();
+    guest.connect(dst);
+    let mut refused = false;
+    let mut denied_event = false;
+    for _ in 0..500 {
+        pump(&mut guest, nat);
+        if nat.drain_events().iter().any(|e| e.domain == "tcp" && !e.allowed) {
+            denied_event = true;
+        }
+        let s = guest.sockets.get_mut::<tcp::Socket>(guest.sock);
+        if !s.is_active() && s.state() != tcp::State::SynSent {
+            refused = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    (refused, denied_event)
+}
+
+#[test]
+fn relays_guest_tcp_to_a_host_echo_server() {
+    let port = spawn_echo_server();
+    let mut nat = NatResponder::new(
+        [192, 168, 249, 1],
+        [0x02, 0, 0, 0, 0, 1],
+        EgressPolicy::allow_all(),
+    );
+    let dst = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port);
+    let payload = b"hello nat";
     assert_eq!(
-        received, payload,
+        drive_echo(&mut nat, dst, payload),
+        payload,
         "the echo server's reply must reach the guest through the NAT"
     );
 }
@@ -162,33 +188,44 @@ fn default_deny_refuses_the_connection() {
         [0x02, 0, 0, 0, 0, 1],
         EgressPolicy::from_profile("deny", &[], &[], "locked"),
     );
-    let mut guest = Guest::new();
     let dst = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port);
-    guest.connect(dst);
-
-    let mut refused = false;
-    let mut denied_event = false;
-    for _ in 0..500 {
-        pump(&mut guest, &mut nat);
-        if nat.drain_events().iter().any(|e| e.domain == "tcp" && !e.allowed) {
-            denied_event = true;
-        }
-        let s = guest.sockets.get_mut::<tcp::Socket>(guest.sock);
-        // A RST drives the guest socket to a closed/non-active state.
-        if !s.is_active() && s.state() != tcp::State::SynSent {
-            refused = true;
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-
+    let (refused, denied_event) = drive_expect_refused(&mut nat, dst);
     assert!(denied_event, "a denied tcp egress event must be recorded");
     assert!(refused, "the guest connection must not establish under default-deny");
-    assert!(nat_never_listened(&nat), "no listener may be armed for a denied dst");
+    assert!(nat.listeners.is_empty(), "no listener may be armed for a denied dst");
 }
 
-/// True if the NAT holds no armed listeners (a denied connect must not create
-/// one).
-fn nat_never_listened(nat: &NatResponder) -> bool {
-    nat.listeners.is_empty()
+#[test]
+fn allow_list_permits_listed_and_refuses_unlisted() {
+    // The product-critical property (M28.3): with a default-deny policy that
+    // allows exactly one destination, the guest reaches the allowed host and is
+    // refused everywhere else. Enforced at the TCP connect the NAT mediates.
+    let port = spawn_echo_server();
+    let allowed = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port);
+    let denied = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port.wrapping_add(1).max(1));
+    let profile_allow = vec![format!("127.0.0.1:{port}")];
+
+    // Allowed destination: the flow establishes and echoes.
+    let mut nat_allow = NatResponder::new(
+        [192, 168, 249, 1],
+        [0x02, 0, 0, 0, 0, 1],
+        EgressPolicy::from_profile("deny", &profile_allow, &[], "sha256:test"),
+    );
+    let payload = b"through the gate";
+    assert_eq!(
+        drive_echo(&mut nat_allow, allowed, payload),
+        payload,
+        "the allow-listed destination must be reachable"
+    );
+
+    // Unlisted destination under the SAME allow-list: refused.
+    let mut nat_deny = NatResponder::new(
+        [192, 168, 249, 1],
+        [0x02, 0, 0, 0, 0, 1],
+        EgressPolicy::from_profile("deny", &profile_allow, &[], "sha256:test"),
+    );
+    let (refused, denied_event) = drive_expect_refused(&mut nat_deny, denied);
+    assert!(denied_event, "the unlisted destination must record a denial");
+    assert!(refused, "the unlisted destination must not establish");
 }
+

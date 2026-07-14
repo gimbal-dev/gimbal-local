@@ -811,6 +811,22 @@ fn run_assignment(cp: &ControlPlane, runner_id: &str, opts: &RunOpts) -> Result<
     match policy::parse_and_verify(&assign) {
         Ok(Some(governed)) => {
             eprintln!("chm runner: {}", governed.summary());
+            // Hand the egress profile down to the `chm run` subprocess (which
+            // actually boots the VM) so its userspace NAT enforces the
+            // allow-list at the DNS resolve + host connect (M28.3). The digest
+            // was just verified, so the child can trust this value.
+            let egress = &governed.profile.egress;
+            let egress_json = json!({
+                "digest": governed.digest,
+                "default": egress.default,
+                "allow": egress.allow,
+                "deny": egress.deny,
+            });
+            // SAFETY: single-threaded runner setup; the value is consumed by the
+            // child `chm run` we spawn later in this function.
+            unsafe {
+                env::set_var("CHM_EGRESS_POLICY", egress_json.to_string());
+            }
             cp.report_policy_decision(
                 &sandbox_id,
                 &json!({

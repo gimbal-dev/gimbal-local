@@ -42,7 +42,7 @@ use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::{tcp, udp};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::sync::mpsc;
@@ -103,6 +103,9 @@ pub struct NatResponder {
     listeners: HashMap<SocketAddrV4, SocketHandle>,
     flows: Vec<Flow>,
     events: Vec<EgressEvent>,
+    /// Denials already logged to the console, keyed by `"domain target"`, so a
+    /// guest retransmitting a blocked SYN doesn't spam the operator.
+    logged_denials: HashSet<String>,
     gateway_ip: Ipv4Addr,
     boot: Instant,
 }
@@ -138,6 +141,7 @@ impl NatResponder {
             listeners: HashMap::new(),
             flows: Vec::new(),
             events: Vec::new(),
+            logged_denials: HashSet::new(),
             gateway_ip: gw,
             boot,
         }
@@ -146,6 +150,18 @@ impl NatResponder {
     /// Take the egress-decision events accumulated since the last drain.
     pub fn drain_events(&mut self) -> Vec<EgressEvent> {
         std::mem::take(&mut self.events)
+    }
+
+    /// Log a blocked flow to the console once per unique target — the visible
+    /// proof that the control-plane allow-list is being enforced on the Mac.
+    fn note_denial(&mut self, domain: &str, target: &str, rule: &str) {
+        let key = format!("{domain} {target}");
+        if self.logged_denials.insert(key) {
+            eprintln!(
+                "chm: [egress] DENY {domain} {target} ({rule}) — sandbox policy {}",
+                self.policy.label()
+            );
+        }
     }
 
     /// The governing policy label (digest or `"allow-all"`).
@@ -175,6 +191,7 @@ impl NatResponder {
             rule: decision.rule().to_string(),
         });
         if !allowed {
+            self.note_denial("tcp", &dst.to_string(), decision.rule());
             return false;
         }
         if self.listeners.contains_key(&dst) {
@@ -250,6 +267,7 @@ impl NatResponder {
             rule: decision.rule().to_string(),
         });
         if !allowed {
+            self.note_denial("dns", &query.name, decision.rule());
             return dns::Outcome::Refused;
         }
         match host_resolve_a(&query.name) {

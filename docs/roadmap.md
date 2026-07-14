@@ -116,7 +116,7 @@ from cache in 0.077 s).
 | **M25 · Live local lifecycle** | ① | **Complete** (one perf ceiling: runtime memfd page-sharing) | #4, #6 |
 | **M30 · Security hardening** | trust/isolation | **P0 + no-FS guard shipped** (#33–#35, #37); signing + limits next (#36, #38) | #33–#39 |
 | **M27 · Plane-native edge** | ② | **push/pull shipped** (#7 core); postcopy memory + disk plane next (#5) | #5, #7 |
-| **M28 · Consistent controls** | ③ | **M28.1 shipped** (policy plumbing + digest teleport); NAT + gate next (#50–#53) | #20 |
+| **M28 · Consistent controls** | ③ | **M28.1–M28.3 shipped** (policy plumbing + digest teleport; userspace egress NAT; allow-list gate at DNS + TCP-connect). Demo + fs scopes next (#52–#53); needs a net-enabled snapshot for the live demo. | #20 |
 | **M29 · Observability & cost** | ④ | Waits on the gctl telemetry contract | — |
 
 ### M25 · Live local lifecycle — suspend · resume · fork
@@ -232,13 +232,19 @@ host sockets `chm` opens — makes networking *real* **and** makes enforcement
 default-deny is literally "don't open the socket," and the guest has no path
 around us. Same model as gVisor/slirp/passt.
 
-Staged: **M28.1** policy plumbing + digest teleport (#49, no datapath change) →
-**M28.2** userspace egress NAT (#50, the hard engine work) → **M28.3** the
-allow-list gate at DNS + TCP-connect (#51) → **M28.4** the demo + teleport proof
-(#52) → **M28.5** fs scopes (#53, modest — no host-FS passthrough exists, so this
-scopes overlays/mounts). The demo it must land: the plane sets *allow-list only
-for sandbox N*, it follows the sandbox down, and the guest **provably can't get
-out** except to the allow-list.
+Staged: **M28.1** policy plumbing + digest teleport (#49, no datapath change,
+shipped) → **M28.2** userspace egress NAT (#50, the hard engine work — shipped:
+real IPv4 TCP + DNS through a smoltcp NAT, proven by an in-CI relay test) →
+**M28.3** the allow-list gate at DNS + TCP-connect (#51, shipped: the verified
+`chm_profile` teleports through `CHM_EGRESS_POLICY` into the NAT, which refuses
+unlisted DNS names and TCP connects and logs each denial) → **M28.4** the demo +
+teleport proof (#52) → **M28.5** fs scopes (#53, modest — no host-FS passthrough
+exists, so this scopes overlays/mounts). The demo it must land: the plane sets
+*allow-list only for sandbox N*, it follows the sandbox down, and the guest
+**provably can't get out** except to the allow-list. **Remaining before the live
+demo: a net-enabled snapshot** — every capture in the corpus was taken without
+`--net`, so the capture path needs a virtio-net device before guest egress can be
+exercised end-to-end on real HVF.
 
 ### M29 · Observability & cost — logging, insights, both sides
 
