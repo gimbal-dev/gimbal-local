@@ -17,3 +17,9 @@ __pycache__
 # copy-on-write overlays must never be committed.
 /snapshots/
 **/.chm-overlays/
+# Per-run overlays, live checkpoints, the revision store, and the desktop app's
+# per-sandbox workspace dirs are all machine-local runtime state the app/daemon
+# create under the working directory; never commit them.
+**/.chm-revisions/
+**/.chm-checkpoint/
+/.chm-workspaces/
