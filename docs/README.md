@@ -18,6 +18,7 @@ Gimbal Local app — these are the docs you want:
 | [`networking.md`](networking.md) | User guide: how a rehydrated guest reaches the network through the userspace NAT, and how the control-plane egress allow-list is enforced locally (DNS + TCP connect). |
 | [`state-cdn-memory-plane.md`](state-cdn-memory-plane.md) | How `chm` consumes the control plane's content-addressed, encrypted memory plane (Phase 2), and the honest demand-fault gap. |
 | [`macos-local-runtime.md`](macos-local-runtime.md) | Architecture of the HVF port: how a KVM snapshot is translated and rehydrated onto Apple Hypervisor.framework. |
+| [`gimbal-local-fork-model.md`](gimbal-local-fork-model.md) | How Gimbal Local models images, live checkpoints, and running sandboxes as a fork-based, branchable lineage — the local edge of the control plane's revision graph. |
 | [`hvf-compatible-snapshots.md`](hvf-compatible-snapshots.md) | The snapshot contract: GICv2M/message-SPI interrupt mode, why ITS/LPI snapshots are unsupported, and the disk + copy-on-write requirement. |
 | [`aws-byo-setup.md`](aws-byo-setup.md) | Bring-your-own-AWS setup for the remote→local→remote capture loop (`chm cloud …`). |
 | [`raspberry-pi-offbox-plan.md`](raspberry-pi-offbox-plan.md) | Plan for off-box snapshot capture on a Raspberry Pi / ARM Linux host. |
