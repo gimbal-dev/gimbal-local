@@ -90,16 +90,87 @@ stack through the NAT to a real host socket (`hypervisor` crate,
 `hvf::virtio::nat` — an allow-listed destination connects, an unlisted one is
 refused). To run the **guest-side** demo you need a snapshot that was captured
 **with a network device**: the captures in the current corpus were taken without
-`--net`, so their guests have no NIC. A net-enabled capture must:
+`--net`, so their guests have no NIC.
 
-- boot cloud-hypervisor with a `--net` device, and
-- configure the guest statically as `192.168.249.2/24`, gateway `192.168.249.1`
-  (the address the NAT presents).
+### Capturing a net-enabled snapshot
 
-Once such a snapshot exists, resuming it under a default-deny+allow-list policy
-demonstrates the full loop: *the plane sets an allow-list for sandbox N, it
-follows the sandbox down, and the guest provably can't get out except to the
-allow-list.*
+The capture pipeline (`scripts/hvf/capture-arm-snapshot.sh`) boots a throwaway
+Ubuntu guest under cloud-hypervisor and snapshots it. To make its snapshot carry
+a usable virtio-net device, two things must change in that boot:
+
+1. **Give cloud-hypervisor a NIC.** Add a `--net` device to the boot command. When
+   run privileged (the capture already boots under `sudo`), cloud-hypervisor
+   auto-creates the backing tap:
+
+   ```
+   --net tap=,mac=12:34:56:78:9a:bc
+   ```
+
+   The tap needs no real uplink — the guest only has to *have* the NIC and
+   configure it, so the device state lands in the snapshot. On the Mac, `chm`'s
+   userspace NAT provides the actual connectivity.
+
+2. **Configure the guest statically to match the NAT.** Add a netplan file to the
+   NoCloud seed's `write_files` so the guest comes up on the address the NAT
+   presents:
+
+   ```yaml
+   - path: /etc/netplan/50-chm.yaml
+     permissions: '0644'
+     content: |
+       network:
+         version: 2
+         ethernets:
+           enp0s1:              # the virtio-net iface name; verify in the guest
+             addresses: [192.168.249.2/24]
+             routes:
+               - to: default
+                 via: 192.168.249.1
+             nameservers:
+               addresses: [192.168.249.1]
+   ```
+
+   (and `netplan apply` in `runcmd` before the readiness marker).
+
+The gateway/nameserver `192.168.249.1` and guest `192.168.249.2/24` are the
+addresses the NAT hard-codes today.
+
+### Running the demo
+
+Once a net-enabled snapshot exists and is registered with the control plane:
+
+1. **Bind an allow-list to the sandbox** (plane side). Author a default-deny
+   policy that allows exactly one host, then bind it:
+
+   ```console
+   $ curl -s localhost:8080/policies -d '{"version":1,"default_egress":"deny",
+       "egress":[{"action":"allow","host":"api.github.com","ports":[443]}]}'
+   # → returns a policy_digest, e.g. sha256:147f…
+   $ curl -s localhost:8080/sandboxes/$SBX/policy \
+       -d '{"policy_digest":"sha256:147f…","requested_by":"demo"}'
+   ```
+
+2. **Bring the sandbox down and run it** (Mac side). The runner verifies the
+   digest teleported intact, hands the profile to `chm run`, and the NAT enforces
+   it. On the guest console you'll see:
+
+   ```
+   chm runner: governed by sha256:147f… · egress default=deny, 1 rule(s) · digest verified
+   chm: virtio-net _net0 governed by egress policy sha256:147f… (default-deny enforced at the NAT)
+   ```
+
+3. **Prove it from inside the guest.** The allowed host works; everything else is
+   refused, and each denial is logged:
+
+   ```console
+   guest$ curl https://api.github.com      # ✅ succeeds — allow-listed
+   guest$ curl https://example.com         # ⛔ refused
+   # host console: chm: [egress] DENY dns example.com (default-deny) — sandbox policy sha256:147f…
+   ```
+
+4. **Prove the teleport.** The `policy_digest` that governed the cloud run is the
+   same one `chm policy show --sandbox $SBX` reports and that the runner verified
+   on resume — one content-addressed policy, both sides.
 
 ## Scope & non-goals
 
