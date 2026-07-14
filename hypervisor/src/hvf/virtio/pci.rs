@@ -295,6 +295,16 @@ impl VirtioPciDevice {
             inner.notify(qi);
         }
     }
+
+    /// Advance an async net responder (the userspace egress NAT) and inject any
+    /// frames it produced into the guest's RX queue. Returns whether a frame
+    /// reached the guest. Driven by the net service thread on a periodic tick,
+    /// off the vCPU thread; interrupt injection is delivered cross-thread
+    /// through the GIC exactly as the vtimer/serial paths are. A no-op for
+    /// non-net devices.
+    pub fn service_net(&self) -> bool {
+        self.inner.lock().unwrap().service_net()
+    }
 }
 
 impl Inner {
@@ -427,8 +437,8 @@ impl Inner {
     /// for: each frame gets a zeroed virtio-net header (`num_buffers = 1`) and is
     /// written into one popped RX descriptor chain, then the RX completion vector
     /// is signalled. A frame with no available buffer is requeued for the next RX
-    /// notify.
-    fn flush_rx(&mut self) {
+    /// notify. Returns whether any frame was delivered into the guest.
+    fn flush_rx(&mut self) -> bool {
         let mem = self.mem.clone();
         let mut delivered = false;
         let old_used = self
@@ -500,6 +510,22 @@ impl Inner {
                 let _ = rx.arm_notification(&mem);
             }
         }
+        delivered
+    }
+
+    /// Advance the net responder's asynchronous work (a userspace NAT polling
+    /// its host sockets) and deliver any produced frames into the guest's
+    /// receive queue. Returns whether a frame reached the guest, so the caller
+    /// can wake a parked vCPU to take the RX completion promptly. A no-op for a
+    /// non-net backend.
+    fn service_net(&mut self) -> bool {
+        match &mut self.backend {
+            Backend::Net(n) => {
+                n.service();
+            }
+            _ => return false,
+        }
+        self.flush_rx()
     }
 
     fn read_common(&self, offset: u64, data: &mut [u8]) {

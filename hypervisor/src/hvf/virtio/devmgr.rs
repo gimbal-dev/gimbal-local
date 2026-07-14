@@ -14,7 +14,8 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use super::block::{BlockBackend, BlockDevice, FileBackend, OverlayBackend};
-use super::net::{EchoResponder, NetDevice};
+use super::nat::{EgressPolicy, NatResponder};
+use super::net::NetDevice;
 use super::pathsafe;
 use super::pci::{Backend, RestoreParams, VirtioPciDevice, CAPABILITY_BAR_SIZE};
 use super::queue::Queue;
@@ -413,6 +414,7 @@ pub fn build_device(
     mem: Arc<GuestMemory>,
     overlay_dir: &std::path::Path,
     resume: bool,
+    net_policy: Option<EgressPolicy>,
 ) -> Result<(u64, u64, Arc<VirtioPciDevice>), DevMgrError> {
     let queues = desc
         .queues
@@ -438,11 +440,22 @@ pub fn build_device(
             (Backend::Rng(RngDevice::new(Box::new(src))), Vec::new())
         }
         BackendKind::Net => {
-            // The gateway the resumed guest talks to. The capture-side
-            // cloud-init configures the guest as 192.168.249.2/24 with this
-            // gateway, so the host responder owns .1 and answers the guest's
-            // ARP + ICMP echo over the deliverable message-based-SPI path.
-            let responder = EchoResponder::new([192, 168, 249, 1], [0x02, 0, 0, 0, 0, 1]);
+            // The gateway the resumed guest talks to. Capture-side cloud-init
+            // configures the guest as 192.168.249.2/24 with this gateway, so the
+            // NAT owns .1 and terminates the guest's flows. The control-plane
+            // egress profile (verified by `chm`, M28.1) is enforced here at the
+            // DNS resolve + host connect the NAT mediates; absent a bound policy
+            // the guest gets unrestricted egress (allow-all).
+            let policy = net_policy.unwrap_or_else(EgressPolicy::allow_all);
+            if policy.is_restrictive() {
+                eprintln!(
+                    "chm: virtio-net {} governed by egress policy {} (default-deny \
+                     enforced at the NAT)",
+                    desc.name,
+                    policy.label()
+                );
+            }
+            let responder = NatResponder::new([192, 168, 249, 1], [0x02, 0, 0, 0, 0, 1], policy);
             (Backend::Net(NetDevice::new(Box::new(responder))), Vec::new())
         }
         BackendKind::Unsupported { virtio_type } => {

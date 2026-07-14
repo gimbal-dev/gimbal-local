@@ -113,40 +113,70 @@ byte-for-byte in a unit test against the captured assignment.
 *App governance badge is sequenced into M28.4* (the demo), where the bring-down
 flow establishes the cloud-sandbox ↔ plane-sandbox id linkage the badge needs.
 
-### M28.2 · Userspace egress NAT — real guest networking  **[the hard engine work]**
+### M28.2 · Userspace egress NAT — real guest networking  **[the hard engine work — SHIPPED]**
 
-Replace `EchoResponder` with a `NatResponder` giving the guest **real outbound
-networking**, scoped to what the demo needs:
+Replaced `EchoResponder` with a `NatResponder` giving the guest **real outbound
+networking**:
 
-- A userspace TCP/IP stack (**smoltcp** — see Decisions) terminates the guest's
-  Ethernet/IP frames at the `NetResponder` seam.
-- Guest bring-up: answer **DHCP** (or honor the snapshot's static IP) so the
-  guest configures its NIC + default route + DNS to our virtual gateway; keep the
-  ARP responder.
-- **DNS**: forward guest queries to the host resolver and return answers.
-- **TCP**: on a guest SYN, `chm` opens a host `TcpStream` to the destination and
-  relays bytes both ways (connection-proxy NAT). UDP + ICMP best-effort.
-- No enforcement yet — this stage is "the guest can `curl` the internet through
-  chm," proven by reaching a real host.
+- A userspace TCP/IP stack (**smoltcp**, a justified new dep, `hvf`-gated so
+  Linux/KVM builds don't pull it) terminates the guest's Ethernet/IP frames at
+  the `NetResponder` seam. AnyIP + a default route to our own address let it
+  accept connections to **arbitrary destinations** — no header rewriting.
+- Guest bring-up: the guest keeps its capture-side static IP
+  (`192.168.249.2/24`, gateway `.1`); the NAT owns `.1` and answers its ARP.
+- **DNS**: a small server parses the guest's queries (bound to `:53` on any
+  local address, so it catches whatever resolver the guest was pointed at),
+  resolves permitted names through the host resolver, and replies.
+- **TCP**: on a guest SYN, `chm` opens a host `TcpStream` to the destination (on
+  a short-lived connect thread) and relays bytes both ways with backpressure — a
+  connection-proxy NAT. The relay is driven off the vCPU thread by a **net
+  service thread** that polls host sockets and injects frames into the guest RX
+  queue, waking the vCPU to take the completion.
+- Enforcement seam is wired but set to **allow-all** here; M28.3 threads the real
+  profile in.
 
-*Acceptance:* a resumed guest runs `curl https://api.github.com` and gets a real
-response, through the userspace NAT, on an unentitled Mac.
+*Shipped surface:* IPv4 TCP + DNS (A records). UDP-beyond-DNS, IPv6, and
+inbound/listen are out of V0 scope (answered-empty or denied, never
+silently-broken).
 
-### M28.3 · The egress gate — allow-list enforcement  **[small, given M28.2]**
+*Proven:* a two-stack integration test drives a *guest* smoltcp endpoint through
+the `NatResponder` to a real localhost TCP echo server and gets its bytes back
+(and a default-deny policy refuses the connect) — the datapath, exercised in CI
+without HVF. **Live guest `curl` still pending a net-enabled snapshot: every
+capture in the corpus was taken without `--net`, so the capture path must add a
+virtio-net device (guest configured `192.168.249.2/24`, gw `.1`) before the
+end-to-end demo can run on real HVF.**
 
-Insert the `chm_profile` egress decision at the two authoritative points the NAT
-already owns:
+### M28.3 · The egress gate — allow-list enforcement  **[small, given M28.2 — SHIPPED]**
 
-- **DNS resolve**: answer only names permitted by the allow-list; refuse the rest
-  (defeats "resolve elsewhere").
-- **TCP connect**: before `chm` dials, match the destination (resolved IP + the
-  originating name, host + port) against `egress` (author order, first match
-  wins) falling back to `default`. Allow → dial; deny → refuse the guest's
-  connection **and** `report-policy-decision`.
-- Dual name+IP checks defeat the hardcoded-IP bypass.
+Inserted the `chm_profile` egress decision at the two authoritative points the
+NAT already owns:
 
-*Acceptance:* under `default: deny, allow: [api.github.com:443]`, the guest reaches
-api.github.com and **fails every other destination**, each denial audited.
+- **DNS resolve**: only names permitted by the allow-list are resolved through
+  the host; the rest are answered `REFUSED`, so the guest never learns the
+  address (defeats "resolve elsewhere").
+- **TCP connect**: before `chm` dials, the destination (resolved IP, plus the
+  originating name via a resolve cache, host + port) is matched against `egress`
+  (deny rules first, then allow, then `default`). Allow → arm the smoltcp
+  listener + dial the host socket; deny → no listener is armed, so smoltcp RSTs
+  the SYN and `chm` never opens a socket.
+- Dual name+IP checks defeat the hardcoded-IP bypass: a raw-IP connect the guest
+  never resolved through us matches no hostname rule and falls to `default`
+  (deny under a locked-down policy).
+- Each denial is logged to the console once per unique target
+  (`chm: [egress] DENY …`) — the visible enforcement proof.
+
+**How the profile reaches the datapath:** the runner (`run_assignment`) verifies
+the digest (M28.1), then hands the compiled egress profile to the `chm run`
+subprocess that boots the VM via the `CHM_EGRESS_POLICY` env var; `wire_virtio`
+parses it into an `EgressPolicy` and threads it into the net device's NAT.
+
+*Proven:* an in-CI relay test builds a NAT under `default: deny, allow:
+[127.0.0.1:<echo>]` — the allow-listed destination connects and echoes, an
+unlisted one is refused with a recorded denial. `chm` unit tests cover the
+`CHM_EGRESS_POLICY` parse. *Deferred to M28.4:* reporting per-flow denials to the
+plane's audit log (cross-process), and the live guest demo (needs a net-enabled
+snapshot).
 
 ### M28.4 · The demo + provenance proof  **[the product acceptance]**
 
@@ -160,14 +190,25 @@ Wire it end-to-end and make it demoable + tested:
 
 *Acceptance:* the demo at the top of this doc runs green, reproducibly.
 
-### M28.5 · Filesystem scopes  **[smaller, separate — modest by design]**
+### M28.5 · Filesystem scopes  **[smaller, separate — modest by design — SHIPPED]**
 
-Apply `chm_profile.fs` (`ro`/`rw`) + `mounts`. Honest scope: there is **no host-FS
-passthrough** (an M30 invariant), so the guest's filesystem is its own disk +
-overlay — "fs scoping" here means which mounts/overlays are writable vs
-read-only, and reporting `filesystem` decisions, not gating host directories.
-Kept minimal and clearly bounded; the **network half is the product must**, this
-rounds out the pillar.
+`chm_profile.fs` (`ro`/`rw`) + `mounts`, handled honestly given the invariant:
+there is **no host-FS passthrough** (an M30 invariant), so the guest's filesystem
+is its own disk + private overlay.
+
+- **Mounts are refused, loudly.** A host mount the plane requests cannot be
+  honored (no virtiofs/9p/shared-folder path exists), so the runner logs a
+  prominent `REFUSED` warning per mount and reports a `fs / mount-refused`
+  decision to the plane, rather than silently running the sandbox in an
+  unexpected config. The guest runs confined, without the host directory — the
+  safe direction (no host exposure).
+- **fs ro/rw scopes describe guest-internal paths** chm cannot police from
+  outside the guest, so they are surfaced (in the governed summary) but not
+  gated. Overlays are already created in a private `0700` runtime dir (M30).
+
+*Proven:* `chm` unit tests cover mount extraction (source/target/mode/durable,
+with defaults) and the empty case. *Tested manually:* a policy with a `mounts`
+entry produces the refusal warning + audit report.
 
 ---
 

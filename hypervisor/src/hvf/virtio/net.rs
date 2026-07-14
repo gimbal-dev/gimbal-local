@@ -45,6 +45,15 @@ pub trait NetResponder: Send {
     /// Given an outbound Ethernet `frame` from the guest, return zero or more
     /// Ethernet frames to deliver back to the guest.
     fn handle(&mut self, frame: &[u8]) -> Vec<Vec<u8>>;
+
+    /// Advance any asynchronous work (e.g. a userspace NAT polling its host
+    /// sockets) and return frames to deliver to the guest, independent of guest
+    /// transmit activity. Called periodically by the net service thread. The
+    /// default is a no-op: a purely request/reply responder has nothing to do
+    /// between guest frames.
+    fn service(&mut self) -> Vec<Vec<u8>> {
+        Vec::new()
+    }
 }
 
 /// A minimal host responder that makes a resumed guest's link demonstrably
@@ -207,6 +216,20 @@ impl NetDevice {
         for reply in self.responder.handle(frame) {
             self.pending_rx.push_back(reply);
         }
+    }
+
+    /// Advance the responder's asynchronous work (e.g. a NAT relaying host
+    /// socket data) and queue any resulting frames for the guest's receive
+    /// queue. Returns whether any frame was produced, so the caller can decide
+    /// to wake a parked vCPU. Driven by the net service thread, not a guest
+    /// notify.
+    pub fn service(&mut self) -> bool {
+        let mut produced = false;
+        for reply in self.responder.service() {
+            self.pending_rx.push_back(reply);
+            produced = true;
+        }
+        produced
     }
 
     /// Whether a frame is waiting to be delivered into the guest's receive
