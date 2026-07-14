@@ -94,8 +94,20 @@ systemd userspace.
 
 When the guest executes `WFI`/`WFE`, HVF returns the exit to the host rather
 than blocking in-kernel. The backend implements the idle by parking the vCPU
-thread on a wake fd (`kick`) with a bounded poll, so an interrupt asserted from
-another thread wakes it promptly and a missed kick can never wedge it.
+thread on a wake fd (`kick`), so an interrupt asserted from another thread wakes
+it promptly and a missed kick can never wedge it.
+
+The park duration is the guest's own virtual-timer deadline, not a flat poll.
+While a vCPU is parked it sits *outside* `hv_vcpu_run`, so HVF's native
+virtual-timer delivery is suspended and the guest can only take its next
+scheduler tick when the host re-enters the guest. Parking a flat interval would
+therefore clamp an idle guest's effective tick rate to the poll rate — starving
+idle-heavy phases (cloud-init's final stage, a `serial-getty` restart) so they
+crawl or look wedged. Instead the backend reads `CNTV_CVAL_EL0`/`CNTV_CTL_EL0`,
+converts the remaining ticks to milliseconds via `mach_timebase_info`, and wakes
+exactly when the timer is due; re-entering `hv_vcpu_run` at that point lets the
+managed GIC deliver PPI 27 on time. A disabled/masked timer falls back to a
+100 ms cap (only a device IRQ, which also kicks the wake fd, can wake it).
 
 A guest that is *busy* (a CPU-bound spin with no traps) never returns from
 `hv_vcpu_run` on its own. To stop such a guest from another thread,
@@ -110,6 +122,12 @@ backend's `VmOps` MMIO hooks) and a faithful `Pl011` UART at `0x0900_0000` —
 the base Cloud Hypervisor's `arm64` machine uses. The bus is the seam every
 future device plugs into. Today that is the serial console; Phase 3 adds the
 virtio devices (block/net/console over PCI) a guest needs to run open-endedly.
+
+The PL011 presents a live virtual carrier: its flag register ties the
+modem-status lines (DCD/DSR/CTS) high. A guest `agetty` that opens `ttyAMA0`
+without `CLOCAL` blocks in `open()` until Data Carrier Detect is seen, so a
+resumed snapshot whose cloud-init restarts `serial-getty@ttyAMA0` needs the
+carrier asserted or the reopened getty hangs before printing its login prompt.
 
 ## `chm` and `chm serve`
 

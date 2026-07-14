@@ -36,6 +36,19 @@ digest so identical bases dedupe across the cache.
 
 > Code today: `SnapshotSummary` (`name`, `path`, `vcpus`, `ramMib`).
 
+An image may also ship a **golden checkpoint** — a `.chm-checkpoint` (plus its
+matching `.chm-overlays`) captured at a settled, quiescent point such as a fully
+booted idle login. When present, a new sandbox's workspace is *seeded* from it
+(the RAM dump is hard-linked copy-on-write, the disk overlays copied), so the
+sandbox **resumes that settled state instead of cold-booting**. This lets an
+image skip replaying a fragile boot phase on every start — for example a
+cold-boot snapshot captured mid-cloud-init would otherwise re-run cloud-init's
+`serial-getty` restart each time, whereas a golden checkpoint taken after that
+completes starts straight at a usable shell.
+
+> Code today: `checkpoint::workspace_from_image` seeds a golden checkpoint when
+> the image carries one; otherwise the workspace starts cold from the base.
+
 ### Revision (a checkpoint / commit)
 An immutable, point-in-time **live state** — guest RAM + vCPU + interrupt
 (GIC) + device + filesystem delta — captured by suspending a sandbox. A
