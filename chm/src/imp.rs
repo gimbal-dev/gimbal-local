@@ -416,6 +416,7 @@ pub fn main() -> ExitCode {
         Some("push") => control_plane::push_main(&raw[1..]),
         Some("pull") => control_plane::pull_main(&raw[1..]),
         Some("branches") => control_plane::branches_main(&raw[1..]),
+        Some("policy") => control_plane::policy_main(&raw[1..]),
         Some("state-cdn") => state_cdn::state_cdn_main(&raw[1..]),
         Some("serve") => serve::serve_main(&raw[1..]),
         Some("ctl") => serve::ctl_main(&raw[1..]),
@@ -522,6 +523,7 @@ fn usage() -> String {
          chm push <CHECKPOINT_DIR> --branch N   (commit a revision to the plane)\n    \
          chm pull --branch N --to DIR           (rehydrate a branch head)\n    \
          chm state-cdn reconstruct [OPTIONS]    (pull memory from the state CDN)\n    \
+         chm policy show --sandbox ID           (show a sandbox's bound policy)\n    \
          chm cloud <COMMAND> aws [OPTIONS]      (BYO cloud helpers)\n    \
          chm serve <LIBRARY_DIR> [OPTIONS]      (background daemon)\n    \
          chm ctl <COMMAND> [ARG] [--socket P]   (talk to a daemon)\n\

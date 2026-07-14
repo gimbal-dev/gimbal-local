@@ -116,7 +116,7 @@ from cache in 0.077 s).
 | **M25 · Live local lifecycle** | ① | **Complete** (one perf ceiling: runtime memfd page-sharing) | #4, #6 |
 | **M30 · Security hardening** | trust/isolation | **P0 + no-FS guard shipped** (#33–#35, #37); signing + limits next (#36, #38) | #33–#39 |
 | **M27 · Plane-native edge** | ② | **push/pull shipped** (#7 core); postcopy memory + disk plane next (#5) | #5, #7 |
-| **M28 · Consistent controls** | ③ | **Planned** ([network-policy-plan.md](network-policy-plan.md)) — userspace-NAT egress enforcement; #49–#53 | #20 |
+| **M28 · Consistent controls** | ③ | **M28.1 shipped** (policy plumbing + digest teleport); NAT + gate next (#50–#53) | #20 |
 | **M29 · Observability & cost** | ④ | Waits on the gctl telemetry contract | — |
 
 ### M25 · Live local lifecycle — suspend · resume · fork

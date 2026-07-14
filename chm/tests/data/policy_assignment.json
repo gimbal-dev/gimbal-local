@@ -1,0 +1,40 @@
+{
+  "policy_digest": "sha256:147f9297406ccd92c0bc206791e487c27da44ed48eec8015ed58828425256642",
+  "policy": {
+    "version": 1,
+    "default_egress": "deny",
+    "egress": [
+      {
+        "action": "allow",
+        "host": "api.github.com",
+        "ports": [
+          443
+        ]
+      }
+    ],
+    "fs": [
+      {
+        "path": "/workspace",
+        "mode": "rw"
+      }
+    ],
+    "digest": "sha256:147f9297406ccd92c0bc206791e487c27da44ed48eec8015ed58828425256642"
+  },
+  "enforcement": {
+    "substrate": "apple-hvf",
+    "policy_digest": "sha256:147f9297406ccd92c0bc206791e487c27da44ed48eec8015ed58828425256642",
+    "chm_profile": {
+      "egress": {
+        "default": "deny",
+        "allow": [
+          "api.github.com:443"
+        ]
+      },
+      "fs": {
+        "rw": [
+          "/workspace"
+        ]
+      }
+    }
+  }
+}
