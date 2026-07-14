@@ -297,6 +297,7 @@ struct SandboxDetailPage: View {
                     } else {
                         WorkInsideCard(sandbox: sandbox)
                         SandboxControlsCard(sandbox: sandbox)
+                        ConnectivityCard(sandbox: sandbox)
                         RevisionHistoryCard(
                             dirPath: sandbox.workspacePath,
                             emptyHint: "Run this sandbox (Open terminal), then end the session to save its live state as a revision here — isolated from other sandboxes of the same image."
@@ -453,6 +454,188 @@ private struct SandboxControlsCard: View {
     private func consoleBytes(_ sandbox: Sandbox) -> String {
         guard let bytes = sandbox.consoleBytes else { return "0 B" }
         return ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+    }
+}
+
+/// Per-sandbox outbound network firewall. A client of `chm firewall`: the user
+/// picks a posture (Open / No network / Allow-list) and the model writes the
+/// sandbox workspace's `egress-policy.json`, which the userspace NAT enforces on
+/// the next start — no control plane required. A cloud-bound policy is shown
+/// read-only.
+private struct ConnectivityCard: View {
+    @EnvironmentObject private var model: AppModel
+    let sandbox: Sandbox
+
+    @State private var mode: EgressPolicy.Mode = .open
+    @State private var rules: [String] = []
+    @State private var newRule = ""
+
+    private var policy: EgressPolicy { model.egressPolicyBySandbox[sandbox.id] ?? .unrestricted }
+    private var isApplying: Bool { model.applyingFirewallID == sandbox.id }
+
+    var body: some View {
+        GlassCard(title: "Connectivity", subtitle: "outbound network firewall", systemImage: "network") {
+            if policy.isControlPlaneBound {
+                controlPlaneBound
+            } else {
+                editor
+            }
+        }
+        .task(id: sandbox.id) { model.refreshFirewall(for: sandbox) }
+        .onChange(of: policy) { _, _ in syncFromPolicy() }
+        .onAppear(perform: syncFromPolicy)
+    }
+
+    // MARK: locally-authored editor
+
+    private var editor: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Picker("Egress", selection: $mode) {
+                Text("Open").tag(EgressPolicy.Mode.open)
+                Text("No network").tag(EgressPolicy.Mode.noNetwork)
+                Text("Allow-list").tag(EgressPolicy.Mode.allowList)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .disabled(isApplying)
+
+            Text(modeHint)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            if mode == .allowList {
+                allowListEditor
+            }
+
+            Divider().opacity(0.25)
+
+            HStack(spacing: 10) {
+                StatusDot(color: posture.color, size: 7)
+                Text(posture.text)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 8)
+                Button {
+                    model.setConnectivity(for: sandbox, mode: mode, allow: rules)
+                } label: {
+                    if isApplying {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Text("Apply")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isApplying || !hasChanges)
+            }
+        }
+    }
+
+    private var allowListEditor: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if rules.isEmpty {
+                Text("No destinations allowed yet — the guest can reach nothing until you add one.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(rules, id: \.self) { rule in
+                    HStack(spacing: 8) {
+                        Image(systemName: "checkmark.shield.fill")
+                            .font(.caption)
+                            .foregroundStyle(Theme.green)
+                        Text(rule)
+                            .font(.callout.monospaced())
+                        Spacer()
+                        Button {
+                            rules.removeAll { $0 == rule }
+                        } label: {
+                            Image(systemName: "minus.circle.fill").foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .disabled(isApplying)
+                    }
+                }
+            }
+            HStack(spacing: 8) {
+                TextField("host:port  ·  e.g. github.com:443", text: $newRule)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.callout.monospaced())
+                    .onSubmit(addRule)
+                    .disabled(isApplying)
+                Button("Add", action: addRule)
+                    .disabled(isApplying || newRule.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
+    }
+
+    // MARK: control-plane-bound (read-only)
+
+    private var controlPlaneBound: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Label("Governed by the control plane", systemImage: "lock.shield.fill")
+                .font(.headline)
+                .foregroundStyle(Theme.purple)
+            Text(posture.text)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+            if let label = policy.label {
+                Text("policy \(label)")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
+                    .textSelection(.enabled)
+            }
+            Text("This sandbox's egress is set by a bound control-plane policy and can't be edited locally.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    // MARK: helpers
+
+    private var modeHint: String {
+        switch mode {
+        case .open:
+            return "Unrestricted outbound network — the guest can reach anything."
+        case .noNetwork:
+            return "Default-deny with nothing allowed — the guest is fully offline."
+        case .allowList:
+            return "Default-deny except the destinations below. A guest that dials a raw IP (skipping DNS) is denied too."
+        }
+    }
+
+    private var posture: (text: String, color: Color) {
+        switch policy.mode {
+        case .open:
+            return ("Active: unrestricted egress", Theme.cyan)
+        case .noNetwork:
+            return ("Active: no network", Theme.orange)
+        case .allowList:
+            return ("Active: \(policy.allow.count) destination\(policy.allow.count == 1 ? "" : "s") allowed", Theme.green)
+        }
+    }
+
+    private var hasChanges: Bool {
+        if mode != policy.mode { return true }
+        if mode == .allowList { return Set(cleanRules) != Set(policy.allow) }
+        return false
+    }
+
+    private var cleanRules: [String] {
+        rules.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+    }
+
+    private func addRule() {
+        let rule = newRule.trimmingCharacters(in: .whitespaces)
+        guard !rule.isEmpty, !rules.contains(rule) else { return }
+        rules.append(rule)
+        newRule = ""
+    }
+
+    private func syncFromPolicy() {
+        mode = policy.mode
+        rules = policy.allow
     }
 }
 

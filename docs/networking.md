@@ -61,6 +61,28 @@ governed by sha256:147f… · egress default=deny, 1 rule(s) · fs 0 ro / 1 rw �
     allow api.github.com:443
 ```
 
+### Locally, with no control plane
+
+The same enforcement is available to a self-served (no-`gctl`) user, authored
+locally with **`chm firewall`**. It writes a per-workspace `egress-policy.json`
+(the same shape as the cloud `chm_profile.egress`), which the NAT reads on the
+next start — no plane, no digest, same gate:
+
+```console
+$ chm firewall set ./my-sandbox --default deny --allow api.github.com:443
+wrote ./my-sandbox/egress-policy.json — egress default=deny · 1 allow / 0 deny rule(s)
+$ chm firewall show ./my-sandbox
+./my-sandbox [local]  egress default=deny · 1 allow / 0 deny rule(s)
+$ chm firewall clear ./my-sandbox        # back to unrestricted egress
+```
+
+`chm run` / `chm resume` / `chm connect` also accept a one-shot
+`--egress-policy <file>` override. `chm` resolves the effective policy in priority
+order: the **`--egress-policy` flag** › the **`CHM_EGRESS_POLICY`** binding (what
+the cloud runner sets) › the per-workspace **`egress-policy.json`**. So a
+control-plane binding always wins over a local file, and the Gimbal Local app's
+per-sandbox **Connectivity** control is a thin client of `chm firewall`.
+
 ## What enforcement looks like
 
 With a default-deny policy that allows only `api.github.com:443`, a guest that

@@ -60,6 +60,11 @@ creates `target/GimbalLocal.app`.
 - Start/stop sandboxes via `chm ctl`, and open an interactive session with
   `chm connect`. Surfaces start failures (including unsupported ITS/LPI
   snapshots) in the sandbox detail.
+- **Connectivity** control in the sandbox detail: a per-sandbox outbound network
+  firewall with **Open / No network / Allow-list** postures (`host:port` rules).
+  It is a client of `chm firewall`, which writes the sandbox workspace's
+  `egress-policy.json`; the userspace NAT enforces it on the next start — no
+  control plane required. A control-plane-bound policy is shown read-only.
 - Shows optional cloud-control health, runner/snapshot/sandbox counts, and cost
   summary in the Control plane settings tab when `gimbal-cloud-control` is
   reachable.

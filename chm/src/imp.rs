@@ -18,6 +18,7 @@ use crate::cloud;
 use crate::console::{self, RawConsole};
 use crate::console_filter::ConsoleFilter;
 use crate::control_plane;
+use crate::firewall;
 use crate::serve;
 use crate::state_cdn;
 
@@ -302,6 +303,7 @@ pub(crate) fn wire_virtio(
     overlay_dir: &Path,
     gic: Option<&Arc<Mutex<dyn Vgic>>>,
     resume: bool,
+    cli_egress: Option<&Path>,
 ) -> Result<WiredVirtio, String> {
     let descs =
         devmgr::parse_devices(state_json).map_err(|e| format!("parse virtio devices: {e}"))?;
@@ -332,11 +334,13 @@ pub(crate) fn wire_virtio(
     let msi_sink: Option<Arc<dyn MsiSink>> =
         gic.map(|g| Arc::new(GicMsiSink::new(g.clone())) as Arc<dyn MsiSink>);
 
-    // The control-plane egress policy for this sandbox, if the runner bound one
-    // (M28.3). It rides in through `CHM_EGRESS_POLICY` — a process boundary,
-    // since the runner re-execs `chm run` to boot the VM — and is enforced by
-    // the net device's userspace NAT at the DNS resolve + host connect.
-    let mut net_policy = load_egress_policy();
+    // The egress policy governing this sandbox's outbound network, if any. It is
+    // resolved (in priority order) from the `--egress-policy` flag, the
+    // `CHM_EGRESS_POLICY` env binding the runner sets for a cloud assignment
+    // (M28.3), or a per-workspace `egress-policy.json` a local user authored with
+    // `chm firewall` — the same seam, whether the run is cloud- or self-served.
+    // It is enforced by the net device's userspace NAT at DNS resolve + connect.
+    let mut net_policy = load_egress_policy(overlay_dir, cli_egress);
 
     for desc in &descs {
         let kind = match &desc.backend {
@@ -397,20 +401,44 @@ pub(crate) fn wire_virtio(
     })
 }
 
-/// Load the control-plane egress policy the runner bound for this sandbox from
-/// the `CHM_EGRESS_POLICY` environment variable (set by `run_assignment` before
-/// it re-execs `chm run`). The value is a compact JSON object:
+/// Resolve the egress policy governing a sandbox's outbound network, in priority
+/// order:
 ///
-/// ```json
-/// {"digest":"sha256:…","default":"deny","allow":["api.github.com:443"],"deny":[]}
-/// ```
+/// 1. `cli_override` — an explicit `--egress-policy <file>` on `chm run`/
+///    `resume`/`connect`. Highest, because it is the most specific intent.
+/// 2. `CHM_EGRESS_POLICY` env — the binding the runner sets for a cloud
+///    assignment (`run_assignment` re-execs `chm run`); preserves cloud parity.
+/// 3. `<workspace>/egress-policy.json` — the per-workspace file a local,
+///    no-control-plane user authors with `chm firewall`. The workspace is the
+///    parent of `overlay_dir` (`<snapshot_dir>/.chm-overlays`), so both `chm run`
+///    and the `chm serve` daemon pick it up with no extra plumbing.
 ///
-/// Returns `None` when unset or unparseable (the guest then gets unrestricted
-/// egress) — a malformed policy is logged but must not silently *tighten* or
-/// crash the boot; the runner already verified the digest before setting it.
-fn load_egress_policy() -> Option<EgressPolicy> {
-    let raw = env::var("CHM_EGRESS_POLICY").ok()?;
-    parse_egress_policy(&raw)
+/// Returns `None` when nothing is configured (the guest then gets unrestricted
+/// egress). A malformed policy is logged but must not silently *tighten* or crash
+/// the boot: an allow-list you cannot read is treated as "no policy", never as
+/// "deny everything".
+fn load_egress_policy(overlay_dir: &Path, cli_override: Option<&Path>) -> Option<EgressPolicy> {
+    if let Some(path) = cli_override {
+        match fs::read_to_string(path) {
+            Ok(raw) => return parse_egress_policy(&raw),
+            Err(e) => {
+                eprintln!(
+                    "chm: warning: ignoring --egress-policy {}: {e}",
+                    path.display()
+                );
+                return None;
+            }
+        }
+    }
+    if let Ok(raw) = env::var("CHM_EGRESS_POLICY") {
+        return parse_egress_policy(&raw);
+    }
+    let workspace = overlay_dir.parent().unwrap_or(overlay_dir);
+    let file = workspace.join("egress-policy.json");
+    match fs::read_to_string(&file) {
+        Ok(raw) => parse_egress_policy(&raw),
+        Err(_) => None,
+    }
 }
 
 /// Parse a `CHM_EGRESS_POLICY` JSON document into an [`EgressPolicy`]. Returns
@@ -435,6 +463,7 @@ fn parse_egress_policy(raw: &str) -> Option<EgressPolicy> {
     let label = v
         .get("digest")
         .and_then(|d| d.as_str())
+        .or_else(|| v.get("label").and_then(|d| d.as_str()))
         .unwrap_or("control-plane")
         .to_string();
     Some(EgressPolicy::from_profile(
@@ -518,6 +547,11 @@ struct Args {
     /// stop so the next start continues where this one left off. Set by `chm
     /// resume` and by `chm connect --checkpoint`; `false` cold-boots.
     checkpoint: bool,
+    /// Optional path to a local egress-policy file (`--egress-policy`). When set,
+    /// it governs the guest's outbound network for this run, overriding the
+    /// `CHM_EGRESS_POLICY` env binding and any per-workspace `egress-policy.json`.
+    /// `None` falls back to that resolution order. See [`load_egress_policy`].
+    egress_policy: Option<PathBuf>,
 }
 
 struct ConnectArgs {
@@ -535,6 +569,7 @@ pub fn main() -> ExitCode {
         Some("pull") => control_plane::pull_main(&raw[1..]),
         Some("branches") => control_plane::branches_main(&raw[1..]),
         Some("policy") => control_plane::policy_main(&raw[1..]),
+        Some("firewall") => firewall::firewall_main(&raw[1..]),
         Some("state-cdn") => state_cdn::state_cdn_main(&raw[1..]),
         Some("serve") => serve::serve_main(&raw[1..]),
         Some("ctl") => serve::ctl_main(&raw[1..]),
@@ -642,6 +677,7 @@ fn usage() -> String {
          chm pull --branch N --to DIR           (rehydrate a branch head)\n    \
          chm state-cdn reconstruct [OPTIONS]    (pull memory from the state CDN)\n    \
          chm policy show --sandbox ID           (show a sandbox's bound policy)\n    \
+         chm firewall set <WORKSPACE_DIR> ...   (author a local egress policy)\n    \
          chm cloud <COMMAND> aws [OPTIONS]      (BYO cloud helpers)\n    \
          chm serve <LIBRARY_DIR> [OPTIONS]      (background daemon)\n    \
          chm ctl <COMMAND> [ARG] [--socket P]   (talk to a daemon)\n\
@@ -656,6 +692,9 @@ fn usage() -> String {
          --idle-exit <N>     Stop after N seconds with no console output\n                        \
          (0 = disabled; default 10).\n    \
          --quiet             Suppress the informational banner on stderr.\n    \
+         --egress-policy <FILE>  Govern this run's outbound network with a local\n                        \
+         egress policy (see `chm firewall`); overrides any per-workspace\n                        \
+         `egress-policy.json` and the control-plane binding.\n    \
          --checkpoint         Use live checkpoints: resume from a saved\n                        \
          checkpoint in the snapshot dir if present, and capture a fresh one on\n                        \
          a clean stop so the next start continues where this left off. Implied\n                        \
@@ -695,6 +734,7 @@ fn parse(raw: &[String]) -> Parsed {
     let mut idle_exit_secs = DEFAULT_IDLE_EXIT_SECS;
     let mut quiet = false;
     let mut checkpoint = false;
+    let mut egress_policy: Option<PathBuf> = None;
 
     let mut i = 0;
     // A leading `run`/`restore` subcommand is accepted but optional; `resume`
@@ -713,6 +753,13 @@ fn parse(raw: &[String]) -> Parsed {
             "-V" | "--version" => return Parsed::Version,
             "--quiet" => quiet = true,
             "--checkpoint" => checkpoint = true,
+            "--egress-policy" => {
+                i += 1;
+                let Some(v) = raw.get(i) else {
+                    return Parsed::Error(format!("{a} requires a value"));
+                };
+                egress_policy = Some(PathBuf::from(v));
+            }
             "--max-seconds" | "--idle-exit" => {
                 i += 1;
                 let Some(v) = raw.get(i) else {
@@ -748,6 +795,7 @@ fn parse(raw: &[String]) -> Parsed {
             quiet,
             session_lock: None,
             checkpoint,
+            egress_policy,
         }),
         None => Parsed::Error("missing <SNAPSHOT_DIR>".to_string()),
     }
@@ -762,6 +810,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
     let mut no_stop_daemon = false;
     let mut session_lock: Option<PathBuf> = None;
     let mut checkpoint = false;
+    let mut egress_policy: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < raw.len() {
@@ -772,7 +821,8 @@ fn parse_connect(raw: &[String]) -> Parsed {
             "--quiet" => quiet = true,
             "--no-stop-daemon" => no_stop_daemon = true,
             "--checkpoint" => checkpoint = true,
-            "--socket" | "--max-seconds" | "--idle-exit" | "--session-lock" => {
+            "--socket" | "--max-seconds" | "--idle-exit" | "--session-lock"
+            | "--egress-policy" => {
                 i += 1;
                 let Some(v) = raw.get(i) else {
                     return Parsed::Error(format!("{a} requires a value"));
@@ -780,6 +830,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
                 match a.as_str() {
                     "--socket" => socket_path = PathBuf::from(v),
                     "--session-lock" => session_lock = Some(PathBuf::from(v)),
+                    "--egress-policy" => egress_policy = Some(PathBuf::from(v)),
                     "--max-seconds" | "--idle-exit" => {
                         let Ok(n) = v.parse::<u64>() else {
                             return Parsed::Error(format!("{a}: `{v}` is not a number"));
@@ -815,6 +866,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
                 quiet,
                 session_lock,
                 checkpoint,
+                egress_policy,
             },
             socket_path,
             no_stop_daemon,
@@ -1526,6 +1578,7 @@ fn resume_smp(
         overlay_dir,
         Some(&prepared.gic),
         resume_from.is_some(),
+        args.egress_policy.as_deref(),
     ) {
         Ok(wired) => {
             if !wired.summary.is_empty() && !args.quiet {
@@ -1825,6 +1878,68 @@ mod tests {
     #[test]
     fn parse_egress_policy_rejects_malformed_json() {
         assert!(parse_egress_policy("not json").is_none());
+    }
+
+    #[test]
+    fn load_egress_policy_reads_the_per_workspace_file() {
+        // A local user's `chm firewall set` writes <workspace>/egress-policy.json;
+        // a run whose overlay dir is <workspace>/.chm-overlays must pick it up.
+        let ws = std::env::temp_dir().join(format!("chm-egress-{}", std::process::id()));
+        let overlay = ws.join(".chm-overlays");
+        fs::create_dir_all(&overlay).expect("mkdir");
+        fs::write(
+            ws.join("egress-policy.json"),
+            r#"{"default":"deny","allow":["api.github.com:443"],"label":"local"}"#,
+        )
+        .expect("write policy");
+
+        let p = load_egress_policy(&overlay, None).expect("policy resolved from workspace file");
+        assert!(p.is_restrictive());
+        assert_eq!(p.label(), "local");
+        assert!(p.decide_dns("api.github.com").is_allow());
+        assert!(!p.decide_dns("evil.test").is_allow());
+
+        fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn load_egress_policy_cli_override_beats_the_workspace_file() {
+        // `--egress-policy <file>` is the most specific intent and must win over a
+        // per-workspace file.
+        let ws = std::env::temp_dir().join(format!("chm-egress-cli-{}", std::process::id()));
+        let overlay = ws.join(".chm-overlays");
+        fs::create_dir_all(&overlay).expect("mkdir");
+        fs::write(
+            ws.join("egress-policy.json"),
+            r#"{"default":"deny","allow":["only-workspace.test:443"]}"#,
+        )
+        .expect("write ws policy");
+        let override_path = ws.join("override.json");
+        fs::write(
+            &override_path,
+            r#"{"default":"deny","allow":["override.test:443"],"label":"flag"}"#,
+        )
+        .expect("write override");
+
+        let p = load_egress_policy(&overlay, Some(&override_path)).expect("override resolved");
+        assert_eq!(p.label(), "flag");
+        assert!(p.decide_dns("override.test").is_allow());
+        assert!(
+            !p.decide_dns("only-workspace.test").is_allow(),
+            "the workspace file must not apply when the flag is set"
+        );
+
+        fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn load_egress_policy_is_none_without_any_source() {
+        let ws = std::env::temp_dir().join(format!("chm-egress-none-{}", std::process::id()));
+        let overlay = ws.join(".chm-overlays");
+        fs::create_dir_all(&overlay).expect("mkdir");
+        // No env binding is set in this test process and no workspace file exists.
+        assert!(load_egress_policy(&overlay, None).is_none());
+        fs::remove_dir_all(&ws).ok();
     }
 
     #[test]

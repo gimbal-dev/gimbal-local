@@ -102,6 +102,40 @@ struct ChmClient {
         await runRaw(settings: settings, args: ["workspace", image, workspace])
     }
 
+    /// Read a directory's effective egress firewall posture
+    /// (`chm firewall show <dir> --json`). Returns `.unrestricted` on any failure
+    /// or when no directory is known yet, so the UI degrades to "open".
+    func firewallShow(path: String, settings: AppSettings) async -> EgressPolicy {
+        let result = await runRaw(settings: settings, args: ["firewall", "show", path, "--json"])
+        guard result.status == 0, let data = result.output.data(using: .utf8),
+              let policy = try? JSONDecoder().decode(EgressPolicy.self, from: data)
+        else {
+            return .unrestricted
+        }
+        return policy
+    }
+
+    /// Write a directory's egress policy (`chm firewall set`). Writes exactly the
+    /// requested state — the UI passes the full desired allow/deny lists.
+    func firewallSet(
+        path: String,
+        defaultStance: String,
+        allow: [String],
+        deny: [String],
+        settings: AppSettings
+    ) async -> CommandResult {
+        var args = ["firewall", "set", path, "--default", defaultStance]
+        for rule in allow { args += ["--allow", rule] }
+        for rule in deny { args += ["--deny", rule] }
+        return await runRaw(settings: settings, args: args)
+    }
+
+    /// Remove a directory's egress policy (`chm firewall clear`) — back to
+    /// unrestricted egress.
+    func firewallClear(path: String, settings: AppSettings) async -> CommandResult {
+        await runRaw(settings: settings, args: ["firewall", "clear", path])
+    }
+
     /// Drive the control-plane runner pipeline for one snapshot: register →
     /// assign-run → verify checksums → mark-local-copy → run/resume, reporting
     /// state to the plane. Runs `chm runner run` with **no** `--socket` (it talks

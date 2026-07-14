@@ -242,6 +242,55 @@ struct RevisionSummary: Codable, Identifiable, Equatable, Hashable {
     }
 }
 
+/// A sandbox's local egress firewall posture, as reported by
+/// `chm firewall show <dir> --json`. The same file (`egress-policy.json`) the
+/// control plane teleports for a cloud run, but here authored locally — so a
+/// no-control-plane user governs outbound network the same way. `source` is
+/// `local` (a workspace file), `control-plane` (a bound cloud policy, read-only
+/// here), or `none` (unrestricted).
+struct EgressPolicy: Codable, Equatable, Hashable {
+    var source: String
+    var defaultStance: String
+    var allow: [String]
+    var deny: [String]
+    var label: String?
+    var restrictive: Bool
+    var path: String?
+
+    enum CodingKeys: String, CodingKey {
+        case source
+        case defaultStance = "default"
+        case allow, deny, label, restrictive, path
+    }
+
+    /// The three postures the UI offers, derived from the raw policy.
+    enum Mode: Hashable {
+        case open        // unrestricted egress (no policy, or default-allow)
+        case noNetwork   // default-deny with nothing allowed
+        case allowList   // default-deny with an explicit allow-list
+    }
+
+    var mode: Mode {
+        guard restrictive else { return .open }
+        if defaultStance.lowercased() == "deny" && allow.isEmpty { return .noNetwork }
+        return .allowList
+    }
+
+    /// True when a cloud control plane bound this policy — the local UI shows it
+    /// read-only rather than letting a user edit a plane-governed posture.
+    var isControlPlaneBound: Bool { source == "control-plane" }
+
+    static let unrestricted = EgressPolicy(
+        source: "none",
+        defaultStance: "allow",
+        allow: [],
+        deny: [],
+        label: nil,
+        restrictive: false,
+        path: nil
+    )
+}
+
 /// Sidebar selection / primary navigation. The two `…Home` cases are the main
 /// pages; the others focus a specific instance or image.
 enum SidebarItem: Hashable {

@@ -31,6 +31,39 @@ final class GimbalLocalAppTests: XCTestCase {
         XCTAssertEqual(status.consoleBytes, 42)
     }
 
+    func testDecodesEgressPolicyAndDerivesAllowListMode() throws {
+        // The shape `chm firewall show --json` emits.
+        let json = """
+        {"source":"local","default":"deny","allow":["api.github.com:443"],"deny":[],
+         "label":"local","restrictive":true,"path":"/ws/egress-policy.json"}
+        """
+        let policy = try JSONDecoder().decode(EgressPolicy.self, from: Data(json.utf8))
+
+        XCTAssertEqual(policy.source, "local")
+        XCTAssertEqual(policy.defaultStance, "deny")
+        XCTAssertEqual(policy.allow, ["api.github.com:443"])
+        XCTAssertTrue(policy.restrictive)
+        XCTAssertEqual(policy.mode, .allowList)
+        XCTAssertFalse(policy.isControlPlaneBound)
+    }
+
+    func testEgressPolicyModeDerivation() {
+        let open = EgressPolicy(source: "none", defaultStance: "allow", allow: [], deny: [],
+                                label: nil, restrictive: false, path: nil)
+        XCTAssertEqual(open.mode, .open)
+        XCTAssertEqual(EgressPolicy.unrestricted.mode, .open)
+
+        let offline = EgressPolicy(source: "local", defaultStance: "deny", allow: [], deny: [],
+                                   label: "local", restrictive: true, path: nil)
+        XCTAssertEqual(offline.mode, .noNetwork)
+
+        let bound = EgressPolicy(source: "control-plane", defaultStance: "deny",
+                                 allow: ["x:443"], deny: [], label: "sha256:abc",
+                                 restrictive: true, path: nil)
+        XCTAssertEqual(bound.mode, .allowList)
+        XCTAssertTrue(bound.isControlPlaneBound)
+    }
+
     func testCountsCommonControlPlaneEnvelopeShapes() throws {
         XCTAssertEqual(
             CloudControlClient.countItems(in: Data(#"[{"id":"r1"},{"id":"r2"}]"#.utf8)),

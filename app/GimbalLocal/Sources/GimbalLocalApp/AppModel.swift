@@ -64,6 +64,10 @@ final class AppModel: ObservableObject {
     // `chm revisions --json`, + the directory currently being rolled back.
     @Published var revisionsByPath: [String: [RevisionSummary]] = [:]
     @Published var rollingBackPath: String?
+    // Egress firewall posture per sandbox id, from `chm firewall show --json`,
+    // + the sandbox whose policy is currently being written.
+    @Published var egressPolicyBySandbox: [String: EgressPolicy] = [:]
+    @Published var applyingFirewallID: String?
     @Published var consoleText = ""
     @Published var activityLog = ""
     @Published var selectedSnapshot: SnapshotSummary?
@@ -695,6 +699,70 @@ final class AppModel: ObservableObject {
             if !trimmed.isEmpty { appendLog(trimmed) }
             rollingBackPath = nil
             refreshRevisions(path: path)
+        }
+    }
+
+    // MARK: - Local egress firewall (per-sandbox connectivity)
+
+    /// The directory whose `egress-policy.json` governs a sandbox: its isolated
+    /// workspace once it exists, else `nil` (no policy can be bound until the
+    /// sandbox has a workspace, which is created lazily on first run or apply).
+    private func firewallDir(for sandbox: Sandbox) -> String? {
+        if let ws = storedSandboxes.first(where: { $0.id == sandbox.id })?.workspacePath {
+            return ws
+        }
+        return sandbox.workspacePath
+    }
+
+    /// Load a sandbox's egress posture into `egressPolicyBySandbox`. A sandbox
+    /// with no workspace yet has no policy — it shows as unrestricted until the
+    /// user applies one (which creates the workspace).
+    func refreshFirewall(for sandbox: Sandbox) {
+        guard let dir = firewallDir(for: sandbox) else {
+            egressPolicyBySandbox[sandbox.id] = .unrestricted
+            return
+        }
+        Task {
+            egressPolicyBySandbox[sandbox.id] = await chm.firewallShow(path: dir, settings: settings)
+        }
+    }
+
+    /// Apply a connectivity posture to a sandbox, authoring its workspace
+    /// `egress-policy.json` via `chm firewall`. Ensures the workspace exists first
+    /// so the policy is per-sandbox (not shared across sandboxes of one image).
+    /// Takes effect on the sandbox's next start (the daemon reads the file when it
+    /// wires the guest's network).
+    func setConnectivity(for sandbox: Sandbox, mode: EgressPolicy.Mode, allow: [String]) {
+        guard applyingFirewallID == nil else { return }
+        applyingFirewallID = sandbox.id
+        Task {
+            defer { applyingFirewallID = nil }
+            guard let dir = await ensureWorkspace(sandboxID: sandbox.id) else {
+                appendLog("cannot set connectivity for \(sandbox.name): no workspace")
+                return
+            }
+            let result: CommandResult
+            switch mode {
+            case .open:
+                result = await chm.firewallClear(path: dir, settings: settings)
+            case .noNetwork:
+                result = await chm.firewallSet(
+                    path: dir, defaultStance: "deny", allow: [], deny: [], settings: settings
+                )
+            case .allowList:
+                let rules = allow
+                    .map { $0.trimmingCharacters(in: .whitespaces) }
+                    .filter { !$0.isEmpty }
+                result = await chm.firewallSet(
+                    path: dir, defaultStance: "deny", allow: rules, deny: [], settings: settings
+                )
+            }
+            let trimmed = result.output.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmed.isEmpty { appendLog(trimmed) }
+            egressPolicyBySandbox[sandbox.id] = await chm.firewallShow(path: dir, settings: settings)
+            if sandbox.state == .running {
+                appendLog("connectivity change applies the next time \(sandbox.name) starts")
+            }
         }
     }
 
