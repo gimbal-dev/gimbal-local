@@ -1273,6 +1273,10 @@ fn resume_smp(
     let dist_gate = Arc::new(PhaseGate::new());
     let go_gate = Arc::new(PhaseGate::new());
     let exits: Arc<Mutex<Vec<ExitSignal>>> = Arc::new(Mutex::new(Vec::new()));
+    // WFI wake handles for each vCPU (writes its idle-park fd). Collected so the
+    // serial input pump + re-assert tick can wake a parked vCPU the instant a
+    // keystroke's interrupt is asserted, instead of waiting for its idle poll.
+    let wakes: Arc<Mutex<Vec<ExitSignal>>> = Arc::new(Mutex::new(Vec::new()));
     let outcome: Arc<Mutex<Option<Result<Outcome, String>>>> = Arc::new(Mutex::new(None));
     let (created_tx, created_rx) = mpsc::channel::<Result<(), String>>();
     let (restored_tx, restored_rx) = mpsc::channel::<Result<(), String>>();
@@ -1298,6 +1302,7 @@ fn resume_smp(
         let dist_gate = dist_gate.clone();
         let go_gate = go_gate.clone();
         let exits = exits.clone();
+        let wakes = wakes.clone();
         let outcome = outcome.clone();
         let created_tx = created_tx.clone();
         let restored_tx = restored_tx.clone();
@@ -1336,6 +1341,9 @@ fn resume_smp(
                 }
                 if let Some(sig) = vcpu.exit_signal() {
                     exits.lock().unwrap().push(sig);
+                }
+                if let Some(wake) = vcpu.wake_signal() {
+                    wakes.lock().unwrap().push(wake);
                 }
                 let _ = created_tx.send(Ok(()));
 
@@ -1567,7 +1575,28 @@ fn resume_smp(
         }
     });
     let serial_sink: Arc<dyn MsiSink> = Arc::new(GicMsiSink::new(prepared.gic.clone()));
-    console::spawn_stdin_pump(uart.clone(), serial_sink, raw_console.handle());
+    // A waker that nudges every vCPU out of its WFI idle park, so a keystroke's
+    // serial interrupt is taken immediately. Populated during vCPU creation.
+    let serial_wake: Option<Arc<dyn Fn() + Send + Sync>> = {
+        let wakes = wakes.clone();
+        Some(Arc::new(move || {
+            for w in wakes.lock().unwrap().iter() {
+                w();
+            }
+        }))
+    };
+    console::spawn_stdin_pump(
+        uart.clone(),
+        serial_sink.clone(),
+        raw_console.handle(),
+        serial_wake.clone(),
+    );
+    // Watchdog that restores level-triggered serial RX semantics: re-asserts the
+    // interrupt if input is ever stranded in the FIFO with the guest's RXIM
+    // unmasked (e.g. after cloud-init reopens ttyAMA0), so an interactive
+    // session can never wedge waiting for an edge that already passed.
+    let serial_reassert =
+        console::spawn_serial_reassert(uart.clone(), serial_sink, serial_wake, running.clone());
     if !args.quiet {
         eprintln!(
             "chm: interactive console active — close this window or press Ctrl-A x \
@@ -1594,6 +1623,8 @@ fn resume_smp(
     if let Some(h) = net_service {
         let _ = h.join();
     }
+    // Stop the serial re-assert watchdog (also observes `running`).
+    let _ = serial_reassert.join();
     for h in handles {
         let _ = h.join();
     }

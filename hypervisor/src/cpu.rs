@@ -381,6 +381,16 @@ pub trait Vcpu: Send + Sync {
     fn exit_signal(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
         None
     }
+    /// Return a handle that, when invoked from another thread, wakes this vCPU
+    /// from a host-side idle wait (the WFI/WFE park) promptly, so an interrupt
+    /// asserted cross-thread is taken without waiting for the idle re-evaluation
+    /// poll to elapse. Unlike [`Self::exit_signal`] (which forces a *running*
+    /// vCPU out of `run()`), this targets a vCPU that is parked waiting for work.
+    /// Backends without a host-side idle park return `None` (the default); the
+    /// macOS HVF backend implements it by writing the vCPU's WFI wake fd.
+    fn wake_signal(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        None
+    }
     ///
     /// Returns StandardRegisters with default value set
     ///

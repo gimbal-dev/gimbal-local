@@ -37,7 +37,8 @@ chm: guest resumed — serial console follows.
 ## Requirements
 
 - Apple Silicon Mac (`macOS`, `aarch64`).
-- A Rust toolchain (edition 2024; see `rust-toolchain.toml` / `Cargo.toml`).
+- A Rust toolchain (edition 2024; Rust 1.89.0 or later — see the
+  `package.rust-version` in `Cargo.toml`).
 - The binary must be **code-signed with the `com.apple.security.hypervisor`
   entitlement** before it can create a VM. `scripts/build-chm.sh` does this for
   you.
