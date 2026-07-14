@@ -190,14 +190,25 @@ Wire it end-to-end and make it demoable + tested:
 
 *Acceptance:* the demo at the top of this doc runs green, reproducibly.
 
-### M28.5 · Filesystem scopes  **[smaller, separate — modest by design]**
+### M28.5 · Filesystem scopes  **[smaller, separate — modest by design — SHIPPED]**
 
-Apply `chm_profile.fs` (`ro`/`rw`) + `mounts`. Honest scope: there is **no host-FS
-passthrough** (an M30 invariant), so the guest's filesystem is its own disk +
-overlay — "fs scoping" here means which mounts/overlays are writable vs
-read-only, and reporting `filesystem` decisions, not gating host directories.
-Kept minimal and clearly bounded; the **network half is the product must**, this
-rounds out the pillar.
+`chm_profile.fs` (`ro`/`rw`) + `mounts`, handled honestly given the invariant:
+there is **no host-FS passthrough** (an M30 invariant), so the guest's filesystem
+is its own disk + private overlay.
+
+- **Mounts are refused, loudly.** A host mount the plane requests cannot be
+  honored (no virtiofs/9p/shared-folder path exists), so the runner logs a
+  prominent `REFUSED` warning per mount and reports a `fs / mount-refused`
+  decision to the plane, rather than silently running the sandbox in an
+  unexpected config. The guest runs confined, without the host directory — the
+  safe direction (no host exposure).
+- **fs ro/rw scopes describe guest-internal paths** chm cannot police from
+  outside the guest, so they are surfaced (in the governed summary) but not
+  gated. Overlays are already created in a private `0700` runtime dir (M30).
+
+*Proven:* `chm` unit tests cover mount extraction (source/target/mode/durable,
+with defaults) and the empty case. *Tested manually:* a policy with a `mounts`
+entry produces the refusal warning + audit report.
 
 ---
 

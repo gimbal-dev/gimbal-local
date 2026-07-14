@@ -84,6 +84,27 @@ impl GovernedPolicy {
             if self.digest_recomputed { " · digest verified" } else { "" }
         )
     }
+
+    /// The host mounts the policy requests. `chm` has **no host-filesystem
+    /// passthrough** (a deliberate security invariant — no virtiofs/9p/shared
+    /// folder), so these cannot be honored and are refused loudly rather than
+    /// silently dropped. Returns `(source, target, mode, durable)` per mount.
+    pub fn requested_mounts(&self) -> Vec<(String, String, String, bool)> {
+        self.profile
+            .mounts
+            .iter()
+            .map(|m| {
+                let s = m.get("source").and_then(Value::as_str).unwrap_or("").to_string();
+                let t = m.get("target").and_then(Value::as_str).unwrap_or("").to_string();
+                let mode = {
+                    let md = m.get("mode").and_then(Value::as_str).unwrap_or("");
+                    if md.is_empty() { "ro".to_string() } else { md.to_string() }
+                };
+                let durable = m.get("durable").and_then(Value::as_bool).unwrap_or(false);
+                (s, t, mode, durable)
+            })
+            .collect()
+    }
 }
 
 /// Parse + verify the policy an assignment carries, if any.
@@ -383,5 +404,44 @@ mod tests {
     #[test]
     fn go_escape_matches_go_html_escaping() {
         assert_eq!(go_escape(r#"{"host":"a&b<c>"}"#), r#"{"host":"a\u0026b\u003cc\u003e"}"#);
+    }
+
+    #[test]
+    fn requested_mounts_extracts_source_target_mode_durable() {
+        let gp = GovernedPolicy {
+            digest: "sha256:x".to_string(),
+            profile: ChmProfile {
+                egress: ChmEgress::default(),
+                fs: ChmFs::default(),
+                mounts: vec![
+                    json!({"source":"/host/data","target":"/mnt/data","mode":"rw","durable":true}),
+                    json!({"source":"/host/ro","target":"/mnt/ro"}),
+                ],
+            },
+            digest_recomputed: true,
+            egress_rule_count: 0,
+        };
+        let mounts = gp.requested_mounts();
+        assert_eq!(mounts.len(), 2);
+        assert_eq!(
+            mounts[0],
+            ("/host/data".to_string(), "/mnt/data".to_string(), "rw".to_string(), true)
+        );
+        // Missing mode defaults to "ro"; missing durable defaults to false.
+        assert_eq!(
+            mounts[1],
+            ("/host/ro".to_string(), "/mnt/ro".to_string(), "ro".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn no_mounts_means_nothing_to_refuse() {
+        let gp = GovernedPolicy {
+            digest: "sha256:x".to_string(),
+            profile: ChmProfile::default(),
+            digest_recomputed: true,
+            egress_rule_count: 0,
+        };
+        assert!(gp.requested_mounts().is_empty());
     }
 }

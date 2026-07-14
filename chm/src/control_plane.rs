@@ -841,6 +841,37 @@ fn run_assignment(cp: &ControlPlane, runner_id: &str, opts: &RunOpts) -> Result<
                     "requested_by": "chm-runner",
                 }),
             );
+
+            // Filesystem policy (M28.5). chm has no host-filesystem passthrough
+            // (a deliberate security invariant — see docs/security-model.md), so
+            // a requested host mount cannot be honored. Refuse it loudly and
+            // report the decision rather than silently running the sandbox in an
+            // unexpected configuration. The guest runs confined, without the
+            // host directory — the safe direction (no host exposure). The fs
+            // ro/rw scopes describe guest-internal paths chm cannot police from
+            // outside, so they are surfaced (in the summary) but not enforced.
+            for (source, target, mode, durable) in governed.requested_mounts() {
+                eprintln!(
+                    "chm runner: WARNING: policy requests host mount {source} -> \
+                     {target} ({mode}{}) — REFUSED: chm has no host-filesystem \
+                     passthrough; the sandbox runs without it",
+                    if durable { ", durable" } else { "" }
+                );
+                cp.report_policy_decision(
+                    &sandbox_id,
+                    &json!({
+                        "substrate": "apple-hvf",
+                        "domain": "fs",
+                        "action": "mount-refused",
+                        "target": format!("{source}:{target}"),
+                        "detail": format!(
+                            "no host-FS passthrough on apple-hvf; mount not honored \
+                             (mode={mode}, durable={durable})"
+                        ),
+                        "requested_by": "chm-runner",
+                    }),
+                );
+            }
         }
         Ok(None) => {}
         Err(e) => {

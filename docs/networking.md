@@ -105,6 +105,11 @@ allow-list.*
 
 - **No host filesystem passthrough.** There is deliberately no virtiofs/9p/shared
   folder path (see [`security-model.md`](security-model.md)); networking is the
-  only egress surface, and it is fully mediated.
+  only egress surface, and it is fully mediated. If a policy requests a host
+  **mount**, `chm` refuses it loudly (a `fs / mount-refused` decision reported to
+  the plane) and runs the sandbox without it, rather than silently changing the
+  environment. The policy's `fs` read-only/read-write scopes describe
+  guest-internal paths that `chm` cannot police from outside the guest, so they
+  are surfaced but not gated.
 - **V0 is IPv4 TCP + DNS.** Other protocols are denied or answered-empty rather
   than partially working — a clear, honest boundary.
