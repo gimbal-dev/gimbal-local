@@ -31,6 +31,8 @@ use std::{env, thread};
 
 use serde_json::{Value, json};
 
+use crate::policy;
+
 /// Default control-plane base URL (overridable via `GCTL_API`).
 const DEFAULT_API: &str = "http://127.0.0.1:8080";
 
@@ -170,6 +172,22 @@ impl ControlPlane {
         ok_or_http_err(resp, "report-state").map(|_| ())
     }
 
+    /// Report a policy enforcement/consumption decision to the plane's audit
+    /// trail (M28). Best-effort: an audit hiccup must never fail the run, so a
+    /// transport/HTTP error is logged and swallowed.
+    fn report_policy_decision(&self, sandbox_id: &str, req: &Value) {
+        let path = format!("/sandboxes/{sandbox_id}/report-policy-decision");
+        match self.request("POST", &path, Some(req)) {
+            Ok(resp) if resp.status < 300 => {}
+            Ok(resp) => eprintln!(
+                "chm runner: note: report-policy-decision HTTP {} ({})",
+                resp.status,
+                http_error_message(&resp.body)
+            ),
+            Err(e) => eprintln!("chm runner: note: report-policy-decision failed: {e}"),
+        }
+    }
+
     fn push_artifacts(&self, sandbox_id: &str, req: &Value) -> Result<(), String> {
         let path = format!("/sandboxes/{sandbox_id}/push-artifacts");
         let resp = self.request("POST", &path, Some(req))?;
@@ -213,6 +231,14 @@ impl ControlPlane {
         let path = format!("/branches/{branch_id}/review");
         let resp = self.request("POST", &path, Some(req))?;
         ok_or_http_err(resp, "branches/review")
+    }
+
+    /// Fetch a sandbox's effective policy compiled for a substrate
+    /// (`GET /sandboxes/{id}/policy?substrate=`). Used by `chm policy show`.
+    fn effective_policy(&self, sandbox_id: &str, substrate: &str) -> Result<Value, String> {
+        let path = format!("/sandboxes/{sandbox_id}/policy?substrate={substrate}");
+        let resp = self.request("GET", &path, None)?;
+        ok_or_http_err(resp, "effective-policy")
     }
 
     /// Pull a branch head (or an explicit revision) back to a resume assignment
@@ -533,6 +559,11 @@ fn capabilities() -> Value {
         "supports_offload_daemon": true,
         // `chm state-cdn serve` serves held (ciphertext) chunks to LAN peers.
         "supports_peer_cache": true,
+        // chm consumes the plane's per-sandbox policy: it parses the compiled
+        // `enforcement.chm_profile`, verifies the `policy_digest` teleported
+        // intact, and surfaces it (M28.1). Egress enforcement lands with the
+        // userspace NAT (M28.2/M28.3).
+        "supports_policy": true,
     })
 }
 
@@ -772,6 +803,36 @@ fn run_assignment(cp: &ControlPlane, runner_id: &str, opts: &RunOpts) -> Result<
         checksum_tree.len()
     );
 
+    // Sandbox policy (Pillar ③, M28.1): if the plane bound a policy, parse the
+    // compiled profile and verify the `policy_digest` teleported intact. A
+    // present-but-unverifiable policy is fatal (we must not run a governed
+    // sandbox ungoverned); an unbound sandbox is unaffected. Egress is not yet
+    // enforced on the datapath — that is M28.2/M28.3.
+    match policy::parse_and_verify(&assign) {
+        Ok(Some(governed)) => {
+            eprintln!("chm runner: {}", governed.summary());
+            cp.report_policy_decision(
+                &sandbox_id,
+                &json!({
+                    "substrate": "apple-hvf",
+                    "domain": "policy",
+                    "action": "received",
+                    "target": governed.digest,
+                    "detail": format!(
+                        "chm_profile parsed; digest teleport {}",
+                        if governed.digest_recomputed { "verified" } else { "reference-checked" }
+                    ),
+                    "requested_by": "chm-runner",
+                }),
+            );
+        }
+        Ok(None) => {}
+        Err(e) => {
+            cp.report_state(&sandbox_id, "error").ok();
+            return Err(format!("policy verification failed: {e}"));
+        }
+    }
+
     // Resume-side provenance + gic gate. A cloud-origin checkpoint carries
     // `manifest.origin_substrate` (where it ran) and `manifest.gic_mode`. HVF can
     // only restore message-based-SPI (GICv2M) checkpoints, so re-verify the gate
@@ -964,6 +1025,91 @@ pub fn push_main(raw: &[String]) -> ExitCode {
             ExitCode::FAILURE
         }
     }
+}
+
+/// `chm policy show --sandbox ID [--substrate S] [--json]` — fetch a sandbox's
+/// effective policy from the plane, verify the digest, and print the governed
+/// summary. The read-only operator view of Pillar ③ governance (M28.1).
+pub fn policy_main(raw: &[String]) -> ExitCode {
+    match raw.first().map(String::as_str) {
+        Some("show") => match cmd_policy_show(&raw[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("chm policy show: {e}");
+                ExitCode::FAILURE
+            }
+        },
+        Some("-h") | Some("--help") | None => {
+            print!(
+                "chm policy — inspect the control plane's per-sandbox governance\n\
+                 \n\
+                 USAGE:\n    \
+                     chm policy show --sandbox ID [--substrate apple-hvf] [--json] [--api URL]\n\
+                 \n\
+                 Fetches the sandbox's effective policy, verifies the policy_digest,\n    \
+                 and prints the compiled egress/fs posture chm would enforce.\n"
+            );
+            ExitCode::SUCCESS
+        }
+        Some(other) => {
+            eprintln!("chm policy: unknown subcommand `{other}`");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn cmd_policy_show(raw: &[String]) -> Result<(), String> {
+    let mut api = None;
+    let mut sandbox = None;
+    let mut substrate = "apple-hvf".to_string();
+    let mut as_json = false;
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i].as_str() {
+            "--api" => api = Some(take_value(raw, &mut i, "--api")?),
+            "--sandbox" => sandbox = Some(take_value(raw, &mut i, "--sandbox")?),
+            "--substrate" => substrate = take_value(raw, &mut i, "--substrate")?,
+            "--json" => as_json = true,
+            other => return Err(format!("unknown flag `{other}`")),
+        }
+        i += 1;
+    }
+    let sandbox = sandbox.ok_or("--sandbox ID is required")?;
+    let cp = ControlPlane::from_env_or(api);
+    let effective = cp.effective_policy(&sandbox, &substrate)?;
+
+    let restricted = effective.get("restricted").and_then(Value::as_bool).unwrap_or(false);
+    if !restricted {
+        if as_json {
+            println!("{}", json!({ "sandbox_id": sandbox, "restricted": false }));
+        } else {
+            println!("sandbox {sandbox} is unrestricted (no policy bound)");
+        }
+        return Ok(());
+    }
+    // The effective-policy response carries the same fields an assignment does
+    // (policy, policy_digest, enforcement), so reuse the teleport verifier.
+    match policy::parse_and_verify(&effective)? {
+        Some(governed) => {
+            if as_json {
+                println!(
+                    "{}",
+                    json!({
+                        "sandbox_id": sandbox,
+                        "restricted": true,
+                        "policy_digest": governed.digest,
+                        "digest_verified": governed.digest_recomputed,
+                        "egress_rule_count": governed.egress_rule_count,
+                        "enforcement": effective.get("enforcement").cloned().unwrap_or(Value::Null),
+                    })
+                );
+            } else {
+                println!("sandbox {sandbox}: {}", governed.summary());
+            }
+        }
+        None => println!("sandbox {sandbox} reports restricted but carries no enforcement block"),
+    }
+    Ok(())
 }
 
 pub fn branches_main(raw: &[String]) -> ExitCode {

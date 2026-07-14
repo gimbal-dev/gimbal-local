@@ -92,20 +92,26 @@ Nothing new is needed from the plane for the demo.
 
 Right-sized so the hard engine work is bounded and every stage stands on its own.
 
-### M28.1 · Policy plumbing + digest teleport  **[ships without touching the datapath]**
+### M28.1 · Policy plumbing + digest teleport  **[ships without touching the datapath — SHIPPED]**
 
-Consume the contract before enforcing anything:
+Consume the contract before enforcing anything. **Shipped:** `chm/src/policy.rs`
+parses `enforcement.chm_profile` + `policy_digest` off every assignment,
+**independently recomputes the digest** over the normalized policy (reproducing
+the plane's Go `json.Marshal` canonical form byte-for-byte — proven against a real
+plane vector) and asserts it agrees with the enforcement + top-level digests, so a
+policy that didn't teleport intact is refused. The runner advertises
+`supports_policy`, prints a `governed by sha256:… · digest verified` line, and
+reports a `policy.decision` audit event. `chm policy show --sandbox ID` is the
+operator view. **No egress change yet** — a bound sandbox still runs.
 
-- Parse `enforcement.chm_profile` + `policy_digest` off assign-run/resume/pull.
-- Carry the profile into the run; **verify `policy_digest` is intact** end-to-end
-  (recompute over the normalized policy and assert it matches what the cloud
-  side ran under — proves governance survived the teleport).
-- Advertise `supports_policy`; surface the bound policy + digest in the app.
-- Emit a `policy received` audit line. **No egress change yet** — a bound sandbox
-  still runs, we just prove the policy arrived and matches.
+*Verified live on `:8080`:* a default-deny + `api.github.com:443` policy bound to a
+sandbox; `chm runner run` printed `governed by sha256:147f… · egress default=deny,
+1 rule(s) · fs 0 ro / 1 rw · digest verified`, recorded the audit event, and the
+guest still **booted Ubuntu 24.04 to login**. Digest recompute matches the plane
+byte-for-byte in a unit test against the captured assignment.
 
-*Acceptance:* pull a policy-bound sandbox; the digest matches the plane's; the app
-shows "governed by sha256:… (N egress rules)".
+*App governance badge is sequenced into M28.4* (the demo), where the bring-down
+flow establishes the cloud-sandbox ↔ plane-sandbox id linkage the badge needs.
 
 ### M28.2 · Userspace egress NAT — real guest networking  **[the hard engine work]**
 
