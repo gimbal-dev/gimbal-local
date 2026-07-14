@@ -20,6 +20,7 @@ use std::io::{self, Read};
 use std::ptr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, Ordering};
+use std::time::Duration;
 use std::{env, mem, thread};
 
 use hypervisor::hvf::devices::Pl011;
@@ -202,8 +203,10 @@ pub(crate) fn install_signal_handlers(restore: RestoreHandle) {
 
 /// Spawn the host-input pump. Reads stdin and feeds each byte into `uart`,
 /// asserting the serial SPI through `sink` so the guest takes its receive
-/// interrupt. Watches for the `Ctrl-A x` escape, in which case it restores the
-/// terminal (via `restore`) and requests a graceful session shutdown.
+/// interrupt, then invoking `wake` so a vCPU idling in its WFI park takes that
+/// interrupt immediately instead of after the idle poll interval. Watches for
+/// the `Ctrl-A x` escape, in which case it restores the terminal (via `restore`)
+/// and requests a graceful session shutdown.
 ///
 /// The thread is detached: it blocks on stdin for the life of the VM and the
 /// process tears it down on exit. The `Ctrl-A x` escape sets the shared
@@ -214,6 +217,7 @@ pub(crate) fn spawn_stdin_pump(
     uart: Arc<Pl011>,
     sink: Arc<dyn MsiSink>,
     restore: RestoreHandle,
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
 ) {
     let spi = serial_spi();
     let trace = env::var_os("CHM_TRACE_INPUT").is_some();
@@ -269,10 +273,58 @@ pub(crate) fn spawn_stdin_pump(
                 }
                 if assert {
                     sink.deliver_spi(spi);
+                    // Wake a WFI-parked vCPU so it takes the serial interrupt
+                    // now, rather than after its idle re-evaluation poll.
+                    if let Some(wake) = &wake {
+                        wake();
+                    }
                 }
             }
         }
     });
+}
+
+/// Cadence at which the serial re-assert tick re-evaluates the receive
+/// interrupt. Short enough that a wedged getty recovers imperceptibly, long
+/// enough to be negligible overhead; it only ever acts when input is genuinely
+/// stuck (pending in the FIFO with the guest's RXIM unmasked).
+const SERIAL_REASSERT_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Spawn the serial re-assert tick: a lightweight watchdog that restores the
+/// PL011 receive interrupt's level-triggered semantics. This model only pulses
+/// the serial SPI when the host types (see [`spawn_stdin_pump`]); a guest that
+/// unmasks RXIM *after* input was already queued — the cloud-init
+/// `systemctl restart serial-getty@ttyAMA0` reopening the tty is the canonical
+/// case — or that returns from its ISR with bytes still buffered would otherwise
+/// wait for the next keystroke to be interrupted, wedging an interactive session
+/// that produced no new input. The tick re-asserts the SPI (and wakes a parked
+/// vCPU) whenever [`Pl011::rx_irq_pending`] holds, so pending input can never be
+/// stranded. It exits when `running` clears.
+pub(crate) fn spawn_serial_reassert(
+    uart: Arc<Pl011>,
+    sink: Arc<dyn MsiSink>,
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    running: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    let spi = serial_spi();
+    let trace = env::var_os("CHM_TRACE_INPUT").is_some();
+    thread::Builder::new()
+        .name("chm-serial-reassert".into())
+        .spawn(move || {
+            while running.load(Ordering::Acquire) {
+                thread::sleep(SERIAL_REASSERT_INTERVAL);
+                if uart.rx_irq_pending() {
+                    if trace {
+                        eprintln!("[chm-input] re-asserting stuck serial RX irq spi={spi}");
+                    }
+                    sink.deliver_spi(spi);
+                    if let Some(wake) = &wake {
+                        wake();
+                    }
+                }
+            }
+        })
+        .expect("spawn serial re-assert thread")
 }
 
 #[cfg(test)]

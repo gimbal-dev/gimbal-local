@@ -256,6 +256,20 @@ impl Pl011 {
         // guest is interrupt-driven on RX; either one warrants asserting.
         !st.read_fifo.is_empty() && (st.imsc & (INT_RX | INT_RT)) != 0
     }
+
+    /// Whether the receive interrupt should currently be asserted: there is
+    /// unread input in the FIFO and the guest has RXIM/RTIM unmasked. The PL011
+    /// receive interrupt is level-triggered — it stays asserted while data is
+    /// pending — but this model only pulses the SPI from [`Self::push_input`] on
+    /// a fresh keystroke. A guest that unmasks RXIM *after* input was queued
+    /// (e.g. a getty reopening `ttyAMA0`), or that returns from its ISR with
+    /// bytes still buffered, would otherwise never see another edge. A serial
+    /// service tick polls this and re-asserts, restoring level semantics so the
+    /// guest can never wedge with input stuck in the FIFO.
+    pub fn rx_irq_pending(&self) -> bool {
+        let st = self.state.lock().unwrap();
+        !st.read_fifo.is_empty() && (st.imsc & (INT_RX | INT_RT)) != 0
+    }
 }
 
 fn read_u32(data: &mut [u8], value: u32) {
@@ -444,6 +458,43 @@ mod tests {
         let _ = read_reg(&uart, UARTDR);
         assert_eq!(read_reg(&uart, UARTRIS) & (INT_RX | INT_RT), 0, "cleared");
         assert_eq!(read_reg(&uart, UARTMIS) & (INT_RX | INT_RT), 0);
+    }
+
+    #[test]
+    fn pl011_rx_irq_pending_tracks_level_state() {
+        let uart = Pl011::new();
+        // Nothing queued: not pending regardless of mask.
+        assert!(!uart.rx_irq_pending(), "no pending irq with empty FIFO");
+        uart.write(UARTIMSC, &INT_RX.to_le_bytes());
+        assert!(!uart.rx_irq_pending(), "still nothing pending, FIFO empty");
+
+        // Data present + unmasked: the receive irq is level-asserted.
+        uart.push_input(b"z");
+        assert!(uart.rx_irq_pending(), "pending with data + RXIM unmasked");
+
+        // Draining the FIFO clears it.
+        let _ = read_reg(&uart, UARTDR);
+        assert!(!uart.rx_irq_pending(), "cleared once the FIFO drains");
+    }
+
+    #[test]
+    fn pl011_rx_irq_reasserts_after_unmask_with_pending_data() {
+        // The freeze scenario: input is queued while RX is masked (push_input
+        // reports no assert), then the guest unmasks RXIM *after* — e.g. a getty
+        // reopening ttyAMA0. push_input is not called again (no new keystroke),
+        // so nothing re-pulses the SPI; the serial re-assert tick relies on
+        // rx_irq_pending() staying true so the stranded input is delivered.
+        let uart = Pl011::new();
+        assert!(!uart.push_input(b"login"), "queued while masked, no assert");
+        assert!(!uart.rx_irq_pending(), "masked: irq not pending yet");
+
+        // Guest unmasks RX with the five bytes still sitting in the FIFO.
+        uart.write(UARTIMSC, &INT_RX.to_le_bytes());
+        assert!(
+            uart.rx_irq_pending(),
+            "after unmask with pending data the irq must be assertable — otherwise \
+             the guest wedges waiting for an edge that already passed"
+        );
     }
 
     #[test]

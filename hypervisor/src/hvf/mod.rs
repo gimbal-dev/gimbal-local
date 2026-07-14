@@ -912,6 +912,18 @@ impl Vcpu for HvfVcpu {
         }))
     }
 
+    fn wake_signal(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        // A clone of the WFI wake fd the owning vCPU thread parks on. Writing it
+        // wakes a vCPU idling in the host-side WFI park (see the `EC_WFX` arm in
+        // `run`), so an interrupt asserted cross-thread (a keystroke's serial
+        // SPI, a virtio completion) is taken immediately instead of waiting up
+        // to `WFI_IDLE_POLL_MS` for the park's re-evaluation poll.
+        let fd = self.wake_handle();
+        Some(Arc::new(move || {
+            let _ = fd.write(1);
+        }))
+    }
+
     fn run(&mut self) -> std::result::Result<VmExit, HypervisorCpuError> {
         // SAFETY: FFI on the owning thread.
         let ret = unsafe { hv_vcpu_run(self.id) };
