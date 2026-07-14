@@ -14,7 +14,8 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use super::block::{BlockBackend, BlockDevice, FileBackend, OverlayBackend};
-use super::net::{EchoResponder, NetDevice};
+use super::nat::{EgressPolicy, NatResponder};
+use super::net::NetDevice;
 use super::pathsafe;
 use super::pci::{Backend, RestoreParams, VirtioPciDevice, CAPABILITY_BAR_SIZE};
 use super::queue::Queue;
@@ -438,11 +439,17 @@ pub fn build_device(
             (Backend::Rng(RngDevice::new(Box::new(src))), Vec::new())
         }
         BackendKind::Net => {
-            // The gateway the resumed guest talks to. The capture-side
-            // cloud-init configures the guest as 192.168.249.2/24 with this
-            // gateway, so the host responder owns .1 and answers the guest's
-            // ARP + ICMP echo over the deliverable message-based-SPI path.
-            let responder = EchoResponder::new([192, 168, 249, 1], [0x02, 0, 0, 0, 0, 1]);
+            // The gateway the resumed guest talks to. Capture-side cloud-init
+            // configures the guest as 192.168.249.2/24 with this gateway, so the
+            // NAT owns .1 and terminates the guest's flows. M28.2 ships an
+            // allow-all policy (real networking, no gate); M28.3 threads the
+            // control-plane egress profile in so the allow-list is enforced
+            // here — at the DNS resolve and host connect the NAT mediates.
+            let responder = NatResponder::new(
+                [192, 168, 249, 1],
+                [0x02, 0, 0, 0, 0, 1],
+                EgressPolicy::allow_all(),
+            );
             (Backend::Net(NetDevice::new(Box::new(responder))), Vec::new())
         }
         BackendKind::Unsupported { virtio_type } => {

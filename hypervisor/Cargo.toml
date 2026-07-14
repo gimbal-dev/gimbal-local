@@ -8,8 +8,11 @@ version = "0.1.0"
 
 [features]
 # Apple Hypervisor.framework backend (macOS, arm64). Links the system
-# Hypervisor.framework via build.rs; pulls in no external crates.
-hvf = []
+# Hypervisor.framework via build.rs. Pulls in `smoltcp` for the userspace
+# egress NAT (`hvf::virtio::nat`): the resumed guest has no tap/bridge, so its
+# only network path is a userspace TCP/IP stack that terminates guest flows and
+# relays them to host sockets under the control-plane egress policy (M28).
+hvf = ["dep:smoltcp"]
 kvm = ["kvm-bindings", "kvm-ioctls", "vfio-ioctls/kvm"]
 # Ingest a serialized KVM arm64 vCPU snapshot (the real `kvm-bindings` ABI
 # types) WITHOUT the Linux-only `kvm-ioctls`/VFIO machinery, so the HVF backend
@@ -44,6 +47,17 @@ serde_json = { workspace = true }
 serde_with = { workspace = true, default-features = false, features = [
   "macros",
 ] }
+# Userspace TCP/IP stack for the HVF egress NAT (M28). Enabled only by the
+# `hvf` feature so Linux/KVM builds don't pull it. `std` gives us the host
+# socket glue; ipv4 + tcp/udp cover the V0 egress surface. The guest is
+# statically addressed by capture-side cloud-init, so no DHCP server is needed.
+smoltcp = { version = "0.12", default-features = false, features = [
+  "std",
+  "medium-ethernet",
+  "proto-ipv4",
+  "socket-tcp",
+  "socket-udp",
+], optional = true }
 thiserror = { workspace = true }
 vm-memory = { workspace = true, features = [
   "backend-atomic",
