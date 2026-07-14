@@ -4,8 +4,12 @@
 # boot a real HVF-compatible snapshot, log in over a PTY, write a file inside
 # the guest, `ls` it back, and assert there are no ext4/IO errors.
 #
-# This wraps the `#[ignore]`d integration test `chm/tests/e2e_microvm_loop.rs`
-# so a single command exercises (and guards) the rehydrate→connect→use loop.
+# This wraps the `#[ignore]`d integration tests in `chm/tests/e2e_microvm_loop.rs`
+# so a single command exercises (and guards) the whole local sandbox loop:
+#   * boot → login → write → ls → cat (the shipped-disk rehydration guard),
+#   * suspend → resume (live checkpoint restores RAM + the logged-in shell), and
+#   * the delta/rollback hero journey: file → checkpoint → second file →
+#     checkpoint → confirm both → roll back → prove the second file is gone.
 #
 # Usage:
 #   scripts/hvf/e2e-microvm-loop.sh [SNAPSHOT_DIR]
@@ -43,7 +47,8 @@ echo "e2e-microvm-loop: running the boot → login → write → ls loop..."
 
 # The test copies and ad-hoc-signs the cargo-built `chm` itself, so no separate
 # signing step is needed here. `--ignored` opts the heavy tests in; `--nocapture`
-# streams their progress; `--test-threads=1` runs them serially so the two VMs
-# (boot loop, then suspend/resume) never contend for the single HVF slot.
+# streams their progress; `--test-threads=1` runs them serially so the VMs
+# (boot loop, suspend/resume, then the rollback journey) never contend for the
+# single HVF slot.
 exec cargo test -p cloud-hypervisor-mac --test e2e_microvm_loop -- \
     --ignored --nocapture --test-threads=1

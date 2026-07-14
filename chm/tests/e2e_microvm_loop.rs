@@ -377,6 +377,173 @@ fn microvm_suspends_and_resumes_live_state() {
     eprintln!("e2e: suspend/resume preserved the logged-in shell and RAM marker {marker}");
 }
 
+/// Hero journey — the fork/delta/rollback lineage end to end:
+///
+///   1. boot a sandbox and log in,
+///   2. create a file, checkpoint it (delta 1),
+///   3. create a second file, checkpoint again (delta 2),
+///   4. list + cat both files (both present),
+///   5. roll back to delta 1, and
+///   6. prove the second file is gone while the first remains.
+///
+/// The files live in `/dev/shm` (tmpfs, pure guest RAM) so each checkpoint
+/// captures them in its RAM image and a rollback — which restores an earlier RAM
+/// image — provably reverts the later delta.
+///
+/// IMPORTANT: rollback restores guest RAM (and tmpfs with it), NOT the persistent
+/// disk overlay, which is not versioned per revision (see
+/// `chm/src/checkpoint.rs::write_checkpoint`). A file written to the real disk
+/// would still be present after a rollback. This test uses tmpfs deliberately so
+/// it exercises the behavior rollback actually guarantees today; the disk-overlay
+/// gap is tracked separately.
+#[test]
+#[ignore = "needs a local HVF-compatible snapshot; run via scripts/hvf/e2e-microvm-loop.sh"]
+fn microvm_delta_rollback_removes_the_later_delta() {
+    let Some(snapshot) = snapshot_from_env() else {
+        eprintln!("skipping: set CHM_E2E_SNAPSHOT to a snapshot dir to run the rollback journey");
+        return;
+    };
+    assert!(
+        snapshot.join("state.json").is_file(),
+        "CHM_E2E_SNAPSHOT={} has no state.json",
+        snapshot.display()
+    );
+
+    // Start clean: no prior checkpoint or archived revisions, fresh overlays.
+    let _ = fs::remove_dir_all(snapshot.join(".chm-checkpoint"));
+    let _ = fs::remove_dir_all(snapshot.join(".chm-revisions"));
+    let overlays = snapshot.join(".chm-overlays");
+    if overlays.is_dir() {
+        for entry in fs::read_dir(&overlays).into_iter().flatten().flatten() {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+
+    let shell = "@ch-snap:~$";
+    let uniq = format!("{}_{}", process::id(), nanos());
+    let file1 = format!("/dev/shm/gimbal_hero1_{uniq}");
+    let file2 = format!("/dev/shm/gimbal_hero2_{uniq}");
+    let m1 = format!("HERO_ONE_{uniq}");
+    let m2 = format!("HERO_TWO_{uniq}");
+    let snap_str = snapshot.to_str().unwrap().to_string();
+    let args = [
+        "connect",
+        &snap_str,
+        "--no-stop-daemon",
+        "--checkpoint",
+        "--idle-exit",
+        "0",
+        "--max-seconds",
+        "180",
+    ];
+    let chm = signed_chm_binary();
+
+    // --- 1) boot, log in, write file 1, checkpoint (delta 1) ----------------- //
+    let mut s1 = PtySession::spawn(&chm, &args);
+    let deadline = Instant::now() + OVERALL_BUDGET;
+    login_to_shell(&mut s1, shell, deadline);
+    s1.drain_for(Duration::from_secs(2));
+    s1.send(&format!(
+        "printf '%s\\n' {m1} > {file1}; sync; echo W1_{uniq}_done\n"
+    ));
+    if s1.wait_for(&[&format!("W1_{uniq}_done")], deadline).is_none() {
+        s1.fail("delta 1: writing file 1 never completed");
+    }
+    s1.drain_for(Duration::from_secs(2));
+    s1.suspend();
+    assert!(
+        snapshot.join(".chm-checkpoint/checkpoint.json").is_file(),
+        "delta 1 did not produce a checkpoint"
+    );
+    let rev1 = head_revision_id(&snapshot);
+    eprintln!("e2e: delta 1 captured as revision {rev1}");
+
+    // --- 2) resume, write file 2, checkpoint (delta 2) ----------------------- //
+    let mut s2 = PtySession::spawn(&chm, &args);
+    let deadline2 = Instant::now() + OVERALL_BUDGET;
+    resume_to_shell(&mut s2, shell, deadline2);
+    s2.send(&format!(
+        "printf '%s\\n' {m2} > {file2}; sync; echo W2_{uniq}_done\n"
+    ));
+    if s2.wait_for(&[&format!("W2_{uniq}_done")], deadline2).is_none() {
+        s2.fail("delta 2: writing file 2 never completed");
+    }
+    s2.drain_for(Duration::from_secs(2));
+    s2.suspend();
+    // Capturing delta 2 archives delta 1 into the revision store so a rollback
+    // can reach it.
+    assert!(
+        snapshot
+            .join(format!(".chm-revisions/{rev1}/memory-ranges"))
+            .is_file(),
+        "delta 1 (revision {rev1}) was not archived with its RAM when delta 2 was captured — \
+         rollback would have nothing resumable to return to"
+    );
+
+    // --- 3) resume and confirm BOTH files are present ------------------------ //
+    let mut s3 = PtySession::spawn(&chm, &args);
+    let deadline3 = Instant::now() + OVERALL_BUDGET;
+    resume_to_shell(&mut s3, shell, deadline3);
+    s3.send(&format!(
+        "echo LS_{uniq}; ls -1 {file1} {file2} 2>&1; cat {file1} {file2} 2>&1; echo DONE_{uniq}\n"
+    ));
+    if s3.wait_for(&[&format!("DONE_{uniq}")], deadline3).is_none() {
+        s3.fail("could not list/cat both files after delta 2");
+    }
+    let seen_both = s3.transcript();
+    s3.suspend();
+    assert!(
+        seen_both.contains(&m1) && seen_both.contains(&m2),
+        "after two deltas both files must be readable (saw m1={}, m2={})\n--- console tail ---\n{}",
+        seen_both.contains(&m1),
+        seen_both.contains(&m2),
+        tail(&seen_both)
+    );
+    eprintln!("e2e: both deltas present after delta 2");
+
+    // --- 4) roll back to delta 1 -------------------------------------------- //
+    let status = Command::new(&chm)
+        .args(["rollback", &snap_str, &rev1])
+        .status()
+        .expect("run chm rollback");
+    assert!(status.success(), "chm rollback to {rev1} failed");
+
+    // --- 5) resume and prove file 2 is GONE, file 1 remains ------------------ //
+    let mut s4 = PtySession::spawn(&chm, &args);
+    let deadline4 = Instant::now() + OVERALL_BUDGET;
+    resume_to_shell(&mut s4, shell, deadline4);
+    s4.send(&format!(
+        "echo RB_{uniq}; cat {file1} 2>&1; ls {file2} 2>&1; echo DONE_{uniq}\n"
+    ));
+    if s4.wait_for(&[&format!("DONE_{uniq}")], deadline4).is_none() {
+        s4.fail("could not inspect files after rollback");
+    }
+    let after = s4.transcript();
+    s4.shutdown();
+
+    if let Some(log) = env::var_os("CHM_E2E_LOG") {
+        let _ = fs::write(&log, &after);
+    }
+    // Only look at output produced after the rollback prod marker, so earlier
+    // sessions' echoes in a shared transcript can't confuse the assertions.
+    let post = after
+        .rsplit_once(&format!("RB_{uniq}"))
+        .map_or(after.as_str(), |(_, tailtext)| tailtext);
+    assert!(
+        post.contains(&m1),
+        "rollback lost the FIRST file — it should survive (delta 1 is the target).\n\
+         --- console tail ---\n{}",
+        tail(&after)
+    );
+    assert!(
+        !post.contains(&m2),
+        "rollback did NOT remove the second file — the later delta was not reverted.\n\
+         --- console tail ---\n{}",
+        tail(&after)
+    );
+    eprintln!("e2e: rollback to delta 1 kept file 1 and removed file 2 — lineage verified");
+}
+
 /// Drive a `chm connect` session from spawn to a shell prompt, logging in with
 /// `ubuntu` / `ubuntu` if a getty prompt is shown (autologin is also accepted).
 fn login_to_shell(session: &mut PtySession, shell: &str, deadline: Instant) {
@@ -408,6 +575,51 @@ fn snapshot_from_env() -> Option<PathBuf> {
         return None;
     }
     Some(PathBuf::from(raw))
+}
+
+/// Prod a freshly-`chm resume`d session until it lands at a logged-in shell
+/// (a live resume restores the prompt but does not reprint it, so nudge with a
+/// newline and retry). Fails if it cold-boots (a fresh `login:`) or errors.
+fn resume_to_shell(session: &mut PtySession, shell: &str, deadline: Instant) {
+    session.drain_for(Duration::from_secs(4));
+    for _ in 0..12 {
+        if Instant::now() >= deadline {
+            break;
+        }
+        session.send("\n");
+        match session.wait_for_or_abort(
+            &[shell, "login:"],
+            &DISK_ERRORS,
+            Instant::now() + Duration::from_secs(5),
+        ) {
+            WaitOutcome::Found(m) if m == "login:" => {
+                session.fail("resume cold-booted (saw `login:`) instead of restoring the session")
+            }
+            WaitOutcome::Found(_) => return,
+            WaitOutcome::Aborted(e) => {
+                session.fail(&format!("guest reported a disk error ({e:?}) on resume"))
+            }
+            WaitOutcome::TimedOut => continue,
+        }
+    }
+    session.fail("resumed guest never produced a shell prompt");
+}
+
+/// Read the current HEAD revision id from a snapshot's live checkpoint manifest
+/// (`.chm-checkpoint/checkpoint.json`). Minimal string extraction so the test
+/// stays dependency-free.
+fn head_revision_id(snapshot: &Path) -> String {
+    let manifest = snapshot.join(".chm-checkpoint/checkpoint.json");
+    let body = fs::read_to_string(&manifest)
+        .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
+    let key = "\"id\":\"";
+    let start = body
+        .find(key)
+        .unwrap_or_else(|| panic!("no `id` field in {}", manifest.display()))
+        + key.len();
+    let rest = &body[start..];
+    let end = rest.find('"').expect("unterminated id string");
+    rest[..end].to_string()
 }
 
 fn nanos() -> u128 {
