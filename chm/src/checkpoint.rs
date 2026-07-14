@@ -467,15 +467,33 @@ pub(crate) fn fork_into(src_dir: &Path, dst_dir: &Path) -> Result<(), String> {
 /// `ws_dir`, not the shared image. So N sandboxes launched from the same image
 /// diverge independently instead of clobbering each other's disk + checkpoints.
 ///
-/// Unlike [`fork_into`], it needs no saved revision — the workspace starts cold
-/// from the image (`chm run <ws_dir>` cold-boots; a later suspend saves a
-/// checkpoint inside the workspace).
+/// If the image ships a **golden checkpoint** (a `.chm-checkpoint` captured at a
+/// settled, quiescent point — e.g. a fully booted idle login), the workspace is
+/// seeded from it: the RAM dump is shared read-only (hard-linked, copy-on-write)
+/// and the matching disk overlays are copied so RAM and disk stay consistent.
+/// `chm connect <ws_dir> --checkpoint` then RESUMES that settled state instead
+/// of cold-booting. This lets an image avoid replaying a fragile boot phase
+/// (e.g. cloud-init's `serial-getty` restart) on every new sandbox. When the
+/// image has no golden checkpoint the workspace starts cold from the base
+/// (`chm run <ws_dir>` cold-boots; a later suspend saves a checkpoint inside the
+/// workspace).
 pub(crate) fn workspace_from_image(image_dir: &Path, ws_dir: &Path) -> Result<(), String> {
     if ws_dir.exists() {
         return Err(format!("workspace {} already exists", ws_dir.display()));
     }
     fs::create_dir_all(ws_dir).map_err(|e| format!("create {}: {e}", ws_dir.display()))?;
-    symlink_base(image_dir, ws_dir)
+    symlink_base(image_dir, ws_dir)?;
+
+    // Seed a golden checkpoint + its matching disk overlays if the image ships
+    // one, so the new sandbox resumes the settled state rather than cold-booting.
+    if has_checkpoint(image_dir) {
+        clone_checkpoint(&checkpoint_dir(image_dir), &checkpoint_dir(ws_dir))?;
+        let overlays = image_dir.join(".chm-overlays");
+        if overlays.is_dir() {
+            copy_tree(&overlays, &ws_dir.join(".chm-overlays"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Symlink an image's immutable base (`state.json`, `snapshot/`, `disks/`) into a
@@ -762,6 +780,46 @@ mod tests {
         assert!(!has_checkpoint(&ws));
         // Re-creating over an existing workspace is refused.
         workspace_from_image(&image, &ws).unwrap_err();
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn workspace_seeds_golden_checkpoint_and_overlays_from_image() {
+        let root = env::temp_dir().join(format!("chm-gold-{}-{}", process::id(), now_ms()));
+        let image = root.join("image");
+        let ws = root.join("ws");
+        let _ = fs::remove_dir_all(&root);
+
+        // An image that ships a golden checkpoint (settled boot) + disk overlays.
+        fs::create_dir_all(image.join("snapshot")).unwrap();
+        fs::create_dir_all(image.join("disks")).unwrap();
+        fs::write(image.join("state.json"), b"{}").unwrap();
+        fs::write(image.join("snapshot/memory-ranges"), b"base-ram").unwrap();
+        write_test_checkpoint(&image, b"golden-ram", "connect");
+        fs::create_dir_all(image.join(".chm-overlays")).unwrap();
+        fs::write(image.join(".chm-overlays/disk0-cow.raw"), b"cloud-init-writes").unwrap();
+
+        workspace_from_image(&image, &ws).expect("create workspace");
+
+        // The workspace resumes the golden checkpoint (not a cold boot) with its
+        // matching disk overlays, so RAM and disk stay consistent.
+        assert!(has_checkpoint(&ws), "workspace should be seeded resumable");
+        assert_eq!(
+            fs::read(checkpoint_dir(&ws).join(MEMORY_RANGES)).unwrap(),
+            b"golden-ram"
+        );
+        assert_eq!(
+            fs::read(ws.join(".chm-overlays/disk0-cow.raw")).unwrap(),
+            b"cloud-init-writes"
+        );
+        // Overlays are copied (private), not shared, so sandboxes diverge.
+        fs::write(ws.join(".chm-overlays/disk0-cow.raw"), b"diverged").unwrap();
+        assert_eq!(
+            fs::read(image.join(".chm-overlays/disk0-cow.raw")).unwrap(),
+            b"cloud-init-writes",
+            "image overlay must be untouched by a workspace write"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
