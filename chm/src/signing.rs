@@ -127,6 +127,11 @@ impl TrustStore {
         Ok(())
     }
 
+    /// Whether the store holds no keys (i.e. no trust root is configured).
+    pub fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
     /// Add or replace a trusted key.
     pub fn insert_hex(&mut self, key_id: &str, pubkey_hex: &str) {
         self.keys.insert(key_id.to_string(), pubkey_hex.to_string());
