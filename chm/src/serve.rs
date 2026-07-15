@@ -27,6 +27,8 @@ use hypervisor::{VmExit, VmOps};
 use crate::checkpoint;
 use crate::console_filter::ConsoleFilter;
 use crate::imp::{build_vm_ops, its_lpi_guard, load_snapshot, wire_virtio};
+use crate::limits;
+use hypervisor::hvf::virtio::nat::NatLimits;
 
 /// Set by the daemon's termination-signal handlers so the accept loop exits and
 /// tears the running VM down gracefully (checkpoint + `hv_vm_destroy`) instead
@@ -794,6 +796,11 @@ fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Resu
     // state and install it onto the bus, sharing the just-mapped guest RAM. On
     // resume, reattach the disk overlays so writes made before the stop persist.
     let overlay_dir = dir.join(".chm-overlays");
+    let (doc, _) = limits::resolve_limits(dir, None);
+    let net_limits = NatLimits {
+        max_connections: doc.max_connections.map(|n| n as usize),
+        max_bytes_per_sec: doc.max_bandwidth_kbps.map(|kbps| kbps * 125),
+    };
     if let Err(e) = wire_virtio(
         &bus,
         &rvm.guest_mem,
@@ -802,6 +809,7 @@ fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Resu
         Some(&rvm.gic),
         resume_state.is_some(),
         None,
+        &net_limits,
     ) {
         eprintln!("chm serve: warning: virtio device model not wired: {e}");
     }

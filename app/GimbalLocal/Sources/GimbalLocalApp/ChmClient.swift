@@ -149,6 +149,8 @@ struct ChmClient {
         if let v = limits.maxDiskMb { args += ["--max-disk-mb", String(v)] }
         if let v = limits.maxWallSeconds { args += ["--max-wall-seconds", String(v)] }
         if let v = limits.maxConsoleMb { args += ["--max-console-mb", String(v)] }
+        if let v = limits.maxConnections { args += ["--max-connections", String(v)] }
+        if let v = limits.maxBandwidthKbps { args += ["--max-bandwidth-kbps", String(v)] }
         args += ["--label", "app-default"]
         return await runRaw(settings: settings, args: args)
     }

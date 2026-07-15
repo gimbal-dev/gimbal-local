@@ -14,7 +14,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use super::block::{BlockBackend, BlockDevice, FileBackend, OverlayBackend};
-use super::nat::{EgressPolicy, NatResponder};
+use super::nat::{EgressPolicy, NatLimits, NatResponder};
 use super::net::NetDevice;
 use super::pathsafe;
 use super::pci::{Backend, RestoreParams, VirtioPciDevice, CAPABILITY_BAR_SIZE};
@@ -415,6 +415,7 @@ pub fn build_device(
     overlay_dir: &std::path::Path,
     resume: bool,
     net_policy: Option<EgressPolicy>,
+    net_limits: NatLimits,
 ) -> Result<(u64, u64, Arc<VirtioPciDevice>), DevMgrError> {
     let queues = desc
         .queues
@@ -455,7 +456,7 @@ pub fn build_device(
                     policy.label()
                 );
             }
-            let responder = NatResponder::new([192, 168, 249, 1], [0x02, 0, 0, 0, 0, 1], policy);
+            let responder = NatResponder::new([192, 168, 249, 1], [0x02, 0, 0, 0, 0, 1], policy, net_limits);
             (Backend::Net(NetDevice::new(Box::new(responder))), Vec::new())
         }
         BackendKind::Unsupported { virtio_type } => {

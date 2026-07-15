@@ -167,6 +167,7 @@ fn relays_guest_tcp_to_a_host_echo_server() {
         [192, 168, 249, 1],
         [0x02, 0, 0, 0, 0, 1],
         EgressPolicy::allow_all(),
+        NatLimits::default(),
     );
     let dst = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port);
     let payload = b"hello nat";
@@ -187,6 +188,7 @@ fn default_deny_refuses_the_connection() {
         [192, 168, 249, 1],
         [0x02, 0, 0, 0, 0, 1],
         EgressPolicy::from_profile("deny", &[], &[], "locked"),
+        NatLimits::default(),
     );
     let dst = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port);
     let (refused, denied_event) = drive_expect_refused(&mut nat, dst);
@@ -210,6 +212,7 @@ fn allow_list_permits_listed_and_refuses_unlisted() {
         [192, 168, 249, 1],
         [0x02, 0, 0, 0, 0, 1],
         EgressPolicy::from_profile("deny", &profile_allow, &[], "sha256:test"),
+        NatLimits::default(),
     );
     let payload = b"through the gate";
     assert_eq!(
@@ -223,9 +226,102 @@ fn allow_list_permits_listed_and_refuses_unlisted() {
         [192, 168, 249, 1],
         [0x02, 0, 0, 0, 0, 1],
         EgressPolicy::from_profile("deny", &profile_allow, &[], "sha256:test"),
+        NatLimits::default(),
     );
     let (refused, denied_event) = drive_expect_refused(&mut nat_deny, denied);
     assert!(denied_event, "the unlisted destination must record a denial");
     assert!(refused, "the unlisted destination must not establish");
 }
+
+/// Stream up to `cap_total` bytes from a fresh guest to the echo server through
+/// `nat`, draining the echoed reply, over a fixed `iters` service ticks. Returns
+/// the number of bytes echoed back to the guest within that window. Used to
+/// compare throughput with and without a bandwidth cap.
+fn drive_stream(nat: &mut NatResponder, dst: SocketAddrV4, cap_total: usize, iters: usize) -> usize {
+    let mut guest = Guest::new();
+    guest.connect(dst);
+    let mut sent = 0usize;
+    let mut received = 0usize;
+    let chunk = [0x5au8; 4096];
+    for _ in 0..iters {
+        pump(&mut guest, nat);
+        let s = guest.sockets.get_mut::<tcp::Socket>(guest.sock);
+        while sent < cap_total && s.can_send() {
+            let want = chunk.len().min(cap_total - sent);
+            let n = s.send_slice(&chunk[..want]).unwrap_or(0);
+            if n == 0 {
+                break;
+            }
+            sent += n;
+        }
+        if s.can_recv() {
+            let _ = s.recv(|buf| {
+                received += buf.len();
+                (buf.len(), ())
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    received
+}
+
+#[test]
+fn bandwidth_cap_throttles_relay_throughput() {
+    // The datapath resource cap (M30.6): a permitted flow may still be bounded in
+    // how much it moves. Stream the same offered load through an unlimited NAT
+    // and a tightly-capped one over the same fixed window, and prove the cap
+    // moved dramatically fewer bytes (throttled, not dropped — TCP backpressure
+    // leaves the rest buffered).
+    const OFFERED: usize = 4 * 1024 * 1024;
+    const ITERS: usize = 400;
+
+    let uncapped_port = spawn_echo_server();
+    let mut uncapped = NatResponder::new(
+        [192, 168, 249, 1],
+        [0x02, 0, 0, 0, 0, 1],
+        EgressPolicy::allow_all(),
+        NatLimits::default(),
+    );
+    let uncapped_rx = drive_stream(
+        &mut uncapped,
+        SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), uncapped_port),
+        OFFERED,
+        ITERS,
+    );
+
+    let capped_port = spawn_echo_server();
+    let mut capped = NatResponder::new(
+        [192, 168, 249, 1],
+        [0x02, 0, 0, 0, 0, 1],
+        EgressPolicy::allow_all(),
+        NatLimits {
+            max_connections: None,
+            max_bytes_per_sec: Some(8_000),
+        },
+    );
+    let capped_rx = drive_stream(
+        &mut capped,
+        SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), capped_port),
+        OFFERED,
+        ITERS,
+    );
+
+    // The uncapped flow moves a lot; the capped flow is bounded by its 8 KB/s
+    // budget (plus a 1 s burst). The window is well under 8 s, so the cap cannot
+    // have passed 64 KiB — a generous ceiling that stays clear of timing jitter.
+    assert!(
+        uncapped_rx >= 200_000,
+        "an unthrottled flow should move plenty (got {uncapped_rx} bytes)"
+    );
+    assert!(
+        capped_rx <= 64 * 1024,
+        "the bandwidth cap must throttle throughput (got {capped_rx} bytes)"
+    );
+    assert!(
+        capped_rx < uncapped_rx / 2,
+        "the cap must be dramatically slower than unthrottled \
+         (capped {capped_rx} vs uncapped {uncapped_rx})"
+    );
+}
+
 

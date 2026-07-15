@@ -33,7 +33,7 @@ use hypervisor::hvf::rehydrate::{
     restore_vcpu_state,
 };
 use hypervisor::hvf::virtio::GuestMemory;
-use hypervisor::hvf::virtio::nat::EgressPolicy;
+use hypervisor::hvf::virtio::nat::{EgressPolicy, NatLimits};
 use hypervisor::hvf::virtio::pci::{MsiSink, MsiSpiInjector, VirtioPciDevice};
 use hypervisor::hvf::virtio::{devmgr, its};
 use hypervisor::{HypervisorVmError, StandardRegisters, Vcpu, VmExit, VmOps};
@@ -298,6 +298,7 @@ fn ensure_private_overlay_dir(overlay_dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("create overlay dir {}: {e}", overlay_dir.display()))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn wire_virtio(
     bus: &MmioBus,
     guest_mem: &Arc<GuestMemory>,
@@ -306,6 +307,7 @@ pub(crate) fn wire_virtio(
     gic: Option<&Arc<Mutex<dyn Vgic>>>,
     resume: bool,
     cli_egress: Option<&Path>,
+    net_limits: &NatLimits,
 ) -> Result<WiredVirtio, String> {
     let descs =
         devmgr::parse_devices(state_json).map_err(|e| format!("parse virtio devices: {e}"))?;
@@ -375,8 +377,9 @@ pub(crate) fn wire_virtio(
         let is_net = matches!(desc.backend, devmgr::BackendKind::Net);
         // Clone (not take) so a second NIC is governed by the same policy.
         let policy = if is_net { enforced_policy.clone() } else { None };
+        let dev_limits = if is_net { net_limits.clone() } else { NatLimits::default() };
         let (base, size, dev) =
-            devmgr::build_device(desc, guest_mem.clone(), overlay_dir, resume, policy)
+            devmgr::build_device(desc, guest_mem.clone(), overlay_dir, resume, policy, dev_limits)
                 .map_err(|e| format!("build device {}: {e}", desc.name))?;
         if !desc.vector_events.is_empty() {
             if let Some(its) = &its_engine {
@@ -1676,6 +1679,11 @@ fn resume_smp(
         Some(&prepared.gic),
         resume_from.is_some(),
         args.egress_policy.as_deref(),
+        &NatLimits {
+            max_connections: limits.max_connections.map(|n| n as usize),
+            // kbps (kilobits/sec) -> bytes/sec: * 1000 / 8 = * 125.
+            max_bytes_per_sec: limits.max_bandwidth_kbps.map(|kbps| kbps * 125),
+        },
     ) {
         Ok(wired) => {
             if !wired.summary.is_empty() && !args.quiet {

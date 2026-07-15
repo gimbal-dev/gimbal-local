@@ -55,6 +55,25 @@ use super::net::NetResponder;
 const TCP_BUF: usize = 64 * 1024;
 /// How long a host connect may take before the flow is torn down.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+/// How much burst the bandwidth token bucket allows: one second of the rate, so
+/// a short idle period lets a subsequent transfer briefly run at line rate
+/// before settling to the sustained cap.
+const BW_BURST_SECS: f64 = 1.0;
+
+/// Datapath resource caps enforced by the NAT (M30.6). Separate from the egress
+/// *policy* (which decides *whether* a flow is allowed); these bound *how much* an
+/// allowed guest may do, so a permitted destination can't be used to exhaust host
+/// sockets or saturate the uplink.
+#[derive(Debug, Clone, Default)]
+pub struct NatLimits {
+    /// Maximum concurrent guest TCP flows (`None` = unlimited). A SYN that would
+    /// exceed it is refused like a policy denial.
+    pub max_connections: Option<usize>,
+    /// Maximum sustained throughput in bytes/sec across all flows, both
+    /// directions (`None` = unlimited). Enforced by a token bucket that throttles
+    /// relaying (TCP backpressure slows the guest) rather than dropping data.
+    pub max_bytes_per_sec: Option<u64>,
+}
 
 /// An egress decision worth surfacing to the control-plane audit log. `chm`
 /// drains these after servicing the device (see [`NatResponder::drain_events`]).
@@ -108,11 +127,22 @@ pub struct NatResponder {
     logged_denials: HashSet<String>,
     gateway_ip: Ipv4Addr,
     boot: Instant,
+    /// Datapath caps (connections + bandwidth).
+    limits: NatLimits,
+    /// Bandwidth token bucket: available bytes, refilled at `max_bytes_per_sec`.
+    bw_tokens: f64,
+    bw_last_refill: Instant,
 }
 
 impl NatResponder {
-    /// Build a NAT owning `gateway_ip`/`gateway_mac` and enforcing `policy`.
-    pub fn new(gateway_ip: [u8; 4], gateway_mac: [u8; 6], policy: EgressPolicy) -> Self {
+    /// Build a NAT owning `gateway_ip`/`gateway_mac`, enforcing `policy` (what is
+    /// allowed) and `limits` (how much an allowed guest may do).
+    pub fn new(
+        gateway_ip: [u8; 4],
+        gateway_mac: [u8; 6],
+        policy: EgressPolicy,
+        limits: NatLimits,
+    ) -> Self {
         let mut device = FrameDevice::default();
         let mac = EthernetAddress(gateway_mac);
         let mut config = Config::new(HardwareAddress::Ethernet(mac));
@@ -132,6 +162,11 @@ impl NatResponder {
         let mut sockets = SocketSet::new(Vec::new());
         let dns = sockets.add(new_dns_socket(gw));
 
+        // Start the bucket full (one burst) so the first transfer isn't throttled
+        // from a cold start.
+        let bw_tokens = limits
+            .max_bytes_per_sec
+            .map_or(0.0, |r| r as f64 * BW_BURST_SECS);
         Self {
             iface,
             device,
@@ -144,6 +179,9 @@ impl NatResponder {
             logged_denials: HashSet::new(),
             gateway_ip: gw,
             boot,
+            limits,
+            bw_tokens,
+            bw_last_refill: boot,
         }
     }
 
@@ -197,6 +235,20 @@ impl NatResponder {
         if self.listeners.contains_key(&dst) {
             return true; // a retransmitted SYN; listener already armed
         }
+        // Connection cap: a permitted destination may not be used to open an
+        // unbounded number of concurrent flows and exhaust host sockets (M30.6).
+        if let Some(max) = self.limits.max_connections
+            && self.flows.len() + self.listeners.len() >= max
+        {
+            self.events.push(EgressEvent {
+                domain: "tcp",
+                target: dst.to_string(),
+                allowed: false,
+                rule: "connection-limit".to_string(),
+            });
+            self.note_denial("tcp", &dst.to_string(), "connection-limit");
+            return false;
+        }
         let mut sock = new_tcp_socket();
         // Listen on the exact destination the guest dialed; AnyIP lets smoltcp
         // accept a SYN to this foreign local address.
@@ -215,6 +267,14 @@ impl NatResponder {
     /// established flows. Returns frames to inject into the guest's RX queue.
     fn service(&mut self) -> Vec<Vec<u8>> {
         let now = self.now();
+        // Refill the bandwidth token bucket for the elapsed wall-clock time.
+        if let Some(rate) = self.limits.max_bytes_per_sec {
+            let real_now = Instant::now();
+            let dt = real_now.duration_since(self.bw_last_refill).as_secs_f64();
+            self.bw_last_refill = real_now;
+            let cap = rate as f64 * BW_BURST_SECS;
+            self.bw_tokens = (self.bw_tokens + rate as f64 * dt).min(cap);
+        }
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.service_dns();
         self.promote_listeners();
@@ -322,6 +382,11 @@ impl NatResponder {
     /// and retire closed flows.
     fn service_flows(&mut self) {
         let mut retire: Vec<usize> = Vec::new();
+        // This tick's byte budget from the bandwidth bucket (None = unlimited).
+        let mut budget: Option<u64> = self
+            .limits
+            .max_bytes_per_sec
+            .map(|_| self.bw_tokens.max(0.0) as u64);
         for idx in 0..self.flows.len() {
             let handle = self.flows[idx].handle;
             // Resolve a pending connect first (may transition the host side).
@@ -332,12 +397,17 @@ impl NatResponder {
                 HostSide::Relaying { .. } => Self::relay(
                     self.sockets.get_mut::<tcp::Socket>(handle),
                     &mut self.flows[idx].host,
+                    &mut budget,
                 ),
             };
             let sock = self.sockets.get_mut::<tcp::Socket>(handle);
             if done || (!sock.is_active() && !sock.is_open()) {
                 retire.push(idx);
             }
+        }
+        // Deduct the bytes actually relayed from the bucket.
+        if let Some(remaining) = budget {
+            self.bw_tokens = remaining as f64;
         }
         // Retire high-to-low so indices stay valid.
         for idx in retire.into_iter().rev() {
@@ -381,7 +451,12 @@ impl NatResponder {
 
     /// Relay bytes between one smoltcp socket and its host stream. Returns
     /// `true` when the flow is fully done and should be retired.
-    fn relay(sock: &mut tcp::Socket, host: &mut HostSide) -> bool {
+    /// Relay bytes between one smoltcp socket and its host stream, consuming from
+    /// `budget` (the tick's remaining bandwidth allowance; `None` = unlimited).
+    /// When the budget is exhausted, bytes are left buffered — TCP backpressure
+    /// then slows the guest — rather than dropped. Returns `true` when the flow is
+    /// fully done and should be retired.
+    fn relay(sock: &mut tcp::Socket, host: &mut HostSide, budget: &mut Option<u64>) -> bool {
         let HostSide::Relaying {
             stream,
             pending,
@@ -391,17 +466,27 @@ impl NatResponder {
             return false;
         };
 
-        // Guest -> host: consume only what the host accepts (backpressure).
+        // Guest -> host: consume only what the host accepts (backpressure) and
+        // only up to this tick's byte budget.
         while sock.can_recv() {
-            let mut wrote_any = false;
+            let cap = match *budget {
+                Some(0) => break, // out of budget this tick
+                Some(n) => n as usize,
+                None => usize::MAX,
+            };
+            let mut moved = 0usize;
             let res: Result<Result<(), std::io::Error>, tcp::RecvError> = sock.recv(|buf| {
                 if buf.is_empty() {
                     return (0, Ok(()));
                 }
-                match stream.write(buf) {
+                let take = buf.len().min(cap);
+                if take == 0 {
+                    return (0, Ok(()));
+                }
+                match stream.write(&buf[..take]) {
                     Ok(0) => (0, Err(std::io::ErrorKind::WriteZero.into())),
                     Ok(n) => {
-                        wrote_any = true;
+                        moved = n;
                         (n, Ok(()))
                     }
                     Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => (0, Ok(())),
@@ -412,28 +497,42 @@ impl NatResponder {
                 sock.close();
                 break;
             }
-            if !wrote_any {
+            if moved == 0 {
                 break; // host not writable right now
+            }
+            if let Some(b) = budget {
+                *b = b.saturating_sub(moved as u64);
             }
         }
 
-        // Host -> guest: flush any backlog first, then read more.
+        // Host -> guest: flush any backlog first (already-read bytes, not counted
+        // again), then read more up to the remaining budget.
         if !pending.is_empty() {
             let sent = sock.send_slice(pending).unwrap_or(0);
             pending.drain(..sent);
         }
         if pending.is_empty() && !*host_eof && sock.can_send() {
-            let mut buf = [0u8; 16 * 1024];
-            match stream.read(&mut buf) {
-                Ok(0) => *host_eof = true,
-                Ok(n) => {
-                    let sent = sock.send_slice(&buf[..n]).unwrap_or(0);
-                    if sent < n {
-                        pending.extend_from_slice(&buf[sent..n]);
+            let cap = match *budget {
+                Some(0) => 0,
+                Some(n) => (n as usize).min(16 * 1024),
+                None => 16 * 1024,
+            };
+            if cap > 0 {
+                let mut buf = [0u8; 16 * 1024];
+                match stream.read(&mut buf[..cap]) {
+                    Ok(0) => *host_eof = true,
+                    Ok(n) => {
+                        let sent = sock.send_slice(&buf[..n]).unwrap_or(0);
+                        if sent < n {
+                            pending.extend_from_slice(&buf[sent..n]);
+                        }
+                        if let Some(b) = budget {
+                            *b = b.saturating_sub(n as u64);
+                        }
                     }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(_) => *host_eof = true,
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                Err(_) => *host_eof = true,
             }
         }
 
@@ -583,7 +682,8 @@ mod tests {
     #[test]
     fn denied_syn_arms_no_listener_and_records_event() {
         let policy = EgressPolicy::from_profile("deny", &[], &[], "test");
-        let mut nat = NatResponder::new([192, 168, 249, 1], [0x02, 0, 0, 0, 0, 1], policy);
+        let mut nat =
+            NatResponder::new([192, 168, 249, 1], [0x02, 0, 0, 0, 0, 1], policy, NatLimits::default());
         let dst = SocketAddrV4::new(Ipv4Addr::new(140, 82, 112, 6), 443);
         assert!(!nat.admit_syn(dst), "default-deny refuses the connect");
         assert!(nat.listeners.is_empty(), "no listener armed for a denied dst");
@@ -599,6 +699,7 @@ mod tests {
             [192, 168, 249, 1],
             [0x02, 0, 0, 0, 0, 1],
             EgressPolicy::allow_all(),
+            NatLimits::default(),
         );
         let dst = SocketAddrV4::new(Ipv4Addr::new(140, 82, 112, 6), 443);
         assert!(nat.admit_syn(dst));
@@ -609,11 +710,41 @@ mod tests {
     }
 
     #[test]
+    fn connection_cap_refuses_syn_over_the_limit() {
+        let mut nat = NatResponder::new(
+            [192, 168, 249, 1],
+            [0x02, 0, 0, 0, 0, 1],
+            EgressPolicy::allow_all(),
+            NatLimits {
+                max_connections: Some(2),
+                max_bytes_per_sec: None,
+            },
+        );
+        let a = SocketAddrV4::new(Ipv4Addr::new(140, 82, 112, 6), 443);
+        let b = SocketAddrV4::new(Ipv4Addr::new(140, 82, 112, 7), 443);
+        let c = SocketAddrV4::new(Ipv4Addr::new(140, 82, 112, 8), 443);
+        assert!(nat.admit_syn(a), "first connect under the cap is admitted");
+        assert!(nat.admit_syn(b), "second connect at the cap is admitted");
+        assert!(!nat.admit_syn(c), "third connect over the cap is refused");
+        assert!(!nat.listeners.contains_key(&c), "no listener armed past the cap");
+        let events = nat.drain_events();
+        let denial = events
+            .iter()
+            .find(|e| e.rule == "connection-limit")
+            .expect("a connection-limit denial is recorded");
+        assert!(!denial.allowed);
+        // Below the cap again after one flow is dropped: a retransmit of an
+        // already-armed listener still succeeds (does not count as new).
+        assert!(nat.admit_syn(a), "retransmit of an armed flow is not re-counted");
+    }
+
+    #[test]
     fn construction_wires_gateway_and_dns() {
         let nat = NatResponder::new(
             [192, 168, 249, 1],
             [0x02, 0, 0, 0, 0, 1],
             EgressPolicy::allow_all(),
+            NatLimits::default(),
         );
         assert_eq!(nat.gateway_ip, Ipv4Addr::new(192, 168, 249, 1));
         assert_eq!(nat.policy_label(), "allow-all");

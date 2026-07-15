@@ -266,13 +266,19 @@ set`) bounds a sandbox's resources, enforced in the run loop:
 - **App defaults:** Gimbal Local ships sane global defaults (an 8 GiB disk +
   64 MiB console cap on by default) applied to every new sandbox's workspace, so
   a runaway can't exhaust the host out of the box.
+- **Network caps (NAT datapath):** `max_connections` bounds the concurrent
+  outbound TCP flows the guest may hold open (a SYN over the cap is refused like
+  a policy denial and audited as `connection-limit`, so a permitted destination
+  can't be used to exhaust host sockets), and `max_bandwidth_kbps` bounds
+  sustained egress throughput via a token bucket that *throttles* (TCP
+  backpressure slows the guest) rather than dropping. The cap applies to every
+  NIC, matching the per-NIC fail-closed egress policy (M30.9).
 
 Verified end to end: a guest running `dd if=/dev/zero` was stopped after ~64 MiB
-against a 64 MiB cap.
-
-**Remaining.** Network **connection-count** and **bandwidth** caps enforced at
-the userspace NAT (the datapath already sees every flow) are the next slice; they
-were listed in the review but are not in the shipped core.
+against a 64 MiB cap; the NAT connection and bandwidth caps are proven by the
+two-stack relay test (a real guest smoltcp stack moving bytes through the NAT to
+a real localhost server) — an over-limit SYN is refused, and a tightly-capped
+flow moves dramatically fewer bytes than an unthrottled one over the same window.
 
 ### M30.2 daemon follow-up · runtime-dir ownership  **[P1, daemon]**
 
@@ -367,7 +373,8 @@ M30.4/M30.6.
       signs; local verifies before exposing "Run" (M30.4).
 - [x] **No host FS passthrough** — invariant documented, behavioural test +
       `make security-check` guard (M30.5, shipped).
-- [ ] **Resource limits** — per-sandbox vCPU/mem/disk ceilings (M30.6).
+- [x] **Resource limits** — per-sandbox vCPU/mem/disk/console/wall ceilings plus
+      NAT connection-count + bandwidth caps (M30.6, shipped).
 - [ ] **Network policy** — egress allow/deny enforced on the local datapath
       (converges with **M28**; the firewall half of pillar ③).
 - [ ] **Audit logs** — start/stop/verify/deny decisions recorded (converges with

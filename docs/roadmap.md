@@ -172,11 +172,13 @@ them. Full model + plan: [`security-model.md`](security-model.md).
 - **M30.5 (#37, P1) — shipped.** The **no host-FS-passthrough** invariant is
   explicit: a behavioural test proves virtio-fs/9p classify as `Unsupported`,
   and `make security-check` fails if host-FS wiring appears without review.
-- **M30.6 (#38, P2) — core shipped.** Per-sandbox resource limits: a launch
+- **M30.6 (#38, P2) — shipped.** Per-sandbox resource limits: a launch
   gate (vCPU/mem ceiling) + a run-loop monitor that stops a runaway on disk
-  overlay / console / wall-clock caps, authored with `chm limits` and applied to
-  new sandboxes by the app's sane global defaults. Network connection/bandwidth
-  caps at the NAT are the remaining slice.
+  overlay / console / wall-clock caps, plus NAT `max_connections` /
+  `max_bandwidth_kbps` caps enforced on the egress datapath (over-limit SYN
+  refused + audited; bandwidth throttled via token-bucket backpressure).
+  Authored with `chm limits` and applied to new sandboxes by the app's sane
+  global defaults.
 - **M30.7 (#39)** — the threat model + hardening checklist (this doc set).
 - **M30.8 (P0) — shipped.** CAS digest hardening: a manifest checksum is
   validated as a canonical sha256 hex digest before it is used as a

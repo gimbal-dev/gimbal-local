@@ -197,6 +197,8 @@ struct DefaultLimits: Codable, Equatable {
     var maxDiskMb: Int?
     var maxWallSeconds: Int?
     var maxConsoleMb: Int?
+    var maxConnections: Int?
+    var maxBandwidthKbps: Int?
 }
 
 /// The global default egress posture applied to a new sandbox's workspace
@@ -229,7 +231,9 @@ struct GlobalDefaults: Codable, Equatable {
             maxMemoryMb: nil,
             maxDiskMb: 8192,
             maxWallSeconds: nil,
-            maxConsoleMb: 64
+            maxConsoleMb: 64,
+            maxConnections: nil,
+            maxBandwidthKbps: nil
         ),
         firewall: DefaultFirewall(enabled: false, mode: .open, allow: [])
     )

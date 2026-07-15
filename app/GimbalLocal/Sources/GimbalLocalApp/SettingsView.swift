@@ -43,6 +43,10 @@ private struct DefaultsSettingsTab: View {
                     .disabled(!model.globalDefaults.limits.enabled)
                 OptionalIntRow(label: "Max memory", unit: "MiB", value: $model.globalDefaults.limits.maxMemoryMb)
                     .disabled(!model.globalDefaults.limits.enabled)
+                OptionalIntRow(label: "Max connections", unit: "", value: $model.globalDefaults.limits.maxConnections)
+                    .disabled(!model.globalDefaults.limits.enabled)
+                OptionalIntRow(label: "Max bandwidth", unit: "kbps", value: $model.globalDefaults.limits.maxBandwidthKbps)
+                    .disabled(!model.globalDefaults.limits.enabled)
             }
 
             Section("Connectivity") {

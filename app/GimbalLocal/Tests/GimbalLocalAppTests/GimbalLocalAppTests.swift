@@ -252,7 +252,8 @@ final class GimbalLocalAppTests: XCTestCase {
     func testGlobalDefaultsCodableRoundtrips() {
         let d = GlobalDefaults(
             limits: DefaultLimits(enabled: true, maxVcpus: 4, maxMemoryMb: 4096,
-                                  maxDiskMb: 2048, maxWallSeconds: 3600, maxConsoleMb: 32),
+                                  maxDiskMb: 2048, maxWallSeconds: 3600, maxConsoleMb: 32,
+                                  maxConnections: 128, maxBandwidthKbps: 5000),
             firewall: DefaultFirewall(enabled: true, mode: .allowlist, allow: ["github.com:443"])
         )
         let data = try! JSONEncoder().encode(d)
