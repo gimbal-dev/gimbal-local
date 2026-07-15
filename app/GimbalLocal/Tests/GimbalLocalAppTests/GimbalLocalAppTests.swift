@@ -109,6 +109,28 @@ final class GimbalLocalAppTests: XCTestCase {
     }
 
     @MainActor
+    func testEngineIndicatorReflectsLiveConnectSessionWhenDaemonIdle() {
+        // An app-launched sandbox runs via `chm connect` (its own VM, tracked by
+        // a session lock) that the daemon can't see. The engine bar must reflect
+        // it as running instead of "idle" when the daemon slot reads idle (#61).
+        let model = AppModel()
+        model.snapshots = [SnapshotSummary(name: "ubuntu", path: "/u", vcpus: 1, ramMib: 1024)]
+        let s = model.createSandbox(fromSnapshotNamed: "ubuntu")!
+        // Daemon reports idle (its single VM slot is empty)...
+        model.status = SandboxStatus(state: .idle, name: nil, uptimeSeconds: nil, consoleBytes: nil, reason: nil, message: nil)
+        // ...but an interactive session for this sandbox is live.
+        model.interactiveSandboxID = s.id
+
+        XCTAssertEqual(model.sandbox(id: s.id)?.state, .running)
+        XCTAssertEqual(model.engineIndicator.tone, .active, "a live connect session must not read idle")
+        XCTAssertEqual(model.engineIndicator.label, "Sandbox running")
+
+        // When the session ends, the engine falls back to the daemon's idle.
+        model.interactiveSandboxID = nil
+        XCTAssertEqual(model.engineIndicator.tone, .ready)
+    }
+
+    @MainActor
     func testRecentSandboxesFloatRecentsToFront() {
         let model = AppModel()
         let alpha = SnapshotSummary(name: "alpha", path: "/a", vcpus: 1, ramMib: 256)

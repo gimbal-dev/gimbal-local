@@ -302,7 +302,15 @@ struct RevisionHistoryCard: View {
             }
         }
         .task(id: dirPath) {
-            if let dirPath { model.refreshRevisions(path: dirPath) }
+            // Poll while the card is visible so a snapshot taken during a live
+            // session (suspend / on-delta capture) surfaces within a couple of
+            // seconds, instead of only when the sandbox is re-selected (#69). The
+            // task is cancelled when the card disappears or dirPath changes.
+            guard let dirPath else { return }
+            while !Task.isCancelled {
+                model.refreshRevisions(path: dirPath)
+                try? await Task.sleep(for: .seconds(2))
+            }
         }
     }
 
