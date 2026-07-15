@@ -116,7 +116,7 @@ from cache in 0.077 s).
 | **M25 · Live local lifecycle** | ① | **Complete** (one perf ceiling: runtime memfd page-sharing) | #4, #6 |
 | **M30 · Security hardening** | trust/isolation | **P0s + no-FS guard shipped** (#33–#35, #37; CAS digest M30.8 + multi-NIC fail-closed M30.9); signing (#36) + limits (#38) next | #33–#39 |
 | **M27 · Plane-native edge** | ② | **push/pull shipped** (#7 core); postcopy memory + disk plane next (#5) | #5, #7 |
-| **M28 · Consistent controls** | ③ | **M28.1–M28.3 + M28.5 shipped** (policy plumbing + digest teleport; userspace egress NAT; allow-list gate at DNS + TCP-connect; fs mount refusal). Demo (#52) needs a net-enabled snapshot for the live run. | #20 |
+| **M28 · Consistent controls** | ③ | **M28.1–M28.3 + M28.5 shipped** (policy plumbing + digest teleport; userspace egress NAT; allow-list gate at DNS + TCP-connect; fs mount refusal); enforced on every NIC + fail-closed (M30.9). Live demo (#52) blocked only on a net-enabled snapshot. | #20, #52 |
 | **M29 · Observability & cost** | ④ | Waits on the gctl telemetry contract | — |
 
 ### M25 · Live local lifecycle — suspend · resume · fork
@@ -285,3 +285,17 @@ Progress lives in the
 above. **M30 (security hardening) is the immediate priority and precedes M27.**
 The four pillars are the V0 capability contract (issue #21); each pillar is
 only "done" when it is enforced identically on both substrates.
+
+### What comes next (crisp view, 2026-07-15)
+
+- **Security (priority):** M30.4 signed manifest + trust root (#36, P1 — the
+  largest missing trust feature) → M30.6 resource limits (#38, P2) → the two
+  follow-ups M30.2 runtime-dir ownership (#66) and M30.3 direct-argv (#67).
+- **Open bugs:** rollback does not revert the disk overlay (#62); engine shows
+  idle while sandboxes are alive (#61).
+- **Demo gap:** the live in-guest firewall demo (#52) is blocked only on a
+  net-enabled snapshot; authoring + enforcement already ship.
+- **Cross-repo (CP) handoffs:** #4/#5/#6 (checkpoint/postcopy/fork phases),
+  #20 (policy plane), #21 (V0 pillar alignment).
+- **Recently shipped + closed:** interactive console freeze (#60), CAS digest
+  hardening (#64), per-NIC fail-closed egress (#65).
