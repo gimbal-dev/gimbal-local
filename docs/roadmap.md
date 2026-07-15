@@ -164,9 +164,11 @@ them. Full model + plan: [`security-model.md`](security-model.md).
 - **M30.3 (#35, P0) — shipped.** App command safety: a pure, single-quoting
   `InteractiveTerminalCommand` builder that rejects control characters (the
   snapshot-name vector was already removed).
-- **M30.4 (#36, P1)** — signed snapshot manifest + verification, and one trust
-  root (app trusts the cloud key; gctl signs; local verifies before "Run").
-  Cross-repo — tracks the gctl signing contract.
+- **M30.4 (#36, P1) — verification shipped.** Ed25519 signed-manifest
+  verification in `chm` (trust store via `CHM_TRUST_STORE`, key ids + rotation),
+  fail-closed when configured, plus a `chm manifest keygen|sign|verify` reference
+  signer. gctl producing + signing production manifests is the remaining
+  cross-repo half (#36).
 - **M30.5 (#37, P1) — shipped.** The **no host-FS-passthrough** invariant is
   explicit: a behavioural test proves virtio-fs/9p classify as `Unsupported`,
   and `make security-check` fails if host-FS wiring appears without review.

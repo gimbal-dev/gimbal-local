@@ -92,7 +92,7 @@ test/guard so a regression is caught, not discovered.
 | I3 | **Overlays are private.** Writable overlays/checkpoints are created by `chm` in a fresh `0700` dir it owns, refusing a symlinked overlay/dir shipped in the bundle. | Private `0700` overlay dir + no-follow overlay opens. | **Holds today** (M30.1) |
 | I4 | **The daemon is local-and-owner-only.** Only the same-uid user can drive the control socket; the socket lives in a private `0700` dir with `0600` perms and validates peer credentials. | Private socket dir + `0600` perms + `getpeereid` peer-uid check. | **Holds today** (M30.2) |
 | I5 | **The app never builds host shell code from data.** Snapshot/sandbox names and paths never become shell tokens. | Centralised single-quote builder + control-char rejection; adversarial-input tests. | **Holds today** (M30.3) |
-| I6 | **Only verified, provenance-known snapshots run.** A bundle is checksum-verified **and** signature-verified against a trusted key before import or run; provenance is recorded. | Signed manifest + verification against the cloud trust root. | **Not yet** (M30.4) |
+| I6 | **Only verified, provenance-known snapshots run.** A bundle is checksum-verified **and** signature-verified against a trusted key before import or run; provenance is recorded. | Ed25519 signed-manifest verification with a `CHM_TRUST_STORE` trust root; fails closed when configured. | **Verification holds** (M30.4); gctl signing pending (#36) |
 | I7 | **Undeliverable snapshots are refused, not mis-run.** ITS/LPI snapshots fail loudly at the load guard and the `assign-run` 422 gate. | `its_lpi_guard` + plane gate. | **Holds today** |
 | I8 | **The content store cannot select a host file.** A manifest checksum is only ever used as a CAS path after it is validated as a canonical sha256 hex digest, and every CAS object (including cache hits) is re-hashed before it is linked into a guest. | Digest-shape gate + re-hash on hit in `materialize_bundle`. | **Holds today** (M30.8) |
 | I9 | **A governed session's egress is enforced on every NIC and fails closed.** The resolved policy applies to all virtio-net NICs, and a session whose policy source is present but unresolvable denies all egress rather than running open. | Per-NIC policy clone + `EgressResolution::FailClosed` deny-all. | **Holds today** (M30.9) |
@@ -196,27 +196,43 @@ as literal argv with no host execution.
 
 ### M30.4 · Signed snapshot manifest + verification  **[P1, chm + app + gctl]**
 
-**Finding.** Snapshot trust is missing — bundle contents and `state.json` are
-trusted after only a checksum.
+**Status: verification side shipped; gctl signing side pending.** `chm` can now
+verify a signed manifest and **fails closed** when a trust root is configured but
+a bundle is unsigned/invalid. The remaining half — gctl producing + signing
+manifests in production — is tracked cross-repo (#36).
 
-**Verified.** `materialize_bundle` verifies each object against
-`manifest.checksum_tree` (integrity — detects corruption) but there is **no
-signature** (authenticity — nothing proves the manifest itself came from the
-cloud). A tampered bundle with a matching recomputed `checksum_tree` passes.
+**Finding.** Snapshot trust was missing — bundle contents and `state.json` were
+trusted after only a checksum. `materialize_bundle` verifies each object against
+`manifest.checksum_tree` (integrity — detects corruption) but there was **no
+signature** (authenticity), so a tampered bundle with a recomputed
+`checksum_tree` passed.
 
-**Plan (cross-repo with gctl).**
-- Define a **signed manifest**: the manifest hashes every file **plus** runtime
-  metadata (substrate, gic_mode, origin, sizes), and carries a **signature** over
-  that manifest, produced by the cloud/capture signing key.
-- `chm` (and the app before it exposes "Run") **verify the signature** against a
-  trusted public key, then verify `checksum_tree`, then record provenance.
-- Verify **every object hash, including CAS cache hits**, before use — M30.8
-  already re-hashes hits; signing extends that to authenticity, so a shared blob
-  cannot be trusted on name alone.
-- Establish **one trust root** with key IDs + rotation: gctl signs canonical
-  manifests, `chm` is the authoritative verifier, and the app displays only
-  `chm`-verified provenance. gctl owns producing + signing; Gimbal Local owns
-  verification.
+**The contract (implemented on the verification side; gctl matches on signing).**
+- **Algorithm:** Ed25519 (via the already-vendored `ring`, no new dependency).
+  Public keys and signatures are lowercase hex.
+- **Signed payload = the manifest's raw bytes.** The signature covers the literal
+  manifest document, so signer and verifier need not agree on a canonical JSON
+  encoding (a cross-language hazard). An assignment carries:
+  - `manifest_canonical` — the exact manifest bytes gctl signed (a JSON string
+    with `checksum_tree` + runtime metadata: substrate, gic_mode, origin, sizes);
+  - `manifest_signature` — `{ "alg": "ed25519", "key_id": "<id>", "sig": "<hex>" }`.
+- **Trust store:** `CHM_TRUST_STORE` points at a JSON `{ "keys": { "<id>":
+  "<hex pubkey>" } }`. It is a **map keyed by id so keys rotate** — add the new
+  key id, keep the old until everything is re-signed.
+- **Verification order:** verify the signature over `manifest_canonical` against
+  the trusted key named by `key_id`, then use **that signed manifest's**
+  `checksum_tree` (never the loose, unsigned one) for `materialize_bundle`, which
+  re-hashes every object — including CAS cache hits (M30.8) — before use.
+- **Fail closed:** with a trust root configured, a missing/invalid signature or
+  unknown key id is refused. Without a trust root, the unsigned `checksum_tree`
+  is used so pre-signing flows keep working during rollout.
+- **Reference implementation + local signer:** `chm manifest keygen | sign |
+  verify` produces and checks exactly this format, so the contract is testable
+  end to end and gctl has a concrete target.
+
+**Remaining (cross-repo, #36).** gctl produces + signs canonical manifests and
+publishes its public keys; the app surfaces only `chm`-verified provenance. One
+trust root, key ids + rotation.
 
 ### M30.5 · No-host-FS-passthrough invariant + CI guard  **[P1, docs + test]**
 
