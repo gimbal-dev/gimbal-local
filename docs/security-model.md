@@ -280,13 +280,16 @@ two-stack relay test (a real guest smoltcp stack moving bytes through the NAT to
 a real localhost server) — an over-limit SYN is refused, and a tightly-capped
 flow moves dramatically fewer bytes than an unthrottled one over the same window.
 
-### M30.2 daemon follow-up · runtime-dir ownership  **[P1, daemon]**
+### M30.2 daemon follow-up · runtime-dir ownership  **[P1, daemon] — shipped**
 
 **Finding (2026-07 review).** The socket dir is created private `0700` with a
-`0600` socket + peer-uid check, but a **pre-existing** runtime directory is not
-fully validated. **Plan.** Reject a pre-existing runtime dir unless it is owned
-by the current UID with exact safe permissions, so a planted dir can't
-pre-seed/interpose.
+`0600` socket + peer-uid check, but a **pre-existing** runtime directory was not
+fully validated. **Fixed (#66).** `ensure_private_runtime_dir` now, when the
+runtime dir already exists, rejects it outright if it is owned by another UID (a
+directory planted by another user in the shared temp root must not host the
+control socket) and tightens a self-owned directory back to `0700` if its
+permissions were left loose, so group/other can never interpose. Symlinks at the
+path are still refused. Covered by a unit test.
 
 ### M30.3 app follow-up · direct argv launch  **[P2, app]**
 

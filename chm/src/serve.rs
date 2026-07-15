@@ -139,10 +139,13 @@ pub(crate) fn runtime_dir() -> PathBuf {
 }
 
 /// Create `dir` as a private `0700` directory the current user owns, refusing to
-/// follow a pre-existing symlink planted at that path (M30.2). Returns `Ok` if
-/// it already exists as a real directory.
+/// follow a pre-existing symlink planted at that path (M30.2). If the directory
+/// already exists it is only accepted when the current user owns it; a directory
+/// owned by another user is rejected (it must not host our control socket), and a
+/// self-owned directory left with loose permissions is tightened back to `0700`
+/// so group/other can never interpose in the runtime dir (M30.2 follow-up, #66).
 fn ensure_private_runtime_dir(dir: &Path) -> Result<(), String> {
-    use std::os::unix::fs::DirBuilderExt;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     match fs::symlink_metadata(dir) {
         Ok(md) if md.file_type().is_symlink() => {
             return Err(format!(
@@ -150,7 +153,30 @@ fn ensure_private_runtime_dir(dir: &Path) -> Result<(), String> {
                 dir.display()
             ));
         }
-        Ok(md) if md.is_dir() => return Ok(()),
+        Ok(md) if md.is_dir() => {
+            // SAFETY: geteuid() takes no arguments, cannot fail, and only reads
+            // process credentials.
+            let euid = unsafe { libc::geteuid() };
+            if md.uid() != euid {
+                return Err(format!(
+                    "refusing runtime dir {}: it is owned by uid {}, not the \
+                     current user (uid {}); a directory planted by another user \
+                     must not host the control socket",
+                    dir.display(),
+                    md.uid(),
+                    euid
+                ));
+            }
+            // Owned by us: force private perms (self-heal a dir an older build or
+            // a lax umask left too open) so only we can create/interpose entries.
+            let mode = md.permissions().mode() & 0o777;
+            if mode != 0o700 {
+                fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|e| {
+                    format!("tighten runtime dir {} to 0700: {e}", dir.display())
+                })?;
+            }
+            return Ok(());
+        }
         Ok(_) => return Err(format!("runtime dir {} exists but is not a directory", dir.display())),
         Err(_) => {}
     }
@@ -1032,6 +1058,16 @@ mod tests {
         let link = base.join("link");
         symlink(&dir, &link).unwrap();
         assert!(ensure_private_runtime_dir(&link).is_err());
+
+        // A self-owned dir left with loose permissions is tightened back to
+        // 0700 rather than accepted as-is (#66), so group/other can never
+        // interpose in the runtime dir.
+        let loose = base.join("loose");
+        fs::create_dir_all(&loose).unwrap();
+        fs::set_permissions(&loose, fs::Permissions::from_mode(0o777)).unwrap();
+        ensure_private_runtime_dir(&loose).unwrap();
+        let loose_mode = fs::metadata(&loose).unwrap().permissions().mode() & 0o777;
+        assert_eq!(loose_mode, 0o700, "a loose self-owned runtime dir must be tightened to 0700");
 
         let _ = fs::remove_dir_all(&base);
     }
