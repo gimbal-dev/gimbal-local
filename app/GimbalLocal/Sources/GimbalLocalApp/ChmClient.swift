@@ -136,6 +136,23 @@ struct ChmClient {
         await runRaw(settings: settings, args: ["firewall", "clear", path])
     }
 
+    /// Write a directory's resource limits (`chm limits set`). Only the set axes
+    /// are passed; an omitted axis means "no limit" there.
+    func limitsSet(
+        path: String,
+        limits: DefaultLimits,
+        settings: AppSettings
+    ) async -> CommandResult {
+        var args = ["limits", "set", path]
+        if let v = limits.maxVcpus { args += ["--max-vcpus", String(v)] }
+        if let v = limits.maxMemoryMb { args += ["--max-memory-mb", String(v)] }
+        if let v = limits.maxDiskMb { args += ["--max-disk-mb", String(v)] }
+        if let v = limits.maxWallSeconds { args += ["--max-wall-seconds", String(v)] }
+        if let v = limits.maxConsoleMb { args += ["--max-console-mb", String(v)] }
+        args += ["--label", "app-default"]
+        return await runRaw(settings: settings, args: args)
+    }
+
     /// Drive the control-plane runner pipeline for one snapshot: register →
     /// assign-run → verify checksums → mark-local-copy → run/resume, reporting
     /// state to the plane. Runs `chm runner run` with **no** `--socket` (it talks

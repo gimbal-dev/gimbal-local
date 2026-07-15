@@ -19,6 +19,7 @@ use crate::console::{self, RawConsole};
 use crate::console_filter::ConsoleFilter;
 use crate::control_plane;
 use crate::firewall;
+use crate::limits;
 use crate::serve;
 use crate::signing;
 use crate::state_cdn;
@@ -593,6 +594,10 @@ struct Args {
     /// `CHM_EGRESS_POLICY` env binding and any per-workspace `egress-policy.json`.
     /// `None` falls back to that resolution order. See [`resolve_egress_policy`].
     egress_policy: Option<PathBuf>,
+    /// Optional path to a local resource-limits file (`--limits`). When set, it
+    /// bounds this run's resources, overriding the `CHM_LIMITS` env binding and
+    /// any per-workspace `limits.json`. See [`limits::resolve_limits`].
+    limits_file: Option<PathBuf>,
 }
 
 struct ConnectArgs {
@@ -611,6 +616,7 @@ pub fn main() -> ExitCode {
         Some("branches") => control_plane::branches_main(&raw[1..]),
         Some("policy") => control_plane::policy_main(&raw[1..]),
         Some("firewall") => firewall::firewall_main(&raw[1..]),
+        Some("limits") => limits::limits_main(&raw[1..]),
         Some("manifest") => signing::manifest_main(&raw[1..]),
         Some("state-cdn") => state_cdn::state_cdn_main(&raw[1..]),
         Some("serve") => serve::serve_main(&raw[1..]),
@@ -777,6 +783,7 @@ fn parse(raw: &[String]) -> Parsed {
     let mut quiet = false;
     let mut checkpoint = false;
     let mut egress_policy: Option<PathBuf> = None;
+    let mut limits_file: Option<PathBuf> = None;
 
     let mut i = 0;
     // A leading `run`/`restore` subcommand is accepted but optional; `resume`
@@ -801,6 +808,13 @@ fn parse(raw: &[String]) -> Parsed {
                     return Parsed::Error(format!("{a} requires a value"));
                 };
                 egress_policy = Some(PathBuf::from(v));
+            }
+            "--limits" => {
+                i += 1;
+                let Some(v) = raw.get(i) else {
+                    return Parsed::Error(format!("{a} requires a value"));
+                };
+                limits_file = Some(PathBuf::from(v));
             }
             "--max-seconds" | "--idle-exit" => {
                 i += 1;
@@ -838,6 +852,7 @@ fn parse(raw: &[String]) -> Parsed {
             session_lock: None,
             checkpoint,
             egress_policy,
+            limits_file,
         }),
         None => Parsed::Error("missing <SNAPSHOT_DIR>".to_string()),
     }
@@ -853,6 +868,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
     let mut session_lock: Option<PathBuf> = None;
     let mut checkpoint = false;
     let mut egress_policy: Option<PathBuf> = None;
+    let mut limits_file: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < raw.len() {
@@ -864,7 +880,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
             "--no-stop-daemon" => no_stop_daemon = true,
             "--checkpoint" => checkpoint = true,
             "--socket" | "--max-seconds" | "--idle-exit" | "--session-lock"
-            | "--egress-policy" => {
+            | "--egress-policy" | "--limits" => {
                 i += 1;
                 let Some(v) = raw.get(i) else {
                     return Parsed::Error(format!("{a} requires a value"));
@@ -873,6 +889,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
                     "--socket" => socket_path = PathBuf::from(v),
                     "--session-lock" => session_lock = Some(PathBuf::from(v)),
                     "--egress-policy" => egress_policy = Some(PathBuf::from(v)),
+                    "--limits" => limits_file = Some(PathBuf::from(v)),
                     "--max-seconds" | "--idle-exit" => {
                         let Ok(n) = v.parse::<u64>() else {
                             return Parsed::Error(format!("{a}: `{v}` is not a number"));
@@ -909,6 +926,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
                 session_lock,
                 checkpoint,
                 egress_policy,
+                limits_file,
             },
             socket_path,
             no_stop_daemon,
@@ -1168,11 +1186,39 @@ fn run(args: &Args) -> Result<ExitCode, String> {
         .map_err(|e| format!("prepare VM: {e}"))?;
 
     let overlay_dir = dir.join(".chm-overlays");
+
+    // Resolve + apply resource limits (M30.6). The launch gate is admission
+    // control: a snapshot's vCPU/RAM shape is fixed, so an over-ceiling snapshot
+    // is refused rather than throttled. Runtime caps (disk overlay, console,
+    // wall-clock) are enforced by the console monitor.
+    let (limits, limits_src) = limits::resolve_limits(dir, args.limits_file.as_deref());
+    if let Some(max) = limits.max_vcpus
+        && loaded.num_vcpus > max
+    {
+        return Err(format!(
+            "snapshot declares {} vCPUs but the limit ({limits_src}) is {max} — refusing to run",
+            loaded.num_vcpus
+        ));
+    }
+    if let Some(max_mb) = limits.max_memory_mb {
+        let ram_mb = loaded.total_ram / (1024 * 1024);
+        if ram_mb > max_mb {
+            return Err(format!(
+                "snapshot needs {ram_mb} MiB RAM but the limit ({limits_src}) is {max_mb} MiB — refusing to run"
+            ));
+        }
+    }
+    if limits.is_bounded() && !args.quiet {
+        eprintln!("chm: resource limits [{limits_src}] — {}", limits.summary());
+    }
+
     let ckpt = CheckpointMode {
         resume_from: resume_state,
         capture_to: args.checkpoint.then(|| dir.clone()),
     };
-    let outcome = resume_smp(prepared, loaded, &bus, &uart, &vm_ops, &overlay_dir, args, ckpt)?;
+    let outcome = resume_smp(
+        prepared, loaded, &bus, &uart, &vm_ops, &overlay_dir, args, &limits, ckpt,
+    )?;
 
     if !args.quiet {
         eprintln!();
@@ -1188,6 +1234,9 @@ fn run(args: &Args) -> Result<ExitCode, String> {
             ),
             Outcome::ConsoleClosed => eprintln!("chm: console closed; stopping."),
             Outcome::Interrupted => eprintln!("chm: session closed; VM shut down."),
+            Outcome::LimitExceeded(reason) => {
+                eprintln!("chm: resource limit hit ({reason}); stopped the guest to protect the host.");
+            }
         }
     }
 
@@ -1200,6 +1249,9 @@ enum Outcome {
     Idle(u64),
     ConsoleClosed,
     Interrupted,
+    /// A resource limit was hit; the guest was stopped to protect the host. The
+    /// string names the limit for the operator.
+    LimitExceeded(String),
 }
 
 /// How a run should treat live checkpoints (suspend/resume).
@@ -1348,6 +1400,7 @@ fn resume_smp(
     vm_ops: &Arc<ChmVmOps>,
     overlay_dir: &Path,
     args: &Args,
+    limits: &limits::LimitsDoc,
     ckpt: CheckpointMode,
 ) -> Result<Outcome, String> {
     let Loaded {
@@ -1705,7 +1758,7 @@ fn resume_smp(
     go_gate.set(Gate::Go);
 
     // The orchestrator drains the shared console + enforces the stop policy.
-    let coordinator = run_console(uart, &running, args);
+    let coordinator = run_console(uart, &running, args, limits, overlay_dir);
 
     // Stop every vCPU thread: clear the run flag, force any in-flight `run()` to
     // return (hv_vcpus_exit), and join — each vCPU is destroyed on its thread.
@@ -1735,7 +1788,11 @@ fn resume_smp(
     let external_stop = vcpu_outcome.is_none()
         && matches!(
             coordinator,
-            Ok(Outcome::Interrupted | Outcome::ConsoleClosed | Outcome::Idle(_) | Outcome::MaxSeconds)
+            Ok(Outcome::Interrupted
+                | Outcome::ConsoleClosed
+                | Outcome::Idle(_)
+                | Outcome::MaxSeconds
+                | Outcome::LimitExceeded(_))
         );
     if let Some(dir) = &capture_to {
         if external_stop {
@@ -1819,22 +1876,67 @@ fn collect_checkpoint(
     })
 }
 
+/// The effective wall-clock cap in seconds: the tighter (smaller nonzero) of the
+/// `--max-seconds` flag and the limits doc's `max_wall_seconds`. `0`/`None` mean
+/// "no cap from that source"; `None` result means unlimited.
+fn effective_wall_secs(max_seconds: u64, max_wall: Option<u64>) -> Option<u64> {
+    [max_seconds, max_wall.unwrap_or(0)]
+        .into_iter()
+        .filter(|&s| s > 0)
+        .min()
+}
+
+/// Total *allocated* size in bytes of the files directly under `dir` (the disk
+/// overlays + their bitmaps). Overlays are sparse CoW files whose logical length
+/// equals the full disk, so this must count actually-allocated blocks
+/// (`st_blocks` x 512), not logical length — otherwise a freshly-cloned sparse
+/// overlay would read as its full logical size and trip the cap immediately.
+/// Errors (e.g. a missing dir) read as 0 so the cap simply does not trip.
+fn dir_size_bytes(dir: &Path) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    let Ok(entries) = fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.metadata().ok())
+        .filter(|m| m.is_file())
+        // st_blocks is in 512-byte units; this is real on-disk allocation, so a
+        // sparse hole costs nothing and only genuine writes count.
+        .map(|m| m.blocks() * 512)
+        .sum()
+}
+
 /// The orchestrator-thread console loop: drain the guest's shared PL011 output
-/// to stdout and enforce the `--max-seconds` / `--idle-exit` stop policy. Runs
-/// until a vCPU thread clears `running` (power-off / error) or a stop condition
-/// fires.
+/// to stdout and enforce the stop policy — `--max-seconds` / `--idle-exit` and
+/// the resource limits (M30.6): wall-clock, total console output, and disk
+/// overlay growth. Runs until a vCPU thread clears `running` (power-off / error)
+/// or a stop condition fires.
 fn run_console(
     uart: &Arc<Pl011>,
     running: &Arc<AtomicBool>,
     args: &Args,
+    limits: &limits::LimitsDoc,
+    overlay_dir: &Path,
 ) -> Result<Outcome, String> {
     let start = Instant::now();
     let mut last_output = Instant::now();
     let mut stdout = io::stdout();
     let mut filter = ConsoleFilter::new();
 
-    let max = (args.max_seconds > 0).then(|| Duration::from_secs(args.max_seconds));
+    // The wall-clock cap is the tighter of --max-seconds and the limits doc.
+    let wall_secs = effective_wall_secs(args.max_seconds, limits.max_wall_seconds);
+    let max = wall_secs.map(Duration::from_secs);
     let idle = (args.idle_exit_secs > 0).then(|| Duration::from_secs(args.idle_exit_secs));
+
+    // Byte budgets for the resource caps.
+    let max_console_bytes = limits.max_console_mb.map(|mb| mb * 1024 * 1024);
+    let max_disk_bytes = limits.max_disk_mb.map(|mb| mb * 1024 * 1024);
+    let mut console_bytes: u64 = 0;
+    // Poll the overlay size occasionally (a directory walk is not free), not on
+    // every 5 ms loop iteration.
+    let mut last_disk_check = Instant::now();
+    const DISK_CHECK_INTERVAL: Duration = Duration::from_millis(500);
 
     while running.load(Ordering::Acquire) {
         // A terminating signal (window close / kill) or the Ctrl-A x escape asks
@@ -1864,6 +1966,31 @@ fn run_console(
                     return Ok(Outcome::ConsoleClosed);
                 }
                 Err(e) => return Err(format!("write console: {e}")),
+            }
+            // Cap total console output: a runaway that floods the console (e.g.
+            // `yes` to the tty) is stopped before it can fill logs/pipes.
+            console_bytes += bytes.len() as u64;
+            if let Some(cap) = max_console_bytes
+                && console_bytes >= cap
+            {
+                return Ok(Outcome::LimitExceeded(format!(
+                    "console output exceeded {} MiB",
+                    limits.max_console_mb.unwrap_or(0)
+                )));
+            }
+        }
+
+        // Cap disk overlay growth: a runaway that writes to the persistent disk
+        // (e.g. `dd if=/dev/zero`) can't fill the host disk — stop it first.
+        if let Some(cap) = max_disk_bytes
+            && last_disk_check.elapsed() >= DISK_CHECK_INTERVAL
+        {
+            last_disk_check = Instant::now();
+            if dir_size_bytes(overlay_dir) >= cap {
+                return Ok(Outcome::LimitExceeded(format!(
+                    "disk overlay exceeded {} MiB",
+                    limits.max_disk_mb.unwrap_or(0)
+                )));
             }
         }
 
@@ -1899,6 +2026,42 @@ fn banner(dir: &Path, mem_ranges: &Path, num_vcpus: u32, total_ram: u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn effective_wall_secs_takes_the_tighter_cap() {
+        // Flag only, limit only, both (tighter wins), neither.
+        assert_eq!(effective_wall_secs(30, None), Some(30));
+        assert_eq!(effective_wall_secs(0, Some(60)), Some(60));
+        assert_eq!(effective_wall_secs(30, Some(60)), Some(30));
+        assert_eq!(effective_wall_secs(90, Some(60)), Some(60));
+        assert_eq!(effective_wall_secs(0, None), None);
+        assert_eq!(effective_wall_secs(0, Some(0)), None);
+    }
+
+    #[test]
+    fn dir_size_bytes_counts_allocation_not_logical_length() {
+        let dir = std::env::temp_dir().join(format!("chm-dsz-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        // Missing dir reads as 0 (the cap simply never trips).
+        assert_eq!(dir_size_bytes(&dir), 0);
+        fs::create_dir_all(&dir).unwrap();
+
+        // A sparse file: 8 GiB logical length, but no data written -> ~no blocks.
+        let sparse = fs::File::create(dir.join("sparse.raw")).unwrap();
+        sparse.set_len(8 * 1024 * 1024 * 1024).unwrap();
+        drop(sparse);
+        // A real 1 MiB write.
+        fs::write(dir.join("real.raw"), vec![7u8; 1024 * 1024]).unwrap();
+        fs::create_dir_all(dir.join("nested")).unwrap(); // ignored (not a file)
+
+        let sz = dir_size_bytes(&dir);
+        assert!(sz >= 1024 * 1024, "the real 1 MiB write is counted: {sz}");
+        assert!(
+            sz < 64 * 1024 * 1024,
+            "the 8 GiB sparse file must NOT count as its logical length: {sz}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn parse_egress_policy_builds_a_restrictive_allow_list() {

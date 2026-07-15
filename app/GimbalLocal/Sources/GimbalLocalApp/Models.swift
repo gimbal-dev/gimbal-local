@@ -186,6 +186,55 @@ struct StoredSandbox: Codable, Hashable {
     }
 }
 
+/// The global default resource limits applied to a new sandbox's workspace
+/// (`chm limits set`) unless the sandbox already has its own. All values are
+/// optional (nil = no limit on that axis); `enabled` gates whether the defaults
+/// are applied at all.
+struct DefaultLimits: Codable, Equatable {
+    var enabled: Bool
+    var maxVcpus: Int?
+    var maxMemoryMb: Int?
+    var maxDiskMb: Int?
+    var maxWallSeconds: Int?
+    var maxConsoleMb: Int?
+}
+
+/// The global default egress posture applied to a new sandbox's workspace
+/// (`chm firewall set`) unless the sandbox already has its own.
+enum DefaultEgressMode: String, Codable, CaseIterable {
+    case open       // unrestricted (no policy written)
+    case noNetwork  // default-deny, no allow rules
+    case allowlist  // default-deny + an allow list
+}
+
+struct DefaultFirewall: Codable, Equatable {
+    var enabled: Bool
+    var mode: DefaultEgressMode
+    var allow: [String]
+}
+
+/// App-wide default controls applied to every new sandbox, so a user gets sane
+/// guard rails without configuring each sandbox. Persisted in `UserDefaults`.
+struct GlobalDefaults: Codable, Equatable {
+    var limits: DefaultLimits
+    var firewall: DefaultFirewall
+
+    /// Sane out-of-the-box controls: a generous disk + console cap on (so a
+    /// runaway can't exhaust the host) and the firewall off (opt-in, since the
+    /// guest has no network by default).
+    static let sane = GlobalDefaults(
+        limits: DefaultLimits(
+            enabled: true,
+            maxVcpus: nil,
+            maxMemoryMb: nil,
+            maxDiskMb: 8192,
+            maxWallSeconds: nil,
+            maxConsoleMb: 64
+        ),
+        firewall: DefaultFirewall(enabled: false, mode: .open, allow: [])
+    )
+}
+
 /// A committed revision (live checkpoint) read from a snapshot's
 /// `.chm-checkpoint/checkpoint.json` manifest. The lineage header is the spine
 /// of the fork model (see `docs/gimbal-local-fork-model.md`): each revision

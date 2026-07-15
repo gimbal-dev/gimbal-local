@@ -9,12 +9,131 @@ struct SettingsView: View {
         TabView {
             EngineSettingsTab()
                 .tabItem { Label("Engine", systemImage: "cpu") }
+            DefaultsSettingsTab()
+                .tabItem { Label("Defaults", systemImage: "slider.horizontal.3") }
             PathsSettingsTab()
                 .tabItem { Label("Runtime", systemImage: "folder") }
             ControlPlaneSettingsTab()
                 .tabItem { Label("Control plane", systemImage: "cloud") }
         }
-        .frame(width: 520, height: 400)
+        .frame(width: 520, height: 440)
+    }
+}
+
+/// Global default controls (limits + firewall) applied to every new sandbox.
+private struct DefaultsSettingsTab: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        Form {
+            Section("Resource limits") {
+                Toggle("Apply default limits to new sandboxes", isOn: $model.globalDefaults.limits.enabled)
+                Text("Sane guard rails so a runaway guest can't exhaust the host. Per-sandbox limits (if set) always win.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                OptionalIntRow(label: "Max disk overlay", unit: "MiB", value: $model.globalDefaults.limits.maxDiskMb)
+                    .disabled(!model.globalDefaults.limits.enabled)
+                OptionalIntRow(label: "Max console output", unit: "MiB", value: $model.globalDefaults.limits.maxConsoleMb)
+                    .disabled(!model.globalDefaults.limits.enabled)
+                OptionalIntRow(label: "Max wall-clock", unit: "sec", value: $model.globalDefaults.limits.maxWallSeconds)
+                    .disabled(!model.globalDefaults.limits.enabled)
+                OptionalIntRow(label: "Max vCPUs", unit: "", value: $model.globalDefaults.limits.maxVcpus)
+                    .disabled(!model.globalDefaults.limits.enabled)
+                OptionalIntRow(label: "Max memory", unit: "MiB", value: $model.globalDefaults.limits.maxMemoryMb)
+                    .disabled(!model.globalDefaults.limits.enabled)
+            }
+
+            Section("Connectivity") {
+                Toggle("Apply default firewall to new sandboxes", isOn: $model.globalDefaults.firewall.enabled)
+                Picker("Default egress", selection: $model.globalDefaults.firewall.mode) {
+                    Text("Open (unrestricted)").tag(DefaultEgressMode.open)
+                    Text("No network").tag(DefaultEgressMode.noNetwork)
+                    Text("Allow-list").tag(DefaultEgressMode.allowlist)
+                }
+                .disabled(!model.globalDefaults.firewall.enabled)
+
+                if model.globalDefaults.firewall.mode == .allowlist {
+                    AllowListEditor(rules: $model.globalDefaults.firewall.allow)
+                        .disabled(!model.globalDefaults.firewall.enabled)
+                }
+                Text("Applied only to new sandboxes; a sandbox's own Connectivity setting overrides it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .formStyle(.grouped)
+        .onChange(of: model.globalDefaults) { _, _ in model.saveGlobalDefaults() }
+    }
+}
+
+/// A labelled optional-integer field: a checkbox enables the limit, a text field
+/// holds its value. Unchecked means "no limit on this axis" (nil).
+private struct OptionalIntRow: View {
+    let label: String
+    let unit: String
+    @Binding var value: Int?
+
+    var body: some View {
+        HStack {
+            Toggle(isOn: Binding(
+                get: { value != nil },
+                set: { on in value = on ? (value ?? 0) : nil }
+            )) {
+                Text(label)
+            }
+            .toggleStyle(.checkbox)
+            Spacer()
+            if value != nil {
+                TextField("", value: Binding(
+                    get: { value ?? 0 },
+                    set: { value = max(0, $0) }
+                ), format: .number)
+                .frame(width: 80)
+                .multilineTextAlignment(.trailing)
+                .textFieldStyle(.roundedBorder)
+                if !unit.isEmpty {
+                    Text(unit).font(.caption).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
+}
+
+/// A simple editable list of `host[:port]` allow rules.
+private struct AllowListEditor: View {
+    @Binding var rules: [String]
+    @State private var draft = ""
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(Array(rules.enumerated()), id: \.offset) { index, rule in
+                HStack {
+                    Text(rule).font(.callout.monospaced())
+                    Spacer()
+                    Button(role: .destructive) {
+                        rules.remove(at: index)
+                    } label: {
+                        Image(systemName: "minus.circle")
+                    }
+                    .buttonStyle(.borderless)
+                }
+            }
+            HStack {
+                TextField("host:port (e.g. github.com:443)", text: $draft)
+                    .textFieldStyle(.roundedBorder)
+                Button("Add") {
+                    let trimmed = draft.trimmingCharacters(in: .whitespaces)
+                    if !trimmed.isEmpty, !rules.contains(trimmed) {
+                        rules.append(trimmed)
+                    }
+                    draft = ""
+                }
+                .disabled(draft.trimmingCharacters(in: .whitespaces).isEmpty)
+            }
+        }
     }
 }
 
