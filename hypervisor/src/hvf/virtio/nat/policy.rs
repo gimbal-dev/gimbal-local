@@ -125,7 +125,7 @@ impl Rule {
 /// A short-lived cache mapping resolved IPv4 addresses back to the hostname the
 /// guest asked for, so a TCP connect (which sees only an IP) can be judged
 /// against hostname allow-list rules.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct ResolveCache {
     entries: HashMap<Ipv4Addr, (String, Instant)>,
     ttl: Option<Duration>,
@@ -145,7 +145,7 @@ impl ResolveCache {
 }
 
 /// The egress allow-list the NAT enforces.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct EgressPolicy {
     default_allow: bool,
     allow: Vec<Rule>,
