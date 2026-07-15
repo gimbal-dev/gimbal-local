@@ -20,6 +20,7 @@ use crate::console_filter::ConsoleFilter;
 use crate::control_plane;
 use crate::firewall;
 use crate::serve;
+use crate::signing;
 use crate::state_cdn;
 
 use hypervisor::arch::aarch64::gic::Vgic;
@@ -610,6 +611,7 @@ pub fn main() -> ExitCode {
         Some("branches") => control_plane::branches_main(&raw[1..]),
         Some("policy") => control_plane::policy_main(&raw[1..]),
         Some("firewall") => firewall::firewall_main(&raw[1..]),
+        Some("manifest") => signing::manifest_main(&raw[1..]),
         Some("state-cdn") => state_cdn::state_cdn_main(&raw[1..]),
         Some("serve") => serve::serve_main(&raw[1..]),
         Some("ctl") => serve::ctl_main(&raw[1..]),

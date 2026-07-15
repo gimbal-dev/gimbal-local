@@ -53,6 +53,9 @@ mod policy;
 mod firewall;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod signing;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn main() -> ExitCode {
     imp::main()
 }
