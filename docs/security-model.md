@@ -94,6 +94,8 @@ test/guard so a regression is caught, not discovered.
 | I5 | **The app never builds host shell code from data.** Snapshot/sandbox names and paths never become shell tokens. | Centralised single-quote builder + control-char rejection; adversarial-input tests. | **Holds today** (M30.3) |
 | I6 | **Only verified, provenance-known snapshots run.** A bundle is checksum-verified **and** signature-verified against a trusted key before import or run; provenance is recorded. | Signed manifest + verification against the cloud trust root. | **Not yet** (M30.4) |
 | I7 | **Undeliverable snapshots are refused, not mis-run.** ITS/LPI snapshots fail loudly at the load guard and the `assign-run` 422 gate. | `its_lpi_guard` + plane gate. | **Holds today** |
+| I8 | **The content store cannot select a host file.** A manifest checksum is only ever used as a CAS path after it is validated as a canonical sha256 hex digest, and every CAS object (including cache hits) is re-hashed before it is linked into a guest. | Digest-shape gate + re-hash on hit in `materialize_bundle`. | **Holds today** (M30.8) |
+| I9 | **A governed session's egress is enforced on every NIC and fails closed.** The resolved policy applies to all virtio-net NICs, and a session whose policy source is present but unresolvable denies all egress rather than running open. | Per-NIC policy clone + `EgressResolution::FailClosed` deny-all. | **Holds today** (M30.9) |
 
 ---
 
@@ -208,7 +210,13 @@ cloud). A tampered bundle with a matching recomputed `checksum_tree` passes.
   that manifest, produced by the cloud/capture signing key.
 - `chm` (and the app before it exposes "Run") **verify the signature** against a
   trusted public key, then verify `checksum_tree`, then record provenance.
-- gctl owns producing + signing the manifest; Gimbal Local owns verification.
+- Verify **every object hash, including CAS cache hits**, before use — M30.8
+  already re-hashes hits; signing extends that to authenticity, so a shared blob
+  cannot be trusted on name alone.
+- Establish **one trust root** with key IDs + rotation: gctl signs canonical
+  manifests, `chm` is the authoritative verifier, and the app displays only
+  `chm`-verified provenance. gctl owns producing + signing; Gimbal Local owns
+  verification.
 
 ### M30.5 · No-host-FS-passthrough invariant + CI guard  **[P1, docs + test]**
 
@@ -229,10 +237,27 @@ regress.
 
 **Finding (from area 8).** A hostile sandbox has no declared resource ceiling.
 
-**Plan.** Bound per-sandbox vCPU / memory / disk-overlay growth (the snapshot's
-own vCPU+RAM shape is the baseline; cap overlay size + wall-clock where the
-runner drives it) so a runaway guest can't exhaust host resources. Small MVP;
-integrates with the M28 policy object later.
+**Plan.** Bound per-sandbox **CPU, memory, disk-overlay growth, network, console
+output, connection count, and bandwidth** (the snapshot's own vCPU+RAM shape is
+the baseline; cap overlay size + wall-clock where the runner drives it) so a
+runaway guest can't exhaust host resources. Ceilings default to fail-closed and
+integrate with the M28 policy object. Test deliberate CPU, memory, disk, console,
+connection, and bandwidth exhaustion.
+
+### M30.2 daemon follow-up · runtime-dir ownership  **[P1, daemon]**
+
+**Finding (2026-07 review).** The socket dir is created private `0700` with a
+`0600` socket + peer-uid check, but a **pre-existing** runtime directory is not
+fully validated. **Plan.** Reject a pre-existing runtime dir unless it is owned
+by the current UID with exact safe permissions, so a planted dir can't
+pre-seed/interpose.
+
+### M30.3 app follow-up · direct argv launch  **[P2, app]**
+
+**Finding (2026-07 review).** The central single-quoting builder is safe, but it
+still composes a shell/AppleScript string. **Plan.** Prefer direct argv-based
+process launching where the Terminal UX permits, reducing reliance on layered
+escaping.
 
 ### M30.7 · Threat model + hardening checklist  **[P0, docs]**
 
@@ -242,6 +267,59 @@ model + checklist.
 **Plan.** *This document.* It defines the model, the invariants, and the
 per-area plan, and is the acceptance surface for M30. The checklist below is the
 "done" bar.
+
+### M30.8 · CAS digest hardening — content-store path safety  **[P0, chm]**
+
+**Status: shipped.** `materialize_bundle` now validates every manifest checksum
+is a canonical 64-char lowercase sha256 hex digest before it is used as a
+content-addressed-store path, and re-hashes every CAS object on a dedup hit (not
+only at first fetch) before linking it in.
+
+**Finding (2026-07 review).** The content-addressed store keyed blobs by the
+manifest checksum value used directly as a path (`cas.join(want)`), lower-cased
+but otherwise unvalidated. A crafted checksum — an absolute path (`/etc/passwd`)
+or a `..` traversal — made the blob path point at a **host file**, and a dedup
+hit then hard-linked that host file into the guest-visible cache **without
+re-hashing**. This is a host-file read exposure from an unsigned bundle manifest
+(the checksum-value analogue of the M30.1 relpath-confinement fix).
+
+**Plan (done).**
+- Reject any checksum that is not exactly `[0-9a-f]{64}` before it is used as a
+  path component, so it is always a single safe segment (no absolute path, no
+  `..`, no separators).
+- Re-hash CAS objects on **every** dedup hit; a blob whose bytes no longer match
+  its digest (corrupted or poisoned out of band) is discarded and re-fetched
+  from the verified source, never linked into a guest.
+
+**Tests.** Adversarial checksums (absolute path, traversal, wrong length,
+non-hex) are refused; a poisoned cache hit is re-hashed, dropped, and replaced
+with verified bytes.
+
+### M30.9 · Egress policy on every NIC + fail-closed  **[P0, engine]**
+
+**Status: shipped.** The resolved egress policy is applied to **every**
+virtio-net NIC, and a governed session that cannot resolve its policy fails
+closed (deny-all) instead of running open.
+
+**Finding (2026-07 review).** The policy was moved into the first NIC with
+`net_policy.take()`, so a snapshot with a second NIC left that NIC unrestricted —
+a path straight around the allow-list. Separately, "no policy source" and "a
+source was specified but failed to load" both collapsed to `None`, so a governed
+session whose policy file went missing/malformed booted wide open.
+
+**Plan (done).**
+- Derive `Clone` on `EgressPolicy`; hand every NIC a clone of the single
+  resolved policy so all interfaces enforce the same allow-list.
+- Resolve to an explicit `EgressResolution` (Unrestricted / Policy / FailClosed):
+  a source that is present but unreadable/malformed **fails closed** with a
+  deny-all policy rather than silently disabling the firewall.
+
+**Tests.** The per-NIC clone still enforces the deny; the fail-closed policy
+denies every destination; a missing/malformed source resolves to FailClosed.
+
+**Remaining.** Requiring the HVF path for untrusted sessions and rejecting
+multi-NIC snapshots outright (vs. governing them) are follow-ups tracked with
+M30.4/M30.6.
 
 ---
 

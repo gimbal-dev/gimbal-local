@@ -114,9 +114,9 @@ from cache in 0.077 s).
 | Milestone | Pillar | Status | Issues |
 | --- | --- | --- | --- |
 | **M25 · Live local lifecycle** | ① | **Complete** (one perf ceiling: runtime memfd page-sharing) | #4, #6 |
-| **M30 · Security hardening** | trust/isolation | **P0 + no-FS guard shipped** (#33–#35, #37); signing + limits next (#36, #38) | #33–#39 |
+| **M30 · Security hardening** | trust/isolation | **P0s + no-FS guard shipped** (#33–#35, #37; CAS digest M30.8 + multi-NIC fail-closed M30.9); signing (#36) + limits (#38) next | #33–#39 |
 | **M27 · Plane-native edge** | ② | **push/pull shipped** (#7 core); postcopy memory + disk plane next (#5) | #5, #7 |
-| **M28 · Consistent controls** | ③ | **M28.1–M28.3 + M28.5 shipped** (policy plumbing + digest teleport; userspace egress NAT; allow-list gate at DNS + TCP-connect; fs mount refusal). Demo (#52) needs a net-enabled snapshot for the live run. | #20 |
+| **M28 · Consistent controls** | ③ | **M28.1–M28.3 + M28.5 shipped** (policy plumbing + digest teleport; userspace egress NAT; allow-list gate at DNS + TCP-connect; fs mount refusal); enforced on every NIC + fail-closed (M30.9). Live demo (#52) blocked only on a net-enabled snapshot. | #20, #52 |
 | **M29 · Observability & cost** | ④ | Waits on the gctl telemetry contract | — |
 
 ### M25 · Live local lifecycle — suspend · resume · fork
@@ -170,8 +170,16 @@ them. Full model + plan: [`security-model.md`](security-model.md).
 - **M30.5 (#37, P1) — shipped.** The **no host-FS-passthrough** invariant is
   explicit: a behavioural test proves virtio-fs/9p classify as `Unsupported`,
   and `make security-check` fails if host-FS wiring appears without review.
-- **M30.6 (#38, P2)** — per-sandbox resource limits (vCPU/mem/disk).
+- **M30.6 (#38, P2)** — per-sandbox resource limits (CPU/mem/disk/network/
+  console/connection/bandwidth ceilings, fail-closed).
 - **M30.7 (#39)** — the threat model + hardening checklist (this doc set).
+- **M30.8 (P0) — shipped.** CAS digest hardening: a manifest checksum is
+  validated as a canonical sha256 hex digest before it is used as a
+  content-store path, and every CAS object (including cache hits) is re-hashed
+  before linking, so a tampered manifest cannot select or expose a host file.
+- **M30.9 (P0) — shipped.** Egress enforced on **every** NIC (not just the
+  first) and fail-closed: a governed session whose policy cannot be resolved
+  denies all egress rather than booting open.
 
 M30 is the *trust + isolation* layer beneath the feature pillars: even with **no**
 policy, a bundle must not escape the host and the daemon must not be hijackable.
@@ -277,3 +285,17 @@ Progress lives in the
 above. **M30 (security hardening) is the immediate priority and precedes M27.**
 The four pillars are the V0 capability contract (issue #21); each pillar is
 only "done" when it is enforced identically on both substrates.
+
+### What comes next (crisp view, 2026-07-15)
+
+- **Security (priority):** M30.4 signed manifest + trust root (#36, P1 — the
+  largest missing trust feature) → M30.6 resource limits (#38, P2) → the two
+  follow-ups M30.2 runtime-dir ownership (#66) and M30.3 direct-argv (#67).
+- **Open bugs:** rollback does not revert the disk overlay (#62); engine shows
+  idle while sandboxes are alive (#61).
+- **Demo gap:** the live in-guest firewall demo (#52) is blocked only on a
+  net-enabled snapshot; authoring + enforcement already ship.
+- **Cross-repo (CP) handoffs:** #4/#5/#6 (checkpoint/postcopy/fork phases),
+  #20 (policy plane), #21 (V0 pillar alignment).
+- **Recently shipped + closed:** interactive console freeze (#60), CAS digest
+  hardening (#64), per-NIC fail-closed egress (#65).

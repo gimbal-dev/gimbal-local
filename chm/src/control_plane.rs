@@ -361,8 +361,12 @@ fn chm_command_args(chm_command: &str, snapshot_dir: &Path) -> Result<Vec<String
 ///
 /// `download_uri` may be a local `file://` object store (a copy) or a networked
 /// `http(s)://` one (streamed via curl). Each object is fetched from
-/// `<download_uri>/<relpath>` and verified before it enters the CAS; CAS hits are
-/// trusted (the blob's name is its verified digest).
+/// `<download_uri>/<relpath>` and verified before it enters the CAS. Both the
+/// object relpath and its checksum are untrusted (the manifest is unsigned until
+/// M30.4): the relpath is confined under the cache root, the checksum is required
+/// to be a canonical sha256 hex digest before it is used as a CAS path, and even
+/// a CAS hit is re-hashed before it is linked in, so a tampered manifest can
+/// neither escape the cache nor select an unverified/host file.
 fn materialize_bundle(
     download_uri: &str,
     checksum_tree: &BTreeMap<String, String>,
@@ -381,18 +385,38 @@ fn materialize_bundle(
         // key like `../../../etc/...` would escape the bundle on ingest (M30.1).
         let dest = confined_join(cache, rel)?;
         let want = want.to_lowercase();
+        // The checksum VALUE is equally untrusted, and we use it as a CAS path
+        // component (`cas.join(want)`). A value like "/etc/passwd" or
+        // "../../secret" would make `blob` point at a host file that a dedup hit
+        // then links into the guest-visible cache (M30.8). Accept only a real
+        // fixed-length sha256 hex digest, which is a single safe path segment.
+        if !is_sha256_hex(&want) {
+            return Err(format!(
+                "refusing bundle object {rel:?}: checksum {want:?} is not a \
+                 64-char hex sha256 (possible tampered manifest)"
+            ));
+        }
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
         }
         let blob = cas.join(&want);
         if blob.is_file() {
-            // Dedup hit: content-addressed blob already local (verified on
-            // ingest) — link it in without re-fetching or re-hashing.
-            link_or_copy(&blob, &dest)?;
-            deduped += 1;
-            continue;
+            // Dedup hit: re-hash the cached blob before trusting it. The CAS is a
+            // shared, on-disk store; a blob could have been corrupted or poisoned
+            // out of band since it was ingested, so verifying it here (not just at
+            // first fetch) keeps a hit from linking unverified bytes into a guest
+            // (M30.8). A mismatch drops the bad blob and falls through to a fresh
+            // fetch + verify.
+            let got = sha256_file(&blob)?;
+            if got.eq_ignore_ascii_case(&want) {
+                link_or_copy(&blob, &dest)?;
+                deduped += 1;
+                continue;
+            }
+            let _ = fs::remove_file(&blob);
         }
-        // Miss: fetch the object, verify it, then promote it into the CAS.
+        // Miss (or an evicted poisoned hit): fetch the object, verify it, then
+        // promote it into the CAS.
         fetch_object(download_uri, rel, &dest, token)?;
         let got = sha256_file(&dest)?;
         if !got.eq_ignore_ascii_case(&want) {
@@ -402,6 +426,16 @@ fn materialize_bundle(
         let _ = fs::hard_link(&dest, &blob).or_else(|_| fs::copy(&dest, &blob).map(|_| ()));
     }
     Ok(deduped)
+}
+
+/// Whether `s` is a canonical lowercase sha256 hex digest: exactly 64 chars,
+/// each `0-9` or `a-f`. Used to gate the untrusted manifest checksum before it
+/// is ever used as a content-addressed store path component, so a crafted value
+/// cannot traverse out of the CAS to select a host file (M30.8).
+fn is_sha256_hex(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 /// The content-addressed store (sha256 → blob) for a given snapshot cache: a
@@ -2019,6 +2053,73 @@ mod tests {
         materialize_bundle(&uri, &BTreeMap::new(), &root.join("snap-d"), None).unwrap_err();
         // An unsupported scheme is refused.
         fetch_object("ftp://x/y", "z", &root.join("z"), None).unwrap_err();
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn materialize_rejects_non_digest_checksums() {
+        // The checksum value is used as a CAS path component. A crafted value that
+        // is not a plain sha256 hex digest — an absolute path, a traversal, a
+        // wrong length, or non-hex — must be refused before it can select or
+        // expose a host file (M30.8).
+        let root = env::temp_dir().join(format!("chm-cp-badck-{}", process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = root.join("store");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("state.json"), b"hello").unwrap();
+        let uri = format!("file://{}", store.display());
+
+        for evil in [
+            "/etc/passwd",
+            "../../../../etc/passwd",
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b98", // 62 chars
+            "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824ff", // 66
+            "zzf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", // non-hex
+        ] {
+            let mut tree = BTreeMap::new();
+            tree.insert("state.json".to_string(), evil.to_string());
+            let err = materialize_bundle(&uri, &tree, &root.join("out"), None).unwrap_err();
+            assert!(
+                err.contains("not a") || err.contains("hex sha256"),
+                "checksum {evil:?} must be rejected as a non-digest, got: {err}"
+            );
+            let _ = fs::remove_dir_all(root.join("out"));
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn materialize_rehashes_a_poisoned_cache_hit() {
+        // A CAS blob that has been corrupted/poisoned out of band (its bytes no
+        // longer match the digest that names it) must not be linked into a guest
+        // on a dedup hit — it is re-hashed, discarded on mismatch, and re-fetched
+        // from the verified source instead (M30.8).
+        let root = env::temp_dir().join(format!("chm-cp-poison-{}", process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = root.join("store");
+        fs::create_dir_all(&store).unwrap();
+        fs::write(store.join("state.json"), b"hello").unwrap();
+        let uri = format!("file://{}", store.display());
+        let digest = "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824"; // sha256("hello")
+
+        // Pre-poison the CAS: a blob named with the valid digest but holding attacker bytes.
+        let cache = root.join("snap");
+        let cas = cas_dir_for(&cache);
+        fs::create_dir_all(&cas).unwrap();
+        fs::write(cas.join(digest), b"POISONED-not-hello").unwrap();
+
+        let mut tree = BTreeMap::new();
+        tree.insert("state.json".to_string(), digest.to_string());
+        // Must succeed by re-fetching the real bytes, not by trusting the poison.
+        materialize_bundle(&uri, &tree, &cache, None).unwrap();
+        assert_eq!(
+            fs::read(cache.join("state.json")).unwrap(),
+            b"hello",
+            "the poisoned cache hit must be re-hashed and replaced with verified bytes"
+        );
+        // The CAS blob is now the correct content.
+        assert_eq!(fs::read(cas.join(digest)).unwrap(), b"hello");
 
         let _ = fs::remove_dir_all(&root);
     }

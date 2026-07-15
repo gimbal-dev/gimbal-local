@@ -340,7 +340,24 @@ pub(crate) fn wire_virtio(
     // (M28.3), or a per-workspace `egress-policy.json` a local user authored with
     // `chm firewall` — the same seam, whether the run is cloud- or self-served.
     // It is enforced by the net device's userspace NAT at DNS resolve + connect.
-    let mut net_policy = load_egress_policy(overlay_dir, cli_egress);
+    //
+    // The resolved policy applies to EVERY virtio-net NIC, not just the first: a
+    // snapshot with a second NIC must not get a free unrestricted path around the
+    // allow-list. If a policy source was specified but could not be honored, the
+    // session was meant to be governed, so we fail closed with a deny-all policy
+    // rather than booting wide open (M30.9).
+    let enforced_policy: Option<EgressPolicy> = match resolve_egress_policy(overlay_dir, cli_egress)
+    {
+        EgressResolution::Unrestricted => None,
+        EgressResolution::Policy(p) => Some(*p),
+        EgressResolution::FailClosed(reason) => {
+            eprintln!(
+                "chm: egress was governed but the policy could not be resolved \
+                 ({reason}); failing closed — denying all egress"
+            );
+            Some(EgressPolicy::from_profile("deny", &[], &[], "fail-closed"))
+        }
+    };
 
     for desc in &descs {
         let kind = match &desc.backend {
@@ -354,7 +371,8 @@ pub(crate) fn wire_virtio(
             }
         };
         let is_net = matches!(desc.backend, devmgr::BackendKind::Net);
-        let policy = if is_net { net_policy.take() } else { None };
+        // Clone (not take) so a second NIC is governed by the same policy.
+        let policy = if is_net { enforced_policy.clone() } else { None };
         let (base, size, dev) =
             devmgr::build_device(desc, guest_mem.clone(), overlay_dir, resume, policy)
                 .map_err(|e| format!("build device {}: {e}", desc.name))?;
@@ -417,27 +435,49 @@ pub(crate) fn wire_virtio(
 /// egress). A malformed policy is logged but must not silently *tighten* or crash
 /// the boot: an allow-list you cannot read is treated as "no policy", never as
 /// "deny everything".
-fn load_egress_policy(overlay_dir: &Path, cli_override: Option<&Path>) -> Option<EgressPolicy> {
+/// How a run's egress policy resolved, distinguishing "no policy was ever
+/// requested" (unrestricted by design) from "a policy source was specified but
+/// could not be honored" (must fail closed). Collapsing both to `None` would let
+/// a governed session silently run wide open if its policy file went missing or
+/// malformed (M30.9).
+enum EgressResolution {
+    /// No policy source at all — egress is unrestricted.
+    Unrestricted,
+    /// A resolved, enforceable policy.
+    Policy(Box<EgressPolicy>),
+    /// A source was specified (flag / env binding / workspace file) but failed to
+    /// load or parse. The session was meant to be governed, so fail closed.
+    FailClosed(String),
+}
+
+/// Resolve a run's egress policy from, in priority order: an explicit
+/// `--egress-policy <file>` flag, the `CHM_EGRESS_POLICY` binding the cloud
+/// runner sets, then a per-workspace `egress-policy.json` a local user authored
+/// with `chm firewall`. A source that is present but unreadable/malformed yields
+/// [`EgressResolution::FailClosed`] rather than silently disabling the firewall.
+fn resolve_egress_policy(overlay_dir: &Path, cli_override: Option<&Path>) -> EgressResolution {
+    let from_raw = |raw: &str, what: String| match parse_egress_policy(raw) {
+        Some(p) => EgressResolution::Policy(Box::new(p)),
+        None => EgressResolution::FailClosed(what),
+    };
     if let Some(path) = cli_override {
-        match fs::read_to_string(path) {
-            Ok(raw) => return parse_egress_policy(&raw),
-            Err(e) => {
-                eprintln!(
-                    "chm: warning: ignoring --egress-policy {}: {e}",
-                    path.display()
-                );
-                return None;
-            }
-        }
+        return match fs::read_to_string(path) {
+            Ok(raw) => from_raw(&raw, format!("--egress-policy {} is malformed", path.display())),
+            Err(e) => EgressResolution::FailClosed(format!(
+                "--egress-policy {} could not be read: {e}",
+                path.display()
+            )),
+        };
     }
     if let Ok(raw) = env::var("CHM_EGRESS_POLICY") {
-        return parse_egress_policy(&raw);
+        return from_raw(&raw, "CHM_EGRESS_POLICY is set but malformed".to_string());
     }
     let workspace = overlay_dir.parent().unwrap_or(overlay_dir);
     let file = workspace.join("egress-policy.json");
     match fs::read_to_string(&file) {
-        Ok(raw) => parse_egress_policy(&raw),
-        Err(_) => None,
+        Ok(raw) => from_raw(&raw, format!("{} is malformed", file.display())),
+        // No workspace file: this run was never asked to be governed.
+        Err(_) => EgressResolution::Unrestricted,
     }
 }
 
@@ -550,7 +590,7 @@ struct Args {
     /// Optional path to a local egress-policy file (`--egress-policy`). When set,
     /// it governs the guest's outbound network for this run, overriding the
     /// `CHM_EGRESS_POLICY` env binding and any per-workspace `egress-policy.json`.
-    /// `None` falls back to that resolution order. See [`load_egress_policy`].
+    /// `None` falls back to that resolution order. See [`resolve_egress_policy`].
     egress_policy: Option<PathBuf>,
 }
 
@@ -1882,8 +1922,18 @@ mod tests {
         assert!(parse_egress_policy("not json").is_none());
     }
 
+    /// Test helper: resolve and return the enforceable policy, or None for an
+    /// unrestricted resolution. Panics if the resolution fails closed.
+    fn resolved_policy(overlay: &Path, cli: Option<&Path>) -> Option<EgressPolicy> {
+        match resolve_egress_policy(overlay, cli) {
+            EgressResolution::Unrestricted => None,
+            EgressResolution::Policy(p) => Some(*p),
+            EgressResolution::FailClosed(r) => panic!("unexpected fail-closed: {r}"),
+        }
+    }
+
     #[test]
-    fn load_egress_policy_reads_the_per_workspace_file() {
+    fn resolve_egress_policy_reads_the_per_workspace_file() {
         // A local user's `chm firewall set` writes <workspace>/egress-policy.json;
         // a run whose overlay dir is <workspace>/.chm-overlays must pick it up.
         let ws = std::env::temp_dir().join(format!("chm-egress-{}", std::process::id()));
@@ -1895,7 +1945,7 @@ mod tests {
         )
         .expect("write policy");
 
-        let p = load_egress_policy(&overlay, None).expect("policy resolved from workspace file");
+        let p = resolved_policy(&overlay, None).expect("policy resolved from workspace file");
         assert!(p.is_restrictive());
         assert_eq!(p.label(), "local");
         assert!(p.decide_dns("api.github.com").is_allow());
@@ -1905,7 +1955,7 @@ mod tests {
     }
 
     #[test]
-    fn load_egress_policy_cli_override_beats_the_workspace_file() {
+    fn resolve_egress_policy_cli_override_beats_the_workspace_file() {
         // `--egress-policy <file>` is the most specific intent and must win over a
         // per-workspace file.
         let ws = std::env::temp_dir().join(format!("chm-egress-cli-{}", std::process::id()));
@@ -1923,7 +1973,7 @@ mod tests {
         )
         .expect("write override");
 
-        let p = load_egress_policy(&overlay, Some(&override_path)).expect("override resolved");
+        let p = resolved_policy(&overlay, Some(&override_path)).expect("override resolved");
         assert_eq!(p.label(), "flag");
         assert!(p.decide_dns("override.test").is_allow());
         assert!(
@@ -1935,13 +1985,76 @@ mod tests {
     }
 
     #[test]
-    fn load_egress_policy_is_none_without_any_source() {
+    fn resolve_egress_policy_fails_closed_on_a_bad_source() {
+        // A source that was specified but cannot be honored must fail closed
+        // (deny-all), never silently run unrestricted (M30.9).
+        let ws = std::env::temp_dir().join(format!("chm-egress-fc-{}", std::process::id()));
+        let overlay = ws.join(".chm-overlays");
+        fs::create_dir_all(&overlay).expect("mkdir");
+
+        // (a) an explicit flag pointing at a missing file.
+        let missing = ws.join("nope.json");
+        assert!(
+            matches!(
+                resolve_egress_policy(&overlay, Some(&missing)),
+                EgressResolution::FailClosed(_)
+            ),
+            "a missing --egress-policy file must fail closed"
+        );
+
+        // (b) a malformed per-workspace file.
+        fs::write(ws.join("egress-policy.json"), b"{ not json").expect("write bad");
+        assert!(
+            matches!(
+                resolve_egress_policy(&overlay, None),
+                EgressResolution::FailClosed(_)
+            ),
+            "a malformed workspace policy must fail closed"
+        );
+
+        fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn resolve_egress_policy_is_unrestricted_without_any_source() {
         let ws = std::env::temp_dir().join(format!("chm-egress-none-{}", std::process::id()));
         let overlay = ws.join(".chm-overlays");
         fs::create_dir_all(&overlay).expect("mkdir");
         // No env binding is set in this test process and no workspace file exists.
-        assert!(load_egress_policy(&overlay, None).is_none());
+        assert!(matches!(
+            resolve_egress_policy(&overlay, None),
+            EgressResolution::Unrestricted
+        ));
         fs::remove_dir_all(&ws).ok();
+    }
+
+    #[test]
+    fn egress_policy_applies_to_every_nic_via_clone() {
+        // The wiring hands each virtio-net NIC a clone of the resolved policy, so
+        // a snapshot with a second NIC cannot slip past the allow-list on an
+        // ungoverned interface (M30.9). Model that: a restrictive policy cloned
+        // for a second NIC still enforces.
+        let p = EgressPolicy::from_profile("deny", &["api.github.com:443".to_string()], &[], "t");
+        let nic1 = Some(p);
+        let nic2 = nic1.clone(); // exactly what the wiring loop does for NIC #2
+        let nic1 = nic1.unwrap();
+        let nic2 = nic2.expect("second NIC must receive the policy, not None");
+        assert!(nic1.decide_dns("api.github.com").is_allow());
+        assert!(
+            !nic2.decide_dns("evil.test").is_allow(),
+            "a second NIC must enforce the same deny, not run unrestricted"
+        );
+        assert!(nic2.decide_dns("api.github.com").is_allow());
+    }
+
+    #[test]
+    fn fail_closed_builds_a_deny_all_policy() {
+        // The fail-closed branch of the wiring builds this policy; it must deny
+        // every destination so a governed-but-unresolved session is not open.
+        let deny_all = EgressPolicy::from_profile("deny", &[], &[], "fail-closed");
+        assert!(deny_all.is_restrictive());
+        assert!(!deny_all.decide_dns("anything.test").is_allow());
+        assert!(!deny_all.decide_dns("api.github.com").is_allow());
     }
 
     #[test]
