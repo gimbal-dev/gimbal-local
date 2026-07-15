@@ -954,6 +954,25 @@ final class AppModel: ObservableObject {
     }
 
     var engineIndicator: EngineIndicator {
+        // Reconcile liveness from all signals, not the daemon slot alone: an
+        // app-launched sandbox runs via `chm connect` in its own process (its own
+        // VM, tracked by a session lock), which the daemon's `ctl status` cannot
+        // see. So the daemon slot can read idle while a sandbox the user is
+        // actively in is very much alive. Reflect any live sandbox as running
+        // rather than reporting the engine idle (#61).
+        if status.state != .running {
+            let live = sandboxes.filter { $0.state == .running || $0.state == .starting }
+            if !live.isEmpty {
+                return EngineIndicator(
+                    label: live.count == 1 ? "Sandbox running" : "\(live.count) sandboxes running",
+                    detail: live.count == 1
+                        ? (live.first?.name ?? "interactive session")
+                        : "interactive sessions",
+                    symbol: "play.circle.fill",
+                    tone: .active
+                )
+            }
+        }
         switch status.state {
         case .running:
             return EngineIndicator(

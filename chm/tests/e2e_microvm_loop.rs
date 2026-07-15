@@ -386,16 +386,11 @@ fn microvm_suspends_and_resumes_live_state() {
 ///   5. roll back to delta 1, and
 ///   6. prove the second file is gone while the first remains.
 ///
-/// The files live in `/dev/shm` (tmpfs, pure guest RAM) so each checkpoint
-/// captures them in its RAM image and a rollback — which restores an earlier RAM
-/// image — provably reverts the later delta.
-///
-/// IMPORTANT: rollback restores guest RAM (and tmpfs with it), NOT the persistent
-/// disk overlay, which is not versioned per revision (see
-/// `chm/src/checkpoint.rs::write_checkpoint`). A file written to the real disk
-/// would still be present after a rollback. This test uses tmpfs deliberately so
-/// it exercises the behavior rollback actually guarantees today; the disk-overlay
-/// gap is tracked separately.
+/// The tmpfs files (`/dev/shm`) live in pure guest RAM; the persistent-disk
+/// files (in `$HOME`, backed by the virtio-blk overlay) exercise disk-overlay
+/// rollback. Each checkpoint now captures both the RAM image and the disk
+/// overlay, so a rollback reverts a consistent RAM+disk pair — the later delta
+/// disappears from tmpfs AND from the persistent disk (#62).
 #[test]
 #[ignore = "needs a local HVF-compatible snapshot; run via scripts/hvf/e2e-microvm-loop.sh"]
 fn microvm_delta_rollback_removes_the_later_delta() {
@@ -423,8 +418,14 @@ fn microvm_delta_rollback_removes_the_later_delta() {
     let uniq = format!("{}_{}", process::id(), nanos());
     let file1 = format!("/dev/shm/gimbal_hero1_{uniq}");
     let file2 = format!("/dev/shm/gimbal_hero2_{uniq}");
+    // Persistent-disk counterparts (in $HOME on the virtio-blk overlay), to prove
+    // rollback reverts the disk overlay too, not just tmpfs/RAM (#62).
+    let dfile1 = format!("$HOME/gimbal_herod1_{uniq}");
+    let dfile2 = format!("$HOME/gimbal_herod2_{uniq}");
     let m1 = format!("HERO_ONE_{uniq}");
     let m2 = format!("HERO_TWO_{uniq}");
+    let md1 = format!("HERO_DISK_ONE_{uniq}");
+    let md2 = format!("HERO_DISK_TWO_{uniq}");
     let snap_str = snapshot.to_str().unwrap().to_string();
     let args = [
         "connect",
@@ -444,7 +445,7 @@ fn microvm_delta_rollback_removes_the_later_delta() {
     login_to_shell(&mut s1, shell, deadline);
     s1.drain_for(Duration::from_secs(2));
     s1.send(&format!(
-        "printf '%s\\n' {m1} > {file1}; sync; echo W1_{uniq}_done\n"
+        "printf '%s\\n' {m1} > {file1}; printf '%s\\n' {md1} > {dfile1}; sync; echo W1_{uniq}_done\n"
     ));
     if s1.wait_for(&[&format!("W1_{uniq}_done")], deadline).is_none() {
         s1.fail("delta 1: writing file 1 never completed");
@@ -463,7 +464,7 @@ fn microvm_delta_rollback_removes_the_later_delta() {
     let deadline2 = Instant::now() + OVERALL_BUDGET;
     resume_to_shell(&mut s2, shell, deadline2);
     s2.send(&format!(
-        "printf '%s\\n' {m2} > {file2}; sync; echo W2_{uniq}_done\n"
+        "printf '%s\\n' {m2} > {file2}; printf '%s\\n' {md2} > {dfile2}; sync; echo W2_{uniq}_done\n"
     ));
     if s2.wait_for(&[&format!("W2_{uniq}_done")], deadline2).is_none() {
         s2.fail("delta 2: writing file 2 never completed");
@@ -485,7 +486,7 @@ fn microvm_delta_rollback_removes_the_later_delta() {
     let deadline3 = Instant::now() + OVERALL_BUDGET;
     resume_to_shell(&mut s3, shell, deadline3);
     s3.send(&format!(
-        "echo LS_{uniq}; ls -1 {file1} {file2} 2>&1; cat {file1} {file2} 2>&1; echo DONE_{uniq}\n"
+        "echo LS_{uniq}; ls -1 {file1} {file2} 2>&1; cat {file1} {file2} {dfile1} {dfile2} 2>&1; echo DONE_{uniq}\n"
     ));
     if s3.wait_for(&[&format!("DONE_{uniq}")], deadline3).is_none() {
         s3.fail("could not list/cat both files after delta 2");
@@ -494,12 +495,19 @@ fn microvm_delta_rollback_removes_the_later_delta() {
     s3.suspend();
     assert!(
         seen_both.contains(&m1) && seen_both.contains(&m2),
-        "after two deltas both files must be readable (saw m1={}, m2={})\n--- console tail ---\n{}",
+        "after two deltas both tmpfs files must be readable (saw m1={}, m2={})\n--- console tail ---\n{}",
         seen_both.contains(&m1),
         seen_both.contains(&m2),
         tail(&seen_both)
     );
-    eprintln!("e2e: both deltas present after delta 2");
+    assert!(
+        seen_both.contains(&md1) && seen_both.contains(&md2),
+        "after two deltas both persistent-disk files must be readable (saw md1={}, md2={})\n--- console tail ---\n{}",
+        seen_both.contains(&md1),
+        seen_both.contains(&md2),
+        tail(&seen_both)
+    );
+    eprintln!("e2e: both deltas present after delta 2 (tmpfs + disk)");
 
     // --- 4) roll back to delta 1 -------------------------------------------- //
     let status = Command::new(&chm)
@@ -513,7 +521,7 @@ fn microvm_delta_rollback_removes_the_later_delta() {
     let deadline4 = Instant::now() + OVERALL_BUDGET;
     resume_to_shell(&mut s4, shell, deadline4);
     s4.send(&format!(
-        "echo RB_{uniq}; cat {file1} 2>&1; ls {file2} 2>&1; echo DONE_{uniq}\n"
+        "echo RB_{uniq}; cat {file1} {dfile1} 2>&1; ls {file2} {dfile2} 2>&1; echo DONE_{uniq}\n"
     ));
     if s4.wait_for(&[&format!("DONE_{uniq}")], deadline4).is_none() {
         s4.fail("could not inspect files after rollback");
@@ -531,17 +539,31 @@ fn microvm_delta_rollback_removes_the_later_delta() {
         .map_or(after.as_str(), |(_, tailtext)| tailtext);
     assert!(
         post.contains(&m1),
-        "rollback lost the FIRST file — it should survive (delta 1 is the target).\n\
+        "rollback lost the FIRST tmpfs file — it should survive (delta 1 is the target).\n\
          --- console tail ---\n{}",
         tail(&after)
     );
     assert!(
         !post.contains(&m2),
-        "rollback did NOT remove the second file — the later delta was not reverted.\n\
+        "rollback did NOT remove the second tmpfs file — the later RAM delta was not reverted.\n\
          --- console tail ---\n{}",
         tail(&after)
     );
-    eprintln!("e2e: rollback to delta 1 kept file 1 and removed file 2 — lineage verified");
+    assert!(
+        post.contains(&md1),
+        "rollback lost the FIRST persistent-disk file — the disk overlay was not restored to \
+         delta 1.\n--- console tail ---\n{}",
+        tail(&after)
+    );
+    assert!(
+        !post.contains(&md2),
+        "rollback did NOT remove the second persistent-disk file — the later disk-overlay delta \
+         was not reverted (#62).\n--- console tail ---\n{}",
+        tail(&after)
+    );
+    eprintln!(
+        "e2e: rollback to delta 1 kept file 1 and removed file 2 (tmpfs + disk) — lineage verified"
+    );
 }
 
 /// Drive a `chm connect` session from spawn to a shell prompt, logging in with
