@@ -32,6 +32,7 @@ use std::{env, thread};
 use serde_json::{Value, json};
 
 use crate::policy;
+use crate::signing::{DetachedSignature, TrustStore};
 
 /// Default control-plane base URL (overridable via `GCTL_API`).
 const DEFAULT_API: &str = "http://127.0.0.1:8080";
@@ -830,9 +831,9 @@ fn run_assignment(cp: &ControlPlane, runner_id: &str, opts: &RunOpts) -> Result<
         .and_then(Value::as_str)
         .ok_or("assign-run: no chm_command")?;
     let kind = assign.get("kind").and_then(Value::as_str).unwrap_or("cold");
-    let checksum_tree = parse_checksum_tree(&assign)?;
+    let (checksum_tree, provenance) = trusted_checksum_tree(&assign)?;
     eprintln!(
-        "chm runner: assigned {} (kind={kind}, {} file(s) to verify)",
+        "chm runner: assigned {} (kind={kind}, {} file(s) to verify, manifest {provenance})",
         opts.snapshot_id,
         checksum_tree.len()
     );
@@ -1644,7 +1645,7 @@ fn materialize_assignment_to(assign: &Value, dest: &Path) -> Result<(), String> 
         .get("download_uri")
         .and_then(Value::as_str)
         .ok_or("pull assignment: no download_uri")?;
-    let checksum_tree = parse_checksum_tree(assign)?;
+    let (checksum_tree, provenance) = trusted_checksum_tree(assign)?;
 
     let manifest = assign.get("manifest").cloned().unwrap_or(Value::Null);
     let gic_mode = manifest
@@ -1662,7 +1663,7 @@ fn materialize_assignment_to(assign: &Value, dest: &Path) -> Result<(), String> 
     let token = assign.get("capability_token").and_then(Value::as_str);
     let deduped = materialize_bundle(download_uri, &checksum_tree, dest, token)?;
     eprintln!(
-        "chm pull: materialized + verified {} file(s){} at {}",
+        "chm pull: materialized + verified {} file(s){} at {} [manifest {provenance}]",
         checksum_tree.len(),
         if deduped > 0 {
             format!(" ({deduped} shared from cache)")
@@ -1792,11 +1793,18 @@ fn runner_cache_dir(snapshot_id: &str) -> PathBuf {
 
 /// Read `manifest.checksum_tree` from an assign-run response into a map.
 fn parse_checksum_tree(assign: &Value) -> Result<BTreeMap<String, String>, String> {
-    let tree = assign
+    let manifest = assign
         .get("manifest")
-        .and_then(|m| m.get("checksum_tree"))
-        .and_then(Value::as_object)
         .ok_or("assign-run: manifest.checksum_tree missing")?;
+    checksum_tree_from_manifest(manifest)
+}
+
+/// Extract + validate a `checksum_tree` from a manifest object.
+fn checksum_tree_from_manifest(manifest: &Value) -> Result<BTreeMap<String, String>, String> {
+    let tree = manifest
+        .get("checksum_tree")
+        .and_then(Value::as_object)
+        .ok_or("manifest.checksum_tree missing")?;
     let mut out = BTreeMap::new();
     for (k, v) in tree {
         let digest = v
@@ -1805,6 +1813,63 @@ fn parse_checksum_tree(assign: &Value) -> Result<BTreeMap<String, String>, Strin
         out.insert(k.clone(), digest.to_string());
     }
     Ok(out)
+}
+
+/// The trust store configured for this host, if any: `CHM_TRUST_STORE` points at
+/// a JSON `{ "keys": { "<id>": "<hex pubkey>" } }`. `None` means no trust root is
+/// configured, so bundles are accepted unsigned (back-compat during the gctl
+/// signing rollout — M30.4). An empty store counts as no trust root.
+fn resolve_trust_store() -> Result<Option<TrustStore>, String> {
+    match env::var("CHM_TRUST_STORE") {
+        Ok(p) if !p.is_empty() => {
+            let store = TrustStore::load(Path::new(&p))?;
+            Ok((!store.is_empty()).then_some(store))
+        }
+        _ => Ok(None),
+    }
+}
+
+/// The `checksum_tree` to trust for a bundle, gated on manifest *authenticity*
+/// (M30.4). Returns the tree plus a human provenance note.
+///
+/// When a trust root is configured, the assignment MUST carry a signed manifest:
+/// `manifest_canonical` (the exact bytes gctl signed) and `manifest_signature`
+/// (`{alg,key_id,sig}`). The signature is verified against the trust store and
+/// the *signed* manifest's `checksum_tree` is used — so a tampered bundle whose
+/// loose `manifest.checksum_tree` was recomputed cannot be trusted. A missing or
+/// invalid signature **fails closed**. Without a trust root, the unsigned
+/// `manifest.checksum_tree` is used so existing (pre-signing) flows keep working.
+fn trusted_checksum_tree(assign: &Value) -> Result<(BTreeMap<String, String>, String), String> {
+    authenticate_checksum_tree(assign, resolve_trust_store()?)
+}
+
+/// The authenticity gate proper, with the trust store passed in (so it is
+/// testable without touching process env). See [`trusted_checksum_tree`].
+fn authenticate_checksum_tree(
+    assign: &Value,
+    trust: Option<TrustStore>,
+) -> Result<(BTreeMap<String, String>, String), String> {
+    let Some(store) = trust else {
+        return Ok((
+            parse_checksum_tree(assign)?,
+            "unsigned (no trust root configured)".to_string(),
+        ));
+    };
+    let canonical = assign.get("manifest_canonical").and_then(Value::as_str).ok_or(
+        "a trust root is configured (CHM_TRUST_STORE) but this bundle carries no \
+         signed manifest_canonical — refusing to run an unsigned bundle (fail closed)",
+    )?;
+    let sig_val = assign.get("manifest_signature").ok_or(
+        "a trust root is configured but this bundle carries no manifest_signature — \
+         refusing to run an unsigned bundle (fail closed)",
+    )?;
+    let sig: DetachedSignature = serde_json::from_value(sig_val.clone())
+        .map_err(|e| format!("parse manifest_signature: {e}"))?;
+    store.verify(canonical.as_bytes(), &sig)?;
+    let manifest: Value =
+        serde_json::from_str(canonical).map_err(|e| format!("parse signed manifest: {e}"))?;
+    let tree = checksum_tree_from_manifest(&manifest)?;
+    Ok((tree, format!("verified (Ed25519 key id {})", sig.key_id)))
 }
 
 #[cfg(test)]
@@ -2133,6 +2198,74 @@ mod tests {
         assert_eq!(tree.get("state.json").map(String::as_str), Some("abc"));
         assert_eq!(tree.len(), 2);
         parse_checksum_tree(&json!({})).unwrap_err();
+    }
+
+    #[test]
+    fn authenticity_gate_allows_unsigned_without_a_trust_root() {
+        // No trust root configured => the unsigned manifest.checksum_tree is used
+        // (back-compat during the gctl signing rollout).
+        let assign = json!({
+            "manifest": { "checksum_tree": { "state.json": "abc" } }
+        });
+        let (tree, note) = authenticate_checksum_tree(&assign, None).unwrap();
+        assert_eq!(tree.get("state.json").map(String::as_str), Some("abc"));
+        assert!(note.contains("unsigned"), "note: {note}");
+    }
+
+    #[test]
+    fn authenticity_gate_fails_closed_when_trust_set_but_bundle_unsigned() {
+        // A trust root is configured but the bundle carries no signature: refuse.
+        let (_pkcs8, pub_hex) = crate::signing::generate_keypair().unwrap();
+        let mut store = TrustStore::default();
+        store.insert_hex("gctl-2026", &pub_hex);
+        let assign = json!({
+            "manifest": { "checksum_tree": { "state.json": "abc" } }
+        });
+        let err = authenticate_checksum_tree(&assign, Some(store)).unwrap_err();
+        assert!(err.contains("fail closed"), "must fail closed, got: {err}");
+    }
+
+    #[test]
+    fn authenticity_gate_verifies_a_signed_bundle_and_uses_its_tree() {
+        // With a trust root and a valid signature, the SIGNED manifest's
+        // checksum_tree is trusted (not the loose one) and provenance is recorded.
+        let (pkcs8, pub_hex) = crate::signing::generate_keypair().unwrap();
+        let mut store = TrustStore::default();
+        store.insert_hex("gctl-2026", &pub_hex);
+
+        let canonical = r#"{"version":1,"checksum_tree":{"state.json":"deadbeef"}}"#;
+        let sig = crate::signing::sign(&pkcs8, "gctl-2026", canonical.as_bytes()).unwrap();
+        let assign = json!({
+            // A loose (untrusted) manifest that disagrees — must be ignored.
+            "manifest": { "checksum_tree": { "state.json": "00" } },
+            "manifest_canonical": canonical,
+            "manifest_signature": { "alg": sig.alg, "key_id": sig.key_id, "sig": sig.sig },
+        });
+        let (tree, note) = authenticate_checksum_tree(&assign, Some(store)).unwrap();
+        assert_eq!(
+            tree.get("state.json").map(String::as_str),
+            Some("deadbeef"),
+            "the signed manifest's tree is trusted, not the loose one"
+        );
+        assert!(note.contains("verified") && note.contains("gctl-2026"), "note: {note}");
+    }
+
+    #[test]
+    fn authenticity_gate_rejects_a_tampered_signed_manifest() {
+        // The signature was made over the original bytes; altering the canonical
+        // manifest after signing must fail verification.
+        let (pkcs8, pub_hex) = crate::signing::generate_keypair().unwrap();
+        let mut store = TrustStore::default();
+        store.insert_hex("k", &pub_hex);
+        let signed = r#"{"checksum_tree":{"state.json":"deadbeef"}}"#;
+        let sig = crate::signing::sign(&pkcs8, "k", signed.as_bytes()).unwrap();
+        let tampered = r#"{"checksum_tree":{"state.json":"evildigest"}}"#;
+        let assign = json!({
+            "manifest_canonical": tampered,
+            "manifest_signature": { "alg": sig.alg, "key_id": sig.key_id, "sig": sig.sig },
+        });
+        authenticate_checksum_tree(&assign, Some(store))
+            .expect_err("a tampered signed manifest must be rejected");
     }
 
     #[test]
