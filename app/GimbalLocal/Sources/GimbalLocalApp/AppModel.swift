@@ -453,10 +453,12 @@ final class AppModel: ObservableObject {
         // sandboxes launched from the same image.
         //
         // Terminal.app's `do script` runs a command *string*, so we cannot hand
-        // it a raw argv. Instead every interpolated value is single-quoted and
-        // control-character-validated by `InteractiveTerminalCommand` (M30.3),
-        // then the whole command is escaped once more for the AppleScript string
-        // literal — so a path can never break out into host shell code.
+        // it a raw argv for `chm` itself. But we avoid a second escaping layer by
+        // passing the (already single-quoted, control-char-validated by
+        // `InteractiveTerminalCommand`, M30.3) command to `osascript` as an
+        // argv parameter via `on run argv` — never interpolated into the
+        // AppleScript source — so a path can never break out of the script text
+        // into host code (M30.3 follow-up, #67).
         let command = try InteractiveTerminalCommand.shellCommand(
             chmPath: settings.chmPath,
             runPath: runPath,
@@ -465,16 +467,20 @@ final class AppModel: ObservableObject {
             workdir: FileManager.default.currentDirectoryPath
         )
 
+        // The script is a constant with no interpolation; the command travels as
+        // argv item 1, so AppleScript string-literal escaping is not needed.
         let script = """
-        tell application "Terminal"
-            activate
-            do script \(InteractiveTerminalCommand.appleScriptString(command))
-        end tell
+        on run argv
+            tell application "Terminal"
+                activate
+                do script (item 1 of argv)
+            end tell
+        end run
         """
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-        process.arguments = ["-e", script]
+        process.arguments = ["-e", script, command]
 
         let pipe = Pipe()
         process.standardOutput = pipe

@@ -580,15 +580,6 @@ final class GimbalLocalAppTests: XCTestCase {
         }
     }
 
-    func testAppleScriptStringEscapesQuotesAndBackslashes() {
-        // The AppleScript literal wrapper must escape backslash then quote, so a
-        // crafted command string cannot terminate the `do script "…"` literal.
-        XCTAssertEqual(
-            InteractiveTerminalCommand.appleScriptString(#"a"b\c"#),
-            #""a\"b\\c""#
-        )
-    }
-
     // MARK: - Branch surfacing (M27 Phase 4)
 
     func testCloudSnapshotFlagsFixturesWithoutDiskImages() {

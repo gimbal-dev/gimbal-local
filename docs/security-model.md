@@ -291,12 +291,18 @@ control socket) and tightens a self-owned directory back to `0700` if its
 permissions were left loose, so group/other can never interpose. Symlinks at the
 path are still refused. Covered by a unit test.
 
-### M30.3 app follow-up · direct argv launch  **[P2, app]**
+### M30.3 app follow-up · direct argv launch  **[P2, app] — shipped**
 
 **Finding (2026-07 review).** The central single-quoting builder is safe, but it
-still composes a shell/AppleScript string. **Plan.** Prefer direct argv-based
-process launching where the Terminal UX permits, reducing reliance on layered
-escaping.
+still composed a shell/AppleScript string with two escaping layers. **Fixed
+(#67).** The interactive `chm connect` command is now delivered to `osascript`
+as an `argv` parameter (`on run argv` ... `do script (item 1 of argv)`) instead
+of being interpolated into the AppleScript source, eliminating the
+AppleScript-literal escaping layer — a path can no longer break out of the
+script text into host code. Terminal.app's `do script` still requires a command
+*string* for `chm` itself, so the single-quote + control-char rejection remains
+(now the only layer). Verified live that a command with shell metacharacters and
+`$(...)` passes through argv verbatim, unexecuted.
 
 ### M30.7 · Threat model + hardening checklist  **[P0, docs]**
 

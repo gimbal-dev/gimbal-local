@@ -296,8 +296,9 @@ only "done" when it is enforced identically on both substrates.
 ### What comes next (crisp view, 2026-07-15)
 
 - **Security (priority):** M30.4 signed manifest + trust root (#36, P1 — the
-  largest missing trust feature) → M30.6 resource limits (#38, P2) → the two
-  follow-ups M30.2 runtime-dir ownership (#66) and M30.3 direct-argv (#67).
+  largest missing trust feature, cross-repo with gctl) is now the main open
+  item. M30.6 resource limits (#38) and the two follow-ups M30.2 runtime-dir
+  ownership (#66) and M30.3 direct-argv launch (#67) are shipped.
 - **Open bugs:** rollback does not revert the disk overlay (#62); engine shows
   idle while sandboxes are alive (#61).
 - **Demo gap:** the live in-guest firewall demo (#52) is blocked only on a

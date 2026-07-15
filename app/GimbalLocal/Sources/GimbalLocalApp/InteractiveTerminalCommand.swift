@@ -10,12 +10,15 @@ import Foundation
 /// Security (M30.1/M30.3 — see `docs/security-model.md`, invariant I5): the app
 /// launches host commands, so it must never let a path or setting become host
 /// shell code. Terminal.app's `do script` runs a command *string*, so a raw
-/// argv is not an option here; instead this builder single-quotes every
-/// interpolated value (robust against every shell metacharacter) and rejects
-/// control characters — newlines/NUL/ESC never appear in a real path and are
-/// exactly what would break the single-quote + AppleScript-literal composition.
-/// The logic is a pure, static builder so it is unit-tested against adversarial
-/// inputs rather than exercised only through the live Terminal.
+/// argv is not an option for `chm` itself; instead this builder single-quotes
+/// every interpolated value (robust against every shell metacharacter) and
+/// rejects control characters — newlines/NUL/ESC never appear in a real path and
+/// are exactly what would break the single-quote composition. The resulting
+/// command string is delivered to `osascript` as an argv parameter (not
+/// interpolated into the AppleScript source, see `AppModel`), so this is the
+/// only escaping layer. The logic is a pure, static builder so it is unit-tested
+/// against adversarial inputs rather than exercised only through the live
+/// Terminal.
 enum InteractiveTerminalCommand {
     enum BuildError: Error, LocalizedError, Equatable {
         /// A path contained a control character (newline, NUL, …) and was refused.
@@ -49,17 +52,6 @@ enum InteractiveTerminalCommand {
     /// this neutralizes shell injection.
     static func shellQuote(_ value: String) -> String {
         "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
-    }
-
-    /// Escape `value` for an AppleScript string literal (`"…"`): backslash first,
-    /// then double quote. Combined with a control-character-free input this makes
-    /// the `do script "…"` literal safe.
-    static func appleScriptString(_ value: String) -> String {
-        "\""
-            + value
-                .replacingOccurrences(of: "\\", with: "\\\\")
-                .replacingOccurrences(of: "\"", with: "\\\"")
-            + "\""
     }
 
     /// True when `value` has no control characters (the class that breaks quoting
