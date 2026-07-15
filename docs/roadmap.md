@@ -114,7 +114,7 @@ from cache in 0.077 s).
 | Milestone | Pillar | Status | Issues |
 | --- | --- | --- | --- |
 | **M25 · Live local lifecycle** | ① | **Complete** (one perf ceiling: runtime memfd page-sharing) | #4, #6 |
-| **M30 · Security hardening** | trust/isolation | **P0 + no-FS guard shipped** (#33–#35, #37); signing + limits next (#36, #38) | #33–#39 |
+| **M30 · Security hardening** | trust/isolation | **P0s + no-FS guard shipped** (#33–#35, #37; CAS digest M30.8 + multi-NIC fail-closed M30.9); signing (#36) + limits (#38) next | #33–#39 |
 | **M27 · Plane-native edge** | ② | **push/pull shipped** (#7 core); postcopy memory + disk plane next (#5) | #5, #7 |
 | **M28 · Consistent controls** | ③ | **M28.1–M28.3 + M28.5 shipped** (policy plumbing + digest teleport; userspace egress NAT; allow-list gate at DNS + TCP-connect; fs mount refusal). Demo (#52) needs a net-enabled snapshot for the live run. | #20 |
 | **M29 · Observability & cost** | ④ | Waits on the gctl telemetry contract | — |
@@ -170,8 +170,16 @@ them. Full model + plan: [`security-model.md`](security-model.md).
 - **M30.5 (#37, P1) — shipped.** The **no host-FS-passthrough** invariant is
   explicit: a behavioural test proves virtio-fs/9p classify as `Unsupported`,
   and `make security-check` fails if host-FS wiring appears without review.
-- **M30.6 (#38, P2)** — per-sandbox resource limits (vCPU/mem/disk).
+- **M30.6 (#38, P2)** — per-sandbox resource limits (CPU/mem/disk/network/
+  console/connection/bandwidth ceilings, fail-closed).
 - **M30.7 (#39)** — the threat model + hardening checklist (this doc set).
+- **M30.8 (P0) — shipped.** CAS digest hardening: a manifest checksum is
+  validated as a canonical sha256 hex digest before it is used as a
+  content-store path, and every CAS object (including cache hits) is re-hashed
+  before linking, so a tampered manifest cannot select or expose a host file.
+- **M30.9 (P0) — shipped.** Egress enforced on **every** NIC (not just the
+  first) and fail-closed: a governed session whose policy cannot be resolved
+  denies all egress rather than booting open.
 
 M30 is the *trust + isolation* layer beneath the feature pillars: even with **no**
 policy, a bundle must not escape the host and the daemon must not be hijackable.
