@@ -118,16 +118,50 @@ final class GimbalLocalAppTests: XCTestCase {
         let s = model.createSandbox(fromSnapshotNamed: "ubuntu")!
         // Daemon reports idle (its single VM slot is empty)...
         model.status = SandboxStatus(state: .idle, name: nil, uptimeSeconds: nil, consoleBytes: nil, reason: nil, message: nil)
-        // ...but an interactive session for this sandbox is live.
-        model.interactiveSandboxID = s.id
+        // ...but the session registry knows this sandbox has a live VM.
+        model.liveLocalSessionIDs = [s.id]
 
         XCTAssertEqual(model.sandbox(id: s.id)?.state, .running)
         XCTAssertEqual(model.engineIndicator.tone, .active, "a live connect session must not read idle")
         XCTAssertEqual(model.engineIndicator.label, "Sandbox running")
 
         // When the session ends, the engine falls back to the daemon's idle.
-        model.interactiveSandboxID = nil
+        model.liveLocalSessionIDs = []
         XCTAssertEqual(model.engineIndicator.tone, .ready)
+    }
+
+    @MainActor
+    func testSlotHolderGuardsTheSingleVMSlot() {
+        // The single HVF slot: while one sandbox holds a live session, launching
+        // another must be refused. slotHolder reports the occupant (#71).
+        let model = AppModel()
+        model.snapshots = [SnapshotSummary(name: "ubuntu", path: "/u", vcpus: 1, ramMib: 1024)]
+        let a = model.createSandbox(fromSnapshotNamed: "ubuntu")!
+        let b = model.createSandbox(fromSnapshotNamed: "ubuntu")!
+
+        // No live sessions -> the slot is free for either.
+        XCTAssertNil(model.slotHolder(excluding: a.id))
+        XCTAssertNil(model.slotHolder(excluding: b.id))
+
+        // A is live: launching B is blocked by A (the slot holder), but A itself
+        // is not blocked by its own session.
+        model.liveLocalSessionIDs = [a.id]
+        XCTAssertEqual(model.slotHolder(excluding: b.id)?.id, a.id)
+        XCTAssertNil(model.slotHolder(excluding: a.id), "a sandbox never blocks itself")
+    }
+
+    @MainActor
+    func testLiveSessionRegistryDrivesSandboxState() {
+        // The registry is authoritative for local liveness, independent of the
+        // daemon and of which console the app is tracking (#71).
+        let model = AppModel()
+        model.snapshots = [SnapshotSummary(name: "ubuntu", path: "/u", vcpus: 1, ramMib: 1024)]
+        let s = model.createSandbox(fromSnapshotNamed: "ubuntu")!
+        XCTAssertEqual(model.sandbox(id: s.id)?.state, .stopped)
+
+        model.liveLocalSessionIDs = [s.id]
+        XCTAssertEqual(model.sandbox(id: s.id)?.state, .running)
+        XCTAssertTrue(model.hasLiveLocalSandbox)
     }
 
     @MainActor
@@ -187,9 +221,11 @@ final class GimbalLocalAppTests: XCTestCase {
 
         // `chm connect` takes over the VM in its own process, so the daemon
         // reports nothing running — but the sandbox must still read as running
-        // because the user is working inside it.
+        // because the user is working inside it. Post-reconcile, the session
+        // registry holds it live (what the grace period / lock scan produces).
         model.interactiveSandboxID = s.id
         model.activeLocalSandboxID = s.id
+        model.liveLocalSessionIDs = [s.id]
         model.status = SandboxStatus(state: .disconnected, name: nil, uptimeSeconds: nil, consoleBytes: nil, reason: nil, message: nil)
 
         XCTAssertEqual(model.sandbox(id: s.id)?.state, .running)

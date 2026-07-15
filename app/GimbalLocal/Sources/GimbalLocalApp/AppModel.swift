@@ -81,6 +81,11 @@ final class AppModel: ObservableObject {
     @Published var activeLocalSandboxID: String?
     @Published var startingSandboxID: String?
     @Published var interactiveSandboxID: String?
+    /// Authoritative set of local sandboxes with a live `chm connect` VM, derived
+    /// by scanning the per-sandbox session-lock files (`reconcileSessions`). This
+    /// is the source of truth for local liveness — correct across app restarts
+    /// and independent of which session's console the app happens to be tracking.
+    @Published var liveLocalSessionIDs: Set<String> = []
     @Published var welcomeDismissed = UserDefaults.standard.bool(forKey: "gimbal.welcomeDismissed")
 
     private let chm = ChmClient()
@@ -107,6 +112,10 @@ final class AppModel: ObservableObject {
     func bootstrap() async {
         loadRecents()
         loadSandboxes()
+        // Adopt any sessions still alive from a previous app run before the first
+        // refresh, so an inherited `chm connect` VM shows running and its slot is
+        // protected rather than appearing free (#71).
+        reconcileSessions()
         await refreshAll()
         guard status.state == .disconnected, !attemptedAutoStart else {
             return
@@ -480,36 +489,84 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Reconcile an open interactive session against its PID lock file, clearing
-    /// the "connected" state once the user has ended it (e.g. by closing the
-    /// Terminal window). Cheap; driven by the periodic refresh loop.
-    func reconcileInteractiveSession() {
-        guard let id = interactiveSandboxID, let lockPath = interactiveLockPath else {
-            return
-        }
+    /// Reconcile the authoritative session registry: scan every stored local
+    /// sandbox's PID lock, derive liveness from the owning process, reap dead
+    /// locks, and update `liveLocalSessionIDs`. Also detects when the tracked
+    /// console session ends (e.g. the user closed the Terminal window). Cheap;
+    /// driven by the periodic refresh loop and by launch guards.
+    ///
+    /// This is authoritative across app restarts: a `chm connect` VM launched by
+    /// a previous app run still owns its lock, so it is re-detected as live and
+    /// the single HVF slot stays protected, instead of appearing free.
+    func reconcileSessions() {
         let fm = FileManager.default
-        let lockExists = fm.fileExists(atPath: lockPath)
-        if lockExists {
-            interactiveLockSeen = true
+        var live: Set<String> = []
+        for stored in storedSandboxes where stored.location == .local {
+            let lock = sessionLockPath(for: stored.id)
+            guard fm.fileExists(atPath: lock) else { continue }
+            if lockOwnerAlive(lock) {
+                live.insert(stored.id)
+                if stored.id == interactiveSandboxID { interactiveLockSeen = true }
+            } else {
+                // Owner gone without cleanup (e.g. SIGKILL): reap the stale lock.
+                try? fm.removeItem(atPath: lock)
+            }
         }
-        let ownerAlive = lockExists && lockOwnerAlive(lockPath)
-        let pastDeadline = interactiveDeadline.map { Date() > $0 } ?? false
-        let ended = InteractiveLiveness.sessionEnded(
-            lockExists: lockExists,
-            ownerAlive: ownerAlive,
-            lockSeen: interactiveLockSeen,
-            pastStartDeadline: pastDeadline
-        )
-        guard ended else { return }
 
-        appendLog("interactive session for \(sandbox(id: id)?.name ?? id) ended")
-        // The connect process stopped the daemon VM and owned the slot itself,
-        // so once it's gone the sandbox is no longer running locally.
-        if activeLocalSandboxID == id { activeLocalSandboxID = nil }
-        // Remove a stale lock left only by an uncatchable SIGKILL.
-        if lockExists { try? fm.removeItem(atPath: lockPath) }
-        clearInteractiveTracking()
-        Task { await refreshLocal() }
+        // The just-launched console session may not have written its lock yet;
+        // keep it live through the start grace period so a slow launch isn't
+        // dropped, and detect a genuine end to clear console tracking.
+        if let id = interactiveSandboxID, !live.contains(id) {
+            let lock = sessionLockPath(for: id)
+            let lockExists = fm.fileExists(atPath: lock)
+            let ended = InteractiveLiveness.sessionEnded(
+                lockExists: lockExists,
+                ownerAlive: lockExists && lockOwnerAlive(lock),
+                lockSeen: interactiveLockSeen,
+                pastStartDeadline: interactiveDeadline.map { Date() > $0 } ?? true
+            )
+            if ended {
+                appendLog("interactive session for \(sandbox(id: id)?.name ?? id) ended")
+                if activeLocalSandboxID == id { activeLocalSandboxID = nil }
+                if lockExists { try? fm.removeItem(atPath: lock) }
+                clearInteractiveTracking()
+                Task { await refreshLocal() }
+            } else {
+                // Still within the launch grace period — treat as live.
+                live.insert(id)
+            }
+        }
+
+        liveLocalSessionIDs = live
+    }
+
+    /// The PID recorded in a sandbox's session lock, if the file names a live
+    /// process. Used to authoritatively stop a `chm connect` session.
+    private func liveSessionPID(for id: String) -> Int32? {
+        let lock = sessionLockPath(for: id)
+        guard
+            FileManager.default.fileExists(atPath: lock),
+            let body = try? String(contentsOfFile: lock, encoding: .utf8),
+            let pid = Int32(body.trimmingCharacters(in: .whitespacesAndNewlines)),
+            kill(pid, 0) == 0 || errno == EPERM
+        else {
+            return nil
+        }
+        return pid
+    }
+
+    /// The sandbox (other than `exclude`) currently holding the single local VM
+    /// slot via a live `chm connect` session, if any. Re-scans the registry first
+    /// so the decision is fresh. Used to prevent slot contention on launch.
+    func liveSlotHolder(excluding exclude: String?) -> Sandbox? {
+        reconcileSessions()
+        return slotHolder(excluding: exclude)
+    }
+
+    /// The current slot holder from the cached registry, without re-scanning.
+    func slotHolder(excluding exclude: String?) -> Sandbox? {
+        guard let id = liveLocalSessionIDs.first(where: { $0 != exclude }) else { return nil }
+        return sandbox(id: id)
     }
 
     /// True if the PID recorded in `lockPath` names a live process.
@@ -590,12 +647,16 @@ final class AppModel: ObservableObject {
         if let cloudState = cloudSandboxStates[id] {
             return cloudState
         }
-        if id == interactiveSandboxID {
+        // The session registry is authoritative for local liveness: a live
+        // `chm connect` VM (tracked or inherited from a previous app run) means
+        // the sandbox is running, regardless of the daemon slot (#61, #71).
+        if liveLocalSessionIDs.contains(id) {
             return .running
         }
         if id == startingSandboxID {
             return .starting
         }
+        // Fall back to the daemon's status for a daemon-run active sandbox.
         guard id == activeLocalSandboxID else {
             return .stopped
         }
@@ -841,6 +902,13 @@ final class AppModel: ObservableObject {
             appendLog("\(sandbox.name) is already running")
             return
         }
+        // Single HVF slot: don't start a second VM while another sandbox is live.
+        if let holder = liveSlotHolder(excluding: sandbox.id) {
+            appendLog(
+                "cannot start \(sandbox.name): \(holder.name) is using the single local VM slot — stop it first"
+            )
+            return
+        }
         activeLocalSandboxID = sandbox.id
         startingSandboxID = sandbox.id
         clearInteractiveTracking()
@@ -872,11 +940,21 @@ final class AppModel: ObservableObject {
             appendLog("cannot connect: snapshot \(sandbox.snapshotName) not in library")
             return
         }
+        // Single HVF slot: refuse to open a second VM while another sandbox holds
+        // a live session, which would contend on the slot (the second VM can be
+        // "alive" but non-functional). Authoritative via the session registry so
+        // this holds even for a session inherited from a previous app run (#71).
+        if let holder = liveSlotHolder(excluding: sandbox.id) {
+            appendLog(
+                "cannot connect \(sandbox.name): \(holder.name) is using the single local VM slot — stop it first"
+            )
+            return
+        }
         activeLocalSandboxID = sandbox.id
         startingSandboxID = nil
         interactiveSandboxID = sandbox.id
         // Maintain a PID lock so the session's end (including a closed window) is
-        // detectable by reconcileInteractiveSession.
+        // detectable by the session registry (reconcileSessions).
         let lockPath = sessionLockPath(for: sandbox.id)
         interactiveLockPath = lockPath
         interactiveLockSeen = false
@@ -900,6 +978,14 @@ final class AppModel: ObservableObject {
     }
 
     func stop(_ sandbox: Sandbox) {
+        // A `chm connect` session runs its own VM (not the daemon's), so stopping
+        // it means terminating that process. Signal the lock owner so the VM tears
+        // down cleanly (chm's Drop destroys the HVF VM); then reap tracking. This
+        // makes Stop authoritative for connect sessions, not just daemon-run ones.
+        if let pid = liveSessionPID(for: sandbox.id) {
+            kill(pid, SIGTERM)
+            appendLog("stopping \(sandbox.name) (signalled its session)")
+        }
         Task {
             do {
                 let output = try await chm.stop(settings: settings)
@@ -910,8 +996,11 @@ final class AppModel: ObservableObject {
             if activeLocalSandboxID == sandbox.id { activeLocalSandboxID = nil }
             if startingSandboxID == sandbox.id { startingSandboxID = nil }
             if interactiveSandboxID == sandbox.id { clearInteractiveTracking() }
+            let lock = sessionLockPath(for: sandbox.id)
+            try? FileManager.default.removeItem(atPath: lock)
             consoleProcess?.terminate()
             consoleProcess = nil
+            reconcileSessions()
             await refreshLocal()
         }
     }
