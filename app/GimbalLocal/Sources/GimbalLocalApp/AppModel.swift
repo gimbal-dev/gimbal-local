@@ -584,8 +584,9 @@ final class AppModel: ObservableObject {
     }
 
     /// Path of the per-sandbox interactive session lock file, under the app's
-    /// Application Support directory.
-    private func sessionLockPath(for id: String) -> String {
+    /// Application Support directory. Internal (not private) so the session
+    /// registry's real scan/reap path can be exercised in tests.
+    func sessionLockPath(for id: String) -> String {
         let base = FileManager.default
             .urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
             .appendingPathComponent("gimbal-local/sessions", isDirectory: true)

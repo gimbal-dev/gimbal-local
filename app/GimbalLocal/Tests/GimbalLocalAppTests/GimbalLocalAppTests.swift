@@ -165,6 +165,43 @@ final class GimbalLocalAppTests: XCTestCase {
     }
 
     @MainActor
+    func testReconcileSessionsScansRealLocksAndReapsDeadOnes() throws {
+        // Exercise the REAL scan/reap path against on-disk lock files: a lock
+        // owned by this (live) process is detected; a lock owned by a dead PID is
+        // not counted and is reaped. This is the ground truth behind liveness
+        // across app restarts (#71) — not a preset flag.
+        let model = AppModel()
+        model.snapshots = [SnapshotSummary(name: "ubuntu", path: "/u", vcpus: 1, ramMib: 1024)]
+        let liveSb = model.createSandbox(fromSnapshotNamed: "ubuntu")!
+        let deadSb = model.createSandbox(fromSnapshotNamed: "ubuntu")!
+
+        // A guaranteed-dead PID: run /usr/bin/true and wait for it to exit.
+        let corpse = Process()
+        corpse.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try corpse.run()
+        corpse.waitUntilExit()
+        let deadPID = corpse.processIdentifier
+
+        let livePID = ProcessInfo.processInfo.processIdentifier
+        let liveLock = model.sessionLockPath(for: liveSb.id)
+        let deadLock = model.sessionLockPath(for: deadSb.id)
+        try "\(livePID)".write(toFile: liveLock, atomically: true, encoding: .utf8)
+        try "\(deadPID)".write(toFile: deadLock, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(atPath: liveLock) }
+
+        model.reconcileSessions()
+
+        XCTAssertTrue(model.liveLocalSessionIDs.contains(liveSb.id), "a live lock owner is detected")
+        XCTAssertFalse(model.liveLocalSessionIDs.contains(deadSb.id), "a dead lock owner is not counted")
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: deadLock),
+            "a dead session's lock is reaped"
+        )
+        XCTAssertEqual(model.sandbox(id: liveSb.id)?.state, .running)
+        XCTAssertEqual(model.sandbox(id: deadSb.id)?.state, .stopped)
+    }
+
+    @MainActor
     func testRecentSandboxesFloatRecentsToFront() {
         let model = AppModel()
         let alpha = SnapshotSummary(name: "alpha", path: "/a", vcpus: 1, ramMib: 256)
