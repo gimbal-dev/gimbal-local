@@ -19,7 +19,12 @@
 //!   .chm-checkpoint/         THIS checkpoint
 //!     checkpoint.json        CheckpointState (vCPU + GIC live state)
 //!     memory-ranges          dumped live guest RAM (parent's region layout)
+//!     overlays/              captured disk overlays — the RAM's matching disk
 //! ```
+//!
+//! Each revision captures the disk `overlays/` alongside `memory-ranges`, so a
+//! revision is a consistent RAM+disk pair: rollback restores both, never an
+//! earlier RAM against a later disk (which could corrupt the guest fs).
 //!
 //! Resume reuses the cold restore machinery, overriding only the runtime-mutable
 //! state (vCPU registers, GIC interrupt state, guest RAM) with the captured live
@@ -42,6 +47,11 @@ const CHECKPOINT_SUBDIR: &str = ".chm-checkpoint";
 const REVISIONS_SUBDIR: &str = ".chm-revisions";
 const MANIFEST: &str = "checkpoint.json";
 const MEMORY_RANGES: &str = "memory-ranges";
+/// The live disk-overlay directory (CoW writes + bitmaps) at the snapshot root.
+const LIVE_OVERLAYS_DIR: &str = ".chm-overlays";
+/// A revision's captured copy of the disk overlays, stored inside the revision
+/// dir alongside `memory-ranges` so a revision is a consistent RAM+disk pair.
+const OVERLAYS_SUBDIR: &str = "overlays";
 
 /// How many revisions keep their full (resumable) guest-RAM dump. Older
 /// revisions are pruned to manifest-only so the lineage graph survives without
@@ -188,6 +198,12 @@ pub(crate) fn write_checkpoint(
 
     dump_guest_ram(&tmp.join(MEMORY_RANGES), guest_mem, mem_mappings)?;
 
+    // Capture the disk overlays alongside the RAM dump so this revision is a
+    // consistent RAM+disk pair. Without this, rollback would restore an earlier
+    // RAM image while the live overlay still held later disk writes -- an
+    // inconsistent pair that can corrupt the guest fs on resume (#62).
+    snapshot_overlays(snapshot_dir, &tmp)?;
+
     let json =
         serde_json::to_string(&revision).map_err(|e| format!("serialize revision: {e}"))?;
     fs::write(tmp.join(MANIFEST), json.as_bytes())
@@ -329,7 +345,10 @@ fn prune_revisions_keeping(snapshot_dir: &Path, max_resumable: usize) {
     archived.sort_by(|a, b| a.0.cmp(&b.0));
     let drop_count = archived.len() - keep;
     for (_, dir) in archived.into_iter().take(drop_count) {
+        // Drop the heavy payload (RAM dump + captured overlays) but keep the
+        // manifest, so the lineage graph survives as metadata-only.
         let _ = fs::remove_file(dir.join(MEMORY_RANGES));
+        let _ = fs::remove_dir_all(dir.join(OVERLAYS_SUBDIR));
     }
 }
 
@@ -358,6 +377,10 @@ pub(crate) fn rollback(snapshot_dir: &Path, rev_id: &str) -> Result<(), String> 
     // revision, so the lineage stays append-only).
     let dir = checkpoint_dir(snapshot_dir);
     copy_tree(&target, &dir)?;
+    // Restore the target revision's disk overlays too, so the rolled-back guest
+    // resumes a consistent RAM+disk pair (#62); a no-op for pre-versioning
+    // revisions, which keep the existing live overlay.
+    restore_overlays(&target, snapshot_dir)?;
     let mut rev = read_revision_manifest(&dir)?;
     let created_at_ms = now_ms();
     rev.parent = Some(rev.id.clone());
@@ -400,6 +423,33 @@ fn dump_guest_ram(
     file.sync_all()
         .map_err(|e| format!("sync {}: {e}", path.display()))?;
     Ok(())
+}
+
+/// Capture the snapshot's live disk overlays into a revision dir (`<rev>/overlays`)
+/// so the revision pins the disk state that matches its RAM dump. A no-op when the
+/// snapshot has no overlays (a cold image never written to). Called at suspend,
+/// when the guest is stopped and the overlays are quiescent.
+fn snapshot_overlays(snapshot_dir: &Path, rev_dir: &Path) -> Result<(), String> {
+    let live = snapshot_dir.join(LIVE_OVERLAYS_DIR);
+    if !live.is_dir() {
+        return Ok(());
+    }
+    copy_tree(&live, &rev_dir.join(OVERLAYS_SUBDIR))
+}
+
+/// Restore a revision's captured overlays back to the snapshot's live overlay
+/// dir, so a rolled-back guest resumes the disk state that matches the restored
+/// RAM. Replaces the live overlays wholesale. A no-op when the revision predates
+/// overlay versioning (no `overlays/` captured) so older revisions still resume
+/// with their existing on-disk overlay rather than erroring.
+fn restore_overlays(rev_dir: &Path, snapshot_dir: &Path) -> Result<(), String> {
+    let captured = rev_dir.join(OVERLAYS_SUBDIR);
+    if !captured.is_dir() {
+        return Ok(());
+    }
+    let live = snapshot_dir.join(LIVE_OVERLAYS_DIR);
+    let _ = fs::remove_dir_all(&live);
+    copy_tree(&captured, &live)
 }
 
 /// Fork a snapshot's current revision into a new snapshot directory.
@@ -515,15 +565,20 @@ fn symlink_base(image_dir: &Path, dst_dir: &Path) -> Result<(), String> {
 
 /// Clone a checkpoint dir for a fork: hard-link the write-once RAM dump (shared
 /// read-only until the fork diverges to a fresh checkpoint) and copy the small
-/// manifest (it is rewritten by re-parenting, so it must be private). Falls back
-/// to a copy if hard-linking fails (e.g. across filesystems).
+/// manifest (it is rewritten by re-parenting, so it must be private). The
+/// captured `overlays/` subdir is copied as a tree. Falls back to a copy if
+/// hard-linking fails (e.g. across filesystems).
 fn clone_checkpoint(from: &Path, to: &Path) -> Result<(), String> {
     fs::create_dir_all(to).map_err(|e| format!("create {}: {e}", to.display()))?;
     for entry in fs::read_dir(from).map_err(|e| format!("read {}: {e}", from.display()))? {
         let entry = entry.map_err(|e| format!("read {}: {e}", from.display()))?;
         let src = entry.path();
         let dst = to.join(entry.file_name());
-        if entry.file_name() == MEMORY_RANGES {
+        let is_dir = entry.file_type().map(|t| t.is_dir()).unwrap_or(false);
+        if is_dir {
+            // The captured disk overlays (a directory) copy as a tree.
+            copy_tree(&src, &dst)?;
+        } else if entry.file_name() == MEMORY_RANGES {
             fs::hard_link(&src, &dst)
                 .or_else(|_| fs::copy(&src, &dst).map(|_| ()))
                 .map_err(|e| format!("share {} -> {}: {e}", src.display(), dst.display()))?;
@@ -699,6 +754,9 @@ mod tests {
         let dir = checkpoint_dir(snapshot_dir);
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join(MEMORY_RANGES), ram).unwrap();
+        // Mirror write_checkpoint: capture the live disk overlays into the
+        // revision so rollback restores a consistent RAM+disk pair.
+        snapshot_overlays(snapshot_dir, &dir).unwrap();
         let created_at_ms = now_ms() + ram.len() as u64; // keep ids ordered in-test
         let rev = Revision {
             manifest_version: REVISION_MANIFEST_VERSION,
@@ -749,6 +807,40 @@ mod tests {
 
         // Rolling back to an unknown revision is refused.
         rollback(&snap, "rev-nope").unwrap_err();
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    #[test]
+    fn rollback_restores_the_disk_overlay_not_just_ram() {
+        // A revision is a consistent RAM+disk pair: rolling back must revert the
+        // disk overlay too, not leave a later revision's disk writes in place
+        // (#62). Without overlay versioning a file written to the persistent disk
+        // survived rollback, and RAM-vs-disk skew risked fs corruption on resume.
+        let snap = env::temp_dir().join(format!("chm-ovl-{}-{}", process::id(), now_ms()));
+        let _ = fs::remove_dir_all(&snap);
+        fs::create_dir_all(&snap).unwrap();
+        let live = snap.join(LIVE_OVERLAYS_DIR);
+        fs::create_dir_all(&live).unwrap();
+
+        // Revision 1: the disk overlay holds v1.
+        fs::write(live.join("disk0-cow.raw"), b"disk-v1").unwrap();
+        write_test_checkpoint(&snap, b"ram-v1", "connect");
+        let v1 = read_revision(&snap).unwrap().id;
+
+        // Revision 2: the guest wrote more to the persistent disk (overlay v2).
+        fs::write(live.join("disk0-cow.raw"), b"disk-v2-with-new-file").unwrap();
+        write_test_checkpoint(&snap, b"ram-v2", "connect");
+        assert_eq!(fs::read(live.join("disk0-cow.raw")).unwrap(), b"disk-v2-with-new-file");
+
+        // Roll back to v1: both RAM and the disk overlay revert to v1.
+        rollback(&snap, &v1).unwrap();
+        assert_eq!(fs::read(memory_ranges_path(&snap)).unwrap(), b"ram-v1");
+        assert_eq!(
+            fs::read(snap.join(LIVE_OVERLAYS_DIR).join("disk0-cow.raw")).unwrap(),
+            b"disk-v1",
+            "rollback must restore the revision's disk overlay, removing v2's writes"
+        );
 
         let _ = fs::remove_dir_all(&snap);
     }
