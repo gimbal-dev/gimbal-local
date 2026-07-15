@@ -118,16 +118,87 @@ final class GimbalLocalAppTests: XCTestCase {
         let s = model.createSandbox(fromSnapshotNamed: "ubuntu")!
         // Daemon reports idle (its single VM slot is empty)...
         model.status = SandboxStatus(state: .idle, name: nil, uptimeSeconds: nil, consoleBytes: nil, reason: nil, message: nil)
-        // ...but an interactive session for this sandbox is live.
-        model.interactiveSandboxID = s.id
+        // ...but the session registry knows this sandbox has a live VM.
+        model.liveLocalSessionIDs = [s.id]
 
         XCTAssertEqual(model.sandbox(id: s.id)?.state, .running)
         XCTAssertEqual(model.engineIndicator.tone, .active, "a live connect session must not read idle")
         XCTAssertEqual(model.engineIndicator.label, "Sandbox running")
 
         // When the session ends, the engine falls back to the daemon's idle.
-        model.interactiveSandboxID = nil
+        model.liveLocalSessionIDs = []
         XCTAssertEqual(model.engineIndicator.tone, .ready)
+    }
+
+    @MainActor
+    func testSlotHolderGuardsTheSingleVMSlot() {
+        // The single HVF slot: while one sandbox holds a live session, launching
+        // another must be refused. slotHolder reports the occupant (#71).
+        let model = AppModel()
+        model.snapshots = [SnapshotSummary(name: "ubuntu", path: "/u", vcpus: 1, ramMib: 1024)]
+        let a = model.createSandbox(fromSnapshotNamed: "ubuntu")!
+        let b = model.createSandbox(fromSnapshotNamed: "ubuntu")!
+
+        // No live sessions -> the slot is free for either.
+        XCTAssertNil(model.slotHolder(excluding: a.id))
+        XCTAssertNil(model.slotHolder(excluding: b.id))
+
+        // A is live: launching B is blocked by A (the slot holder), but A itself
+        // is not blocked by its own session.
+        model.liveLocalSessionIDs = [a.id]
+        XCTAssertEqual(model.slotHolder(excluding: b.id)?.id, a.id)
+        XCTAssertNil(model.slotHolder(excluding: a.id), "a sandbox never blocks itself")
+    }
+
+    @MainActor
+    func testLiveSessionRegistryDrivesSandboxState() {
+        // The registry is authoritative for local liveness, independent of the
+        // daemon and of which console the app is tracking (#71).
+        let model = AppModel()
+        model.snapshots = [SnapshotSummary(name: "ubuntu", path: "/u", vcpus: 1, ramMib: 1024)]
+        let s = model.createSandbox(fromSnapshotNamed: "ubuntu")!
+        XCTAssertEqual(model.sandbox(id: s.id)?.state, .stopped)
+
+        model.liveLocalSessionIDs = [s.id]
+        XCTAssertEqual(model.sandbox(id: s.id)?.state, .running)
+        XCTAssertTrue(model.hasLiveLocalSandbox)
+    }
+
+    @MainActor
+    func testReconcileSessionsScansRealLocksAndReapsDeadOnes() throws {
+        // Exercise the REAL scan/reap path against on-disk lock files: a lock
+        // owned by this (live) process is detected; a lock owned by a dead PID is
+        // not counted and is reaped. This is the ground truth behind liveness
+        // across app restarts (#71) — not a preset flag.
+        let model = AppModel()
+        model.snapshots = [SnapshotSummary(name: "ubuntu", path: "/u", vcpus: 1, ramMib: 1024)]
+        let liveSb = model.createSandbox(fromSnapshotNamed: "ubuntu")!
+        let deadSb = model.createSandbox(fromSnapshotNamed: "ubuntu")!
+
+        // A guaranteed-dead PID: run /usr/bin/true and wait for it to exit.
+        let corpse = Process()
+        corpse.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try corpse.run()
+        corpse.waitUntilExit()
+        let deadPID = corpse.processIdentifier
+
+        let livePID = ProcessInfo.processInfo.processIdentifier
+        let liveLock = model.sessionLockPath(for: liveSb.id)
+        let deadLock = model.sessionLockPath(for: deadSb.id)
+        try "\(livePID)".write(toFile: liveLock, atomically: true, encoding: .utf8)
+        try "\(deadPID)".write(toFile: deadLock, atomically: true, encoding: .utf8)
+        defer { try? FileManager.default.removeItem(atPath: liveLock) }
+
+        model.reconcileSessions()
+
+        XCTAssertTrue(model.liveLocalSessionIDs.contains(liveSb.id), "a live lock owner is detected")
+        XCTAssertFalse(model.liveLocalSessionIDs.contains(deadSb.id), "a dead lock owner is not counted")
+        XCTAssertFalse(
+            FileManager.default.fileExists(atPath: deadLock),
+            "a dead session's lock is reaped"
+        )
+        XCTAssertEqual(model.sandbox(id: liveSb.id)?.state, .running)
+        XCTAssertEqual(model.sandbox(id: deadSb.id)?.state, .stopped)
     }
 
     @MainActor
@@ -187,9 +258,11 @@ final class GimbalLocalAppTests: XCTestCase {
 
         // `chm connect` takes over the VM in its own process, so the daemon
         // reports nothing running — but the sandbox must still read as running
-        // because the user is working inside it.
+        // because the user is working inside it. Post-reconcile, the session
+        // registry holds it live (what the grace period / lock scan produces).
         model.interactiveSandboxID = s.id
         model.activeLocalSandboxID = s.id
+        model.liveLocalSessionIDs = [s.id]
         model.status = SandboxStatus(state: .disconnected, name: nil, uptimeSeconds: nil, consoleBytes: nil, reason: nil, message: nil)
 
         XCTAssertEqual(model.sandbox(id: s.id)?.state, .running)
