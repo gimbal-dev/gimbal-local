@@ -238,6 +238,47 @@ final class GimbalLocalAppTests: XCTestCase {
         XCTAssertEqual(first.map { model.sandbox(id: $0.id)?.state }, .some(.stopped))
     }
 
+    func testSaneGlobalDefaultsHaveProtectiveCaps() {
+        // Out of the box, a runaway can't exhaust the host: disk + console are
+        // capped and limits are on; the firewall is opt-in (guest has no net).
+        let d = GlobalDefaults.sane
+        XCTAssertTrue(d.limits.enabled)
+        XCTAssertEqual(d.limits.maxDiskMb, 8192)
+        XCTAssertEqual(d.limits.maxConsoleMb, 64)
+        XCTAssertFalse(d.firewall.enabled)
+        XCTAssertEqual(d.firewall.mode, .open)
+    }
+
+    func testGlobalDefaultsCodableRoundtrips() {
+        let d = GlobalDefaults(
+            limits: DefaultLimits(enabled: true, maxVcpus: 4, maxMemoryMb: 4096,
+                                  maxDiskMb: 2048, maxWallSeconds: 3600, maxConsoleMb: 32),
+            firewall: DefaultFirewall(enabled: true, mode: .allowlist, allow: ["github.com:443"])
+        )
+        let data = try! JSONEncoder().encode(d)
+        let back = try! JSONDecoder().decode(GlobalDefaults.self, from: data)
+        XCTAssertEqual(back, d)
+    }
+
+    @MainActor
+    func testGlobalDefaultsPersistAcrossModelInstances() {
+        let a = AppModel()
+        a.globalDefaults.limits.maxDiskMb = 1234
+        a.globalDefaults.firewall.enabled = true
+        a.globalDefaults.firewall.mode = .noNetwork
+        a.saveGlobalDefaults()
+
+        let b = AppModel()
+        b.loadGlobalDefaults()
+        XCTAssertEqual(b.globalDefaults.limits.maxDiskMb, 1234)
+        XCTAssertTrue(b.globalDefaults.firewall.enabled)
+        XCTAssertEqual(b.globalDefaults.firewall.mode, .noNetwork)
+
+        // Restore the sane defaults so this test doesn't leak into others.
+        b.globalDefaults = .sane
+        b.saveGlobalDefaults()
+    }
+
     @MainActor
     func testStartingSandboxIsNotRestartable() {
         let model = AppModel()

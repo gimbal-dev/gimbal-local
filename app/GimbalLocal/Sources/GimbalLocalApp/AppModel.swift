@@ -78,6 +78,8 @@ final class AppModel: ObservableObject {
     // Sandbox-instance layer (the UI is built around N sandboxes / N snapshots).
     @Published var selection: SidebarItem? = .sandboxesHome
     @Published var storedSandboxes: [StoredSandbox] = []
+    /// App-wide default controls applied to every new sandbox (limits + firewall).
+    @Published var globalDefaults: GlobalDefaults = .sane
     @Published var activeLocalSandboxID: String?
     @Published var startingSandboxID: String?
     @Published var interactiveSandboxID: String?
@@ -107,11 +109,13 @@ final class AppModel: ObservableObject {
     private let recentsDefaultsKey = "gimbal.recentSandboxNames"
     private let sandboxesDefaultsKey = "gimbal.sandboxes"
     private let welcomeDefaultsKey = "gimbal.welcomeDismissed"
+    private let globalDefaultsKey = "gimbal.globalDefaults"
     private let maxRecents = 8
 
     func bootstrap() async {
         loadRecents()
         loadSandboxes()
+        loadGlobalDefaults()
         // Adopt any sessions still alive from a previous app run before the first
         // refresh, so an inherited `chm connect` VM shows running and its slot is
         // protected rather than appearing free (#71).
@@ -724,7 +728,43 @@ final class AppModel: ObservableObject {
         storedSandboxes[idx].workspacePath = ws
         saveSandboxes()
         appendLog("prepared isolated workspace for \(stored.name)")
+        await applyGlobalDefaults(toWorkspace: ws, sandboxName: stored.name)
         return ws
+    }
+
+    /// Apply the app's global default limits + firewall to a freshly created
+    /// workspace, so every new sandbox gets sane guard rails without per-sandbox
+    /// setup. Only writes a control the workspace does not already have (so a
+    /// re-created workspace or a user-authored policy is never clobbered), and
+    /// only when that default is enabled.
+    private func applyGlobalDefaults(toWorkspace ws: String, sandboxName: String) async {
+        let fm = FileManager.default
+        let defaults = globalDefaults
+
+        if defaults.limits.enabled, !fm.fileExists(atPath: ws + "/limits.json") {
+            let result = await chm.limitsSet(path: ws, limits: defaults.limits, settings: settings)
+            if result.status == 0 {
+                appendLog("applied default limits to \(sandboxName)")
+            }
+        }
+
+        if defaults.firewall.enabled, !fm.fileExists(atPath: ws + "/egress-policy.json") {
+            let fw = defaults.firewall
+            let result: CommandResult
+            switch fw.mode {
+            case .open:
+                result = await chm.firewallClear(path: ws, settings: settings)
+            case .noNetwork:
+                result = await chm.firewallSet(
+                    path: ws, defaultStance: "deny", allow: [], deny: [], settings: settings)
+            case .allowlist:
+                result = await chm.firewallSet(
+                    path: ws, defaultStance: "deny", allow: fw.allow, deny: [], settings: settings)
+            }
+            if result.status == 0 {
+                appendLog("applied default firewall (\(fw.mode.rawValue)) to \(sandboxName)")
+            }
+        }
     }
 
     /// The current saved revision (live checkpoint) for a snapshot image, read
@@ -1035,6 +1075,20 @@ final class AppModel: ObservableObject {
               let list = try? JSONDecoder().decode([StoredSandbox].self, from: data)
         else { return }
         storedSandboxes = list
+    }
+
+    func loadGlobalDefaults() {
+        guard let data = UserDefaults.standard.data(forKey: globalDefaultsKey),
+              let defaults = try? JSONDecoder().decode(GlobalDefaults.self, from: data)
+        else { return }
+        globalDefaults = defaults
+    }
+
+    /// Persist the global defaults (call after the user edits them in Settings).
+    func saveGlobalDefaults() {
+        if let data = try? JSONEncoder().encode(globalDefaults) {
+            UserDefaults.standard.set(data, forKey: globalDefaultsKey)
+        }
     }
 
     private func saveSandboxes() {
