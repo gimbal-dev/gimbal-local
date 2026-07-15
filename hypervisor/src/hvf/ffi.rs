@@ -239,3 +239,19 @@ unsafe extern "C" {
     /// it: `CNTVCT_EL0 = mach_absolute_time() - offset`.
     pub fn mach_absolute_time() -> u64;
 }
+
+/// Ratio converting `mach_absolute_time` ticks to nanoseconds
+/// (`ns = ticks * numer / denom`).
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct MachTimebaseInfo {
+    pub numer: u32,
+    pub denom: u32,
+}
+
+unsafe extern "C" {
+    /// Fill in the timebase ratio used to convert `mach_absolute_time` ticks to
+    /// nanoseconds. Returns `KERN_SUCCESS` (0) on success.
+    pub fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+}
+

@@ -37,6 +37,12 @@ enum InteractiveTerminalCommand {
         + "Ctrl-A x to end the session — it suspends the sandbox (live state "
         + "saved); reconnect to resume where you left off."
 
+    /// Shown once the session ends, so the window makes clear it is over — the
+    /// guest is gone and this is no longer a sandbox prompt (constant, no
+    /// interpolation).
+    private static let sessionEndedNotice =
+        "-- Sandbox session ended. Reopen it from Gimbal Local to reconnect. --"
+
     /// Single-quote `value` for POSIX `sh`: wrap in `'…'`, closing/escaping/
     /// reopening each embedded single quote (`'\''`). Inside single quotes every
     /// other character — `;`, `$( )`, backticks, `&&`, spaces — is literal, so
@@ -95,5 +101,12 @@ enum InteractiveTerminalCommand {
             "echo \(shellQuote(usageHint))",
             connect.joined(separator: " "),
         ].joined(separator: " && ")
+            // Once `chm connect` exits (the guest shut down or the session was
+            // suspended), print a clear end-of-session notice and exit the shell
+            // instead of dropping back to an interactive host shell sitting in
+            // the workspace directory — where an unwitting `ls`/`rm` would hit
+            // the Mac, not the (now gone) sandbox. `;` (not `&&`) so the notice
+            // and exit run on any chm exit status.
+            + "; echo \(shellQuote(sessionEndedNotice)); exit"
     }
 }

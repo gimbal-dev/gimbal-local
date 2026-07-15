@@ -403,6 +403,28 @@ final class GimbalLocalAppTests: XCTestCase {
         )
     }
 
+    func testInteractiveCommandEndsSessionInsteadOfHostShell() throws {
+        // When chm exits (guest shut down / suspended), the terminal must not
+        // fall through to an interactive host shell in the workspace dir — where
+        // an `ls`/`rm` would hit the Mac. The command prints an end notice and
+        // exits the shell, on any chm exit status (`;`, not `&&`).
+        let command = try InteractiveTerminalCommand.shellCommand(
+            chmPath: "/usr/local/bin/chm",
+            runPath: "/tmp/ws",
+            socketPath: "/tmp/chm.sock",
+            lockPath: nil,
+            workdir: "/work"
+        )
+        XCTAssertTrue(command.hasSuffix("; exit"), "session must exit the shell: \(command)")
+        XCTAssertTrue(
+            command.contains("; echo '-- Sandbox session ended."),
+            "an end-of-session notice must be shown before exit: \(command)"
+        )
+        // The chm invocation is reached with `&&` but the teardown uses `;` so it
+        // runs regardless of how chm exits.
+        XCTAssertTrue(command.contains("--idle-exit 0; echo "), "teardown must be ;-joined: \(command)")
+    }
+
     func testInteractiveCommandRejectsControlCharacters() {
         // A newline in a path breaks single-quote + AppleScript-literal
         // composition, so it is refused rather than quoted.

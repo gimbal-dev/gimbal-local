@@ -160,6 +160,18 @@ const UART_ID_LOW: u64 = 0xfe0; // PeriphID0..3 + PCellID0..3 (0xfe0..0x1000)
 const FR_TXFE: u32 = 1 << 7; // transmit FIFO empty
 const FR_RXFF: u32 = 1 << 6; // receive FIFO full
 const FR_RXFE: u32 = 1 << 4; // receive FIFO empty
+// Modem-status flags. These reflect a virtual serial line whose carrier is
+// permanently present: Data Carrier Detect, Data Set Ready, and Clear To Send
+// are always asserted. A guest `agetty` that opens `ttyAMA0` without `CLOCAL`
+// blocks in `open()` until Carrier Detect is seen; a resumed snapshot whose
+// cloud-init restarts `serial-getty@ttyAMA0` reopens the tty against this fresh
+// model, so without a live carrier the new getty would hang before it could
+// print `login:` (the console appears dead). Tying them high matches how a
+// console UART presents to the guest.
+const FR_CTS: u32 = 1 << 0; // clear to send
+const FR_DSR: u32 = 1 << 1; // data set ready
+const FR_DCD: u32 = 1 << 2; // data carrier detect
+const FR_MODEM_PRESENT: u32 = FR_CTS | FR_DSR | FR_DCD;
 
 // Interrupt bits, shared by UARTRIS / UARTMIS / UARTIMSC / UARTICR.
 const INT_RX: u32 = 1 << 4; // receive interrupt (RXRIS/RXMIS/RXIM)
@@ -300,9 +312,11 @@ impl Pl011State {
         }
     }
 
-    /// Flag register (UARTFR): TX always empty/ready, RX flags from the FIFO.
+    /// Flag register (UARTFR): TX always empty/ready, RX flags from the FIFO,
+    /// and the modem-status lines (DCD/DSR/CTS) tied high so a guest that opens
+    /// the tty waiting for carrier proceeds.
     fn flags(&self) -> u32 {
-        let mut fr = FR_TXFE;
+        let mut fr = FR_TXFE | FR_MODEM_PRESENT;
         if self.read_fifo.is_empty() {
             fr |= FR_RXFE;
         } else if self.read_fifo.len() >= RX_FIFO_DEPTH {
@@ -377,6 +391,21 @@ mod tests {
         assert_eq!(uart.take_output(), b"hi\n");
         // Output is drained by take_output.
         assert!(uart.take_output().is_empty());
+    }
+
+    #[test]
+    fn pl011_flag_register_asserts_carrier() {
+        // A guest agetty opening ttyAMA0 without CLOCAL blocks in open() until
+        // Data Carrier Detect is seen; the modem-status lines must read asserted
+        // so a serial-getty restart on a resumed snapshot does not hang before
+        // printing its login prompt.
+        let uart = Pl011::new();
+        let mut fr = [0u8; 4];
+        uart.read(UARTFR, &mut fr);
+        let fr = u32::from_le_bytes(fr);
+        assert_ne!(fr & FR_DCD, 0, "DCD (carrier) must read asserted");
+        assert_ne!(fr & FR_DSR, 0, "DSR must read asserted");
+        assert_ne!(fr & FR_CTS, 0, "CTS must read asserted");
     }
 
     #[test]

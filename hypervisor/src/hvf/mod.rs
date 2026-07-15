@@ -53,11 +53,30 @@ pub mod virtio;
 type CpuResult<T> = std::result::Result<T, HypervisorCpuError>;
 type VmResult<T> = std::result::Result<T, HypervisorVmError>;
 
-/// Re-evaluation cadence (milliseconds) for a vCPU parked on WFI with no kick.
-/// A cross-thread interrupt wakes the vCPU immediately via its wake fd; this
-/// bound only caps how long a kick-less wakeup source (e.g. a virtual-timer
-/// deadline) can wait, and guarantees a parked vCPU can never wedge.
+/// Re-evaluation cadence (milliseconds) for a vCPU parked on WFI with no armed
+/// virtual-timer deadline. A cross-thread interrupt wakes the vCPU immediately
+/// via its wake fd; this bound only caps how long a kick-less wakeup source can
+/// wait, and guarantees a parked vCPU can never wedge. When a timer IS armed the
+/// park instead wakes at the deadline (see [`HvfVcpu::wfi_park_ms`]).
 const WFI_IDLE_POLL_MS: i32 = 100;
+
+/// The host `mach_absolute_time` -> nanoseconds timebase, read once. Converting
+/// a virtual-timer deadline (in mach ticks) to a wall-clock park duration needs
+/// this ratio; it is constant for the life of the process.
+fn mach_timebase() -> ffi::MachTimebaseInfo {
+    use std::sync::OnceLock;
+    static TB: OnceLock<ffi::MachTimebaseInfo> = OnceLock::new();
+    *TB.get_or_init(|| {
+        let mut info = ffi::MachTimebaseInfo::default();
+        // SAFETY: FFI; out-param is a valid, owned struct.
+        let ret = unsafe { ffi::mach_timebase_info(&mut info) };
+        if ret != 0 || info.numer == 0 || info.denom == 0 {
+            // Fall back to the Apple-Silicon 24 MHz timebase (125/3 ns per tick).
+            info = ffi::MachTimebaseInfo { numer: 125, denom: 3 };
+        }
+        info
+    })
+}
 
 /// Fill `buf` with cryptographically-strong host entropy for the guest's TRNG
 /// firmware calls. Reads `/dev/urandom` (never blocks on modern macOS); on the
@@ -585,6 +604,44 @@ impl HvfVcpu {
         now.wrapping_sub(self.vtimer_offset.load(Ordering::Relaxed))
     }
 
+    /// How long (in milliseconds) to park a WFI-idle vCPU on its wake fd before
+    /// re-evaluating, derived from the armed virtual-timer deadline.
+    ///
+    /// While parked the vCPU is outside `hv_vcpu_run`, so HVF's native
+    /// virtual-timer delivery is suspended: the guest can only take its next
+    /// scheduler tick when we re-enter the guest. A flat poll would therefore
+    /// clamp an idle guest's effective tick rate to the poll rate (e.g. 10 Hz
+    /// at 100 ms), so an idle-heavy phase like cloud-init or a `serial-getty`
+    /// restart crawls or appears wedged. Instead, wake exactly when the guest's
+    /// own `CNTV_CVAL_EL0` deadline is due: re-entering `hv_vcpu_run` at that
+    /// point lets the managed GIC deliver PPI 27 on time, restoring a
+    /// near-native tick rate. When no timer is armed (disabled or masked) we
+    /// fall back to the cap, since only a device IRQ (which also kicks the wake
+    /// fd) will wake the guest. The result is clamped to `[1, WFI_IDLE_POLL_MS]`.
+    fn wfi_park_ms(&self) -> i32 {
+        const CNTV_CTL_EL0: u16 = 0xDF19;
+        const CNTV_CVAL_EL0: u16 = 0xDF1A;
+        let ctl = self.get_sysreg(CNTV_CTL_EL0).unwrap_or(0);
+        let enabled = ctl & 1 != 0;
+        let masked = ctl & 2 != 0;
+        if !enabled || masked {
+            return WFI_IDLE_POLL_MS;
+        }
+        let cval = self.get_sysreg(CNTV_CVAL_EL0).unwrap_or(0);
+        let now = self.current_cntvct();
+        if cval <= now {
+            // Deadline already passed: re-enter immediately so HVF delivers the
+            // overdue timer PPI.
+            return 0;
+        }
+        let remaining_ticks = cval - now;
+        // Convert mach ticks -> ns -> ms via the host timebase.
+        let tb = mach_timebase();
+        let remaining_ns = (remaining_ticks as u128) * (tb.numer as u128) / (tb.denom as u128);
+        let remaining_ms = (remaining_ns / 1_000_000) as i64;
+        remaining_ms.clamp(1, WFI_IDLE_POLL_MS as i64) as i32
+    }
+
     fn set_icc_reg(&self, reg: u16, val: u64) -> CpuResult<()> {
         // SAFETY: FFI on the owning thread.
         let ret = unsafe { hv_gic_set_icc_reg(self.id, reg, val) };
@@ -991,9 +1048,10 @@ impl Vcpu for HvfVcpu {
                         // re-executes WFI and parks again.
                         let pc = self.get_reg(HV_REG_PC)?;
                         self.set_reg(HV_REG_PC, pc.wrapping_add(4))?;
-                        // Park until kicked or the poll interval elapses; a
-                        // failed wait just falls through to a guest re-entry.
-                        let _ = self.kick.wait_timeout(WFI_IDLE_POLL_MS);
+                        // Park until kicked or the virtual-timer deadline is due
+                        // (see wfi_park_ms); a failed wait just falls through to
+                        // a guest re-entry.
+                        let _ = self.kick.wait_timeout(self.wfi_park_ms());
                         Ok(VmExit::Ignore)
                     }
                     EC_HVC64 => {
