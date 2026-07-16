@@ -59,6 +59,9 @@ mod signing;
 mod limits;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod audit;
+
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn main() -> ExitCode {
     imp::main()
 }

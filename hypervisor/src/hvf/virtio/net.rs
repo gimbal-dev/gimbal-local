@@ -54,6 +54,13 @@ pub trait NetResponder: Send {
     fn service(&mut self) -> Vec<Vec<u8>> {
         Vec::new()
     }
+
+    /// Take the egress-decision events (allow/deny) accumulated since the last
+    /// drain, for the audit trail. The default responder makes no policy
+    /// decisions, so it has none.
+    fn drain_egress_events(&mut self) -> Vec<super::nat::EgressEvent> {
+        Vec::new()
+    }
 }
 
 /// A minimal host responder that makes a resumed guest's link demonstrably
@@ -230,6 +237,12 @@ impl NetDevice {
             produced = true;
         }
         produced
+    }
+
+    /// Take the responder's accumulated egress-decision events for the audit
+    /// trail (see [`NetResponder::drain_egress_events`]).
+    pub fn drain_egress_events(&mut self) -> Vec<super::nat::EgressEvent> {
+        self.responder.drain_egress_events()
     }
 
     /// Whether a frame is waiting to be delivered into the guest's receive

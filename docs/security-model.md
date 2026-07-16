@@ -304,6 +304,32 @@ script text into host code. Terminal.app's `do script` still requires a command
 (now the only layer). Verified live that a command with shell metacharacters and
 `$(...)` passes through argv verbatim, unexecuted.
 
+### M29 · Audit trail — durable session + egress log  **[P2, chm] — shipped**
+
+**Status: shipped.** A per-workspace append-only `audit.jsonl` records the
+security-relevant history of a sandbox, independent of the console scrollback
+(which the guest can flood). Each line is a self-contained JSON object stamped
+with a UTC timestamp:
+
+- **`session-start` / `session-stop`** — written by the run loop for every
+  `chm run` / `resume` / `connect`, capturing the resume-vs-cold mode, the
+  vCPU/RAM shape, the resolved limits summary, the governing egress label, and
+  the stop outcome + duration.
+- **`egress-deny`** — the userspace NAT's denied outbound flows, drained off the
+  net-service thread and recorded once per unique `(domain, target, rule)` so a
+  guest retrying a blocked host in a loop leaves one line, not thousands. This is
+  the "what did the sandbox try to reach that we blocked" signal.
+- **`verify`** — the runner's bundle-trust decisions (manifest provenance +
+  per-object checksum re-hash, M30.4/M30.8) recorded to the same trail the child
+  session appends to, so a cloud-run session's log carries verify → start →
+  deny → stop end to end.
+
+Writes are best-effort (an audit failure never crashes or stalls the run) and use
+`O_APPEND`, so the vCPU and net-service threads interleave records safely without
+a shared lock. Read it back with `chm audit show <WORKSPACE_DIR> [--json]`.
+Verified live: a real HVF resume session recorded start + stop records that
+`chm audit show` renders back.
+
 ### M30.7 · Threat model + hardening checklist  **[P0, docs]**
 
 **Finding.** Not production-ready as a hostile sandbox; needs a written threat
@@ -386,8 +412,8 @@ M30.4/M30.6.
       NAT connection-count + bandwidth caps (M30.6, shipped).
 - [ ] **Network policy** — egress allow/deny enforced on the local datapath
       (converges with **M28**; the firewall half of pillar ③).
-- [ ] **Audit logs** — start/stop/verify/deny decisions recorded (converges with
-      **M29** telemetry).
+- [x] **Audit logs** — session start/stop, denied egress, and bundle-verify
+      decisions recorded to a durable per-workspace `audit.jsonl` (M29, shipped).
 - [ ] **Update / signing chain** — the app + `chm` binaries themselves are signed
       and updated over a verified channel (macOS notarisation + release signing).
 - [ ] **Escape-response assumptions** — documented: a guest escape is assumed

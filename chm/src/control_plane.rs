@@ -31,6 +31,7 @@ use std::{env, thread};
 
 use serde_json::{Value, json};
 
+use crate::audit;
 use crate::policy;
 use crate::signing::{DetachedSignature, TrustStore};
 
@@ -963,6 +964,18 @@ fn run_assignment(cp: &ControlPlane, runner_id: &str, opts: &RunOpts) -> Result<
             cache.display()
         );
     }
+
+    // Audit the trust decisions (M29) to the same per-workspace trail the child
+    // `chm run` will append its session lifecycle to: reaching this point means
+    // the manifest provenance was accepted and every bundle object re-hashed to
+    // its checksum.
+    let ingest_audit = audit::AuditLog::open(&cache);
+    ingest_audit.verify("manifest", true, &provenance);
+    ingest_audit.verify(
+        "bundle-checksums",
+        true,
+        &format!("{} object(s) verified", checksum_tree.len()),
+    );
 
     // Prove continuity: read the mid-flight marker the cloud session embedded
     // (a `gimbal-marker.json` sidecar, or the `GIMBLMK1` frame at the head of

@@ -4,6 +4,7 @@
 
 //! macOS / Apple-Silicon implementation of the `chm` CLI.
 
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -17,6 +18,7 @@ use crate::checkpoint;
 use crate::cloud;
 use crate::console::{self, RawConsole};
 use crate::console_filter::ConsoleFilter;
+use crate::audit;
 use crate::control_plane;
 use crate::firewall;
 use crate::limits;
@@ -541,6 +543,7 @@ fn spawn_net_service(
     net_devices: Vec<Arc<VirtioPciDevice>>,
     running: Arc<AtomicBool>,
     exits: Arc<Mutex<Vec<ExitSignal>>>,
+    audit: audit::AuditLog,
 ) -> Option<thread::JoinHandle<()>> {
     if net_devices.is_empty() {
         return None;
@@ -548,11 +551,24 @@ fn spawn_net_service(
     thread::Builder::new()
         .name("chm-net-service".into())
         .spawn(move || {
+            // Record each unique denied target once, so a guest retrying a blocked
+            // host in a tight loop leaves one audit line, not thousands.
+            let mut audited_denials: HashSet<String> = HashSet::new();
             while running.load(Ordering::Acquire) {
                 let mut delivered = false;
                 for dev in &net_devices {
                     if dev.service_net() {
                         delivered = true;
+                    }
+                    // Drain egress decisions and audit the denials. Draining also
+                    // bounds the NAT's event buffer over a long session.
+                    for ev in dev.drain_egress_events() {
+                        if !ev.allowed {
+                            let key = format!("{} {} {}", ev.domain, ev.target, ev.rule);
+                            if audited_denials.insert(key) {
+                                audit.egress_deny(ev.domain, &ev.target, &ev.rule, "sandbox-policy");
+                            }
+                        }
                     }
                 }
                 if delivered {
@@ -620,6 +636,7 @@ pub fn main() -> ExitCode {
         Some("policy") => control_plane::policy_main(&raw[1..]),
         Some("firewall") => firewall::firewall_main(&raw[1..]),
         Some("limits") => limits::limits_main(&raw[1..]),
+        Some("audit") => audit::audit_main(&raw[1..]),
         Some("manifest") => signing::manifest_main(&raw[1..]),
         Some("state-cdn") => state_cdn::state_cdn_main(&raw[1..]),
         Some("serve") => serve::serve_main(&raw[1..]),
@@ -1219,9 +1236,39 @@ fn run(args: &Args) -> Result<ExitCode, String> {
         resume_from: resume_state,
         capture_to: args.checkpoint.then(|| dir.clone()),
     };
+
+    // Durable audit trail (M29): record the session lifecycle and every denied
+    // egress flow to a per-workspace append-only log, so an operator can review
+    // what the sandbox did independent of the (guest-floodable) console.
+    let audit = audit::AuditLog::open(dir);
+    let egress_label = match resolve_egress_policy(&overlay_dir, args.egress_policy.as_deref()) {
+        EgressResolution::Unrestricted => "unrestricted".to_string(),
+        EgressResolution::Policy(p) => p.label().to_string(),
+        EgressResolution::FailClosed(_) => "fail-closed:deny-all".to_string(),
+    };
+    audit.session_start(
+        if resuming { "resume" } else { "cold" },
+        loaded.num_vcpus as usize,
+        loaded.total_ram / (1024 * 1024),
+        &limits.summary(),
+        &egress_label,
+    );
+    let session_started = Instant::now();
+
     let outcome = resume_smp(
-        prepared, loaded, &bus, &uart, &vm_ops, &overlay_dir, args, &limits, ckpt,
+        prepared, loaded, &bus, &uart, &vm_ops, &overlay_dir, args, &limits, ckpt, &audit,
     )?;
+
+    let duration_s = session_started.elapsed().as_secs();
+    let outcome_label = match &outcome {
+        Outcome::PoweredOff => "powered-off".to_string(),
+        Outcome::MaxSeconds => "max-seconds".to_string(),
+        Outcome::Idle(_) => "idle".to_string(),
+        Outcome::ConsoleClosed => "console-closed".to_string(),
+        Outcome::Interrupted => "interrupted".to_string(),
+        Outcome::LimitExceeded(reason) => format!("limit-exceeded:{reason}"),
+    };
+    audit.session_stop(&outcome_label, duration_s);
 
     if !args.quiet {
         eprintln!();
@@ -1405,6 +1452,7 @@ fn resume_smp(
     args: &Args,
     limits: &limits::LimitsDoc,
     ckpt: CheckpointMode,
+    audit: &audit::AuditLog,
 ) -> Result<Outcome, String> {
     let Loaded {
         snap, state_json, ..
@@ -1693,7 +1741,7 @@ fn resume_smp(
                 }
             }
             // Start relaying guest egress through the userspace NAT.
-            spawn_net_service(wired.net_devices, running.clone(), exits.clone())
+            spawn_net_service(wired.net_devices, running.clone(), exits.clone(), audit.clone())
         }
         Err(e) => {
             eprintln!("chm: warning: virtio device model not wired: {e}");

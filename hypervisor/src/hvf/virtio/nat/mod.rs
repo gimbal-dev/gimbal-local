@@ -558,6 +558,10 @@ impl NetResponder for NatResponder {
     fn service(&mut self) -> Vec<Vec<u8>> {
         NatResponder::service(self)
     }
+
+    fn drain_egress_events(&mut self) -> Vec<EgressEvent> {
+        self.drain_events()
+    }
 }
 
 /// Extract the destination of a fresh TCP SYN (SYN set, ACK clear) from an
