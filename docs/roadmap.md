@@ -304,6 +304,30 @@ so insights and cost accounting are uniform regardless of where a session ran.
 The app already reads the plane's read-only cost/health panel; the rest waits on
 the gctl telemetry/cost event contract.
 
+### M32 · Agent workloads + benchmark vs Docker (#76)  **[the next pivot]**
+
+With the local runtime and host-isolation complete, the next thrust is putting
+**real agents/workloads to work inside gimbal microVMs** and measuring how the
+platform compares to the incumbent (Docker Desktop's Linux VM) on the same Mac.
+
+- **M32.1 — agent workload readiness.** Prove a representative dev/agent loop runs
+  end to end inside a gimbal sandbox: clone a repo, install deps, build, run
+  tests, and (nested) `docker build` inside the guest. Shake out anything the
+  minimal snapshot lacks (container runtime, disk headroom, DNS/egress allow-list
+  for package registries under the new default-deny). This is the "actually put
+  an agent to work" proof.
+- **M32.2 — benchmark vs Docker sandboxes.** A reproducible harness that runs the
+  **same workload** — starting with a real `docker build` (plus package installs
+  and a compile job) — inside (a) Docker Desktop's Linux VM and (b) a gimbal
+  microVM on the same host, and reports **wall-clock, cold-start/rehydrate time,
+  CPU, memory, and disk I/O**. Both run on Apple HVF, so this measures gimbal's
+  snapshot-rehydrate + NAT/overlay datapath against Docker's LinuxKit pipeline.
+  Publish the methodology + numbers (honest, reproducible — no cherry-picking).
+
+Both are local-doable and do not depend on the control plane. They also stress
+the security posture (egress allow-list vs. package registries; disk/console caps
+vs. real builds), so they double as end-to-end validation of M30/M31.
+
 ---
 
 ## Standing platform boundaries
@@ -333,6 +357,12 @@ enforced identically on both substrates.
 
 ### What comes next (crisp view, 2026-07-16)
 
+- **The pivot — M32 agent workloads + benchmark vs Docker.** Local runtime +
+  host-isolation are complete, so the next thrust is putting real agent/dev
+  workloads to work inside gimbal microVMs (M32.1) and a reproducible benchmark
+  of the same `docker build` / compile job inside a gimbal microVM vs Docker
+  Desktop's Linux VM on the same Mac (M32.2). Local-doable; doubles as end-to-end
+  validation of the M30/M31 security posture.
 - **Security — M31.1, M31.2, M31.3, M31.4 SHIPPED.** The NAT reserved-address
   guard (M31.1) denies loopback / private LAN / link-local (`169.254.169.254`)
   regardless of policy, re-checks resolved IPs (closes DNS rebinding), and drops
