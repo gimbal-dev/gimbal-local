@@ -827,6 +827,11 @@ fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Resu
         max_connections: doc.max_connections.map(|n| n as usize),
         max_bytes_per_sec: doc.max_bandwidth_kbps.map(|kbps| kbps * 125),
     };
+    // Reserved-address guard (M31.1) is on by default; the daemon path honours the
+    // same `CHM_ALLOW_LOCAL_EGRESS` opt-in as the CLI.
+    let allow_local_egress = env::var("CHM_ALLOW_LOCAL_EGRESS")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
     if let Err(e) = wire_virtio(
         &bus,
         &rvm.guest_mem,
@@ -836,6 +841,7 @@ fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Resu
         resume_state.is_some(),
         None,
         &net_limits,
+        allow_local_egress,
     ) {
         eprintln!("chm serve: warning: virtio device model not wired: {e}");
     }

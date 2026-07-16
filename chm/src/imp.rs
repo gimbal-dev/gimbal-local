@@ -310,6 +310,7 @@ pub(crate) fn wire_virtio(
     resume: bool,
     cli_egress: Option<&Path>,
     net_limits: &NatLimits,
+    allow_local_egress: bool,
 ) -> Result<WiredVirtio, String> {
     let descs =
         devmgr::parse_devices(state_json).map_err(|e| format!("parse virtio devices: {e}"))?;
@@ -380,9 +381,16 @@ pub(crate) fn wire_virtio(
         // Clone (not take) so a second NIC is governed by the same policy.
         let policy = if is_net { enforced_policy.clone() } else { None };
         let dev_limits = if is_net { net_limits.clone() } else { NatLimits::default() };
-        let (base, size, dev) =
-            devmgr::build_device(desc, guest_mem.clone(), overlay_dir, resume, policy, dev_limits)
-                .map_err(|e| format!("build device {}: {e}", desc.name))?;
+        let (base, size, dev) = devmgr::build_device(
+            desc,
+            guest_mem.clone(),
+            overlay_dir,
+            resume,
+            policy,
+            dev_limits,
+            allow_local_egress,
+        )
+        .map_err(|e| format!("build device {}: {e}", desc.name))?;
         if !desc.vector_events.is_empty() {
             if let Some(its) = &its_engine {
                 // LPI-routed (bypass mode): resolve to the guest's real LPI and
@@ -617,6 +625,11 @@ struct Args {
     /// bounds this run's resources, overriding the `CHM_LIMITS` env binding and
     /// any per-workspace `limits.json`. See [`limits::resolve_limits`].
     limits_file: Option<PathBuf>,
+    /// Opt the guest into reaching reserved / host-internal address ranges
+    /// (loopback, private LAN, link-local metadata) through the NAT. Off by
+    /// default: the reserved-address guard (M31.1) denies those regardless of
+    /// the egress policy. Set by `--allow-local-egress` or `CHM_ALLOW_LOCAL_EGRESS`.
+    allow_local_egress: bool,
 }
 
 struct ConnectArgs {
@@ -763,6 +776,10 @@ fn usage() -> String {
          --egress-policy <FILE>  Govern this run's outbound network with a local\n                        \
          egress policy (see `chm firewall`); overrides any per-workspace\n                        \
          `egress-policy.json` and the control-plane binding.\n    \
+         --allow-local-egress  Let the guest reach reserved / host-internal\n                        \
+         address ranges (loopback, private LAN, link-local metadata). OFF by\n                        \
+         default: the NAT blocks them regardless of policy (M31.1). Also via\n                        \
+         `CHM_ALLOW_LOCAL_EGRESS=1`.\n    \
          --checkpoint         Use live checkpoints: resume from a saved\n                        \
          checkpoint in the snapshot dir if present, and capture a fresh one on\n                        \
          a clean stop so the next start continues where this left off. Implied\n                        \
@@ -796,6 +813,14 @@ fn usage() -> String {
         .to_string()
 }
 
+/// Read a boolean opt-in from an environment variable: true for `1`/`true`/`yes`
+/// (case-insensitive), false otherwise or when unset.
+fn env_flag(name: &str) -> bool {
+    env::var(name)
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false)
+}
+
 fn parse(raw: &[String]) -> Parsed {
     let mut snapshot_dir: Option<PathBuf> = None;
     let mut max_seconds = 0u64;
@@ -804,6 +829,7 @@ fn parse(raw: &[String]) -> Parsed {
     let mut checkpoint = false;
     let mut egress_policy: Option<PathBuf> = None;
     let mut limits_file: Option<PathBuf> = None;
+    let mut allow_local_egress = env_flag("CHM_ALLOW_LOCAL_EGRESS");
 
     let mut i = 0;
     // A leading `run`/`restore` subcommand is accepted but optional; `resume`
@@ -822,6 +848,7 @@ fn parse(raw: &[String]) -> Parsed {
             "-V" | "--version" => return Parsed::Version,
             "--quiet" => quiet = true,
             "--checkpoint" => checkpoint = true,
+            "--allow-local-egress" => allow_local_egress = true,
             "--egress-policy" => {
                 i += 1;
                 let Some(v) = raw.get(i) else {
@@ -873,6 +900,7 @@ fn parse(raw: &[String]) -> Parsed {
             checkpoint,
             egress_policy,
             limits_file,
+            allow_local_egress,
         }),
         None => Parsed::Error("missing <SNAPSHOT_DIR>".to_string()),
     }
@@ -889,6 +917,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
     let mut checkpoint = false;
     let mut egress_policy: Option<PathBuf> = None;
     let mut limits_file: Option<PathBuf> = None;
+    let mut allow_local_egress = env_flag("CHM_ALLOW_LOCAL_EGRESS");
 
     let mut i = 0;
     while i < raw.len() {
@@ -899,6 +928,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
             "--quiet" => quiet = true,
             "--no-stop-daemon" => no_stop_daemon = true,
             "--checkpoint" => checkpoint = true,
+            "--allow-local-egress" => allow_local_egress = true,
             "--socket" | "--max-seconds" | "--idle-exit" | "--session-lock"
             | "--egress-policy" | "--limits" => {
                 i += 1;
@@ -947,6 +977,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
                 checkpoint,
                 egress_policy,
                 limits_file,
+                allow_local_egress,
             },
             socket_path,
             no_stop_daemon,
@@ -1732,6 +1763,7 @@ fn resume_smp(
             // kbps (kilobits/sec) -> bytes/sec: * 1000 / 8 = * 125.
             max_bytes_per_sec: limits.max_bandwidth_kbps.map(|kbps| kbps * 125),
         },
+        args.allow_local_egress,
     ) {
         Ok(wired) => {
             if !wired.summary.is_empty() && !args.quiet {

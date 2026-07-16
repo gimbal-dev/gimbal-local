@@ -13,6 +13,15 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::time::Instant as StdInstant;
 
+/// An allow-all policy that also opts into local egress, for the relay tests
+/// that deliberately dial a `127.0.0.1` echo server (the reserved-address guard
+/// blocks loopback by default — M31.1).
+fn local_allow_all() -> EgressPolicy {
+    let mut p = EgressPolicy::allow_all();
+    p.set_allow_local_egress(true);
+    p
+}
+
 /// A localhost TCP echo server that services one connection until EOF. Returns
 /// the bound port; the thread exits when the client closes.
 fn spawn_echo_server() -> u16 {
@@ -166,7 +175,7 @@ fn relays_guest_tcp_to_a_host_echo_server() {
     let mut nat = NatResponder::new(
         [192, 168, 249, 1],
         [0x02, 0, 0, 0, 0, 1],
-        EgressPolicy::allow_all(),
+        local_allow_all(),
         NatLimits::default(),
     );
     let dst = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port);
@@ -195,6 +204,26 @@ fn default_deny_refuses_the_connection() {
     assert!(denied_event, "a denied tcp egress event must be recorded");
     assert!(refused, "the guest connection must not establish under default-deny");
     assert!(nat.listeners.is_empty(), "no listener may be armed for a denied dst");
+}
+
+#[test]
+fn allow_all_cannot_reach_loopback_echo_server() {
+    // End-to-end proof of the reserved-address guard (M31.1): with the default
+    // allow-all policy (guard ON, no local-egress opt-in), a real relay attempt
+    // to a localhost service is refused — the guest never reaches the host's own
+    // loopback, even though the policy would otherwise permit everything.
+    let port = spawn_echo_server();
+    let mut nat = NatResponder::new(
+        [192, 168, 249, 1],
+        [0x02, 0, 0, 0, 0, 1],
+        EgressPolicy::allow_all(),
+        NatLimits::default(),
+    );
+    let dst = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), port);
+    let (refused, denied_event) = drive_expect_refused(&mut nat, dst);
+    assert!(denied_event, "a reserved-address denial must be recorded");
+    assert!(refused, "allow-all must NOT reach the loopback echo server");
+    assert!(nat.listeners.is_empty(), "no listener armed for a reserved dst");
 }
 
 #[test]
@@ -279,7 +308,7 @@ fn bandwidth_cap_throttles_relay_throughput() {
     let mut uncapped = NatResponder::new(
         [192, 168, 249, 1],
         [0x02, 0, 0, 0, 0, 1],
-        EgressPolicy::allow_all(),
+        local_allow_all(),
         NatLimits::default(),
     );
     let uncapped_rx = drive_stream(
@@ -293,7 +322,7 @@ fn bandwidth_cap_throttles_relay_throughput() {
     let mut capped = NatResponder::new(
         [192, 168, 249, 1],
         [0x02, 0, 0, 0, 0, 1],
-        EgressPolicy::allow_all(),
+        local_allow_all(),
         NatLimits {
             max_connections: None,
             max_bytes_per_sec: Some(8_000),

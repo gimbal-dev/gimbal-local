@@ -17,22 +17,26 @@ also the **enforcement point**: the control plane's per-sandbox egress allow-lis
 is checked at the moment a name is resolved and a connection is dialed, and a
 denied flow is enforced simply by *not opening the socket*.
 
-> **Important boundary (being fixed — M31.1).** Because the NAT relays through a
-> real host socket, whatever the guest dials, `chm` dials *on the host*. Today
-> there is **no reserved-address guard**, so absent a locked-down policy a guest
-> can reach the host's own networks — loopback (`127.0.0.1`), your private LAN,
-> and link-local (incl. the cloud metadata IP `169.254.169.254`). Networking is
-> also **allow-all by default** (no bound policy) and the app ships its firewall
-> disabled. Do **not** treat a sandbox as isolated from your Mac's network until
-> M31.1 (the reserved-address guard) lands. See
+> **Host-network boundary (enforced — M31.1).** The NAT relays through a real
+> host socket, so a guest's connection would otherwise reach the host's own
+> networks. A **reserved-address guard** now denies any flow to loopback
+> (`127.0.0.1`), private LAN, or link-local (incl. the cloud metadata IP
+> `169.254.169.254`) — **regardless of the egress policy**, so even the allow-all
+> default and a DNS-rebound allow-listed name cannot reach the host. Only an
+> explicit IP-literal allow rule in your policy, or `--allow-local-egress`
+> (`CHM_ALLOW_LOCAL_EGRESS=1`), lifts it. Note networking is still **allow-all by
+> default** for *public* destinations (no bound policy) and the app ships its
+> firewall disabled — so a sandbox can still reach the public internet unless you
+> bind a policy. See
 > [`security-model.md`](security-model.md#m31--network-host-isolation--the-reserved-address-boundary).
 
 ```
-guest ──virtio-net──▶ chm userspace NAT ──host socket──▶ internet
-                          │                              (incl. host loopback /
-                          └─ egress policy               LAN / metadata today —
-                             checked at DNS resolve         M31.1 closes that)
-                             + TCP connect
+guest ──virtio-net──▶ chm userspace NAT ──host socket──▶ public internet
+                          │                              (host loopback / LAN /
+                          ├─ reserved-address guard         metadata are denied
+                          │  (M31.1, always on)             by the guard)
+                          └─ egress policy
+                             checked at DNS resolve + TCP connect
 ```
 
 ## What works today
@@ -42,8 +46,8 @@ guest ──virtio-net──▶ chm userspace NAT ──host socket──▶ int
 | Outbound IPv4 **TCP** (e.g. HTTPS) | ✅ real, via connection-proxy NAT |
 | **DNS** (A-record lookups) | ✅ resolved through the host resolver |
 | **Egress allow-list enforcement** | ✅ at DNS resolve **and** TCP connect, *when a policy is bound* |
-| Default posture | ⚠️ **allow-all** when no policy is bound (the shipping default); default-deny only applies once a policy sets it |
-| Host-network isolation (loopback / LAN / metadata) | ⛔ **not yet** — no reserved-address guard (M31.1) |
+| Default posture | ⚠️ **allow-all to the public internet** when no policy is bound; default-deny only once a policy sets it |
+| Host-network isolation (loopback / LAN / metadata) | ✅ **enforced** by the reserved-address guard, regardless of policy (M31.1) |
 | Denial visibility | ✅ each blocked flow is logged to the console + audit trail once |
 | UDP beyond DNS, IPv6, inbound/listen, ICMP to real hosts | ⛔ out of V0 scope (answered-empty or denied, never silently broken) |
 

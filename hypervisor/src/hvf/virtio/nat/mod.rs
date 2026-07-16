@@ -31,12 +31,14 @@
 mod device;
 mod dns;
 pub mod policy;
+mod reserved;
 
 #[cfg(test)]
 mod relay_test;
 
 use device::{FrameDevice, NAT_MTU};
 pub use policy::{Decision, EgressPolicy};
+pub use reserved::is_reserved_egress_ip;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
 use smoltcp::socket::{tcp, udp};
@@ -332,10 +334,29 @@ impl NatResponder {
         }
         match host_resolve_a(&query.name) {
             Some(ips) if !ips.is_empty() => {
-                for ip in &ips {
+                // Reserved-address guard (M31.1): never hand the guest a
+                // host-internal IP, so a rebinding answer (an allow-listed name
+                // resolving to 127.0.0.1 / a private IP / the metadata address)
+                // is dropped before the guest can ever dial it.
+                let allow_local = self.policy.allow_local_egress();
+                let public: Vec<Ipv4Addr> = ips
+                    .into_iter()
+                    .filter(|ip| allow_local || !is_reserved_egress_ip(*ip))
+                    .collect();
+                if public.is_empty() {
+                    self.events.push(EgressEvent {
+                        domain: "dns",
+                        target: query.name.clone(),
+                        allowed: false,
+                        rule: "reserved-address".to_string(),
+                    });
+                    self.note_denial("dns", &query.name, "reserved-address");
+                    return dns::Outcome::NoData;
+                }
+                for ip in &public {
                     self.policy.record_resolution(&query.name, *ip);
                 }
-                dns::Outcome::Answers(ips)
+                dns::Outcome::Answers(public)
             }
             Some(_) => dns::Outcome::NoData,
             None => dns::Outcome::NxDomain,
@@ -681,6 +702,36 @@ mod tests {
         arp[12] = 0x08;
         arp[13] = 0x06; // ARP
         assert!(parse_tcp_syn_dst(&arp).is_none());
+    }
+
+    #[test]
+    fn reserved_dst_is_refused_under_allow_all() {
+        // M31.1: even with an allow-all policy, the NAT must not arm a listener
+        // for a host-internal destination (loopback / LAN / metadata), so the
+        // guest cannot reach the Mac's own networks.
+        let mut nat = NatResponder::new(
+            [192, 168, 249, 1],
+            [0x02, 0, 0, 0, 0, 1],
+            EgressPolicy::allow_all(),
+            NatLimits::default(),
+        );
+        for reserved in [
+            Ipv4Addr::new(127, 0, 0, 1),
+            Ipv4Addr::new(169, 254, 169, 254),
+            Ipv4Addr::new(192, 168, 0, 10),
+        ] {
+            let dst = SocketAddrV4::new(reserved, 80);
+            assert!(!nat.admit_syn(dst), "{reserved} must be refused under allow-all");
+            assert!(!nat.listeners.contains_key(&dst), "no listener armed for {reserved}");
+        }
+        let denials = nat.drain_events();
+        assert!(
+            denials.iter().any(|e| e.rule == "reserved-address" && !e.allowed),
+            "a reserved-address denial is recorded"
+        );
+        // A public destination is still admitted.
+        let ok = SocketAddrV4::new(Ipv4Addr::new(140, 82, 112, 6), 443);
+        assert!(nat.admit_syn(ok), "a public destination is still allowed");
     }
 
     #[test]

@@ -212,6 +212,7 @@ break even without filesystem access. Full findings + plan:
   link-local / other special-use ranges independently of the policy, re-check the
   *resolved* IP at connect (closes DNS rebinding), drop DNS answers resolving into
   reserved ranges, with an explicit opt-in for deliberate localhost access.
+  **Shipped.**
 - **M31.2 (P1)** — safe default posture (guard-on floor; app default-deny for
   untrusted sessions).
 - **M31.3 (P1)** — correct the overstated network docs to match enforcement.
@@ -326,12 +327,12 @@ only "done" when it is enforced identically on both substrates.
 
 ### What comes next (crisp view, 2026-07-16)
 
-- **Security — the new #1 (M31.1, P0):** a **reserved-address egress guard**. The
-  NAT relays through host sockets, so a guest can currently reach loopback / LAN /
-  `169.254.169.254` by default — a host-boundary break found by the 2026-07-16
-  review. Deny special-use ranges independently of policy, re-check resolved IPs
-  (closes DNS rebinding), and fix the overstated network docs. This precedes
-  further feature work.
+- **Security — M31.1 reserved-address guard SHIPPED (P0).** The NAT now denies
+  loopback / private LAN / link-local (`169.254.169.254`) regardless of policy,
+  re-checks resolved IPs (closes DNS rebinding), and drops reserved DNS answers —
+  so the allow-all default can no longer reach the host. Opt out with
+  `--allow-local-egress`. Remaining M31: safe app default posture (M31.2),
+  cloud-path boundary docs (M31.4), and the signing fail-closed default (M31.5).
 - **Security (also open):** M30.4 signed manifest + trust root (#36, P1) —
   `chm` verification ships; gctl signing + a fail-closed default (M31.5) is the
   remaining half. Distribution notarisation is still unchecked.

@@ -105,7 +105,7 @@ test/guard so a regression is caught, not discovered.
 | I7 | **Undeliverable snapshots are refused, not mis-run.** ITS/LPI snapshots fail loudly at the load guard and the `assign-run` 422 gate. | `its_lpi_guard` + plane gate. | **Holds today** |
 | I8 | **The content store cannot select a host file.** A manifest checksum is only ever used as a CAS path after it is validated as a canonical sha256 hex digest, and every CAS object (including cache hits) is re-hashed before it is linked into a guest. | Digest-shape gate + re-hash on hit in `materialize_bundle`. | **Holds today** (M30.8) |
 | I9 | **A governed session's egress is enforced on every NIC and fails closed.** The resolved policy applies to all virtio-net NICs, and a session whose policy source is present but unresolvable denies all egress rather than running open. | Per-NIC policy clone + `EgressResolution::FailClosed` deny-all. | **Holds today** (M30.9) |
-| I10 | **A guest cannot reach the host's own networks.** No sandbox flow reaches loopback, RFC1918 LAN, link-local (incl. `169.254.169.254`), or other special-use ranges, regardless of policy or DNS answers — the NAT relays only to public destinations unless explicitly opted in. | *Not enforced yet:* the NAT dials whatever the policy admits, and allow-all is the default. | **Does NOT hold — M31.1** |
+| I10 | **A guest cannot reach the host's own networks.** No sandbox flow reaches loopback, RFC1918 LAN, link-local (incl. `169.254.169.254`), or other special-use ranges, regardless of policy or DNS answers, unless local egress is explicitly opted in or the trusted policy names the exact IP. | Reserved-address guard in the NAT: `decide_connect` denies reserved IPs before the allow rules (IP-literal allow or `--allow-local-egress` excepted); DNS answers resolving into reserved ranges are dropped. | **Holds today** (M31.1) |
 
 ---
 
@@ -404,9 +404,9 @@ M30.4/M30.6.
 
 ### M31 · Network host-isolation — the reserved-address boundary  **[P0, engine]**
 
-**Status: NOT shipped — the critical open gap.** A second adversarial review
+**Status: M31.1 shipped; M31.2-M31.5 open.** A second adversarial review
 (2026-07-16) found that the egress boundary M28/M30.9 built is only a *policy*
-gate; it does not stop a guest from reaching the **host's own networks**. The
+gate; it did not stop a guest from reaching the **host's own networks**. The
 userspace NAT relays a permitted flow through an ordinary host socket, so
 whatever the guest dials, `chm` dials on the host — including:
 
@@ -429,13 +429,16 @@ name at connect time).
 
 **Plan.**
 
-- **M31.1 (P0, #75) — reserved-address guard.** In the NAT, deny any connect whose
-  destination IP falls in a special-use / non-public range, **independently of
-  and before** the egress policy, so even allow-all cannot reach host-internal
-  networks. Re-check the *resolved* IP at connect time (a hostname allow-match
-  never authorises a reserved IP → closes DNS rebinding), and drop DNS answers
-  that resolve into reserved ranges. Provide an explicit opt-in
-  (e.g. `--allow-local-egress`) for users who deliberately want localhost access.
+- **M31.1 (P0, #75) — reserved-address guard. SHIPPED.** The NAT denies any
+  connect whose destination IP falls in a special-use / non-public range,
+  **independently of and before** the egress policy, so even allow-all cannot
+  reach host-internal networks. The *resolved* IP is checked at connect time (a
+  hostname allow-match never authorises a reserved IP → DNS rebinding closed),
+  DNS answers resolving into reserved ranges are dropped, and an IP-literal allow
+  rule in the *trusted* policy (or `--allow-local-egress` / `CHM_ALLOW_LOCAL_EGRESS`)
+  is the only way to reach them. Proven by unit tests (the reserved predicate,
+  the policy decision, DNS rebinding) and an end-to-end relay test: under
+  allow-all a real guest stack cannot reach a localhost echo server.
 - **M31.2 (P1) — safe default posture.** With the guard always-on, allow-all is
   a safe floor (public egress only, never the host). Move the app's default for
   untrusted sessions toward default-deny, and have `chm` warn when running an
@@ -478,9 +481,10 @@ name at connect time).
       pending only a net-enabled snapshot; enforcement already ships.
 - [x] **Audit logs** — session start/stop, denied egress, and bundle-verify
       decisions recorded to a durable per-workspace `audit.jsonl` (M29, shipped).
-- [ ] **Network host-isolation** — a guest cannot reach loopback / private LAN /
-      link-local (incl. `169.254.169.254`) regardless of policy or DNS answers
-      (M31.1). **The critical open gap** found by the 2026-07-16 review.
+- [x] **Network host-isolation** — a guest cannot reach loopback / private LAN /
+      link-local (incl. `169.254.169.254`) regardless of policy or DNS answers,
+      unless explicitly opted in (M31.1, shipped). Closes the critical gap found
+      by the 2026-07-16 review.
 - [ ] **Update / signing chain** — the app + `chm` binaries themselves are signed
       and updated over a verified channel (macOS notarisation + release signing).
 - [x] **Escape-response assumptions** — documented (§1 "Out of scope"): a guest
