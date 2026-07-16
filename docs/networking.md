@@ -24,10 +24,10 @@ denied flow is enforced simply by *not opening the socket*.
 > `169.254.169.254`) — **regardless of the egress policy**, so even the allow-all
 > default and a DNS-rebound allow-listed name cannot reach the host. Only an
 > explicit IP-literal allow rule in your policy, or `--allow-local-egress`
-> (`CHM_ALLOW_LOCAL_EGRESS=1`), lifts it. Note networking is still **allow-all by
-> default** for *public* destinations (no bound policy) and the app ships its
-> firewall disabled — so a sandbox can still reach the public internet unless you
-> bind a policy. See
+> (`CHM_ALLOW_LOCAL_EGRESS=1`), lifts it. For **public** egress: `chm` itself is
+> allow-all when no policy is bound, but the Gimbal Local app now defaults new
+> sandboxes to firewall-on **default-deny** (M31.2) — so a sandbox created through
+> the app has no public egress until you allow-list what it needs. See
 > [`security-model.md`](security-model.md#m31--network-host-isolation--the-reserved-address-boundary).
 
 ```

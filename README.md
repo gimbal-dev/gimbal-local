@@ -142,6 +142,7 @@ Milestones completed (all hardware-verified on Apple Silicon):
 | M28 | Consistent sandbox controls: userspace-NAT egress firewall (default-deny allow-list, `chm firewall`) enforced locally at DNS resolve + TCP connect. |
 | M29 | Durable per-sandbox audit trail (`audit.jsonl`: session start/stop, denied egress, bundle-verify), readable via `chm audit show`. |
 | M30 | Security hardening for untrusted snapshots + hostile guest agents: bundle/overlay confinement, daemon socket auth, no host-FS passthrough, resource + NAT limits, per-NIC fail-closed egress, CAS digest hardening, and Ed25519 signed-manifest verification. See [`docs/security-model.md`](docs/security-model.md). |
+| M31 | Network host-isolation: a reserved-address guard blocks the guest from reaching host loopback / private LAN / link-local metadata (`169.254.169.254`) regardless of policy (closing DNS rebinding), and new sandboxes default to firewall-on default-deny. |
 
 Next:
 

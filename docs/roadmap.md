@@ -323,10 +323,13 @@ the gctl telemetry/cost event contract.
 
 Progress lives in the
 [GitHub milestones](https://github.com/gimbal-dev/gimbal-local/milestones)
-`M25`–`M30`, one per remaining capability, with the cross-repo handoff issues
-above. **M30 (security hardening) is the immediate priority and precedes M27.**
-The four pillars are the V0 capability contract (issue #21); each pillar is
-only "done" when it is enforced identically on both substrates.
+`M25`–`M31`, one per remaining capability, with the cross-repo handoff issues
+above. **The security track (M30 + M31) is substantially complete** — the local
+host boundary (filesystem, network, resource, daemon) holds; the remaining
+security work is cross-repo (snapshot signing, #36) or distribution notarisation.
+Feature work (M27 plane-native edge) is the next major thrust. The four pillars
+are the V0 capability contract (issue #21); each pillar is only "done" when it is
+enforced identically on both substrates.
 
 ### What comes next (crisp view, 2026-07-16)
 
