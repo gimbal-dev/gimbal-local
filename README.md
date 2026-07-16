@@ -1,15 +1,17 @@
-# Cloud Hypervisor for macOS
+# Gimbal Local
 
-> Rehydrate Cloud Hypervisor cloud snapshots on Apple Silicon.
+> Rehydrate Cloud Hypervisor cloud snapshots on your Mac.
 
-This is a macOS-focused fork of [Cloud Hypervisor](https://www.cloudhypervisor.org/)
-that brings the VMM's `arm64` guests to Apple's **Hypervisor.framework (HVF)**.
-The goal is a local runtime: take a snapshot of a running cloud VM (captured on
-a Linux/KVM host with `ch-remote snapshot`) and **resume it on your Mac** —
+**Gimbal Local** is a macOS (Apple Silicon) runtime that brings the `arm64`
+guests of [Cloud Hypervisor](https://www.cloudhypervisor.org/) to Apple's
+**Hypervisor.framework (HVF)**. Take a snapshot of a running cloud VM (captured
+on a Linux/KVM host with `ch-remote snapshot`) and **resume it on your Mac** —
 same guest RAM, vCPU state, GIC, and virtual timer — then watch it boot on into
 userspace.
 
-It ships as a single, standalone, code-signed executable: **`chm`**.
+Under the hood it is a single, standalone, code-signed engine CLI — **`chm`** —
+built as a macOS-focused fork of Cloud Hypervisor, with a native SwiftUI desktop
+app (**Gimbal Local**) on top. `chm run` prints the engine banner shown below.
 
 ```console
 $ chm run /path/to/ch-snapshot
@@ -135,21 +137,27 @@ Milestones completed (all hardware-verified on Apple Silicon):
 | M10–M20 | Native virtio block/rng/net, interactive serial console, bidirectional net, and multi-vCPU snapshot resume. |
 | R3 | PSCI `CPU_ON` path hardware-proven; HVF SPI affinity routing remains unsupported, so message-SPI delivery deliberately uses the proven 1-of-N route. |
 | M23 | **Gimbal Local** native macOS app: local sandbox dashboard, daemon controls, console view, and optional gimbal-cloud-control health/cost panel. |
+| M25 | Live local lifecycle: suspend/resume live checkpoints, per-revision disk overlays, fork, and a durable single-slot session registry. |
+| M26/M27 | Faithful cloud rehydration through the control-plane runner; branchable image/checkpoint/sandbox lineage (`chm push`/`pull`/`revisions`/`rollback`). |
+| M28 | Consistent sandbox controls: userspace-NAT egress firewall (default-deny allow-list, `chm firewall`) enforced locally at DNS resolve + TCP connect. |
+| M29 | Durable per-sandbox audit trail (`audit.jsonl`: session start/stop, denied egress, bundle-verify), readable via `chm audit show`. |
+| M30 | Security hardening for untrusted snapshots + hostile guest agents: bundle/overlay confinement, daemon socket auth, no host-FS passthrough, resource + NAT limits, per-NIC fail-closed egress, CAS digest hardening, and Ed25519 signed-manifest verification. See [`docs/security-model.md`](docs/security-model.md). |
 
 Next:
 
-- **Remote capture validation:** blocked on real arm64 KVM capacity. Raspberry
-  Pi/OCI options were checked; AWS bare-metal quota is the current route back.
-- **BYO-subscription loop:** first local-managed AWS helper commands are now
-  available: `init`, `preflight`, `capture`, `pull`, `push`, and `cleanup`.
-  They let the Mac manage a user's AWS profile, S3 handoff bucket, and existing
-  SSH capture host without a hosted control plane.
-- **Desktop app:** native SwiftUI shell is stood up in `app/GimbalLocal`, backed
-  by `chm serve` / `chm ctl` plus the optional `gimbal-cloud-control` API.
-- **Create from container image:** future app action that accepts an OCI/Docker
-  image reference, hides the pull/rootfs/disk/capture process, produces an
-  HVF-compatible snapshot in the local library, and then starts it like any
-  other sandbox.
+- **Snapshot signing trust root (M30.4):** `chm` verifies Ed25519-signed
+  manifests today; the remaining half is the control plane producing + signing
+  production manifests (cross-repo with `gimbal-cloud-control`).
+- **Live in-guest firewall demo:** enforcement ships; the end-to-end demo is
+  blocked only on a net-enabled capture snapshot.
+- **Remote capture validation:** needs real arm64 KVM capacity (a Lima
+  nested-KVM guest, or AWS Graviton bare metal); the Mac only *runs* snapshots.
+- **BYO-subscription loop:** local-managed AWS helpers (`init`, `preflight`,
+  `capture`, `pull`, `push`, `cleanup`) let the Mac drive a user's AWS profile,
+  S3 handoff bucket, and SSH capture host without a hosted control plane.
+- **Create from container image:** a future app action that accepts an OCI/Docker
+  image reference, hides the pull/rootfs/disk/capture process, and produces an
+  HVF-compatible snapshot in the local library.
 
 AWS setup notes for the later cloud round-trip live in
 [`docs/aws-byo-setup.md`](docs/aws-byo-setup.md).

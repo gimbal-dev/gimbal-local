@@ -73,6 +73,15 @@ takes priority over the remaining feature milestones (it precedes M27).
 - **HVF / Apple silicon hypervisor escapes.** We rely on the platform VM
   boundary; if HVF is broken, so are we. We minimise our own attack surface but
   do not re-implement the CPU/memory isolation.
+- **Escape-response posture.** A guest-level compromise — a hostile agent
+  breaking out of its own userspace into the *guest kernel* — is assumed
+  **contained by the HVF VM boundary**: the guest is a real hardware-isolated VM,
+  not a shared-kernel container, so an in-guest attacker cannot reach host files,
+  other sandboxes, or the daemon *through the VM*. The escape we actively defend
+  is the **bundle-driven host-file** path — a crafted snapshot / manifest / disk
+  reaching a host file before or around the VM — closed by bundle confinement
+  (M30.1), the CAS digest gate (M30.8), and the no-host-FS invariant (I1). A break
+  of HVF itself (first bullet) defeats this assumption.
 - **Side channels** (timing, cache, Spectre-class) between guest and host.
 - **Physical access / a compromised macOS account** running as the user.
 - **The control plane's own security** — owned by `gimbal-cloud-control`; we
@@ -410,15 +419,17 @@ M30.4/M30.6.
       `make security-check` guard (M30.5, shipped).
 - [x] **Resource limits** — per-sandbox vCPU/mem/disk/console/wall ceilings plus
       NAT connection-count + bandwidth caps (M30.6, shipped).
-- [ ] **Network policy** — egress allow/deny enforced on the local datapath
-      (converges with **M28**; the firewall half of pillar ③).
+- [x] **Network policy** — egress allow/deny enforced on the local datapath: a
+      default-deny allow-list applied to every NIC, fail-closed, plus NAT
+      connection/bandwidth caps (M28 + M30.9). The live in-guest demo (#52) is
+      pending only a net-enabled snapshot; enforcement already ships.
 - [x] **Audit logs** — session start/stop, denied egress, and bundle-verify
       decisions recorded to a durable per-workspace `audit.jsonl` (M29, shipped).
 - [ ] **Update / signing chain** — the app + `chm` binaries themselves are signed
       and updated over a verified channel (macOS notarisation + release signing).
-- [ ] **Escape-response assumptions** — documented: a guest escape is assumed
-      contained by HVF; a bundle-driven host-file escape is the boundary M30.1
-      closes.
+- [x] **Escape-response assumptions** — documented (§1 "Out of scope"): a guest
+      escape is assumed contained by the HVF VM boundary; the actively-defended
+      escape is the bundle-driven host-file path, closed by M30.1 / M30.8 / I1.
 
 ---
 

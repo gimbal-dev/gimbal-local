@@ -160,10 +160,14 @@ them. Full model + plan: [`security-model.md`](security-model.md).
   manifest relpath confinement in `materialize_bundle`.
 - **M30.2 (#34, P0) — shipped.** Daemon socket hardening: private `0700` dir,
   `0600` socket, and a peer-uid (`getpeereid`) check before
-  start/stop/console/shutdown.
+  start/stop/console/shutdown. Follow-up #66 shipped: a pre-existing runtime dir
+  is rejected unless the current user owns it, and self-owned dirs left too open
+  are tightened back to `0700`.
 - **M30.3 (#35, P0) — shipped.** App command safety: a pure, single-quoting
   `InteractiveTerminalCommand` builder that rejects control characters (the
-  snapshot-name vector was already removed).
+  snapshot-name vector was already removed). Follow-up #67 shipped: the command
+  is handed to `osascript` as an `argv` parameter, dropping the AppleScript
+  string-literal escaping layer.
 - **M30.4 (#36, P1) — verification shipped.** Ed25519 signed-manifest
   verification in `chm` (trust store via `CHM_TRUST_STORE`, key ids + rotation),
   fail-closed when configured, plus a `chm manifest keygen|sign|verify` reference
@@ -263,11 +267,16 @@ before guest egress can be exercised end-to-end on real HVF.
 
 ### M29 · Observability & cost — logging, insights, both sides
 
-Pillar ④. Local sandboxes emit the **same** structured logs + usage events
-(cpu-seconds, wall-time, memory, bytes faulted) through the runner's
-report-state / push-artifacts path, so insights and cost accounting are uniform
-regardless of where a session ran. The app already reads the plane's read-only
-cost/health panel; the rest waits on the gctl telemetry/cost event contract.
+Pillar ④. **Local audit trail shipped:** every sandbox writes a durable,
+append-only `audit.jsonl` (session start/stop with shape + outcome, denied
+egress flows, and bundle-verify decisions), readable with `chm audit show`, so an
+operator can review what a sandbox did independent of the guest-floodable
+console. The remaining half is the shared telemetry/cost contract: local
+sandboxes emit the **same** structured usage events (cpu-seconds, wall-time,
+memory, bytes faulted) through the runner's report-state / push-artifacts path,
+so insights and cost accounting are uniform regardless of where a session ran.
+The app already reads the plane's read-only cost/health panel; the rest waits on
+the gctl telemetry/cost event contract.
 
 ---
 
@@ -293,18 +302,22 @@ above. **M30 (security hardening) is the immediate priority and precedes M27.**
 The four pillars are the V0 capability contract (issue #21); each pillar is
 only "done" when it is enforced identically on both substrates.
 
-### What comes next (crisp view, 2026-07-15)
+### What comes next (crisp view, 2026-07-16)
 
-- **Security (priority):** M30.4 signed manifest + trust root (#36, P1 — the
-  largest missing trust feature, cross-repo with gctl) is now the main open
-  item. M30.6 resource limits (#38), the two follow-ups M30.2 runtime-dir
-  ownership (#66) and M30.3 direct-argv launch (#67), and the M29 durable audit
-  trail (session start/stop, denied egress, bundle-verify) are shipped.
-- **Open bugs:** rollback does not revert the disk overlay (#62); engine shows
-  idle while sandboxes are alive (#61).
+- **Security (priority):** M30.4 signed manifest + trust root (#36, P1) is the
+  main open item — `chm` verification ships; the remaining half is gctl producing
+  and signing production manifests (cross-repo). The rest of M30 is shipped:
+  resource limits + NAT caps (#38), the runtime-dir (#66) and argv-launch (#67)
+  follow-ups, CAS digest hardening (#64), per-NIC fail-closed egress (#65), and
+  the M29 durable audit trail. Remaining checklist items are the escape-response
+  note (docs) and distribution notarisation (needs an Apple Developer ID).
 - **Demo gap:** the live in-guest firewall demo (#52) is blocked only on a
-  net-enabled snapshot; authoring + enforcement already ship.
+  net-enabled snapshot; authoring + enforcement already ship. A cloud-side
+  capture-capability request is filed (`gimbal-cloud-control#4`).
 - **Cross-repo (CP) handoffs:** #4/#5/#6 (checkpoint/postcopy/fork phases),
   #20 (policy plane), #21 (V0 pillar alignment).
 - **Recently shipped + closed:** interactive console freeze (#60), CAS digest
-  hardening (#64), per-NIC fail-closed egress (#65).
+  hardening (#64) + per-NIC fail-closed egress (#65), disk-overlay rollback (#62)
+  + live engine/revision UI (#61/#69), durable session registry (#71), resource
+  limits + NAT caps (#38), the #66/#67 security follow-ups, and the M29 audit
+  trail.
