@@ -313,19 +313,36 @@ platform compares to the incumbent (Docker Desktop's Linux VM) on the same Mac.
 - **M32.1 — agent workload readiness.** Prove a representative dev/agent loop runs
   end to end inside a gimbal sandbox: clone a repo, install deps, build, run
   tests, and (nested) `docker build` inside the guest. Shake out anything the
-  minimal snapshot lacks (container runtime, disk headroom, DNS/egress allow-list
-  for package registries under the new default-deny). This is the "actually put
-  an agent to work" proof.
-- **M32.2 — benchmark vs Docker sandboxes.** A reproducible harness that runs the
-  **same workload** — starting with a real `docker build` (plus package installs
-  and a compile job) — inside (a) Docker Desktop's Linux VM and (b) a gimbal
-  microVM on the same host, and reports **wall-clock, cold-start/rehydrate time,
-  CPU, memory, and disk I/O**. Both run on Apple HVF, so this measures gimbal's
-  snapshot-rehydrate + NAT/overlay datapath against Docker's LinuxKit pipeline.
-  Publish the methodology + numbers (honest, reproducible — no cherry-picking).
+  guest image lacks (container runtime, disk headroom, DNS/egress allow-list for
+  package registries under the new default-deny). This is the "actually put an
+  agent to work" proof.
+- **M32.2 — benchmark vs Docker sandboxes.** Use an **existing, standardized**
+  build benchmark rather than a bespoke one — the **Phoronix Test Suite** timed
+  builds (`pts/build-linux-kernel`, `pts/build-llvm`, `build-gcc`, …) download →
+  configure → build → time reproducibly and publish to OpenBenchmarking.org, and
+  run *identically* inside a Docker container and a gimbal guest. Optionally add a
+  real `docker build` of a well-known OSS image for the "docker build
+  specifically" angle. A harness runs the same workload inside (a) Docker Desktop
+  and (b) a gimbal microVM on the same host, reporting **wall-clock, cold-start /
+  rehydrate time, CPU, memory, disk I/O**, mean ± stddev over N trials.
+  - *Honest expectations (prior art):* Firecracker/Kata microVMs run ~92–97% of
+    Docker's build throughput for CPU-bound builds, more overhead (~17–20%) for
+    IO/network-heavy multi-stage builds; watch the CoW-overlay I/O and NAT
+    throughput paths for anomalies.
+  - *Gimbal's angle:* the snapshot model can rehydrate a guest **already warm**
+    (deps loaded, caches primed, sitting right before the build) instantly and
+    repeatably, vs a cold container each run — a differentiator to measure, not
+    just a setup cost.
 
-Both are local-doable and do not depend on the control plane. They also stress
-the security posture (egress allow-list vs. package registries; disk/console caps
+**On the "snapshot dependency":** gimbal only *rehydrates a snapshot* — there is
+no boot-from-scratch path — so the microVM you build in **is** a snapshot; it is a
+one-time "provision a Docker/toolchain guest, then capture it" step (local-doable
+on a KVM host), not an external blocker. If the build inputs are **baked into the
+guest image**, the build runs **offline** and needs no network / net-enabled
+snapshot (#52); network is only needed for realistic pull-at-build-time runs.
+
+Both parts are local-doable and do not depend on the control plane. They also
+stress the security posture (egress allow-list vs. registries; disk/console caps
 vs. real builds), so they double as end-to-end validation of M30/M31.
 
 ---
