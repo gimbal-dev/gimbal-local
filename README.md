@@ -15,7 +15,7 @@ app (**Gimbal Local**) on top. `chm run` prints the engine banner shown below.
 
 ```console
 $ chm run /path/to/ch-snapshot
-chm — Cloud Hypervisor for macOS (Apple Silicon)
+chm — Gimbal Local (Cloud Hypervisor on Apple Silicon)
   snapshot:  /path/to/ch-snapshot
   memory:    /path/to/ch-snapshot/snapshot/memory-ranges (1024 MiB)
   vCPUs:     1

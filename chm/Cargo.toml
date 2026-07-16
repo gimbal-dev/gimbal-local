@@ -1,4 +1,4 @@
-# cloud-hypervisor-mac (`chm`)
+# gimbal-local (`chm`)
 #
 # A standalone macOS / Apple Silicon executable that rehydrates a cloud
 # Cloud Hypervisor arm64 KVM snapshot onto Apple's Hypervisor.framework and
@@ -13,7 +13,7 @@
 [package]
 authors = ["The Cloud Hypervisor Authors"]
 edition.workspace = true
-name = "cloud-hypervisor-mac"
+name = "gimbal-local"
 rust-version.workspace = true
 version = "0.1.0"
 

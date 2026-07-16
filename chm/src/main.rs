@@ -2,7 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 
-//! `chm` — Cloud Hypervisor for macOS.
+//! `chm` — the Gimbal Local engine (a macOS fork of Cloud Hypervisor).
 //!
 //! A standalone Apple Silicon executable that rehydrates a Cloud Hypervisor
 //! arm64 KVM snapshot onto Apple's Hypervisor.framework and resumes it locally.
@@ -69,7 +69,7 @@ fn main() -> ExitCode {
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
 fn main() -> ExitCode {
     eprintln!(
-        "chm (Cloud Hypervisor for macOS) only runs on Apple Silicon \
+        "chm (the Gimbal Local engine) only runs on Apple Silicon \
          (macOS, arm64).\nThis build targets a different platform and cannot \
          create a Hypervisor.framework VM."
     );

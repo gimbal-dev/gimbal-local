@@ -727,7 +727,7 @@ enum Parsed {
 }
 
 fn usage() -> String {
-    "chm — Cloud Hypervisor for macOS (Apple Silicon)\n\
+    "chm — Gimbal Local (Cloud Hypervisor on Apple Silicon)\n\
      \n\
      Rehydrate a Cloud Hypervisor arm64 snapshot onto Hypervisor.framework and\n\
      resume it locally, streaming the guest serial console to stdout.\n\
@@ -2072,7 +2072,7 @@ fn run_console(
 
 fn banner(dir: &Path, mem_ranges: &Path, num_vcpus: u32, total_ram: u64) {
     let mib = total_ram / (1024 * 1024);
-    eprintln!("chm — Cloud Hypervisor for macOS (Apple Silicon)");
+    eprintln!("chm — Gimbal Local (Cloud Hypervisor on Apple Silicon)");
     eprintln!("  snapshot:  {}", dir.display());
     eprintln!("  memory:    {} ({mib} MiB)", mem_ranges.display());
     eprintln!("  vCPUs:     {num_vcpus}");

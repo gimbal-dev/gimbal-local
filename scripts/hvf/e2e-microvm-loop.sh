@@ -50,5 +50,5 @@ echo "e2e-microvm-loop: running the boot → login → write → ls loop..."
 # streams their progress; `--test-threads=1` runs them serially so the VMs
 # (boot loop, suspend/resume, then the rollback journey) never contend for the
 # single HVF slot.
-exec cargo test -p cloud-hypervisor-mac --test e2e_microvm_loop -- \
+exec cargo test -p gimbal-local --test e2e_microvm_loop -- \
     --ignored --nocapture --test-threads=1
