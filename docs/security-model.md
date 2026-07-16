@@ -439,10 +439,13 @@ name at connect time).
   is the only way to reach them. Proven by unit tests (the reserved predicate,
   the policy decision, DNS rebinding) and an end-to-end relay test: under
   allow-all a real guest stack cannot reach a localhost echo server.
-- **M31.2 (P1) — safe default posture.** With the guard always-on, allow-all is
-  a safe floor (public egress only, never the host). Move the app's default for
-  untrusted sessions toward default-deny, and have `chm` warn when running an
-  unbounded, guard-only session.
+- **M31.2 (P1) — safe default posture. SHIPPED.** With the guard always-on,
+  allow-all is a safe floor (public egress only, never the host). The app's global
+  default now ships the firewall **on in default-deny (allow-list) mode**, so a
+  new sandbox has no public egress until the user allow-lists what it needs; the
+  Settings copy makes the always-on host/LAN/metadata block explicit. (`chm` still
+  warns when a restrictive policy is bound; an unbound run is public-egress with
+  the host guard on.)
 - **M31.3 (P1) — honest network docs.** Correct `networking.md` and the invariant
   table so claims match enforcement (allow-all default; the NAT relays via host
   sockets; the reserved-address guard is the real host boundary).

@@ -213,8 +213,9 @@ break even without filesystem access. Full findings + plan:
   *resolved* IP at connect (closes DNS rebinding), drop DNS answers resolving into
   reserved ranges, with an explicit opt-in for deliberate localhost access.
   **Shipped.**
-- **M31.2 (P1)** — safe default posture (guard-on floor; app default-deny for
-  untrusted sessions).
+- **M31.2 (P1)** — safe default posture: the app ships the firewall on in
+  default-deny (allow-list) mode, so a new sandbox has no public egress until
+  allow-listed (host/LAN always blocked by M31.1). **Shipped.**
 - **M31.3 (P1)** — correct the overstated network docs to match enforcement.
 - **M31.4 (P2)** — document the cloud/KVM path + external capture-harness boundary.
 - **M31.5 (P1)** — signing fail-closed default + digest recompute enforcement
@@ -327,12 +328,13 @@ only "done" when it is enforced identically on both substrates.
 
 ### What comes next (crisp view, 2026-07-16)
 
-- **Security — M31.1 reserved-address guard SHIPPED (P0).** The NAT now denies
-  loopback / private LAN / link-local (`169.254.169.254`) regardless of policy,
-  re-checks resolved IPs (closes DNS rebinding), and drops reserved DNS answers —
-  so the allow-all default can no longer reach the host. Opt out with
-  `--allow-local-egress`. Remaining M31: safe app default posture (M31.2),
-  cloud-path boundary docs (M31.4), and the signing fail-closed default (M31.5).
+- **Security — M31.1 + M31.2 SHIPPED.** The NAT reserved-address guard (M31.1)
+  denies loopback / private LAN / link-local (`169.254.169.254`) regardless of
+  policy, re-checks resolved IPs (closes DNS rebinding), and drops reserved DNS
+  answers. The app now defaults new sandboxes to firewall-on **default-deny**
+  (M31.2), so there is no public egress until allow-listed. Opt out of the host
+  guard with `--allow-local-egress`. Remaining M31: cloud-path boundary docs
+  (M31.4) and the signing fail-closed default (M31.5).
 - **Security (also open):** M30.4 signed manifest + trust root (#36, P1) —
   `chm` verification ships; gctl signing + a fail-closed default (M31.5) is the
   remaining half. Distribution notarisation is still unchecked.
