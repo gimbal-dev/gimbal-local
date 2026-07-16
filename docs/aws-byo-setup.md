@@ -24,6 +24,23 @@ nested KVM. For the real AWS proof, start with a **Graviton bare-metal**
 instance type, for example a `*.metal` Graviton family in a region where your
 account has quota.
 
+### Security boundary of the capture host (read this)
+
+This capture host is **outside the Gimbal Local trust boundary**. Everything the
+macOS runtime guarantees — bundle confinement, the reserved-address network guard
+(a guest cannot reach host loopback / LAN / `169.254.169.254`), resource limits,
+the audit trail — applies to the **Mac that runs a snapshot**, not to the Linux
+host that **captures** it. On this capture host:
+
+- it holds your **EC2/S3 credentials** and can reach the **instance-metadata
+  endpoint** (`169.254.169.254`), so a workload you capture here is only as
+  isolated as this host and its IAM policy make it — scope the IAM user to just
+  the S3 handoff bucket and the specific EC2 actions in Step 3, nothing more;
+- prefer **IMDSv2** (hop-limit 1, token-required) so a captured workload cannot
+  trivially read instance credentials from the metadata endpoint;
+- treat the captured snapshot as trusted on the Mac only via the signed-manifest
+  chain (M30.4) — see [`security-model.md`](security-model.md) § "Out of scope".
+
 ### The one hard cost rule
 
 Do **not** leave the bare-metal instance running.

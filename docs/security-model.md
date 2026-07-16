@@ -86,6 +86,21 @@ takes priority over the remaining feature milestones (it precedes M27).
 - **Physical access / a compromised macOS account** running as the user.
 - **The control plane's own security** — owned by `gimbal-cloud-control`; we
   consume its trust root (M30.4) but do not audit its internals here.
+- **The cloud/KVM capture path and its harness** (M31.4). Everything in this
+  document — bundle confinement, the reserved-address network guard, resource
+  limits, the audit trail — governs the **macOS / HVF runtime in this repo**. The
+  *capture* side (producing a snapshot on a Linux/KVM host, e.g. the BYO EC2
+  harness in [`aws-byo-setup.md`](aws-byo-setup.md)) runs **outside this
+  repository** and is **not** covered by these guarantees:
+  - the capture host holds EC2/S3 credentials and can reach the cloud
+    instance-metadata endpoint (`169.254.169.254`), so a workload captured there
+    is only as isolated as that host and its IAM policy make it;
+  - the network guarantees (I10 / M31.1) apply to the local NAT datapath, not to
+    how the guest reached the network while it was being captured on KVM;
+  - a snapshot is trusted on the Mac only via the signed-manifest chain (M30.4);
+    the capture harness itself must be audited in its own repo.
+  Treat a snapshot as trustworthy only to the extent you trust the host that
+  captured it and the signature over its manifest.
 
 ---
 
@@ -449,11 +464,12 @@ name at connect time).
 - **M31.3 (P1) — honest network docs.** Correct `networking.md` and the invariant
   table so claims match enforcement (allow-all default; the NAT relays via host
   sockets; the reserved-address guard is the real host boundary).
-- **M31.4 (P2) — cloud/KVM path boundary.** The network guarantees apply to the
-  macOS userspace-NAT path only. The cloud/KVM capture path's isolation depends
-  on the **external EC2 capture harness** (outside this repo) with EC2/S3
-  permissions and a reachable instance-metadata endpoint; document the boundary
-  and track auditing that harness cross-repo.
+- **M31.4 (P2) — cloud/KVM path boundary. DOCUMENTED.** The network guarantees
+  apply to the macOS userspace-NAT path only. The cloud/KVM capture path's
+  isolation depends on the **external EC2 capture harness** (outside this repo)
+  with EC2/S3 permissions and a reachable instance-metadata endpoint. This
+  boundary is now stated explicitly in §1 "Out of scope" and in the BYO capture
+  runbook; auditing the harness itself is tracked cross-repo.
 - **M31.5 (P1) — signing default + digest recompute.** Signing fails *open* when
   `CHM_TRUST_STORE` is unset (by-design back-compat, #36); the policy-digest
   cross-field check fails closed, but the independent recompute is advisory. Once
