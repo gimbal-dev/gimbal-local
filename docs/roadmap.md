@@ -197,7 +197,29 @@ policy, a bundle must not escape the host and the daemon must not be hijackable.
 Its network item converges with M28's firewall enforcement (same datapath); its
 signing item makes M26's displayed provenance cryptographically verified.
 
-### M27 · Plane-native edge — branching filesystem + lazy load
+### M31 · Network host-isolation — the reserved-address boundary
+
+**The new critical priority** (2026-07-16 adversarial review). M28/M30.9 built a
+*policy* gate on egress, but the userspace NAT still relays a permitted flow
+through a real host socket — so a guest can reach the **host's own networks**
+(loopback, private LAN, link-local `169.254.169.254` metadata), reachable
+**by default** (allow-all when no policy is bound; the app firewall ships off),
+and bypassable in allow-list mode via **DNS rebinding**. This is a host-boundary
+break even without filesystem access. Full findings + plan:
+[`security-model.md`](security-model.md#m31--network-host-isolation--the-reserved-address-boundary).
+
+- **M31.1 (P0, #75)** — reserved-address guard in the NAT: deny loopback / RFC1918 /
+  link-local / other special-use ranges independently of the policy, re-check the
+  *resolved* IP at connect (closes DNS rebinding), drop DNS answers resolving into
+  reserved ranges, with an explicit opt-in for deliberate localhost access.
+- **M31.2 (P1)** — safe default posture (guard-on floor; app default-deny for
+  untrusted sessions).
+- **M31.3 (P1)** — correct the overstated network docs to match enforcement.
+- **M31.4 (P2)** — document the cloud/KVM path + external capture-harness boundary.
+- **M31.5 (P1)** — signing fail-closed default + digest recompute enforcement
+  (folds into #36).
+
+
 
 Pillar ②'s deep, plane-coupled half:
 
@@ -304,13 +326,15 @@ only "done" when it is enforced identically on both substrates.
 
 ### What comes next (crisp view, 2026-07-16)
 
-- **Security (priority):** M30.4 signed manifest + trust root (#36, P1) is the
-  main open item — `chm` verification ships; the remaining half is gctl producing
-  and signing production manifests (cross-repo). The rest of M30 is shipped:
-  resource limits + NAT caps (#38), the runtime-dir (#66) and argv-launch (#67)
-  follow-ups, CAS digest hardening (#64), per-NIC fail-closed egress (#65), and
-  the M29 durable audit trail. Remaining checklist items are the escape-response
-  note (docs) and distribution notarisation (needs an Apple Developer ID).
+- **Security — the new #1 (M31.1, P0):** a **reserved-address egress guard**. The
+  NAT relays through host sockets, so a guest can currently reach loopback / LAN /
+  `169.254.169.254` by default — a host-boundary break found by the 2026-07-16
+  review. Deny special-use ranges independently of policy, re-check resolved IPs
+  (closes DNS rebinding), and fix the overstated network docs. This precedes
+  further feature work.
+- **Security (also open):** M30.4 signed manifest + trust root (#36, P1) —
+  `chm` verification ships; gctl signing + a fail-closed default (M31.5) is the
+  remaining half. Distribution notarisation is still unchecked.
 - **Demo gap:** the live in-guest firewall demo (#52) is blocked only on a
   net-enabled snapshot; authoring + enforcement already ship. A cloud-side
   capture-capability request is filed (`gimbal-cloud-control#4`).

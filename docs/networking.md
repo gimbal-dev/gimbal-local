@@ -8,21 +8,31 @@ product does today and how to use it**.
 
 ## The one-paragraph version
 
-A snapshot brought down from the cloud has **no tap, no bridge, and no route to
-your Mac's network**. Its only link is a virtio-net device that `chm` terminates
-in a **userspace NAT** — a small TCP/IP stack inside `chm` that answers the
-guest's DNS, accepts its TCP connections, and relays them out through ordinary
-host sockets. Because `chm` is the process opening every socket, it is also the
-**enforcement point**: the control plane's per-sandbox egress allow-list is
-checked at the moment a name is resolved and a connection is dialed, and a denied
-flow is enforced simply by *not opening the socket*. The guest cannot get around
-this — there is no other way off the box.
+A snapshot brought down from the cloud has **no tap and no bridge** — no
+layer-2 access to your Mac's network. Its only link is a virtio-net device that
+`chm` terminates in a **userspace NAT** — a small TCP/IP stack inside `chm` that
+answers the guest's DNS, accepts its TCP connections, and relays them out through
+ordinary host sockets. Because `chm` is the process opening every socket, it is
+also the **enforcement point**: the control plane's per-sandbox egress allow-list
+is checked at the moment a name is resolved and a connection is dialed, and a
+denied flow is enforced simply by *not opening the socket*.
+
+> **Important boundary (being fixed — M31.1).** Because the NAT relays through a
+> real host socket, whatever the guest dials, `chm` dials *on the host*. Today
+> there is **no reserved-address guard**, so absent a locked-down policy a guest
+> can reach the host's own networks — loopback (`127.0.0.1`), your private LAN,
+> and link-local (incl. the cloud metadata IP `169.254.169.254`). Networking is
+> also **allow-all by default** (no bound policy) and the app ships its firewall
+> disabled. Do **not** treat a sandbox as isolated from your Mac's network until
+> M31.1 (the reserved-address guard) lands. See
+> [`security-model.md`](security-model.md#m31--network-host-isolation--the-reserved-address-boundary).
 
 ```
 guest ──virtio-net──▶ chm userspace NAT ──host socket──▶ internet
-                          │
-                          └─ egress policy (from the control plane)
-                             checked at DNS resolve + TCP connect
+                          │                              (incl. host loopback /
+                          └─ egress policy               LAN / metadata today —
+                             checked at DNS resolve         M31.1 closes that)
+                             + TCP connect
 ```
 
 ## What works today
@@ -31,9 +41,10 @@ guest ──virtio-net──▶ chm userspace NAT ──host socket──▶ int
 | --- | --- |
 | Outbound IPv4 **TCP** (e.g. HTTPS) | ✅ real, via connection-proxy NAT |
 | **DNS** (A-record lookups) | ✅ resolved through the host resolver |
-| **Egress allow-list enforcement** | ✅ at DNS resolve **and** TCP connect |
-| Default-deny (`can't get out` unless allow-listed) | ✅ enforced by not dialing |
-| Denial visibility | ✅ each blocked flow is logged to the console once |
+| **Egress allow-list enforcement** | ✅ at DNS resolve **and** TCP connect, *when a policy is bound* |
+| Default posture | ⚠️ **allow-all** when no policy is bound (the shipping default); default-deny only applies once a policy sets it |
+| Host-network isolation (loopback / LAN / metadata) | ⛔ **not yet** — no reserved-address guard (M31.1) |
+| Denial visibility | ✅ each blocked flow is logged to the console + audit trail once |
 | UDP beyond DNS, IPv6, inbound/listen, ICMP to real hosts | ⛔ out of V0 scope (answered-empty or denied, never silently broken) |
 
 The guest keeps the static address capture-side cloud-init gave it
