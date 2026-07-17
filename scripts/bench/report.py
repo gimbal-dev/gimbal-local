@@ -53,9 +53,9 @@ def fmt(pair):
 
 
 METRIC_LABELS = {
-    "wall_s": "In-guest/container build (s)",
-    "cold_start_s": "Cold start (s)",
-    "host_envelope_s": "Host envelope: rehydrate+build+teardown (s)",
+    "wall_s": "Compute wall-clock (s)",
+    "cold_start_s": "Startup / create (s)",
+    "host_envelope_s": "Host envelope: start+run+teardown (s)",
 }
 
 

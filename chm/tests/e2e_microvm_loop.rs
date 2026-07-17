@@ -649,8 +649,12 @@ fn microvm_xz_benchmark() {
     };
     let trials: usize = env::var("BENCH_TRIALS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
     let n: u64 = env::var("BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(16_000_000);
+    // The single-threaded compressor pipe to time; overridable so the same test
+    // drives the xz (default) or gzip workload for cross-runtime comparison.
+    let pipe = env::var("BENCH_PIPE").unwrap_or_else(|_| "xz -6 -T1 -c".to_string());
+    let workload = env::var("BENCH_WORKLOAD").unwrap_or_else(|_| "xz".to_string());
     let out = env::var("BENCH_OUT")
-        .unwrap_or_else(|_| format!("{}/../scripts/bench/results/gimbal-xz.json", env!("CARGO_MANIFEST_DIR")));
+        .unwrap_or_else(|_| format!("{}/../scripts/bench/results/gimbal-{workload}.json", env!("CARGO_MANIFEST_DIR")));
 
     let shell = "@ch-snap:~$";
     let ncpu = "1"; // demo snapshot is a single vCPU; recorded for the report.
@@ -690,20 +694,20 @@ fn microvm_xz_benchmark() {
         s.drain_for(Duration::from_secs(2));
 
         let uniq = format!("{}_{}", process::id(), nanos());
-        // The same piped workload the Docker side runs: a deterministic `seq`
-        // stream compressed by single-threaded `xz`, output discarded. No temp
-        // file, so no tmpfs RAM pressure and no disk-overlay dependence -- pure
-        // CPU, identical work in both runtimes. The completion tag is emitted via
-        // a shell var ($T) so the *echoed* command line never contains the
-        // contiguous `tag=<uniq>` string we wait on -- only the executed output
-        // does (same trick as the other tests).
+        // The same piped workload the Docker/sbx sides run: a deterministic `seq`
+        // stream compressed by a single-threaded compressor ($BENCH_PIPE), output
+        // discarded. No temp file, so no tmpfs RAM pressure and no disk-overlay
+        // dependence -- pure CPU, identical work across runtimes. The completion
+        // tag is emitted via a shell var ($T) so the *echoed* command line never
+        // contains the contiguous `tag=<uniq>` string we wait on -- only the
+        // executed output does (same trick as the other tests).
         let cmd = format!(
             "T={uniq}; \
              S=$(date +%s.%N); \
-             if seq 1 {n} | xz -6 -T1 -c >/dev/null 2>&1; then OK=1; else OK=0; fi; \
+             if seq 1 {n} | {pipe} >/dev/null 2>&1; then OK=1; else OK=0; fi; \
              E=$(date +%s.%N); \
              W=$(awk -v a=$S -v b=$E 'BEGIN{{printf \"%.3f\", b-a}}'); \
-             echo \"BENCH_RESULT workload=xz wall_s=$W ok=$OK tag=${{T}}\"\n"
+             echo \"BENCH_RESULT workload={workload} wall_s=$W ok=$OK tag=${{T}}\"\n"
         );
         s.send(&cmd);
         let trial_deadline = Instant::now() + Duration::from_secs(200);
@@ -715,7 +719,7 @@ fn microvm_xz_benchmark() {
             (0.0, 0)
         };
         s.shutdown();
-        eprintln!("gimbal xz trial {}/{}: wall_s={wall} ok={ok} host_envelope_s={host_env:.3}", i + 1, trials);
+        eprintln!("gimbal {workload} trial {}/{}: wall_s={wall} ok={ok} host_envelope_s={host_env:.3}", i + 1, trials);
         trial_walls.push((wall, ok, host_env));
     }
 
@@ -730,7 +734,7 @@ fn microvm_xz_benchmark() {
         ));
     }
     let doc = format!(
-        "{{\n  \"runtime\": \"gimbal\",\n  \"workload\": \"xz\",\n  \
+        "{{\n  \"runtime\": \"gimbal\",\n  \"workload\": \"{workload}\",\n  \
          \"host\": {{\"ncpu\": {ncpu}, \"snapshot\": \"{}\"}},\n  \
          \"trials\": [{trials_json}]\n}}\n",
         snapshot.file_name().and_then(|s| s.to_str()).unwrap_or("snapshot")
@@ -739,11 +743,11 @@ fn microvm_xz_benchmark() {
         let _ = fs::create_dir_all(parent);
     }
     fs::write(&out, doc).unwrap_or_else(|e| panic!("write {out}: {e}"));
-    eprintln!("gimbal xz benchmark: wrote {out}");
+    eprintln!("gimbal {workload} benchmark: wrote {out}");
 
     assert!(
         trial_walls.iter().any(|(_, ok, _)| *ok == 1),
-        "no xz trial succeeded in the guest"
+        "no {workload} trial succeeded in the guest"
     );
 }
 
