@@ -630,6 +630,104 @@ fn microvm_probe_toolchain() {
     eprintln!("probe: captured {} bytes of console", transcript.len());
 }
 
+/// Reliability probe for #78 (interactive wedge after a long silent CPU burst).
+///
+/// In a single `chm connect` session, runs a long silent CPU burst then a
+/// follow-up burst, mirroring the back-to-back-compression case that wedged the
+/// benchmark. Because the underlying cause is Apple HVF's internal WFI wait not
+/// reliably waking a freshly-resumed guest (an intermittent, hard hypervisor-
+/// internals issue — see #78/#60), a single run can wedge by chance. So this
+/// retries whole sessions up to `WEDGE_ATTEMPTS` and reports the success rate,
+/// passing if the guest completes a back-to-back-burst session at least once
+/// (proving the path works) and failing only if EVERY attempt wedges (a true
+/// regression). Set `CHM_E2E_LOG` to capture the console of a wedged attempt.
+///
+/// Config (env): `CHM_E2E_SNAPSHOT` (the guest), `WEDGE_N` (burst seq size,
+/// default 16000000 ~ 20s on the 1-vCPU demo), `WEDGE_FOLLOWUPS` (default 2),
+/// `WEDGE_ATTEMPTS` (default 3). The run-progress watchdog (default on) bounds a
+/// wedge into a recoverable crawl; `CHM_DISABLE_RUN_WATCHDOG=1` compares without.
+#[test]
+#[ignore = "needs a local HVF-compatible snapshot; reliability probe for #78"]
+fn microvm_input_wedge_repro() {
+    let Some(snapshot) = snapshot_from_env() else {
+        eprintln!("skipping: set CHM_E2E_SNAPSHOT to a snapshot dir to run the wedge repro");
+        return;
+    };
+    let n: u64 = env::var("WEDGE_N").ok().and_then(|v| v.parse().ok()).unwrap_or(16_000_000);
+    let followups: usize =
+        env::var("WEDGE_FOLLOWUPS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    let attempts: usize =
+        env::var("WEDGE_ATTEMPTS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+
+    let mut successes = 0usize;
+    for attempt in 0..attempts {
+        if wedge_session(&snapshot, n, followups, attempt) {
+            successes += 1;
+        }
+    }
+    eprintln!("wedge-repro: {successes}/{attempts} sessions completed all bursts cleanly");
+    assert!(
+        successes > 0,
+        "guest wedged on EVERY one of {attempts} attempts running back-to-back \
+         CPU bursts in a session -- a real regression of the #78 interactive path"
+    );
+}
+
+/// Run one wedge-probe session: resume, run a burst, then `followups` more
+/// bursts. Returns true iff every burst completed. On a wedge, logs the console
+/// tail (and `CHM_E2E_LOG`, if set) for diagnosis.
+fn wedge_session(snapshot: &Path, n: u64, followups: usize, attempt: usize) -> bool {
+    let shell = "@ch-snap:~$";
+    let overlays = snapshot.join(".chm-overlays");
+    if overlays.is_dir() {
+        for entry in fs::read_dir(&overlays).into_iter().flatten().flatten() {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    let chm = signed_chm_binary();
+    let mut s = PtySession::spawn(
+        &chm,
+        &[
+            "connect",
+            snapshot.to_str().unwrap(),
+            "--no-stop-daemon",
+            "--idle-exit",
+            "0",
+            "--max-seconds",
+            "600",
+        ],
+    );
+    let boot_deadline = Instant::now() + Duration::from_secs(150);
+    login_to_shell(&mut s, shell, boot_deadline);
+    s.drain_for(Duration::from_secs(2));
+
+    let mut wedged = false;
+    // The initial burst plus `followups` more, all back-to-back in one session.
+    // The tag is assembled from a shell var so the *echoed* command never
+    // contains the contiguous `done=<uniq>` string -- only the executed output.
+    for step in 0..=followups {
+        let tag = format!("BURST_{}_{}_{attempt}_{step}", process::id(), nanos());
+        let cmd = format!(
+            "B={tag}; seq 1 {n} | xz -6 -T1 -c >/dev/null 2>&1; echo \"done=${{B}}\"\n"
+        );
+        s.send(&cmd);
+        let ok = s
+            .wait_for(&[&format!("done={tag}")], Instant::now() + Duration::from_secs(120))
+            .is_some();
+        eprintln!("wedge-repro: attempt {} burst {}/{} ok={ok}", attempt + 1, step + 1, followups + 1);
+        if !ok {
+            if let Some(log) = env::var_os("CHM_E2E_LOG") {
+                let _ = fs::write(&log, s.transcript());
+            }
+            eprintln!("wedge-repro: WEDGED; console tail:\n{}", tail(&s.transcript()));
+            wedged = true;
+            break;
+        }
+    }
+    s.shutdown();
+    !wedged
+}
+
 /// M32.2 gimbal-side build/CPU benchmark. Boots the snapshot, logs in, and runs
 /// the SAME deterministic `xz` compression workload the Docker baseline runs
 /// (`scripts/bench/workloads/xz.sh`), timing the compression with the guest's own
