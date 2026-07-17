@@ -6,12 +6,13 @@ wall-clock build time, cold start, and (for gimbal) the rehydrate envelope. Both
 runtimes execute the *identical* inner script, so the only variable is the
 runtime, not the workload.
 
-> **Status: harness ready, no numbers yet.** The Docker side runs today (needs
-> Docker Desktop running). The gimbal side needs a **bench-enabled snapshot** with
-> a build toolchain baked in (the M32.1 provisioning step, #76) — the Mac can only
-> *run* snapshots, not capture them, so that snapshot is produced on a KVM host.
-> This directory deliberately ships **no results**; run it yourself to produce
-> real numbers. Nothing here is fabricated.
+> **Status: harness ready, first real result recorded.** The Docker side and the
+> gimbal side both run today. The gimbal side runs the same workload inside the
+> stock demo snapshot via a PTY-driven integration test (no bench snapshot
+> needed) — see `run-gimbal-e2e.sh`. First measured numbers are in
+> [`RESULTS.md`](RESULTS.md): on an M3, gimbal is within ~2% of Docker on a
+> matched single-core `xz` compression. Raw per-run JSON under `results/` is
+> gitignored; reproduce locally. Nothing is fabricated.
 
 ## Why an existing-style workload
 

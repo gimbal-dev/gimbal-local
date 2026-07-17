@@ -36,6 +36,16 @@ ncpu="$(docker info --format '{{.NCPU}}' 2>/dev/null || echo 0)"
 memb="$(docker info --format '{{.MemTotal}}' 2>/dev/null || echo 0)"
 server="$(docker info --format '{{.ServerVersion}}' 2>/dev/null || echo unknown)"
 
+# Constrain the container to match a gimbal guest's shape for a fair comparison.
+# Defaults match the demo snapshot (1 vCPU / ~1 GiB); override with DOCKER_CPUS /
+# DOCKER_MEMORY, or set them empty to run unconstrained.
+DOCKER_CPUS="${DOCKER_CPUS-1}"
+DOCKER_MEMORY="${DOCKER_MEMORY-1g}"
+limit_args=()
+[ -n "$DOCKER_CPUS" ] && limit_args+=(--cpus "$DOCKER_CPUS")
+[ -n "$DOCKER_MEMORY" ] && limit_args+=(--memory "$DOCKER_MEMORY")
+echo "==> container limits: ${limit_args[*]:-none}" >&2
+
 mkdir -p "$(dirname "$OUT")"
 trials_json=""
 for i in $(seq 1 "$TRIALS"); do
@@ -43,12 +53,12 @@ for i in $(seq 1 "$TRIALS"); do
 
     # Cold-start: time a container that does nothing but start + exit.
     cs_start="$(date +%s.%N)"
-    docker run --rm "$IMAGE" true >/dev/null 2>&1 || true
+    docker run --rm "${limit_args[@]}" "$IMAGE" true >/dev/null 2>&1 || true
     cs_end="$(date +%s.%N)"
     cold="$(awk -v a="$cs_start" -v b="$cs_end" 'BEGIN { printf "%.3f", b - a }')"
 
     # The build trial: parse the BENCH_RESULT line the workload prints.
-    line="$(docker run --rm "$IMAGE" 2>/dev/null | grep '^BENCH_RESULT' || true)"
+    line="$(docker run --rm "${limit_args[@]}" "$IMAGE" 2>/dev/null | grep '^BENCH_RESULT' || true)"
     wall="$(printf '%s' "$line" | sed -n 's/.*wall_s=\([0-9.]*\).*/\1/p')"
     ok="$(printf '%s' "$line" | sed -n 's/.*ok=\([01]\).*/\1/p')"
     wall="${wall:-0}"; ok="${ok:-0}"
@@ -61,6 +71,7 @@ cat > "$OUT" <<EOF
 {
   "runtime": "docker",
   "workload": "${WORKLOAD}",
+  "limits": {"cpus": "${DOCKER_CPUS:-unbounded}", "memory": "${DOCKER_MEMORY:-unbounded}"},
   "host": {"ncpu": ${ncpu}, "mem_bytes": ${memb}, "server_version": "${server}"},
   "trials": [${trials_json}]
 }

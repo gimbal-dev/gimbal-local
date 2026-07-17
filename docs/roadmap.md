@@ -316,24 +316,24 @@ platform compares to the incumbent (Docker Desktop's Linux VM) on the same Mac.
   guest image lacks (container runtime, disk headroom, DNS/egress allow-list for
   package registries under the new default-deny). This is the "actually put an
   agent to work" proof.
-- **M32.2 — benchmark vs Docker sandboxes. Harness shipped (`scripts/bench/`).**
-  A reproducible harness runs the **same** inner build workload inside (a) a
-  Docker Desktop container and (b) a gimbal microVM on the same Mac, N trials,
-  and aggregates wall-clock / cold-start / rehydrate-envelope to markdown with
-  mean ± stddev + a gimbal/Docker ratio. It uses a real pinned software build
-  (Redis by default; drop-in `Dockerfile.<name>` + `workloads/<name>.sh` pairs
-  accommodate the **Phoronix Test Suite** timed builds — `pts/build-linux-kernel`,
-  `build-llvm`, `build-gcc`). The Docker side runs today; the gimbal side needs a
-  bench-enabled snapshot (M32.1) and **fails closed** rather than inventing
-  numbers. No results are committed — reproduce them locally.
-  - *Honest expectations (prior art):* Firecracker/Kata microVMs run ~92–97% of
-    Docker's build throughput for CPU-bound builds, more overhead (~17–20%) for
-    IO/network-heavy multi-stage builds; watch the CoW-overlay I/O and NAT
-    throughput paths for anomalies.
-  - *Gimbal's angle:* the snapshot model can rehydrate a guest **already warm**
-    (deps loaded, caches primed, sitting right before the build) instantly and
-    repeatably, vs a cold container each run — a differentiator to measure, not
-    just a setup cost.
+- **M32.2 — benchmark vs Docker sandboxes. Harness shipped + first result
+  recorded (`scripts/bench/`, `RESULTS.md`).** A reproducible harness runs the
+  **same** inner workload inside a Docker Desktop container and a gimbal microVM
+  on the same Mac, N trials, and aggregates to markdown with mean ± stddev + a
+  gimbal/Docker ratio. The gimbal side runs the workload inside the stock demo
+  snapshot via a PTY-driven integration test (`microvm_xz_benchmark`), so it
+  needs no special snapshot. **First real result (Apple M3, matched 1 vCPU / 1
+  GiB, single-threaded `xz` compression):** gimbal 23.67 ± 0.82 s vs Docker
+  23.17 ± 0.83 s — **gimbal is 1.02x Docker (~2% slower, within noise)**, at or
+  better than the ~1.03–1.09x microVM prior-art band. Warm-checkpoint resume +
+  teardown adds only ~5 s.
+  - *Two findings surfaced:* the stock demo guest has **no C toolchain** (so a
+    real compile benchmark needs a toolchain-provisioned snapshot, M32.1), and a
+    **post-CPU-burst input wedge** where a second command after a long silent
+    compute does not wake the parked vCPU (filed as #78; the benchmark runs each
+    trial in a fresh session to sidestep it).
+  - *Still future:* multi-vCPU / parallel builds, and IO/network-heavy workloads
+    (where microVMs historically lose ~17–20%) to exercise the CoW overlay + NAT.
 
 **On the "snapshot dependency":** gimbal only *rehydrates a snapshot* — there is
 no boot-from-scratch path — so the microVM you build in **is** a snapshot; it is a
