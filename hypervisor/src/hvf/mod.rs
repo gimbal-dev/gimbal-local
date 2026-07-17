@@ -280,6 +280,7 @@ impl Vm for HvfVm {
             vm_ops,
             kick,
             vtimer_offset: AtomicU64::new(0),
+            run_gen: Arc::new(AtomicU64::new(0)),
         }))
     }
 
@@ -450,6 +451,14 @@ pub struct HvfVcpu {
     /// reliably through `hv_vcpu_get_sys_reg` once the vCPU is forced out of
     /// `run()`. Defaults to 0, matching a freshly created vCPU's counter.
     vtimer_offset: AtomicU64,
+    /// Monotonic counter bumped once per `run()` iteration. A host-side watchdog
+    /// samples it to tell a vCPU that is making progress (returning from
+    /// `hv_vcpu_run` for exits) apart from one wedged inside a single
+    /// `hv_vcpu_run` call — e.g. blocked in Apple's internal WFI wait
+    /// (`wait_for_interrupt`) on a deadline it is not honouring. When the counter
+    /// stalls the watchdog forces the vCPU out via [`Self::exit_signal`] so it
+    /// re-enters and Apple re-evaluates pending interrupts / the timer deadline.
+    run_gen: Arc<AtomicU64>,
 }
 
 // SAFETY: HVF requires a vCPU to be created and run on the same thread; the VMM
@@ -640,6 +649,40 @@ impl HvfVcpu {
         let remaining_ns = (remaining_ticks as u128) * (tb.numer as u128) / (tb.denom as u128);
         let remaining_ms = (remaining_ns / 1_000_000) as i64;
         remaining_ms.clamp(1, WFI_IDLE_POLL_MS as i64) as i32
+    }
+
+    /// After a watchdog-forced exit, unmask the virtual timer (HVF host-side) if
+    /// the guest has it enabled, so the managed GIC re-evaluates and delivers
+    /// PPI 27 on re-entry. HVF auto-masks the vtimer when it surfaces an
+    /// activation, so a guest whose scheduler tick stalled during an idle
+    /// transition (e.g. the cloud-init `serial-getty` restart) can sit with the
+    /// timer host-masked while Apple's internal WFI wait never redelivers it;
+    /// unmasking here breaks that wedge. Idempotent when already unmasked, so it
+    /// is safe to call on every forced exit (including a busy compute burst or a
+    /// teardown stop). Reads `CNTV_CTL`/`CNTV_CVAL` on the owning thread (valid
+    /// here — the vCPU is out of `hv_vcpu_run`) and derives the counter via
+    /// [`current_cntvct`] for the diagnostic.
+    fn unmask_vtimer_after_cancel(&self) {
+        const CNTV_CTL_EL0: u16 = 0xDF19;
+        const CNTV_CVAL_EL0: u16 = 0xDF1A;
+        let ctl = self.get_sysreg(CNTV_CTL_EL0).unwrap_or(0);
+        let enabled = ctl & 1 != 0;
+        let guest_masked = ctl & 2 != 0;
+        if !enabled || guest_masked {
+            return;
+        }
+        if std::env::var("CHM_TRACE_WATCHDOG").is_ok() {
+            let cval = self.get_sysreg(CNTV_CVAL_EL0).unwrap_or(0);
+            let now = self.current_cntvct();
+            let delta = (cval as i64).wrapping_sub(now as i64);
+            eprintln!(
+                "[watchdog] vcpu {} forced exit; unmask vtimer CVAL={cval:#x} CNTVCT={now:#x} \
+                 cval_minus_cntvct={delta} ({})",
+                self.index,
+                if delta <= 0 { "OVERDUE" } else { "pending" }
+            );
+        }
+        let _ = gic::rearm_vtimer(self.id);
     }
 
     fn set_icc_reg(&self, reg: u16, val: u64) -> CpuResult<()> {
@@ -981,7 +1024,16 @@ impl Vcpu for HvfVcpu {
         }))
     }
 
+    fn run_progress(&self) -> Option<Arc<AtomicU64>> {
+        Some(self.run_gen.clone())
+    }
+
     fn run(&mut self) -> std::result::Result<VmExit, HypervisorCpuError> {
+        // Signal forward progress to the host-side run watchdog: each entry into
+        // run() bumps this. A vCPU wedged inside a single hv_vcpu_run call (e.g.
+        // Apple's internal WFI wait not honouring its deadline) stops bumping it,
+        // which the watchdog detects and breaks by forcing an exit.
+        self.run_gen.fetch_add(1, Ordering::Relaxed);
         // SAFETY: FFI on the owning thread.
         let ret = unsafe { hv_vcpu_run(self.id) };
         if ret != HV_SUCCESS {
@@ -1166,7 +1218,20 @@ impl Vcpu for HvfVcpu {
                 }
                 Ok(VmExit::Ignore)
             }
-            HV_EXIT_REASON_CANCELED => Ok(VmExit::Ignore),
+            HV_EXIT_REASON_CANCELED => {
+                // A cross-thread `hv_vcpus_exit` forced this return. Two sources:
+                // a host-side stop (teardown) or the run watchdog breaking a vCPU
+                // wedged inside a single `hv_vcpu_run` — typically Apple's
+                // internal WFI wait (`wait_for_interrupt`) failing to honour a due
+                // virtual-timer deadline during an idle transition (e.g. the
+                // cloud-init `serial-getty` restart). If the timer is enabled,
+                // unmasked, and already overdue, re-arm it so the managed GIC
+                // redelivers PPI 27 on re-entry and the guest's scheduler tick
+                // resumes. Same redelivery as the VTIMER_ACTIVATED path, applied
+                // when we (not HVF) surfaced the exit.
+                self.unmask_vtimer_after_cancel();
+                Ok(VmExit::Ignore)
+            }
             other => Err(HypervisorCpuError::RunVcpu(anyhow!(
                 "unexpected HVF exit reason: {other}"
             ))),
