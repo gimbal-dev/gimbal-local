@@ -1,0 +1,34 @@
+# Dockerfile.redis — provisions the Docker side of the M32.2 build benchmark.
+#
+# It bakes a pinned Redis source tree + the build toolchain into the image, so a
+# container run is a pure compile (no network fetch inside the timed section).
+# The SAME `workloads/redis.sh` that a gimbal guest runs is copied in here, so
+# both runtimes execute identical build steps.
+#
+# Pin both the base image (by tag; pin by digest for full reproducibility) and
+# the Redis version so re-runs measure the same amount of work.
+FROM debian:bookworm-slim
+
+ARG REDIS_VERSION=7.4.1
+ENV BENCH_SRC=/opt/bench/redis
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Fetch + unpack the source at build time (untimed provisioning), so the
+# container run itself needs no network.
+RUN mkdir -p /opt/bench \
+    && curl -fsSL "https://download.redis.io/releases/redis-${REDIS_VERSION}.tar.gz" \
+        -o /tmp/redis.tar.gz \
+    && tar -xzf /tmp/redis.tar.gz -C /opt/bench \
+    && mv "/opt/bench/redis-${REDIS_VERSION}" "$BENCH_SRC" \
+    && rm /tmp/redis.tar.gz
+
+COPY workloads/redis.sh /opt/bench/redis.sh
+RUN chmod +x /opt/bench/redis.sh
+
+# The container prints the BENCH_RESULT line and exits; the harness parses it.
+CMD ["/opt/bench/redis.sh"]

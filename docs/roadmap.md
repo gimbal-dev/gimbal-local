@@ -316,15 +316,16 @@ platform compares to the incumbent (Docker Desktop's Linux VM) on the same Mac.
   guest image lacks (container runtime, disk headroom, DNS/egress allow-list for
   package registries under the new default-deny). This is the "actually put an
   agent to work" proof.
-- **M32.2 — benchmark vs Docker sandboxes.** Use an **existing, standardized**
-  build benchmark rather than a bespoke one — the **Phoronix Test Suite** timed
-  builds (`pts/build-linux-kernel`, `pts/build-llvm`, `build-gcc`, …) download →
-  configure → build → time reproducibly and publish to OpenBenchmarking.org, and
-  run *identically* inside a Docker container and a gimbal guest. Optionally add a
-  real `docker build` of a well-known OSS image for the "docker build
-  specifically" angle. A harness runs the same workload inside (a) Docker Desktop
-  and (b) a gimbal microVM on the same host, reporting **wall-clock, cold-start /
-  rehydrate time, CPU, memory, disk I/O**, mean ± stddev over N trials.
+- **M32.2 — benchmark vs Docker sandboxes. Harness shipped (`scripts/bench/`).**
+  A reproducible harness runs the **same** inner build workload inside (a) a
+  Docker Desktop container and (b) a gimbal microVM on the same Mac, N trials,
+  and aggregates wall-clock / cold-start / rehydrate-envelope to markdown with
+  mean ± stddev + a gimbal/Docker ratio. It uses a real pinned software build
+  (Redis by default; drop-in `Dockerfile.<name>` + `workloads/<name>.sh` pairs
+  accommodate the **Phoronix Test Suite** timed builds — `pts/build-linux-kernel`,
+  `build-llvm`, `build-gcc`). The Docker side runs today; the gimbal side needs a
+  bench-enabled snapshot (M32.1) and **fails closed** rather than inventing
+  numbers. No results are committed — reproduce them locally.
   - *Honest expectations (prior art):* Firecracker/Kata microVMs run ~92–97% of
     Docker's build throughput for CPU-bound builds, more overhead (~17–20%) for
     IO/network-heavy multi-stage builds; watch the CoW-overlay I/O and NAT

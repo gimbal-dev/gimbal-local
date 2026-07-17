@@ -23,3 +23,6 @@ __pycache__
 **/.chm-revisions/
 **/.chm-checkpoint/
 /.chm-workspaces/
+
+# bench python cache
+scripts/bench/__pycache__/
