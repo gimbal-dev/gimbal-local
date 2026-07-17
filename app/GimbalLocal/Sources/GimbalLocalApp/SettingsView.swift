@@ -43,14 +43,18 @@ private struct DefaultsSettingsTab: View {
                     .disabled(!model.globalDefaults.limits.enabled)
                 OptionalIntRow(label: "Max memory", unit: "MiB", value: $model.globalDefaults.limits.maxMemoryMb)
                     .disabled(!model.globalDefaults.limits.enabled)
+                OptionalIntRow(label: "Max connections", unit: "", value: $model.globalDefaults.limits.maxConnections)
+                    .disabled(!model.globalDefaults.limits.enabled)
+                OptionalIntRow(label: "Max bandwidth", unit: "kbps", value: $model.globalDefaults.limits.maxBandwidthKbps)
+                    .disabled(!model.globalDefaults.limits.enabled)
             }
 
             Section("Connectivity") {
                 Toggle("Apply default firewall to new sandboxes", isOn: $model.globalDefaults.firewall.enabled)
                 Picker("Default egress", selection: $model.globalDefaults.firewall.mode) {
-                    Text("Open (unrestricted)").tag(DefaultEgressMode.open)
+                    Text("Open (public egress)").tag(DefaultEgressMode.open)
                     Text("No network").tag(DefaultEgressMode.noNetwork)
-                    Text("Allow-list").tag(DefaultEgressMode.allowlist)
+                    Text("Allow-list (default-deny)").tag(DefaultEgressMode.allowlist)
                 }
                 .disabled(!model.globalDefaults.firewall.enabled)
 
@@ -58,7 +62,7 @@ private struct DefaultsSettingsTab: View {
                     AllowListEditor(rules: $model.globalDefaults.firewall.allow)
                         .disabled(!model.globalDefaults.firewall.enabled)
                 }
-                Text("Applied only to new sandboxes; a sandbox's own Connectivity setting overrides it.")
+                Text("New sandboxes default to allow-list mode with no rules — no public egress until you add destinations. Host loopback, your LAN, and link-local metadata (169.254.169.254) are always blocked regardless of this setting. Applied only to new sandboxes; a sandbox's own Connectivity setting overrides it.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

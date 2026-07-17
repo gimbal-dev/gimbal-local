@@ -483,17 +483,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "cloud-hypervisor-mac"
-version = "0.1.0"
-dependencies = [
- "hypervisor",
- "libc",
- "ring",
- "serde",
- "serde_json",
-]
-
-[[package]]
 name = "colorchoice"
 version = "1.0.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1053,6 +1042,17 @@ dependencies = [
  "rand_core 0.10.1",
  "wasip2",
  "wasip3",
+]
+
+[[package]]
+name = "gimbal-local"
+version = "0.1.0"
+dependencies = [
+ "hypervisor",
+ "libc",
+ "ring",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

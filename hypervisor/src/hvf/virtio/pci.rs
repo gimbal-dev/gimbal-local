@@ -305,6 +305,17 @@ impl VirtioPciDevice {
     pub fn service_net(&self) -> bool {
         self.inner.lock().unwrap().service_net()
     }
+
+    /// Drain the net backend's accumulated egress-decision events for the audit
+    /// trail. Empty for a non-net device or a responder that makes no policy
+    /// decisions.
+    pub fn drain_egress_events(&self) -> Vec<super::nat::EgressEvent> {
+        let mut inner = self.inner.lock().unwrap();
+        match &mut inner.backend {
+            Backend::Net(n) => n.drain_egress_events(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 impl Inner {

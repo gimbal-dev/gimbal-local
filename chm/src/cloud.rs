@@ -9,9 +9,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
 use std::env;
 
-const DEFAULT_PROJECT: &str = "cloud-hypervisor-mac";
+const DEFAULT_PROJECT: &str = "gimbal-local";
 const DEFAULT_INSTANCE_TYPE: &str = "c7g.metal";
-const DEFAULT_PREFIX: &str = "cloud-hypervisor-mac/";
+const DEFAULT_PREFIX: &str = "gimbal-local/";
 const ON_DEMAND_STANDARD_QUOTA: &str = "L-1216C47A";
 
 pub(crate) fn cloud_main(raw: &[String]) -> ExitCode {
@@ -133,8 +133,8 @@ fn usage() -> String {
          --profile NAME           AWS CLI profile to use.\n    \
          --region REGION          AWS region to use.\n    \
          --bucket NAME            S3 snapshot bucket.\n    \
-         --prefix PREFIX          S3 object prefix (default cloud-hypervisor-mac/).\n    \
-         --project VALUE          Project tag value (default cloud-hypervisor-mac).\n    \
+         --prefix PREFIX          S3 object prefix (default gimbal-local/).\n    \
+         --project VALUE          Project tag value (default gimbal-local).\n    \
          --instance-type TYPE     Capture host type to check (default c7g.metal).\n\
      \n\
      TRANSFER OPTIONS:\n    \
@@ -821,7 +821,7 @@ mod tests {
         assert_eq!(args.from_local.as_deref(), Some(Path::new("returns")));
         assert_eq!(
             return_uri("bucket", &args.prefix, "snap1"),
-            "s3://bucket/cloud-hypervisor-mac/returns/snap1/"
+            "s3://bucket/gimbal-local/returns/snap1/"
         );
     }
 

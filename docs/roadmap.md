@@ -160,10 +160,14 @@ them. Full model + plan: [`security-model.md`](security-model.md).
   manifest relpath confinement in `materialize_bundle`.
 - **M30.2 (#34, P0) — shipped.** Daemon socket hardening: private `0700` dir,
   `0600` socket, and a peer-uid (`getpeereid`) check before
-  start/stop/console/shutdown.
+  start/stop/console/shutdown. Follow-up #66 shipped: a pre-existing runtime dir
+  is rejected unless the current user owns it, and self-owned dirs left too open
+  are tightened back to `0700`.
 - **M30.3 (#35, P0) — shipped.** App command safety: a pure, single-quoting
   `InteractiveTerminalCommand` builder that rejects control characters (the
-  snapshot-name vector was already removed).
+  snapshot-name vector was already removed). Follow-up #67 shipped: the command
+  is handed to `osascript` as an `argv` parameter, dropping the AppleScript
+  string-literal escaping layer.
 - **M30.4 (#36, P1) — verification shipped.** Ed25519 signed-manifest
   verification in `chm` (trust store via `CHM_TRUST_STORE`, key ids + rotation),
   fail-closed when configured, plus a `chm manifest keygen|sign|verify` reference
@@ -172,11 +176,13 @@ them. Full model + plan: [`security-model.md`](security-model.md).
 - **M30.5 (#37, P1) — shipped.** The **no host-FS-passthrough** invariant is
   explicit: a behavioural test proves virtio-fs/9p classify as `Unsupported`,
   and `make security-check` fails if host-FS wiring appears without review.
-- **M30.6 (#38, P2) — core shipped.** Per-sandbox resource limits: a launch
+- **M30.6 (#38, P2) — shipped.** Per-sandbox resource limits: a launch
   gate (vCPU/mem ceiling) + a run-loop monitor that stops a runaway on disk
-  overlay / console / wall-clock caps, authored with `chm limits` and applied to
-  new sandboxes by the app's sane global defaults. Network connection/bandwidth
-  caps at the NAT are the remaining slice.
+  overlay / console / wall-clock caps, plus NAT `max_connections` /
+  `max_bandwidth_kbps` caps enforced on the egress datapath (over-limit SYN
+  refused + audited; bandwidth throttled via token-bucket backpressure).
+  Authored with `chm limits` and applied to new sandboxes by the app's sane
+  global defaults.
 - **M30.7 (#39)** — the threat model + hardening checklist (this doc set).
 - **M30.8 (P0) — shipped.** CAS digest hardening: a manifest checksum is
   validated as a canonical sha256 hex digest before it is used as a
@@ -191,7 +197,33 @@ policy, a bundle must not escape the host and the daemon must not be hijackable.
 Its network item converges with M28's firewall enforcement (same datapath); its
 signing item makes M26's displayed provenance cryptographically verified.
 
-### M27 · Plane-native edge — branching filesystem + lazy load
+### M31 · Network host-isolation — the reserved-address boundary
+
+**The new critical priority** (2026-07-16 adversarial review). M28/M30.9 built a
+*policy* gate on egress, but the userspace NAT still relays a permitted flow
+through a real host socket — so a guest can reach the **host's own networks**
+(loopback, private LAN, link-local `169.254.169.254` metadata), reachable
+**by default** (allow-all when no policy is bound; the app firewall ships off),
+and bypassable in allow-list mode via **DNS rebinding**. This is a host-boundary
+break even without filesystem access. Full findings + plan:
+[`security-model.md`](security-model.md#m31--network-host-isolation--the-reserved-address-boundary).
+
+- **M31.1 (P0, #75)** — reserved-address guard in the NAT: deny loopback / RFC1918 /
+  link-local / other special-use ranges independently of the policy, re-check the
+  *resolved* IP at connect (closes DNS rebinding), drop DNS answers resolving into
+  reserved ranges, with an explicit opt-in for deliberate localhost access.
+  **Shipped.**
+- **M31.2 (P1)** — safe default posture: the app ships the firewall on in
+  default-deny (allow-list) mode, so a new sandbox has no public egress until
+  allow-listed (host/LAN always blocked by M31.1). **Shipped.**
+- **M31.3 (P1)** — correct the overstated network docs to match enforcement.
+- **M31.4 (P2)** — document the cloud/KVM path + external capture-harness
+  boundary (security-model § "Out of scope" + the BYO capture runbook).
+  **Shipped.**
+- **M31.5 (P1)** — signing fail-closed default + digest recompute enforcement
+  (folds into #36).
+
+
 
 Pillar ②'s deep, plane-coupled half:
 
@@ -261,11 +293,57 @@ before guest egress can be exercised end-to-end on real HVF.
 
 ### M29 · Observability & cost — logging, insights, both sides
 
-Pillar ④. Local sandboxes emit the **same** structured logs + usage events
-(cpu-seconds, wall-time, memory, bytes faulted) through the runner's
-report-state / push-artifacts path, so insights and cost accounting are uniform
-regardless of where a session ran. The app already reads the plane's read-only
-cost/health panel; the rest waits on the gctl telemetry/cost event contract.
+Pillar ④. **Local audit trail shipped:** every sandbox writes a durable,
+append-only `audit.jsonl` (session start/stop with shape + outcome, denied
+egress flows, and bundle-verify decisions), readable with `chm audit show`, so an
+operator can review what a sandbox did independent of the guest-floodable
+console. The remaining half is the shared telemetry/cost contract: local
+sandboxes emit the **same** structured usage events (cpu-seconds, wall-time,
+memory, bytes faulted) through the runner's report-state / push-artifacts path,
+so insights and cost accounting are uniform regardless of where a session ran.
+The app already reads the plane's read-only cost/health panel; the rest waits on
+the gctl telemetry/cost event contract.
+
+### M32 · Agent workloads + benchmark vs Docker (#76)  **[the next pivot]**
+
+With the local runtime and host-isolation complete, the next thrust is putting
+**real agents/workloads to work inside gimbal microVMs** and measuring how the
+platform compares to the incumbent (Docker Desktop's Linux VM) on the same Mac.
+
+- **M32.1 — agent workload readiness.** Prove a representative dev/agent loop runs
+  end to end inside a gimbal sandbox: clone a repo, install deps, build, run
+  tests, and (nested) `docker build` inside the guest. Shake out anything the
+  guest image lacks (container runtime, disk headroom, DNS/egress allow-list for
+  package registries under the new default-deny). This is the "actually put an
+  agent to work" proof.
+- **M32.2 — benchmark vs Docker sandboxes.** Use an **existing, standardized**
+  build benchmark rather than a bespoke one — the **Phoronix Test Suite** timed
+  builds (`pts/build-linux-kernel`, `pts/build-llvm`, `build-gcc`, …) download →
+  configure → build → time reproducibly and publish to OpenBenchmarking.org, and
+  run *identically* inside a Docker container and a gimbal guest. Optionally add a
+  real `docker build` of a well-known OSS image for the "docker build
+  specifically" angle. A harness runs the same workload inside (a) Docker Desktop
+  and (b) a gimbal microVM on the same host, reporting **wall-clock, cold-start /
+  rehydrate time, CPU, memory, disk I/O**, mean ± stddev over N trials.
+  - *Honest expectations (prior art):* Firecracker/Kata microVMs run ~92–97% of
+    Docker's build throughput for CPU-bound builds, more overhead (~17–20%) for
+    IO/network-heavy multi-stage builds; watch the CoW-overlay I/O and NAT
+    throughput paths for anomalies.
+  - *Gimbal's angle:* the snapshot model can rehydrate a guest **already warm**
+    (deps loaded, caches primed, sitting right before the build) instantly and
+    repeatably, vs a cold container each run — a differentiator to measure, not
+    just a setup cost.
+
+**On the "snapshot dependency":** gimbal only *rehydrates a snapshot* — there is
+no boot-from-scratch path — so the microVM you build in **is** a snapshot; it is a
+one-time "provision a Docker/toolchain guest, then capture it" step (local-doable
+on a KVM host), not an external blocker. If the build inputs are **baked into the
+guest image**, the build runs **offline** and needs no network / net-enabled
+snapshot (#52); network is only needed for realistic pull-at-build-time runs.
+
+Both parts are local-doable and do not depend on the control plane. They also
+stress the security posture (egress allow-list vs. registries; disk/console caps
+vs. real builds), so they double as end-to-end validation of M30/M31.
 
 ---
 
@@ -286,21 +364,41 @@ cost/health panel; the rest waits on the gctl telemetry/cost event contract.
 
 Progress lives in the
 [GitHub milestones](https://github.com/gimbal-dev/gimbal-local/milestones)
-`M25`–`M30`, one per remaining capability, with the cross-repo handoff issues
-above. **M30 (security hardening) is the immediate priority and precedes M27.**
-The four pillars are the V0 capability contract (issue #21); each pillar is
-only "done" when it is enforced identically on both substrates.
+`M25`–`M31`, one per remaining capability, with the cross-repo handoff issues
+above. **The security track (M30 + M31) is substantially complete** — the local
+host boundary (filesystem, network, resource, daemon) holds; the remaining
+security work is cross-repo (snapshot signing, #36) or distribution notarisation.
+Feature work (M27 plane-native edge) is the next major thrust. The four pillars
+are the V0 capability contract (issue #21); each pillar is only "done" when it is
+enforced identically on both substrates.
 
-### What comes next (crisp view, 2026-07-15)
+### What comes next (crisp view, 2026-07-16)
 
-- **Security (priority):** M30.4 signed manifest + trust root (#36, P1 — the
-  largest missing trust feature) → M30.6 resource limits (#38, P2) → the two
-  follow-ups M30.2 runtime-dir ownership (#66) and M30.3 direct-argv (#67).
-- **Open bugs:** rollback does not revert the disk overlay (#62); engine shows
-  idle while sandboxes are alive (#61).
+- **The pivot — M32 agent workloads + benchmark vs Docker.** Local runtime +
+  host-isolation are complete, so the next thrust is putting real agent/dev
+  workloads to work inside gimbal microVMs (M32.1) and a reproducible benchmark
+  of the same `docker build` / compile job inside a gimbal microVM vs Docker
+  Desktop's Linux VM on the same Mac (M32.2). Local-doable; doubles as end-to-end
+  validation of the M30/M31 security posture.
+- **Security — M31.1, M31.2, M31.3, M31.4 SHIPPED.** The NAT reserved-address
+  guard (M31.1) denies loopback / private LAN / link-local (`169.254.169.254`)
+  regardless of policy, re-checks resolved IPs (closes DNS rebinding), and drops
+  reserved DNS answers. The app now defaults new sandboxes to firewall-on
+  **default-deny** (M31.2), so there is no public egress until allow-listed; the
+  network docs were corrected (M31.3) and the cloud/capture-harness boundary
+  documented (M31.4). Opt out of the host guard with `--allow-local-egress`. The
+  only remaining M31 item is the signing fail-closed default (M31.5), which folds
+  into #36.
+- **Security (also open):** M30.4 signed manifest + trust root (#36, P1) —
+  `chm` verification ships; gctl signing + a fail-closed default (M31.5) is the
+  remaining half. Distribution notarisation is still unchecked.
 - **Demo gap:** the live in-guest firewall demo (#52) is blocked only on a
-  net-enabled snapshot; authoring + enforcement already ship.
+  net-enabled snapshot; authoring + enforcement already ship. A cloud-side
+  capture-capability request is filed (`gimbal-cloud-control#4`).
 - **Cross-repo (CP) handoffs:** #4/#5/#6 (checkpoint/postcopy/fork phases),
   #20 (policy plane), #21 (V0 pillar alignment).
 - **Recently shipped + closed:** interactive console freeze (#60), CAS digest
-  hardening (#64), per-NIC fail-closed egress (#65).
+  hardening (#64) + per-NIC fail-closed egress (#65), disk-overlay rollback (#62)
+  + live engine/revision UI (#61/#69), durable session registry (#71), resource
+  limits + NAT caps (#38), the #66/#67 security follow-ups, and the M29 audit
+  trail.

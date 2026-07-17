@@ -1,22 +1,22 @@
 #!/usr/bin/env bash
 #
-# Destructive AWS cleanup for cloud-hypervisor-mac BYO-subscription experiments.
+# Destructive AWS cleanup for gimbal-local BYO-subscription experiments.
 #
 # Default mode is dry-run. To actually delete resources, pass BOTH:
 #
 #   --execute --yes
 #
 # The script is intentionally tag-scoped. It only targets EC2 resources tagged
-# with Project=<value> (default: cloud-hypervisor-mac). S3 cleanup is opt-in via
+# with Project=<value> (default: gimbal-local). S3 cleanup is opt-in via
 # --bucket and --delete-bucket.
 
 set -euo pipefail
 
-PROJECT_TAG="cloud-hypervisor-mac"
+PROJECT_TAG="gimbal-local"
 PROFILE="${AWS_PROFILE:-}"
 REGION="${AWS_REGION:-}"
 BUCKET=""
-PREFIX="cloud-hypervisor-mac/"
+PREFIX="gimbal-local/"
 EXECUTE=0
 YES=0
 WAIT=1
@@ -34,7 +34,7 @@ Actually delete tagged resources:
 
 Also delete S3 artifacts:
   scripts/aws-cleanup-chm.sh --profile chm-aws --region us-east-1 \
-    --bucket my-chm-bucket --prefix cloud-hypervisor-mac/ --execute --yes
+    --bucket my-chm-bucket --prefix gimbal-local/ --execute --yes
 
 Delete the bucket itself too:
   scripts/aws-cleanup-chm.sh --profile chm-aws --region us-east-1 \
@@ -43,9 +43,9 @@ Delete the bucket itself too:
 Options:
   --profile NAME       AWS CLI profile to use.
   --region REGION     AWS region to clean.
-  --project VALUE     Tag value for Project=<VALUE>. Default: cloud-hypervisor-mac.
+  --project VALUE     Tag value for Project=<VALUE>. Default: gimbal-local.
   --bucket NAME       Optional S3 bucket to empty under --prefix.
-  --prefix PREFIX     S3 prefix to delete. Default: cloud-hypervisor-mac/.
+  --prefix PREFIX     S3 prefix to delete. Default: gimbal-local/.
   --delete-bucket     Delete --bucket after emptying the prefix/bucket.
   --no-wait           Do not wait for EC2 instance/NAT gateway termination.
   --execute           Perform deletion. Without this, the script only prints.

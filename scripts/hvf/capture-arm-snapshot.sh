@@ -192,8 +192,14 @@ while [ "$(date +%s)" -lt "$deadline" ]; do
     die "guest VMM died before snapshot"
   fi
   if grep -q "$MARKER" "$SERIAL_LOG" 2>/dev/null; then booted=1; break; fi
-  # Fallback signal: a late-boot systemd target also means the GIC is live.
-  if grep -qiE "Reached target .*(Multi-User|Cloud-init|Login)" "$SERIAL_LOG" 2>/dev/null; then
+  # Fallback: cloud-init has FULLY finished. This is the only other signal that
+  # is safe to snapshot on, because the "finished" banner is printed after
+  # `modules:final` completes — i.e. after our runcmd has run, restarted the
+  # getty, and echoed $MARKER. A bare "Reached target ..." is NOT safe:
+  # cloud-init.target / multi-user.target are reached BEFORE cloud-final runs the
+  # runcmd, so snapshotting then can catch the guest mid getty-restart and wedge
+  # the captured state on resume.
+  if grep -qE "Cloud-init v.* finished" "$SERIAL_LOG" 2>/dev/null; then
     booted=1; break
   fi
   sleep 2

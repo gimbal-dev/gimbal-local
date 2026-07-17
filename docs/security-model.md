@@ -73,10 +73,34 @@ takes priority over the remaining feature milestones (it precedes M27).
 - **HVF / Apple silicon hypervisor escapes.** We rely on the platform VM
   boundary; if HVF is broken, so are we. We minimise our own attack surface but
   do not re-implement the CPU/memory isolation.
+- **Escape-response posture.** A guest-level compromise — a hostile agent
+  breaking out of its own userspace into the *guest kernel* — is assumed
+  **contained by the HVF VM boundary**: the guest is a real hardware-isolated VM,
+  not a shared-kernel container, so an in-guest attacker cannot reach host files,
+  other sandboxes, or the daemon *through the VM*. The escape we actively defend
+  is the **bundle-driven host-file** path — a crafted snapshot / manifest / disk
+  reaching a host file before or around the VM — closed by bundle confinement
+  (M30.1), the CAS digest gate (M30.8), and the no-host-FS invariant (I1). A break
+  of HVF itself (first bullet) defeats this assumption.
 - **Side channels** (timing, cache, Spectre-class) between guest and host.
 - **Physical access / a compromised macOS account** running as the user.
 - **The control plane's own security** — owned by `gimbal-cloud-control`; we
   consume its trust root (M30.4) but do not audit its internals here.
+- **The cloud/KVM capture path and its harness** (M31.4). Everything in this
+  document — bundle confinement, the reserved-address network guard, resource
+  limits, the audit trail — governs the **macOS / HVF runtime in this repo**. The
+  *capture* side (producing a snapshot on a Linux/KVM host, e.g. the BYO EC2
+  harness in [`aws-byo-setup.md`](aws-byo-setup.md)) runs **outside this
+  repository** and is **not** covered by these guarantees:
+  - the capture host holds EC2/S3 credentials and can reach the cloud
+    instance-metadata endpoint (`169.254.169.254`), so a workload captured there
+    is only as isolated as that host and its IAM policy make it;
+  - the network guarantees (I10 / M31.1) apply to the local NAT datapath, not to
+    how the guest reached the network while it was being captured on KVM;
+  - a snapshot is trusted on the Mac only via the signed-manifest chain (M30.4);
+    the capture harness itself must be audited in its own repo.
+  Treat a snapshot as trustworthy only to the extent you trust the host that
+  captured it and the signature over its manifest.
 
 ---
 
@@ -96,6 +120,7 @@ test/guard so a regression is caught, not discovered.
 | I7 | **Undeliverable snapshots are refused, not mis-run.** ITS/LPI snapshots fail loudly at the load guard and the `assign-run` 422 gate. | `its_lpi_guard` + plane gate. | **Holds today** |
 | I8 | **The content store cannot select a host file.** A manifest checksum is only ever used as a CAS path after it is validated as a canonical sha256 hex digest, and every CAS object (including cache hits) is re-hashed before it is linked into a guest. | Digest-shape gate + re-hash on hit in `materialize_bundle`. | **Holds today** (M30.8) |
 | I9 | **A governed session's egress is enforced on every NIC and fails closed.** The resolved policy applies to all virtio-net NICs, and a session whose policy source is present but unresolvable denies all egress rather than running open. | Per-NIC policy clone + `EgressResolution::FailClosed` deny-all. | **Holds today** (M30.9) |
+| I10 | **A guest cannot reach the host's own networks.** No sandbox flow reaches loopback, RFC1918 LAN, link-local (incl. `169.254.169.254`), or other special-use ranges, regardless of policy or DNS answers, unless local egress is explicitly opted in or the trusted policy names the exact IP. | Reserved-address guard in the NAT: `decide_connect` denies reserved IPs before the allow rules (IP-literal allow or `--allow-local-egress` excepted); DNS answers resolving into reserved ranges are dropped. | **Holds today** (M31.1) |
 
 ---
 
@@ -266,28 +291,69 @@ set`) bounds a sandbox's resources, enforced in the run loop:
 - **App defaults:** Gimbal Local ships sane global defaults (an 8 GiB disk +
   64 MiB console cap on by default) applied to every new sandbox's workspace, so
   a runaway can't exhaust the host out of the box.
+- **Network caps (NAT datapath):** `max_connections` bounds the concurrent
+  outbound TCP flows the guest may hold open (a SYN over the cap is refused like
+  a policy denial and audited as `connection-limit`, so a permitted destination
+  can't be used to exhaust host sockets), and `max_bandwidth_kbps` bounds
+  sustained egress throughput via a token bucket that *throttles* (TCP
+  backpressure slows the guest) rather than dropping. The cap applies to every
+  NIC, matching the per-NIC fail-closed egress policy (M30.9).
 
 Verified end to end: a guest running `dd if=/dev/zero` was stopped after ~64 MiB
-against a 64 MiB cap.
+against a 64 MiB cap; the NAT connection and bandwidth caps are proven by the
+two-stack relay test (a real guest smoltcp stack moving bytes through the NAT to
+a real localhost server) — an over-limit SYN is refused, and a tightly-capped
+flow moves dramatically fewer bytes than an unthrottled one over the same window.
 
-**Remaining.** Network **connection-count** and **bandwidth** caps enforced at
-the userspace NAT (the datapath already sees every flow) are the next slice; they
-were listed in the review but are not in the shipped core.
-
-### M30.2 daemon follow-up · runtime-dir ownership  **[P1, daemon]**
+### M30.2 daemon follow-up · runtime-dir ownership  **[P1, daemon] — shipped**
 
 **Finding (2026-07 review).** The socket dir is created private `0700` with a
-`0600` socket + peer-uid check, but a **pre-existing** runtime directory is not
-fully validated. **Plan.** Reject a pre-existing runtime dir unless it is owned
-by the current UID with exact safe permissions, so a planted dir can't
-pre-seed/interpose.
+`0600` socket + peer-uid check, but a **pre-existing** runtime directory was not
+fully validated. **Fixed (#66).** `ensure_private_runtime_dir` now, when the
+runtime dir already exists, rejects it outright if it is owned by another UID (a
+directory planted by another user in the shared temp root must not host the
+control socket) and tightens a self-owned directory back to `0700` if its
+permissions were left loose, so group/other can never interpose. Symlinks at the
+path are still refused. Covered by a unit test.
 
-### M30.3 app follow-up · direct argv launch  **[P2, app]**
+### M30.3 app follow-up · direct argv launch  **[P2, app] — shipped**
 
 **Finding (2026-07 review).** The central single-quoting builder is safe, but it
-still composes a shell/AppleScript string. **Plan.** Prefer direct argv-based
-process launching where the Terminal UX permits, reducing reliance on layered
-escaping.
+still composed a shell/AppleScript string with two escaping layers. **Fixed
+(#67).** The interactive `chm connect` command is now delivered to `osascript`
+as an `argv` parameter (`on run argv` ... `do script (item 1 of argv)`) instead
+of being interpolated into the AppleScript source, eliminating the
+AppleScript-literal escaping layer — a path can no longer break out of the
+script text into host code. Terminal.app's `do script` still requires a command
+*string* for `chm` itself, so the single-quote + control-char rejection remains
+(now the only layer). Verified live that a command with shell metacharacters and
+`$(...)` passes through argv verbatim, unexecuted.
+
+### M29 · Audit trail — durable session + egress log  **[P2, chm] — shipped**
+
+**Status: shipped.** A per-workspace append-only `audit.jsonl` records the
+security-relevant history of a sandbox, independent of the console scrollback
+(which the guest can flood). Each line is a self-contained JSON object stamped
+with a UTC timestamp:
+
+- **`session-start` / `session-stop`** — written by the run loop for every
+  `chm run` / `resume` / `connect`, capturing the resume-vs-cold mode, the
+  vCPU/RAM shape, the resolved limits summary, the governing egress label, and
+  the stop outcome + duration.
+- **`egress-deny`** — the userspace NAT's denied outbound flows, drained off the
+  net-service thread and recorded once per unique `(domain, target, rule)` so a
+  guest retrying a blocked host in a loop leaves one line, not thousands. This is
+  the "what did the sandbox try to reach that we blocked" signal.
+- **`verify`** — the runner's bundle-trust decisions (manifest provenance +
+  per-object checksum re-hash, M30.4/M30.8) recorded to the same trail the child
+  session appends to, so a cloud-run session's log carries verify → start →
+  deny → stop end to end.
+
+Writes are best-effort (an audit failure never crashes or stalls the run) and use
+`O_APPEND`, so the vCPU and net-service threads interleave records safely without
+a shared lock. Read it back with `chm audit show <WORKSPACE_DIR> [--json]`.
+Verified live: a real HVF resume session recorded start + stop records that
+`chm audit show` renders back.
 
 ### M30.7 · Threat model + hardening checklist  **[P0, docs]**
 
@@ -351,6 +417,65 @@ denies every destination; a missing/malformed source resolves to FailClosed.
 multi-NIC snapshots outright (vs. governing them) are follow-ups tracked with
 M30.4/M30.6.
 
+### M31 · Network host-isolation — the reserved-address boundary  **[P0, engine]**
+
+**Status: M31.1 shipped; M31.2-M31.5 open.** A second adversarial review
+(2026-07-16) found that the egress boundary M28/M30.9 built is only a *policy*
+gate; it did not stop a guest from reaching the **host's own networks**. The
+userspace NAT relays a permitted flow through an ordinary host socket, so
+whatever the guest dials, `chm` dials on the host — including:
+
+- **loopback** (`127.0.0.0/8`, `::1`) — localhost databases, dev servers, other
+  local tooling;
+- **RFC1918 / private LAN** (`10/8`, `172.16/12`, `192.168/16`) — routers, NAS,
+  other machines on your network;
+- **link-local** (`169.254.0.0/16`), including the cloud **metadata endpoint**
+  `169.254.169.254`;
+- other special-use ranges (`0/8` "this host", CGNAT `100.64/10`, multicast
+  `224/4`, reserved `240/4`).
+
+This is a host-boundary break independent of filesystem isolation, and it is
+reachable **by default**: networking is allow-all when no policy is bound (the
+shipping default), and the app's global firewall ships disabled. Even in
+allow-list mode it is bypassable by **DNS rebinding** — a permitted hostname
+whose authoritative DNS answers `127.0.0.1` / a private IP is cached and then
+authorises the connect to that reserved IP (`policy.rs` matches the resolved
+name at connect time).
+
+**Plan.**
+
+- **M31.1 (P0, #75) — reserved-address guard. SHIPPED.** The NAT denies any
+  connect whose destination IP falls in a special-use / non-public range,
+  **independently of and before** the egress policy, so even allow-all cannot
+  reach host-internal networks. The *resolved* IP is checked at connect time (a
+  hostname allow-match never authorises a reserved IP → DNS rebinding closed),
+  DNS answers resolving into reserved ranges are dropped, and an IP-literal allow
+  rule in the *trusted* policy (or `--allow-local-egress` / `CHM_ALLOW_LOCAL_EGRESS`)
+  is the only way to reach them. Proven by unit tests (the reserved predicate,
+  the policy decision, DNS rebinding) and an end-to-end relay test: under
+  allow-all a real guest stack cannot reach a localhost echo server.
+- **M31.2 (P1) — safe default posture. SHIPPED.** With the guard always-on,
+  allow-all is a safe floor (public egress only, never the host). The app's global
+  default now ships the firewall **on in default-deny (allow-list) mode**, so a
+  new sandbox has no public egress until the user allow-lists what it needs; the
+  Settings copy makes the always-on host/LAN/metadata block explicit. (`chm` still
+  warns when a restrictive policy is bound; an unbound run is public-egress with
+  the host guard on.)
+- **M31.3 (P1) — honest network docs.** Correct `networking.md` and the invariant
+  table so claims match enforcement (allow-all default; the NAT relays via host
+  sockets; the reserved-address guard is the real host boundary).
+- **M31.4 (P2) — cloud/KVM path boundary. DOCUMENTED.** The network guarantees
+  apply to the macOS userspace-NAT path only. The cloud/KVM capture path's
+  isolation depends on the **external EC2 capture harness** (outside this repo)
+  with EC2/S3 permissions and a reachable instance-metadata endpoint. This
+  boundary is now stated explicitly in §1 "Out of scope" and in the BYO capture
+  runbook; auditing the harness itself is tracked cross-repo.
+- **M31.5 (P1) — signing default + digest recompute.** Signing fails *open* when
+  `CHM_TRUST_STORE` is unset (by-design back-compat, #36); the policy-digest
+  cross-field check fails closed, but the independent recompute is advisory. Once
+  gctl signs production manifests, make fail-closed the default (a
+  `CHM_REQUIRE_SIGNED` posture) and enforce the recompute. Folds into #36.
+
 ---
 
 ## 4. Hardening checklist (the "hostile-agent ready" bar)
@@ -367,16 +492,23 @@ M30.4/M30.6.
       signs; local verifies before exposing "Run" (M30.4).
 - [x] **No host FS passthrough** — invariant documented, behavioural test +
       `make security-check` guard (M30.5, shipped).
-- [ ] **Resource limits** — per-sandbox vCPU/mem/disk ceilings (M30.6).
-- [ ] **Network policy** — egress allow/deny enforced on the local datapath
-      (converges with **M28**; the firewall half of pillar ③).
-- [ ] **Audit logs** — start/stop/verify/deny decisions recorded (converges with
-      **M29** telemetry).
+- [x] **Resource limits** — per-sandbox vCPU/mem/disk/console/wall ceilings plus
+      NAT connection-count + bandwidth caps (M30.6, shipped).
+- [x] **Network policy** — egress allow/deny enforced on the local datapath: a
+      default-deny allow-list applied to every NIC, fail-closed, plus NAT
+      connection/bandwidth caps (M28 + M30.9). The live in-guest demo (#52) is
+      pending only a net-enabled snapshot; enforcement already ships.
+- [x] **Audit logs** — session start/stop, denied egress, and bundle-verify
+      decisions recorded to a durable per-workspace `audit.jsonl` (M29, shipped).
+- [x] **Network host-isolation** — a guest cannot reach loopback / private LAN /
+      link-local (incl. `169.254.169.254`) regardless of policy or DNS answers,
+      unless explicitly opted in (M31.1, shipped). Closes the critical gap found
+      by the 2026-07-16 review.
 - [ ] **Update / signing chain** — the app + `chm` binaries themselves are signed
       and updated over a verified channel (macOS notarisation + release signing).
-- [ ] **Escape-response assumptions** — documented: a guest escape is assumed
-      contained by HVF; a bundle-driven host-file escape is the boundary M30.1
-      closes.
+- [x] **Escape-response assumptions** — documented (§1 "Out of scope"): a guest
+      escape is assumed contained by the HVF VM boundary; the actively-defended
+      escape is the bundle-driven host-file path, closed by M30.1 / M30.8 / I1.
 
 ---
 

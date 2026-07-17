@@ -27,7 +27,7 @@ ENTITLEMENTS="hypervisor/tests/data/hv.entitlements"
 # Build only this crate; it target-gates its Hypervisor.framework dependency to
 # Apple Silicon, so this must be run on an arm64 Mac. The `${arr[@]+"${arr[@]}"}`
 # form expands safely even when the array is empty under `set -u` (bash 3.2).
-cargo build -p cloud-hypervisor-mac --bin chm \
+cargo build -p gimbal-local --bin chm \
     ${CARGO_PROFILE_FLAG[@]+"${CARGO_PROFILE_FLAG[@]}"} >&2
 
 BIN="target/${PROFILE}/chm"

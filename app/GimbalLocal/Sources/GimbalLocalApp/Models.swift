@@ -197,6 +197,8 @@ struct DefaultLimits: Codable, Equatable {
     var maxDiskMb: Int?
     var maxWallSeconds: Int?
     var maxConsoleMb: Int?
+    var maxConnections: Int?
+    var maxBandwidthKbps: Int?
 }
 
 /// The global default egress posture applied to a new sandbox's workspace
@@ -220,8 +222,10 @@ struct GlobalDefaults: Codable, Equatable {
     var firewall: DefaultFirewall
 
     /// Sane out-of-the-box controls: a generous disk + console cap on (so a
-    /// runaway can't exhaust the host) and the firewall off (opt-in, since the
-    /// guest has no network by default).
+    /// runaway can't exhaust the host), and the firewall **on** in default-deny
+    /// mode (M31.2) — a new sandbox has no public egress until the user allow-lists
+    /// what it needs. (Host loopback / LAN / link-local are always blocked by the
+    /// reserved-address guard, M31.1, regardless of this policy.)
     static let sane = GlobalDefaults(
         limits: DefaultLimits(
             enabled: true,
@@ -229,9 +233,11 @@ struct GlobalDefaults: Codable, Equatable {
             maxMemoryMb: nil,
             maxDiskMb: 8192,
             maxWallSeconds: nil,
-            maxConsoleMb: 64
+            maxConsoleMb: 64,
+            maxConnections: nil,
+            maxBandwidthKbps: nil
         ),
-        firewall: DefaultFirewall(enabled: false, mode: .open, allow: [])
+        firewall: DefaultFirewall(enabled: true, mode: .allowlist, allow: [])
     )
 }
 

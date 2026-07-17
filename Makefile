@@ -32,7 +32,7 @@ chm-serve: chm
 	@$(CHM_BIN) serve "$(DIR)" --socket "$(SOCKET)"
 
 clippy:
-	cargo clippy -p cloud-hypervisor-mac --bin chm
+	cargo clippy -p gimbal-local --bin chm
 	cargo clippy -p hypervisor --no-default-features --features hvf,kvm-snapshot
 
 # Security invariant I1 (docs/security-model.md): fail if host-filesystem

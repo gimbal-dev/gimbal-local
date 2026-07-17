@@ -57,6 +57,15 @@ pub(crate) struct LimitsDoc {
     /// Maximum console output in MiB before the guest is stopped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_console_mb: Option<u64>,
+    /// Maximum concurrent outbound NAT connections (host sockets) the guest may
+    /// hold open. A runaway guest cannot exhaust host file descriptors (M30.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_connections: Option<u32>,
+    /// Maximum sustained outbound NAT throughput in kilobits per second. The NAT
+    /// throttles (via TCP backpressure) rather than dropping, bounding the
+    /// bandwidth a single sandbox can consume (M30.6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bandwidth_kbps: Option<u64>,
     /// Optional human label (provenance of the limits).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub label: Option<String>,
@@ -70,6 +79,8 @@ impl LimitsDoc {
             || self.max_disk_mb.is_some()
             || self.max_wall_seconds.is_some()
             || self.max_console_mb.is_some()
+            || self.max_connections.is_some()
+            || self.max_bandwidth_kbps.is_some()
     }
 
     /// Reject nonsensical values (a limit of 0 would stop the guest instantly and
@@ -81,6 +92,8 @@ impl LimitsDoc {
             ("max_disk_mb", self.max_disk_mb),
             ("max_wall_seconds", self.max_wall_seconds),
             ("max_console_mb", self.max_console_mb),
+            ("max_connections", self.max_connections.map(u64::from)),
+            ("max_bandwidth_kbps", self.max_bandwidth_kbps),
         ];
         for (name, value) in checks {
             if value == Some(0) {
@@ -110,6 +123,12 @@ impl LimitsDoc {
         }
         if let Some(v) = self.max_console_mb {
             parts.push(format!("console<={v}MiB"));
+        }
+        if let Some(v) = self.max_connections {
+            parts.push(format!("conns<={v}"));
+        }
+        if let Some(v) = self.max_bandwidth_kbps {
+            parts.push(format!("bw<={v}kbps"));
         }
         parts.join(" · ")
     }
@@ -183,7 +202,8 @@ fn usage() -> String {
      commands:\n    \
        show  <WORKSPACE_DIR> [--json]\n    \
        set   <WORKSPACE_DIR> [--max-vcpus N] [--max-memory-mb N] [--max-disk-mb N]\n                          \
-        [--max-wall-seconds N] [--max-console-mb N] [--label TEXT]\n    \
+        [--max-wall-seconds N] [--max-console-mb N] [--max-connections N]\n                          \
+        [--max-bandwidth-kbps N] [--label TEXT]\n    \
        clear <WORKSPACE_DIR>\n    \
        validate <FILE>\n"
         .to_string()
@@ -243,7 +263,8 @@ fn show(raw: &[String]) -> Result<(), String> {
 fn set(raw: &[String]) -> Result<(), String> {
     let dir = positional(raw).ok_or(
         "usage: chm limits set <WORKSPACE_DIR> [--max-vcpus N] [--max-memory-mb N] \
-         [--max-disk-mb N] [--max-wall-seconds N] [--max-console-mb N] [--label TEXT]",
+         [--max-disk-mb N] [--max-wall-seconds N] [--max-console-mb N] \
+         [--max-connections N] [--max-bandwidth-kbps N] [--label TEXT]",
     )?;
     if !dir.is_dir() {
         return Err(format!("{} is not a directory", dir.display()));
@@ -254,6 +275,8 @@ fn set(raw: &[String]) -> Result<(), String> {
         max_disk_mb: opt_u64(raw, "--max-disk-mb")?,
         max_wall_seconds: opt_u64(raw, "--max-wall-seconds")?,
         max_console_mb: opt_u64(raw, "--max-console-mb")?,
+        max_connections: opt_u64(raw, "--max-connections")?.map(|n| n as u32),
+        max_bandwidth_kbps: opt_u64(raw, "--max-bandwidth-kbps")?,
         label: opt_str(raw, "--label")
             .map(str::to_string)
             .or_else(|| Some("local".to_string())),
@@ -366,6 +389,8 @@ mod tests {
             max_disk_mb: Some(4096),
             max_wall_seconds: Some(3600),
             max_console_mb: Some(16),
+            max_connections: Some(256),
+            max_bandwidth_kbps: Some(10_000),
             label: Some("default".into()),
         };
         let back: LimitsDoc = serde_json::from_str(&d.to_json()).unwrap();

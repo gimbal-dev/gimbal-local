@@ -153,11 +153,18 @@ pub struct EgressPolicy {
     resolve_cache: ResolveCache,
     /// A human label for the governing policy (e.g. the digest), for tracing.
     label: String,
+    /// When false (the default), connects to reserved / host-internal address
+    /// ranges (loopback, private LAN, link-local metadata, …) are denied
+    /// *regardless* of the allow/deny rules — the guest must not reach the host's
+    /// own networks (M31.1). The `--allow-local-egress` opt-in sets this true.
+    allow_local_egress: bool,
 }
 
 impl EgressPolicy {
     /// An unrestricted policy: every flow is allowed. This is the M28.2 default
     /// (real networking, no gate) until `chm` supplies a real profile (M28.3).
+    /// Note this is still subject to the reserved-address guard (M31.1) unless
+    /// local egress is explicitly opted in.
     pub fn allow_all() -> Self {
         Self {
             default_allow: true,
@@ -165,6 +172,7 @@ impl EgressPolicy {
             deny: Vec::new(),
             resolve_cache: ResolveCache::default(),
             label: "allow-all".to_string(),
+            allow_local_egress: false,
         }
     }
 
@@ -185,7 +193,19 @@ impl EgressPolicy {
                 ttl: Some(Duration::from_secs(600)),
             },
             label: label.into(),
+            allow_local_egress: false,
         }
+    }
+
+    /// Opt the guest into reaching reserved / host-internal address ranges
+    /// (loopback, private LAN, link-local). Off by default (M31.1).
+    pub fn set_allow_local_egress(&mut self, allow: bool) {
+        self.allow_local_egress = allow;
+    }
+
+    /// Whether reserved / host-internal egress has been explicitly opted in.
+    pub fn allow_local_egress(&self) -> bool {
+        self.allow_local_egress
     }
 
     /// Whether this policy actually restricts anything (a default-allow policy
@@ -231,7 +251,7 @@ impl EgressPolicy {
     pub fn decide_connect(&self, ip: Ipv4Addr, port: u16) -> Decision {
         let host = self.resolve_cache.lookup(ip, Instant::now()).map(str::to_string);
 
-        // Deny rules first.
+        // Deny rules first — an explicit deny always wins.
         for rule in &self.deny {
             if rule.port_matches(port)
                 && (rule.host.matches_ip(ip)
@@ -242,6 +262,26 @@ impl EgressPolicy {
                 };
             }
         }
+
+        // Reserved-address guard (M31.1): the NAT relays through a host socket, so
+        // a connect to a host-internal range would reach the Mac's own networks.
+        // Deny it unless local egress was explicitly opted in, or the *trusted
+        // policy* names this exact IP with an **IP-literal** allow rule. A
+        // hostname allow rule that merely resolved to a reserved IP does NOT lift
+        // the guard — that is exactly the DNS-rebinding vector — so an allow-all
+        // default and a rebound allow-listed name are both refused.
+        if !self.allow_local_egress && super::reserved::is_reserved_egress_ip(ip) {
+            let explicit_ip_allow = self
+                .allow
+                .iter()
+                .any(|rule| rule.port_matches(port) && rule.host.matches_ip(ip));
+            if !explicit_ip_allow {
+                return Decision::Deny {
+                    rule: "reserved-address".to_string(),
+                };
+            }
+        }
+
         for rule in &self.allow {
             if rule.port_matches(port)
                 && (rule.host.matches_ip(ip)
@@ -310,6 +350,49 @@ mod tests {
         // After the guest resolves the allowed name, the IP connect is allowed.
         p.record_resolution("api.github.com", ip);
         assert!(p.decide_connect(ip, 443).is_allow());
+    }
+
+    #[test]
+    fn reserved_addresses_are_denied_even_under_allow_all() {
+        // The reserved-address guard (M31.1) applies before the policy: an
+        // allow-all default still cannot reach the host's own networks.
+        let p = EgressPolicy::allow_all();
+        for host_internal in [
+            Ipv4Addr::new(127, 0, 0, 1),         // loopback
+            Ipv4Addr::new(10, 0, 0, 5),          // private
+            Ipv4Addr::new(192, 168, 1, 1),       // private / router
+            Ipv4Addr::new(169, 254, 169, 254),   // cloud metadata
+        ] {
+            let d = p.decide_connect(host_internal, 443);
+            assert!(!d.is_allow(), "{host_internal} must be denied under allow-all");
+            assert_eq!(d.rule(), "reserved-address");
+        }
+        // A public destination is still allowed.
+        assert!(p.decide_connect(Ipv4Addr::new(140, 82, 112, 6), 443).is_allow());
+    }
+
+    #[test]
+    fn reserved_guard_closes_dns_rebinding() {
+        // An allow-listed name whose DNS answer rebinds to a loopback/private IP
+        // must NOT authorise the connect: the reserved check runs before the
+        // hostname match.
+        let mut p = EgressPolicy::from_profile("deny", &["trusted.example.com".into()], &[], "t");
+        let rebound = Ipv4Addr::new(127, 0, 0, 1);
+        p.record_resolution("trusted.example.com", rebound);
+        let d = p.decide_connect(rebound, 443);
+        assert!(!d.is_allow(), "a rebound reserved IP must be refused despite the allow rule");
+        assert_eq!(d.rule(), "reserved-address");
+    }
+
+    #[test]
+    fn allow_local_egress_opt_in_permits_reserved() {
+        let mut p = EgressPolicy::allow_all();
+        assert!(!p.decide_connect(Ipv4Addr::new(127, 0, 0, 1), 443).is_allow());
+        p.set_allow_local_egress(true);
+        assert!(
+            p.decide_connect(Ipv4Addr::new(127, 0, 0, 1), 443).is_allow(),
+            "the explicit opt-in must lift the reserved-address guard"
+        );
     }
 
     #[test]

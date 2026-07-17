@@ -24,6 +24,23 @@ nested KVM. For the real AWS proof, start with a **Graviton bare-metal**
 instance type, for example a `*.metal` Graviton family in a region where your
 account has quota.
 
+### Security boundary of the capture host (read this)
+
+This capture host is **outside the Gimbal Local trust boundary**. Everything the
+macOS runtime guarantees — bundle confinement, the reserved-address network guard
+(a guest cannot reach host loopback / LAN / `169.254.169.254`), resource limits,
+the audit trail — applies to the **Mac that runs a snapshot**, not to the Linux
+host that **captures** it. On this capture host:
+
+- it holds your **EC2/S3 credentials** and can reach the **instance-metadata
+  endpoint** (`169.254.169.254`), so a workload you capture here is only as
+  isolated as this host and its IAM policy make it — scope the IAM user to just
+  the S3 handoff bucket and the specific EC2 actions in Step 3, nothing more;
+- prefer **IMDSv2** (hop-limit 1, token-required) so a captured workload cannot
+  trivially read instance credentials from the metadata endpoint;
+- treat the captured snapshot as trusted on the Mac only via the signed-manifest
+  chain (M30.4) — see [`security-model.md`](security-model.md) § "Out of scope".
+
 ### The one hard cost rule
 
 Do **not** leave the bare-metal instance running.
@@ -60,7 +77,7 @@ Standing still can cost money if resources are left allocated:
 Everything we create for this project should use:
 
 ```text
-Project=cloud-hypervisor-mac
+Project=gimbal-local
 ```
 
 This tag lets the cleanup script find and delete project resources without
@@ -70,9 +87,9 @@ Use these names unless you have a reason not to:
 
 ```text
 AWS profile:       chm-aws
-Project tag:       cloud-hypervisor-mac
-S3 prefix:         cloud-hypervisor-mac/
-EC2 role name:     cloud-hypervisor-mac-capture-role
+Project tag:       gimbal-local
+S3 prefix:         gimbal-local/
+EC2 role name:     gimbal-local-capture-role
 ```
 
 ## Step 1: Install the AWS CLI on your Mac
@@ -100,7 +117,7 @@ Do this instead:
 
 1. Log in to the AWS Console with your root user.
 2. Turn on MFA for the root user if AWS prompts you to.
-3. Create one IAM user named `cloud-hypervisor-mac-cli`.
+3. Create one IAM user named `gimbal-local-cli`.
 4. Give that IAM user temporary `AdministratorAccess` for this prototype.
 5. Create an access key for that IAM user.
 6. Store that access key only in your local Mac AWS CLI profile.
@@ -117,7 +134,7 @@ In the AWS Console:
 5. Enter this user name:
 
 ```text
-cloud-hypervisor-mac-cli
+gimbal-local-cli
 ```
 
 6. Leave **Provide user access to the AWS Management Console** unchecked.
@@ -136,7 +153,7 @@ treated as a temporary sandbox, and cleanup must be run after experiments.
 
 Still in IAM:
 
-1. Click the new `cloud-hypervisor-mac-cli` user.
+1. Click the new `gimbal-local-cli` user.
 2. Open the **Security credentials** tab.
 3. Scroll to **Access keys**.
 4. Click **Create access key**.
@@ -145,7 +162,7 @@ Still in IAM:
 7. Set the description to:
 
 ```text
-cloud-hypervisor-mac local CLI
+gimbal-local local CLI
 ```
 
 8. Click **Create access key**.
@@ -278,7 +295,7 @@ target/debug/chm cloud init aws \
   --profile chm-aws \
   --region "$AWS_REGION" \
   --bucket "$CHM_BUCKET" \
-  --prefix cloud-hypervisor-mac/
+  --prefix gimbal-local/
 
 target/debug/chm cloud preflight aws
 ```
@@ -413,9 +430,9 @@ cat >/tmp/chm-s3-lifecycle.json <<'JSON'
 {
   "Rules": [
     {
-      "ID": "expire-cloud-hypervisor-mac-artifacts",
+      "ID": "expire-gimbal-local-artifacts",
       "Status": "Enabled",
-      "Filter": { "Prefix": "cloud-hypervisor-mac/" },
+      "Filter": { "Prefix": "gimbal-local/" },
       "Expiration": { "Days": 7 },
       "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 1 }
     }
@@ -434,10 +451,10 @@ Smoke test:
 
 ```bash
 echo "hello from chm aws setup" >/tmp/chm-smoke.txt
-aws s3 cp /tmp/chm-smoke.txt "s3://$CHM_BUCKET/cloud-hypervisor-mac/smoke.txt" \
+aws s3 cp /tmp/chm-smoke.txt "s3://$CHM_BUCKET/gimbal-local/smoke.txt" \
   --profile chm-aws \
   --region "$AWS_REGION"
-aws s3 rm "s3://$CHM_BUCKET/cloud-hypervisor-mac/smoke.txt" \
+aws s3 rm "s3://$CHM_BUCKET/gimbal-local/smoke.txt" \
   --profile chm-aws \
   --region "$AWS_REGION"
 ```
@@ -463,10 +480,10 @@ export VPC_ID=$(aws ec2 describe-vpcs \
   --region "$AWS_REGION")
 
 export CHM_SG_ID=$(aws ec2 create-security-group \
-  --group-name cloud-hypervisor-mac-capture \
-  --description "cloud-hypervisor-mac capture host" \
+  --group-name gimbal-local-capture \
+  --description "gimbal-local capture host" \
   --vpc-id "$VPC_ID" \
-  --tag-specifications 'ResourceType=security-group,Tags=[{Key=Project,Value=cloud-hypervisor-mac}]' \
+  --tag-specifications 'ResourceType=security-group,Tags=[{Key=Project,Value=gimbal-local}]' \
   --query 'GroupId' \
   --output text \
   --profile chm-aws \
@@ -485,14 +502,14 @@ aws ec2 authorize-security-group-ingress \
 
 ```bash
 aws ec2 create-key-pair \
-  --key-name cloud-hypervisor-mac-capture \
-  --tag-specifications 'ResourceType=key-pair,Tags=[{Key=Project,Value=cloud-hypervisor-mac}]' \
+  --key-name gimbal-local-capture \
+  --tag-specifications 'ResourceType=key-pair,Tags=[{Key=Project,Value=gimbal-local}]' \
   --query 'KeyMaterial' \
   --output text \
   --profile chm-aws \
-  --region "$AWS_REGION" > ~/.ssh/cloud-hypervisor-mac-capture.pem
+  --region "$AWS_REGION" > ~/.ssh/gimbal-local-capture.pem
 
-chmod 600 ~/.ssh/cloud-hypervisor-mac-capture.pem
+chmod 600 ~/.ssh/gimbal-local-capture.pem
 ```
 
 If the key already exists, either reuse it or delete/recreate it deliberately.
@@ -537,11 +554,11 @@ Launch:
 export CHM_INSTANCE_ID=$(aws ec2 run-instances \
   --image-id "$CHM_AMI_ID" \
   --instance-type "$CHM_INSTANCE_TYPE" \
-  --key-name cloud-hypervisor-mac-capture \
+  --key-name gimbal-local-capture \
   --security-group-ids "$CHM_SG_ID" \
   --subnet-id "$CHM_SUBNET_ID" \
   --block-device-mappings 'DeviceName=/dev/sda1,Ebs={VolumeSize=100,VolumeType=gp3,DeleteOnTermination=true}' \
-  --tag-specifications 'ResourceType=instance,Tags=[{Key=Project,Value=cloud-hypervisor-mac},{Key=Name,Value=cloud-hypervisor-mac-capture}]' \
+  --tag-specifications 'ResourceType=instance,Tags=[{Key=Project,Value=gimbal-local},{Key=Name,Value=gimbal-local-capture}]' \
   --query 'Instances[0].InstanceId' \
   --output text \
   --profile chm-aws \
@@ -569,7 +586,7 @@ echo "$CHM_HOST"
 ## Step 10: SSH in and check KVM
 
 ```bash
-ssh -i ~/.ssh/cloud-hypervisor-mac-capture.pem "ubuntu@$CHM_HOST"
+ssh -i ~/.ssh/gimbal-local-capture.pem "ubuntu@$CHM_HOST"
 ```
 
 On the AWS host:
@@ -606,7 +623,7 @@ The first milestone should prove this manually before the app automates it:
 target/debug/chm cloud capture aws \
   --name <name> \
   --host "ubuntu@$CHM_HOST" \
-  --ssh-key ~/.ssh/cloud-hypervisor-mac-capture.pem \
+  --ssh-key ~/.ssh/gimbal-local-capture.pem \
   --remote-capture-command 'CH_GIC_V2M=1 ./capture.sh' \
   --remote-snapshot-dir <snapshot-dir> \
   --to ./snapshots
@@ -639,7 +656,7 @@ target/debug/chm cloud pull aws --name <name> --to ./snapshots
 
 ```bash
 rsync -avz \
-  -e "ssh -i ~/.ssh/cloud-hypervisor-mac-capture.pem" \
+  -e "ssh -i ~/.ssh/gimbal-local-capture.pem" \
   ./snapshots/<name>/.chm-overlays/ \
   "ubuntu@$CHM_HOST:~/chm-return/<name>/.chm-overlays/"
 ```
@@ -658,7 +675,7 @@ Dry-run first:
 target/debug/chm cloud cleanup aws \
   --profile chm-aws \
   --region "$AWS_REGION" \
-  --project cloud-hypervisor-mac \
+  --project gimbal-local \
   --bucket "$CHM_BUCKET"
 ```
 
@@ -668,7 +685,7 @@ Actually delete tagged AWS resources and the project S3 prefix:
 target/debug/chm cloud cleanup aws \
   --profile chm-aws \
   --region "$AWS_REGION" \
-  --project cloud-hypervisor-mac \
+  --project gimbal-local \
   --bucket "$CHM_BUCKET" \
   --execute \
   --yes
@@ -680,7 +697,7 @@ Delete the bucket too:
 target/debug/chm cloud cleanup aws \
   --profile chm-aws \
   --region "$AWS_REGION" \
-  --project cloud-hypervisor-mac \
+  --project gimbal-local \
   --bucket "$CHM_BUCKET" \
   --delete-bucket \
   --execute \
@@ -708,7 +725,7 @@ volumes that only become `available` after termination and detach completes.
 
 Before you walk away from AWS, check these console pages:
 
-1. **EC2 -> Instances:** no `cloud-hypervisor-mac` instances running or stopped.
+1. **EC2 -> Instances:** no `gimbal-local` instances running or stopped.
 2. **EC2 -> Volumes:** no unattached test volumes.
 3. **EC2 -> Elastic IPs:** no allocated project IPs.
 4. **VPC -> NAT Gateways:** none created for this project.

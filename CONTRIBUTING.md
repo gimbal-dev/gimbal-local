@@ -1,7 +1,8 @@
-# Contributing to Cloud Hypervisor
+# Contributing to Gimbal Local
 
-Cloud Hypervisor is an open source project licensed under the [Apache v2
-License](https://opensource.org/licenses/Apache-2.0) and the [BSD 3
+Gimbal Local is a macOS-focused fork of
+[Cloud Hypervisor](https://www.cloudhypervisor.org/), dual-licensed under the
+[Apache v2 License](https://opensource.org/licenses/Apache-2.0) and the [BSD 3
 Clause](https://opensource.org/licenses/BSD-3-Clause) license. Individual files
 contain details of their licensing and changes to that file are under the same
 license unless the contribution changes the license of the file. When importing
@@ -11,10 +12,12 @@ license of those projects.
 New code should be under the [Apache v2
 License](https://opensource.org/licenses/Apache-2.0).
 
-Cloud Hypervisor's main supported architectures are `x86_64` and `aarch64`,
-and the main hypervisor backends are KVM and MSHV. `x86_64` with KVM gets the
-most regular exercise, but changes should not make the other supported
-architecture and backend combinations worse.
+Gimbal Local targets **macOS on Apple Silicon (`aarch64`)** via Apple's
+Hypervisor.framework; the product is `chm`, the `hypervisor/src/hvf/` backend,
+and the `app/GimbalLocal/` desktop app. The upstream Linux/KVM VMM crates are
+kept in-tree only to build the patched `cloud-hypervisor` binary used to capture
+HVF-compatible snapshots — changes there should not make the upstream
+architecture/backend combinations (`x86_64`/`aarch64`, KVM/MSHV) worse.
 
 ## Coding Style & Code Comments
 

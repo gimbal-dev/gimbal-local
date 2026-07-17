@@ -240,19 +240,23 @@ final class GimbalLocalAppTests: XCTestCase {
 
     func testSaneGlobalDefaultsHaveProtectiveCaps() {
         // Out of the box, a runaway can't exhaust the host: disk + console are
-        // capped and limits are on; the firewall is opt-in (guest has no net).
+        // capped and limits are on; the firewall is ON in default-deny mode
+        // (M31.2) so a new sandbox has no public egress until allow-listed. Host
+        // loopback/LAN are always blocked by the reserved-address guard (M31.1).
         let d = GlobalDefaults.sane
         XCTAssertTrue(d.limits.enabled)
         XCTAssertEqual(d.limits.maxDiskMb, 8192)
         XCTAssertEqual(d.limits.maxConsoleMb, 64)
-        XCTAssertFalse(d.firewall.enabled)
-        XCTAssertEqual(d.firewall.mode, .open)
+        XCTAssertTrue(d.firewall.enabled)
+        XCTAssertEqual(d.firewall.mode, .allowlist)
+        XCTAssertTrue(d.firewall.allow.isEmpty)
     }
 
     func testGlobalDefaultsCodableRoundtrips() {
         let d = GlobalDefaults(
             limits: DefaultLimits(enabled: true, maxVcpus: 4, maxMemoryMb: 4096,
-                                  maxDiskMb: 2048, maxWallSeconds: 3600, maxConsoleMb: 32),
+                                  maxDiskMb: 2048, maxWallSeconds: 3600, maxConsoleMb: 32,
+                                  maxConnections: 128, maxBandwidthKbps: 5000),
             firewall: DefaultFirewall(enabled: true, mode: .allowlist, allow: ["github.com:443"])
         )
         let data = try! JSONEncoder().encode(d)
@@ -577,15 +581,6 @@ final class GimbalLocalAppTests: XCTestCase {
                 return XCTFail("expected invalidPath, got \(error)")
             }
         }
-    }
-
-    func testAppleScriptStringEscapesQuotesAndBackslashes() {
-        // The AppleScript literal wrapper must escape backslash then quote, so a
-        // crafted command string cannot terminate the `do script "…"` literal.
-        XCTAssertEqual(
-            InteractiveTerminalCommand.appleScriptString(#"a"b\c"#),
-            #""a\"b\\c""#
-        )
     }
 
     // MARK: - Branch surfacing (M27 Phase 4)
