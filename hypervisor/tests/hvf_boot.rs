@@ -2687,3 +2687,57 @@ fn hvf_userspace_gic_distributor_gates_disabled_spi() {
     );
     eprintln!("PROVEN: the software distributor gates a disabled SPI");
 }
+
+// ---------------------------------------------------------------------------
+// PATH A, brick 4: the virtual-timer PPI through the software GIC -- the
+// scheduler tick a real guest needs. With no managed GIC the guest enables PPI
+// 27 in its redistributor (GICR MMIO -> softgic) and arms CNTV; HVF surfaces
+// HV_EXIT_REASON_VTIMER_ACTIVATED when it fires, and the run loop injects PPI 27
+// through the software GIC. The guest acknowledges INTID 27 and powers off.
+#[test]
+fn hvf_userspace_gic_delivers_vtimer_ppi() {
+    let ram = HostRam::new(RAM_SIZE);
+    ram.load(0, include_bytes!("data/vtimer_deliver.bin"));
+    let ops = Arc::new(ProbeVmOps { marks: Mutex::new(Vec::new()) });
+    let hv = hypervisor::new().expect("hypervisor::new() — codesigned?");
+    let vm = hv
+        .create_vm(HypervisorVmConfig { nested: false, smt_enabled: false })
+        .expect("create_vm");
+    // NO managed GIC.
+    // SAFETY: ram outlives the mapping.
+    unsafe {
+        vm.create_user_memory_region(0, RAM_BASE, ram.size, ram.ptr, false, false)
+            .expect("map ram");
+    }
+    let ops_dyn: Arc<dyn VmOps> = ops.clone();
+    let mut vcpu = vm.create_vcpu(0, Some(ops_dyn)).expect("create_vcpu");
+    vcpu.setup_regs(0, RAM_BASE, 0).expect("setup_regs");
+    {
+        let hvcpu = vcpu.as_any_concrete_mut().downcast_mut::<HvfVcpu>().unwrap();
+        hvcpu.set_usgic_enabled(true);
+        hvcpu.usgic_set_gic_bases(GICD_BASE, GICR_BASE, 256);
+    }
+
+    const VTIMER: u32 = 27;
+    let mut outcome = String::new();
+    // The timer fires on its own; no manual injection. Generous bound because a
+    // scratch-MMIO poll spin exits to the host frequently before the deadline.
+    for _ in 0..50_000 {
+        match vcpu.run() {
+            Ok(VmExit::Ignore) => continue,
+            Ok(VmExit::Shutdown) => { outcome = "Shutdown".into(); break; }
+            Ok(other) => { outcome = format!("{other:?}"); break; }
+            Err(e) => { outcome = format!("Err: {e}"); break; }
+        }
+    }
+
+    let recorded: Vec<u32> = ops.marks.lock().unwrap().iter().map(|(_, v)| *v).collect();
+    eprintln!("=== software-GIC vtimer PPI === recorded={recorded:x?} outcome={outcome}");
+    assert!(recorded.contains(&0x1100_0000), "guest never signaled READY");
+    assert!(
+        recorded.contains(&VTIMER),
+        "guest did not take the virtual-timer PPI {VTIMER}; got {recorded:x?}"
+    );
+    assert_eq!(outcome, "Shutdown");
+    eprintln!("PROVEN: virtual-timer PPI 27 delivered through the software GIC");
+}

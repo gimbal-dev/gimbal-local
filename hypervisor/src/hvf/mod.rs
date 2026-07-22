@@ -491,6 +491,10 @@ struct UserGic {
 /// GICv3 spurious INTID returned when no interrupt is pending.
 const GICV3_INTID_SPURIOUS: u32 = 1023;
 
+/// The EL1 virtual-timer PPI (CNTV → INTID 27), delivered through the software
+/// GIC when there is no managed GIC.
+const VTIMER_PPI: u32 = 27;
+
 impl UserGic {
     /// Queue an INTID (SPI, PPI, or LPI) for delivery. Priority ordering is a
     /// later refinement; today the pending set is drained FIFO.
@@ -1025,6 +1029,8 @@ impl HvfVcpu {
         let key = (crn, crm, op2);
         let mut deassert = false;
         let mut set_rt: Option<u64> = None;
+        let mut rearm_timer = false;
+        let mut sgi_intid: Option<u32> = None;
         let name: &str;
         {
             let mut g = self.usgic.lock().unwrap();
@@ -1089,12 +1095,29 @@ impl HvfVcpu {
                     // pending one (correctness the rubber-duck flagged).
                     (12, 12, 1) | (12, 8, 1) => {
                         name = "ICC_EOIR";
+                        let was = g.active;
                         g.write_eoir();
+                        // If the virtual-timer PPI just deactivated, re-arm the
+                        // HVF vtimer so the guest's next armed deadline fires.
+                        if was == Some(VTIMER_PPI) && g.active.is_none() {
+                            rearm_timer = true;
+                        }
                     }
                     // ICC_DIR_EL1 (deactivate interrupt) — used with EOImode=1.
                     (12, 11, 1) => {
                         name = "ICC_DIR";
+                        let was = g.active;
                         g.write_dir();
+                        if was == Some(VTIMER_PPI) {
+                            rearm_timer = true;
+                        }
+                    }
+                    // ICC_SGI1R_EL1: software-generated interrupt (IPI). The INTID
+                    // is bits [27:24]. Single-vCPU delivers to self; multi-target
+                    // routing across vCPUs is future SMP work.
+                    (12, 11, 5) => {
+                        name = "ICC_SGI1R";
+                        sgi_intid = Some(((val >> 24) & 0xf) as u32);
                     }
                     (4, 6, 0) => {
                         name = "ICC_PMR";
@@ -1130,6 +1153,15 @@ impl HvfVcpu {
         }
         if is_read && deassert {
             self.set_irq_line(false)?;
+        }
+        // The guest EOI'd/deactivated the virtual-timer PPI: unmask the HVF
+        // vtimer so its next armed deadline is delivered.
+        if rearm_timer {
+            let _ = gic::rearm_vtimer(self.id);
+        }
+        // A software-generated interrupt targets this vCPU: deliver it.
+        if let Some(intid) = sgi_intid {
+            self.usgic_inject(intid)?;
         }
         // Advance past the trapped MSR/MRS instruction.
         let pc = self.get_reg(HV_REG_PC)?;
@@ -1695,13 +1727,23 @@ impl Vcpu for HvfVcpu {
                 }
             }
             HV_EXIT_REASON_VTIMER_ACTIVATED => {
-                // The virtual timer fired and HVF auto-masked it on exit. With
-                // the managed GIC the timer is normally delivered as GIC PPI 27
-                // without this exit at all (see hvf_guest_takes_virtual_timer);
-                // this branch is the defensive path for when HVF does surface
-                // the activation. Re-arm the timer so the GIC re-evaluates and
-                // delivers PPI 27 — without asserting the raw IRQ line, which
-                // would bypass the GIC and deliver a spurious interrupt.
+                // The virtual timer fired and HVF auto-masked it on exit.
+                if self.usgic_enabled() {
+                    // No managed GIC: deliver the timer as PPI 27 through the
+                    // software GIC (if the guest enabled it in its
+                    // redistributor). Leave the HVF vtimer masked until the guest
+                    // EOIs the timer interrupt — by then it has re-armed CNTV to a
+                    // future deadline, so unmasking on EOI won't immediately
+                    // re-fire. The re-arm happens in handle_icc_trap.
+                    self.usgic_assert_spi(VTIMER_PPI)?;
+                    return Ok(VmExit::Ignore);
+                }
+                // Managed GIC path: with the managed GIC the timer is normally
+                // delivered as GIC PPI 27 without this exit at all (see
+                // hvf_guest_takes_virtual_timer); this is the defensive path for
+                // when HVF does surface the activation. Re-arm so the GIC
+                // re-evaluates and delivers PPI 27 — without asserting the raw IRQ
+                // line, which would bypass the GIC and deliver a spurious IRQ.
                 if let Err(rc) = gic::rearm_vtimer(self.id) {
                     return Err(HypervisorCpuError::RunVcpu(anyhow!(
                         "failed to re-arm vtimer: {:#010x}",
