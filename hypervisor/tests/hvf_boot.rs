@@ -2463,6 +2463,93 @@ fn hvf_userspace_gic_delivers_an_lpi() {
 }
 
 // ---------------------------------------------------------------------------
+// PATH A, brick 7: CROSS-THREAD injection -- the delivery path a real virtio
+// completion uses. On a live resume the device/net-service work runs on a
+// SEPARATE host thread from the vCPU, and hv_vcpu_set_pending_interrupt is
+// owning-thread only. So a device thread enqueues the resolved INTID via
+// `usgic_inject_queue()` and wakes the vCPU; the vCPU drains that queue at its
+// next run() entry (on its own thread) and takes the interrupt. This proves the
+// off-vCPU-thread delivery mechanism the engine plumbing depends on -- the run
+// loop here NEVER injects; a second thread does, exactly as wire_virtio's sinks
+// will.
+#[test]
+fn hvf_userspace_gic_delivers_cross_thread_injected_lpi() {
+    let ram = HostRam::new(RAM_SIZE);
+    ram.load(0, include_bytes!("data/lpi_deliver.bin"));
+    let ops = Arc::new(ProbeVmOps { marks: Mutex::new(Vec::new()) });
+    let hv = hypervisor::new().expect("hypervisor::new() — codesigned?");
+    let vm = hv
+        .create_vm(HypervisorVmConfig { nested: false, smt_enabled: false })
+        .expect("create_vm");
+    // NO managed GIC.
+    // SAFETY: ram outlives the mapping.
+    unsafe {
+        vm.create_user_memory_region(0, RAM_BASE, ram.size, ram.ptr, false, false)
+            .expect("map ram");
+    }
+    let ops_dyn: Arc<dyn VmOps> = ops.clone();
+    let mut vcpu = vm.create_vcpu(0, Some(ops_dyn)).expect("create_vcpu");
+    vcpu.setup_regs(0, RAM_BASE, 0).expect("setup_regs");
+
+    // Grab the cross-thread handles BEFORE the run loop: the injection queue and
+    // a wake closure. Both are Send+Sync and moved into the injector thread.
+    let inject_q = {
+        let hvcpu = vcpu.as_any_concrete_mut().downcast_mut::<HvfVcpu>().unwrap();
+        hvcpu.set_usgic_enabled(true);
+        hvcpu.usgic_inject_queue()
+    };
+    let wake = vcpu.wake_signal().expect("wake signal");
+
+    // A separate thread waits for the guest READY marker, then enqueues both
+    // LPIs and wakes the vCPU. The run loop below never touches the queue.
+    let ops_for_thread = ops.clone();
+    let injector = thread::spawn(move || {
+        for _ in 0..5000 {
+            let ready = ops_for_thread
+                .marks
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, v)| *v == 0x1100_0000);
+            if ready {
+                {
+                    let mut q = inject_q.lock().unwrap();
+                    q.push(8192);
+                    q.push(8193);
+                }
+                wake();
+                return true;
+            }
+            thread::sleep(std::time::Duration::from_millis(1));
+        }
+        false
+    });
+
+    let mut outcome = String::new();
+    for _ in 0..5000 {
+        match vcpu.run() {
+            Ok(VmExit::Ignore) => continue,
+            Ok(VmExit::Shutdown) => { outcome = "Shutdown".into(); break; }
+            Ok(other) => { outcome = format!("{other:?}"); break; }
+            Err(e) => { outcome = format!("Err: {e}"); break; }
+        }
+    }
+    let injected = injector.join().unwrap();
+    let recorded: Vec<u32> = ops.marks.lock().unwrap().iter().map(|(_, v)| *v).collect();
+    eprintln!("=== cross-thread LPI === recorded={recorded:x?} outcome={outcome} injected={injected}");
+    assert!(injected, "injector thread never observed READY");
+    assert!(
+        recorded.contains(&8192) && recorded.contains(&8193),
+        "guest did not take the cross-thread-injected LPIs; got {recorded:x?}"
+    );
+    assert_eq!(outcome, "Shutdown");
+    eprintln!(
+        "PROVEN: a SEPARATE host thread injected LPIs via usgic_inject_queue() and \
+         the vCPU took them (the off-vCPU-thread virtio-completion delivery path)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // PATH A, brick 2: the full virtio-completion chain a stock ITS/LPI snapshot
 // needs -- resolve a (DeviceID, EventID) through the user-space ITS translator
 // (walking real KVM-format tables in the guest's RAM) into an LPI INTID, then

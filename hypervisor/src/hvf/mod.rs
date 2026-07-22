@@ -287,6 +287,7 @@ impl Vm for HvfVm {
                 enabled: std::env::var_os("CHM_USERSPACE_GIC").is_some(),
                 ..UserGic::default()
             }),
+            inject_queue: Arc::new(Mutex::new(Vec::new())),
         }))
     }
 
@@ -643,6 +644,16 @@ pub struct HvfVcpu {
     /// Experimental userspace GICv3 CPU interface (see [`UserGic`]). Active only
     /// when no managed GIC is used and `CHM_USERSPACE_GIC` is set.
     usgic: Mutex<UserGic>,
+    /// Cross-thread interrupt-injection queue for the userspace GIC. A device or
+    /// net-service thread (which does NOT own this vCPU) cannot call
+    /// [`hv_vcpu_set_pending_interrupt`] — that is owning-thread only — so it
+    /// enqueues the resolved INTID here and wakes the vCPU via [`Self::wake_handle`].
+    /// The owning thread drains this queue into `usgic` at the top of every
+    /// [`Self::run`] entry, applying the same distributor/redistributor gating a
+    /// direct [`Self::usgic_assert_spi`]/[`Self::usgic_inject`] would, then
+    /// re-asserts the raw IRQ line. This is how a stock ITS/LPI snapshot's virtio
+    /// completions (delivered from the device thread) reach the guest.
+    inject_queue: Arc<Mutex<Vec<u32>>>,
 }
 
 // SAFETY: HVF requires a vCPU to be created and run on the same thread; the VMM
@@ -931,6 +942,48 @@ impl HvfVcpu {
             g.push_pending(intid);
         }
         self.set_irq_line(true)
+    }
+
+    /// A clone of this vCPU's cross-thread injection queue. A device/net-service
+    /// thread pushes a resolved INTID (an ITS-resolved LPI, a line/message SPI)
+    /// here, then wakes the vCPU via [`Self::wake_handle`]; the owning thread
+    /// drains it at the next [`Self::run`] entry. This is the only cross-thread-
+    /// safe way to inject into the userspace GIC (the raw-line assert itself is
+    /// owning-thread only).
+    pub fn usgic_inject_queue(&self) -> Arc<Mutex<Vec<u32>>> {
+        self.inject_queue.clone()
+    }
+
+    /// Drain the cross-thread injection queue into the userspace GIC, applying
+    /// the same enable gating as the owning-thread inject paths: an LPI
+    /// (`>= 8192`) is always queued (LPI enable rides in the redistributor the
+    /// snapshot seeded); a PPI (`< 32`) is gated on the redistributor's per-vCPU
+    /// enable; an SPI on the distributor. Called at the top of [`Self::run`].
+    /// No-op unless the userspace GIC is enabled.
+    fn usgic_drain_injected(&self) {
+        let queued: Vec<u32> = {
+            let mut q = self.inject_queue.lock().unwrap();
+            if q.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *q)
+        };
+        let mut g = self.usgic.lock().unwrap();
+        if !g.enabled {
+            return;
+        }
+        for intid in queued {
+            let enabled = if intid >= 8192 {
+                true
+            } else if intid < 32 {
+                g.redist.is_ppi_enabled(intid)
+            } else {
+                g.dist.assert_spi(intid)
+            };
+            if enabled {
+                g.push_pending(intid);
+            }
+        }
     }
 
     /// Wire this vCPU's software distributor/redistributor to their guest MMIO
@@ -1538,6 +1591,10 @@ impl Vcpu for HvfVcpu {
         // Apple's internal WFI wait not honouring its deadline) stops bumping it,
         // which the watchdog detects and breaks by forcing an exit.
         self.run_gen.fetch_add(1, Ordering::Relaxed);
+        // Drain any cross-thread injections (device/net-service completions) into
+        // the userspace GIC before we sample the line — they were enqueued off
+        // this vCPU's thread and can only be applied here, on the owning thread.
+        self.usgic_drain_injected();
         // Userspace CPU interface: HVF samples the raw virtual IRQ line at run
         // ENTRY (not continuously), so — like QEMU's hvf_inject_interrupts — we
         // must (re)assert it before every entry whenever an interrupt is pending
