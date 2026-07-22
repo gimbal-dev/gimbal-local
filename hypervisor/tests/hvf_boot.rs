@@ -2173,7 +2173,7 @@ fn hvf_rehydrate_stock_its_snapshot_usgic_executes() {
             .expect("rehydrate_usgic the stock ITS snapshot");
         eprintln!("rehydrated {} vCPU(s) onto the userspace GIC", uvm.vcpus.len());
         let vcpu = uvm.vcpus[0].as_mut();
-        for _ in 0..2000 {
+        for _ in 0..2_000_000 {
             match vcpu.run() {
                 Ok(VmExit::Ignore) => {
                     exits_c.fetch_add(1, Ordering::Relaxed);
@@ -2191,17 +2191,18 @@ fn hvf_rehydrate_stock_its_snapshot_usgic_executes() {
             if !out.is_empty() {
                 console_c.fetch_add(out.len() as u64, Ordering::Relaxed);
             }
-            if exits_c.load(Ordering::Relaxed) >= 40 || console_c.load(Ordering::Relaxed) >= 200 {
+            // Enough evidence of CONTINUOUS execution (not just an initial burst).
+            if exits_c.load(Ordering::Relaxed) >= 500 || console_c.load(Ordering::Relaxed) >= 200 {
                 break;
             }
         }
     });
 
-    // Main thread: wait up to 25s for evidence of execution, then proceed
-    // regardless (the child is abandoned; process exit reclaims the HVF VM).
+    // Main thread: wait up to 25s for evidence of sustained execution, then
+    // proceed regardless (the child is abandoned; process exit reclaims the VM).
     let start = std::time::Instant::now();
     while start.elapsed() < std::time::Duration::from_secs(25) {
-        if exits.load(Ordering::Relaxed) >= 3
+        if exits.load(Ordering::Relaxed) >= 400
             || console_bytes.load(Ordering::Relaxed) > 0
             || powered_off.load(Ordering::Relaxed)
             || faulted.load(Ordering::Relaxed)
@@ -2223,22 +2224,26 @@ fn hvf_rehydrate_stock_its_snapshot_usgic_executes() {
 
     // The core proof is rehydrate_usgic() succeeding (asserted inside the child):
     // the snapshot the MANAGED path REJECTS loads onto the userspace GIC with all
-    // state restored. Execution evidence: the restored kernel takes real run()
-    // exits (GIC ICC-register traps + virtual-timer ticks — see CHM_TRACE_EXIT)
-    // without faulting. A mis-restored guest would fault on the first entry. Note:
-    // an idle guest then wedges in Apple's internal WFI wait (the #78 class) and,
-    // lacking virtio-completion delivery here, has no I/O to make further
-    // progress; open-ended boot needs the resume-path wiring (ITS translate ->
-    // usgic_inject_queue, already proven cross-thread) — a distinct milestone.
+    // state restored. Execution evidence is CONTINUOUS forward progress: the
+    // restored kernel takes hundreds of run() exits — self-managed virtual-timer
+    // ticks (VTIMER_ACTIVATED + the WFI-halt PPI 27 redelivery) driving its
+    // scheduler, GIC ICC-register traps, and WFI idle — without faulting. Before
+    // the timer-continuity fix an idle resumed guest wedged after ~3 exits (HVF
+    // only redelivers the vtimer inside hv_vcpu_run, never while parked in WFI);
+    // now it idle-ticks indefinitely like a live kernel. This snapshot was
+    // captured at an idle post-boot state, so it resumes to a quiet idle (no new
+    // console); driving fresh userspace output additionally needs the resume-path
+    // device wiring (serial input + virtio completions via usgic_inject_queue,
+    // already proven cross-thread) — a distinct milestone.
     assert!(!fault, "rehydrated guest faulted — state restore is wrong");
     assert!(
-        n_exits >= 1 || n_console > 0 || off,
-        "stock-ITS USGIC guest showed no signs of execution \
-         ({n_exits} exits, {n_console} console bytes)"
+        n_exits >= 100 || n_console > 0 || off,
+        "stock-ITS USGIC guest did not sustain execution — only {n_exits} exits \
+         ({n_console} console bytes); the vtimer-continuity fix may have regressed"
     );
     eprintln!(
         "PROVEN: a STOCK ITS/LPI snapshot (managed path rejects it) rehydrates onto \
-         the userspace GIC and executes real restored guest code"
+         the userspace GIC and SUSTAINS execution (self-managed vtimer ticks)"
     );
 }
 

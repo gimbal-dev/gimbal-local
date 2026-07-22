@@ -498,8 +498,15 @@ const VTIMER_PPI: u32 = 27;
 
 impl UserGic {
     /// Queue an INTID (SPI, PPI, or LPI) for delivery. Priority ordering is a
-    /// later refinement; today the pending set is drained FIFO.
+    /// later refinement; today the pending set is drained FIFO. Deduplicated: an
+    /// INTID already pending or currently active is not re-queued, so a source
+    /// that can assert the same line from two paths (e.g. the virtual timer via
+    /// both the run-entry poll and a residual `VTIMER_ACTIVATED`) delivers it
+    /// exactly once — a second copy would desynchronize the guest's EOI count.
     fn push_pending(&mut self, intid: u32) {
+        if self.active == Some(intid) || self.pending.contains(&intid) {
+            return;
+        }
         self.pending.push(intid);
     }
 
@@ -891,6 +898,42 @@ impl HvfVcpu {
     /// by tests; production enables it at creation via `CHM_USERSPACE_GIC`).
     pub fn set_usgic_enabled(&self, on: bool) {
         self.usgic.lock().unwrap().enabled = on;
+    }
+
+    /// Self-manage the guest's virtual timer on the userspace-GIC path.
+    ///
+    /// With no managed GIC, HVF surfaces the timer via `HV_EXIT_REASON_VTIMER_
+    /// ACTIVATED` and auto-masks it on that exit. Empirically, once that mask/
+    /// unmask cycle has run, HVF does NOT reliably re-surface the activation for
+    /// the guest's next armed deadline: an idle guest takes one tick, EOIs, arms
+    /// its next `CNTV_CVAL`, executes WFI, and then wedges inside `hv_vcpu_run`
+    /// with the overdue timer never redelivered. libkrun and QEMU's
+    /// `kernel-irqchip=off` avoid this by self-managing the timer instead of
+    /// trusting the activation exit.
+    ///
+    /// So at every run entry we sample the guest's `CNTV_CTL_EL0`/`CNTV_CVAL_EL0`
+    /// directly and, if the timer is enabled, not guest-masked, and its deadline
+    /// has passed against [`current_cntvct`], assert PPI 27 through the software
+    /// GIC ourselves. [`push_pending`] dedups, so a race with a still-delivered
+    /// `VTIMER_ACTIVATED` cannot double-inject. The WFI idle park already wakes
+    /// at the `CNTV_CVAL` deadline (see [`wfi_park_ms`]), so this poll fires
+    /// promptly on the re-entry after an idle park — restoring a steady tick.
+    /// No-op unless the userspace GIC is enabled.
+    fn usgic_poll_vtimer(&self) {
+        const CNTV_CTL_EL0: u16 = 0xDF19;
+        const CNTV_CVAL_EL0: u16 = 0xDF1A;
+        if !self.usgic_enabled() {
+            return;
+        }
+        let ctl = self.get_sysreg(CNTV_CTL_EL0).unwrap_or(0);
+        // ENABLE (bit0) set and IMASK (bit1) clear: the guest wants timer IRQs.
+        if ctl & 1 == 0 || ctl & 2 != 0 {
+            return;
+        }
+        let cval = self.get_sysreg(CNTV_CVAL_EL0).unwrap_or(u64::MAX);
+        if cval <= self.current_cntvct() {
+            let _ = self.usgic_assert_spi(VTIMER_PPI);
+        }
     }
 
     /// Re-assert (or clear) the raw virtual IRQ line to match the emulated CPU
@@ -1621,6 +1664,12 @@ impl Vcpu for HvfVcpu {
         // the userspace GIC before we sample the line — they were enqueued off
         // this vCPU's thread and can only be applied here, on the owning thread.
         self.usgic_drain_injected();
+        // Self-manage the guest's virtual timer: if its armed CNTV deadline is
+        // due, assert PPI 27 now. HVF's own VTIMER_ACTIVATED delivery is
+        // unreliable across the mask/unmask cycle and wedges an idle guest, so
+        // we poll it here every entry (see usgic_poll_vtimer). The WFI idle park
+        // wakes at that deadline, so this fires promptly on the re-entry.
+        self.usgic_poll_vtimer();
         // Userspace CPU interface: HVF samples the raw virtual IRQ line at run
         // ENTRY (not continuously), so — like QEMU's hvf_inject_interrupts — we
         // must (re)assert it before every entry whenever an interrupt is pending
@@ -1693,10 +1742,64 @@ impl Vcpu for HvfVcpu {
                         // re-executes WFI and parks again.
                         let pc = self.get_reg(HV_REG_PC)?;
                         self.set_reg(HV_REG_PC, pc.wrapping_add(4))?;
-                        // Park until kicked or the virtual-timer deadline is due
-                        // (see wfi_park_ms); a failed wait just falls through to
-                        // a guest re-entry.
-                        let _ = self.kick.wait_timeout(self.wfi_park_ms());
+                        if self.usgic_enabled() {
+                            // Halt IN THE HOST until the software GIC has an
+                            // interrupt to deliver, then return so hv_vcpu_run
+                            // delivers it. Re-entering hv_vcpu_run with nothing
+                            // pending lets HVF service the WFI in-kernel and block
+                            // on a vtimer deadline it never redelivers (it only
+                            // surfaces VTIMER_ACTIVATED *inside* hv_vcpu_run) —
+                            // the idle-guest wedge.
+                            //
+                            // Capture the guest's timer deadline ONCE here, while
+                            // the values are fresh from the just-returned
+                            // hv_vcpu_run (CNTV_* / CNTVCT read unreliably once the
+                            // vCPU is parked out of run), then nap against the
+                            // host monotonic counter (current_cntvct, mach-based
+                            // and always valid) and self-deliver PPI 27 when the
+                            // captured deadline passes. A cross-thread injection
+                            // (drained each nap) also breaks the wait. A wall-clock
+                            // cap bounds the halt so VM teardown (which stops the
+                            // outer run loop) is observed even if nothing becomes
+                            // pending — on re-entry the guest simply re-WFIs and we
+                            // capture its next deadline.
+                            const CNTV_CTL_EL0: u16 = 0xDF19;
+                            const CNTV_CVAL_EL0: u16 = 0xDF1A;
+                            let ctl = self.get_sysreg(CNTV_CTL_EL0).unwrap_or(0);
+                            let timer_live = ctl & 1 != 0 && ctl & 2 == 0;
+                            let cval = self.get_sysreg(CNTV_CVAL_EL0).unwrap_or(u64::MAX);
+                            let halt_deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(1);
+                            loop {
+                                if timer_live && self.current_cntvct() >= cval {
+                                    let _ = self.usgic_assert_spi(VTIMER_PPI);
+                                }
+                                self.usgic_drain_injected();
+                                if self.usgic.lock().unwrap().should_assert()
+                                    || std::time::Instant::now() >= halt_deadline
+                                {
+                                    break;
+                                }
+                                let nap_ms = if timer_live {
+                                    let now = self.current_cntvct();
+                                    if cval > now {
+                                        let tb = mach_timebase();
+                                        let ns = (cval - now) as u128 * tb.numer as u128
+                                            / tb.denom as u128;
+                                        ((ns / 1_000_000) as u64).clamp(1, 10)
+                                    } else {
+                                        1
+                                    }
+                                } else {
+                                    10
+                                };
+                                std::thread::sleep(std::time::Duration::from_millis(nap_ms));
+                            }
+                        } else {
+                            // Managed path: one bounded park; the outer loop
+                            // re-enters and the managed GIC redelivers.
+                            let _ = self.kick.wait_timeout(self.wfi_park_ms());
+                        }
                         Ok(VmExit::Ignore)
                     }
                     EC_HVC64 => {
@@ -1813,11 +1916,16 @@ impl Vcpu for HvfVcpu {
                 // The virtual timer fired and HVF auto-masked it on exit.
                 if self.usgic_enabled() {
                     // No managed GIC: deliver the timer as PPI 27 through the
-                    // software GIC (if the guest enabled it in its
-                    // redistributor). Leave the HVF vtimer masked until the guest
-                    // EOIs the timer interrupt — by then it has re-armed CNTV to a
-                    // future deadline, so unmasking on EOI won't immediately
-                    // re-fire. The re-arm happens in handle_icc_trap.
+                    // software GIC and leave HVF's vtimer masked until the guest
+                    // EOIs it (unmask in handle_icc_trap). This is the libkrun /
+                    // QEMU kernel-irqchip=off sequence; unmasking earlier storms
+                    // (HVF re-fires the activation before the guest can run its
+                    // handler to advance CNTV). The wedge where an idle guest
+                    // never gets its NEXT tick — because HVF only delivers
+                    // VTIMER_ACTIVATED inside hv_vcpu_run, not while we're parked
+                    // in the WFI idle wait — is handled by usgic_poll_vtimer,
+                    // which re-raises PPI 27 at the armed CNTV_CVAL deadline on
+                    // the run entry after the park wakes.
                     self.usgic_assert_spi(VTIMER_PPI)?;
                     return Ok(VmExit::Ignore);
                 }
