@@ -388,6 +388,132 @@ impl Its {
     pub fn replay_pending(&self, mem: &GuestMemory) -> Result<Vec<(u32, u32, u32, u16)>, ItsError> {
         self.replay_commands(mem, self.config.creadr, self.config.cwriter)
     }
+
+    fn write_u64(mem: &GuestMemory, gpa: u64, v: u64) -> Result<(), ItsError> {
+        mem.write_u64(gpa, v)
+            .map_err(|e| ItsError::Memory(format!("write @ {gpa:#x}: {e:?}")))
+    }
+
+    /// Address of a device's device-table entry (resolving the L1 indirection for
+    /// an indirect table), or `None` if the device is out of range / its L2 page
+    /// is not mapped.
+    fn dte_addr(&self, mem: &GuestMemory, device_id: u32) -> Result<Option<u64>, ItsError> {
+        let Some(baser) = self.config.device_baser else {
+            return Ok(None);
+        };
+        if baser.indirect {
+            let per_l2 = baser.page_size / baser.entry_size;
+            let l1_idx = device_id as u64 / per_l2;
+            let l2_idx = device_id as u64 % per_l2;
+            let l1_entries = baser.num_pages * baser.page_size / 8;
+            if l1_idx >= l1_entries {
+                return Ok(None);
+            }
+            let l1e = Self::read_u64(mem, baser.base + l1_idx * 8)?;
+            if (l1e >> 63) & 1 == 0 {
+                return Ok(None);
+            }
+            let l2_base = l1e & 0x000f_ffff_ffff_0000;
+            Ok(Some(l2_base + l2_idx * baser.entry_size))
+        } else if (device_id as u64) < baser.flat_entries() {
+            Ok(Some(baser.base + device_id as u64 * baser.entry_size))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Apply the ITS commands in `[start, end)` (byte offsets into the command
+    /// queue) to the tables in guest RAM, so a subsequent [`Self::translate`]
+    /// reflects the guest's runtime remaps. Handles the mapping-mutating commands
+    /// (`MAPD`/`MAPC`/`MAPTI`/`MOVI`/`DISCARD`); config-cache commands
+    /// (`INV`/`INVALL`/`SYNC`/`CLEAR`/`INT`) are no-ops here because translation
+    /// walks the live tables rather than a cache. This is the runtime complement
+    /// to [`Self::translate`] a resumed guest needs when it advances
+    /// `GITS_CWRITER`.
+    pub fn apply_commands(
+        &self,
+        mem: &GuestMemory,
+        start: u64,
+        end: u64,
+    ) -> Result<(), ItsError> {
+        let size = self.config.cmd_size;
+        if size == 0 {
+            return Ok(());
+        }
+        let mut off = start % size;
+        let end = end % size;
+        while off != end {
+            let base = self.config.cmd_base + off;
+            let dw0 = Self::read_u64(mem, base)?;
+            let dw1 = Self::read_u64(mem, base + 8)?;
+            let dw2 = Self::read_u64(mem, base + 16)?;
+            match dw0 & 0xff {
+                // MAPD: map a device -> ITT. DW1[4:0]=size, DW2=Valid|ITT[51:8].
+                0x08 => {
+                    let dev = (dw0 >> 32) as u32;
+                    if let Some(addr) = self.dte_addr(mem, dev)? {
+                        let dte = if dw2 >> 63 & 1 == 0 {
+                            0 // Valid=0: unmap the device.
+                        } else {
+                            let itt = dw2 & 0x000f_ffff_ffff_ff00;
+                            let sz = dw1 & 0x1f;
+                            (1u64 << 63) | (((itt >> 8) & ((1 << 44) - 1)) << 5) | sz
+                        };
+                        Self::write_u64(mem, addr, dte)?;
+                    }
+                }
+                // MAPC: map a collection -> rdbase. DW2=Valid|RDbase[50:16]|ICID.
+                0x09 => {
+                    if let Some(baser) = self.config.collection_baser {
+                        let icid = dw2 & 0xffff;
+                        if !baser.indirect && icid < baser.flat_entries() {
+                            let addr = baser.base + icid * baser.entry_size;
+                            let cte = if dw2 >> 63 & 1 == 0 {
+                                0
+                            } else {
+                                let rdbase = (dw2 >> 16) & 0x7_ffff_ffff;
+                                (1u64 << 63) | (rdbase << 16) | icid
+                            };
+                            Self::write_u64(mem, addr, cte)?;
+                        }
+                    }
+                }
+                // MAPTI: map (device,event) -> (pINTID, collection).
+                0x0a => {
+                    let dev = (dw0 >> 32) as u32;
+                    let event = dw1 & 0xffff_ffff;
+                    let intid = (dw1 >> 32) & 0xffff_ffff;
+                    let icid = dw2 & 0xffff;
+                    if let Some(d) = self.device_entry(mem, dev)? {
+                        Self::write_u64(mem, d.itt + event * ITE_SIZE, (intid << 16) | icid)?;
+                    }
+                }
+                // MOVI: retarget (device,event) to a new collection.
+                0x01 => {
+                    let dev = (dw0 >> 32) as u32;
+                    let event = dw1 & 0xffff_ffff;
+                    let icid = dw2 & 0xffff;
+                    if let Some(d) = self.device_entry(mem, dev)? {
+                        let ite_addr = d.itt + event * ITE_SIZE;
+                        let ite = Self::read_u64(mem, ite_addr)?;
+                        Self::write_u64(mem, ite_addr, (ite & !0xffff) | icid)?;
+                    }
+                }
+                // DISCARD: unmap (device,event).
+                0x0f => {
+                    let dev = (dw0 >> 32) as u32;
+                    let event = dw1 & 0xffff_ffff;
+                    if let Some(d) = self.device_entry(mem, dev)? {
+                        Self::write_u64(mem, d.itt + event * ITE_SIZE, 0)?;
+                    }
+                }
+                // INV/INVALL/SYNC/CLEAR/INT/...: no cache to flush; no-op.
+                _ => {}
+            }
+            off = (off + 32) % size;
+        }
+        Ok(())
+    }
 }
 
 /// Sink that delivers a resolved LPI to the guest's CPU interface. The hardware
@@ -537,6 +663,93 @@ mod tests {
     /// indirect) @ 0x40240000, BASER1 (Collections, flat) @ 0x40250000,
     /// CBASER @ 0x40230000, CWRITER/CREADR = 608.
     const KVM_ITS_STATE: &str = r#"{"Kvm":{"its_ctlr":2147483649,"its_iidr":1258292283,"its_cbaser":13258597304054776847,"its_cwriter":608,"its_creadr":608,"its_baser":[17944311241357133312,13548798005043594752,0,0,0,0,0,0]}}"#;
+
+    /// Build an ITS with FLAT device + collection tables and an empty command
+    /// queue, all in a fresh 16 MiB region, for exercising the live command path.
+    fn flat_its() -> (Its, GuestMemory) {
+        let mem = GuestMemory::new();
+        mem.register_owned(0x4000_0000, 16 * 1024 * 1024);
+        let cfg = ItsConfig {
+            enabled: true,
+            device_baser: Some(Baser {
+                indirect: false,
+                typ: 1,
+                entry_size: 8,
+                page_size: 4096,
+                num_pages: 1,
+                base: 0x4010_0000,
+            }),
+            collection_baser: Some(Baser {
+                indirect: false,
+                typ: 4,
+                entry_size: 8,
+                page_size: 4096,
+                num_pages: 1,
+                base: 0x4011_0000,
+            }),
+            cmd_base: 0x4013_0000,
+            cmd_size: 4096,
+            cwriter: 0,
+            creadr: 0,
+        };
+        (Its::new(cfg), mem)
+    }
+
+    /// Write one 32-byte ITS command (three used doublewords) at queue slot `i`.
+    fn cmd(mem: &GuestMemory, i: u64, dw0: u64, dw1: u64, dw2: u64) {
+        let base = 0x4013_0000 + i * 32;
+        mem.write_u64(base, dw0).unwrap();
+        mem.write_u64(base + 8, dw1).unwrap();
+        mem.write_u64(base + 16, dw2).unwrap();
+    }
+
+    #[test]
+    fn live_commands_map_move_and_discard() {
+        let (its, mem) = flat_its();
+        let itt = 0x4012_0000u64;
+        // MAPD dev 5 -> ITT, 32 events (size = evbits-1 = 4).
+        cmd(&mem, 0, 0x08 | (5u64 << 32), 4, (1u64 << 63) | itt);
+        // MAPC collection 0 -> rdbase 0, and collection 1 -> rdbase 3.
+        cmd(&mem, 1, 0x09, 0, (1u64 << 63) | 0);
+        cmd(&mem, 2, 0x09, 0, (1u64 << 63) | (3u64 << 16) | 1);
+        // MAPTI dev 5 event 2 -> LPI 8200, collection 0.
+        cmd(&mem, 3, 0x0a | (5u64 << 32), 2 | (8200u64 << 32), 0);
+        its.apply_commands(&mem, 0, 4 * 32).unwrap();
+
+        let lpi = its.translate(&mem, 5, 2).unwrap().expect("mapped after MAPTI");
+        assert_eq!(lpi.intid, 8200);
+        assert_eq!(lpi.rdbase, 0);
+
+        // MOVI dev 5 event 2 -> collection 1 (rdbase 3).
+        cmd(&mem, 4, 0x01 | (5u64 << 32), 2, 1);
+        its.apply_commands(&mem, 4 * 32, 5 * 32).unwrap();
+        let lpi = its.translate(&mem, 5, 2).unwrap().expect("still mapped after MOVI");
+        assert_eq!(lpi.intid, 8200);
+        assert_eq!(lpi.rdbase, 3, "MOVI must retarget the collection");
+
+        // DISCARD dev 5 event 2 -> unmapped.
+        cmd(&mem, 5, 0x0f | (5u64 << 32), 2, 0);
+        its.apply_commands(&mem, 5 * 32, 6 * 32).unwrap();
+        assert!(
+            its.translate(&mem, 5, 2).unwrap().is_none(),
+            "DISCARD must unmap the event"
+        );
+    }
+
+    #[test]
+    fn live_mapd_unmap_removes_device() {
+        let (its, mem) = flat_its();
+        let itt = 0x4012_0000u64;
+        cmd(&mem, 0, 0x08 | (7u64 << 32), 4, (1u64 << 63) | itt);
+        cmd(&mem, 1, 0x09, 0, 1u64 << 63);
+        cmd(&mem, 2, 0x0a | (7u64 << 32), 0 | (8300u64 << 32), 0);
+        its.apply_commands(&mem, 0, 3 * 32).unwrap();
+        assert_eq!(its.translate(&mem, 7, 0).unwrap().unwrap().intid, 8300);
+        // MAPD with Valid=0 unmaps the whole device.
+        cmd(&mem, 3, 0x08 | (7u64 << 32), 0, 0);
+        its.apply_commands(&mem, 3 * 32, 4 * 32).unwrap();
+        assert!(its.translate(&mem, 7, 0).unwrap().is_none());
+    }
 
     /// Lay down a KVM-format ITS table image in a fresh guest-memory region and
     /// return it. Mirrors the snapshot: an indirect device table, a flat

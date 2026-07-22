@@ -47,6 +47,8 @@ pub mod devices;
 pub mod rehydrate;
 pub mod translate;
 pub mod checkpoint;
+
+pub mod softgic;
 #[cfg(feature = "kvm-snapshot")]
 pub mod virtio;
 
@@ -285,6 +287,7 @@ impl Vm for HvfVm {
                 enabled: std::env::var_os("CHM_USERSPACE_GIC").is_some(),
                 ..UserGic::default()
             }),
+            inject_queue: Arc::new(Mutex::new(Vec::new())),
         }))
     }
 
@@ -473,10 +476,152 @@ struct UserGic {
     ctlr: u64,
     igrpen1: u64,
     sre: u64,
+    /// The GICv3 distributor model (SPI config + routing). VM-global in the
+    /// architecture; kept per-vCPU here for the single-vCPU path (SMP sharing is
+    /// a later refinement). Serviced when the guest hits the GICD MMIO frame.
+    dist: crate::hvf::softgic::Distributor,
+    /// This vCPU's redistributor model (SGI/PPI frame + LPI control registers).
+    redist: crate::hvf::softgic::Redistributor,
+    /// MMIO base of the distributor frame (`0` = not wired; MMIO falls through to
+    /// the device bus). Set on resume from the snapshot's GIC config.
+    gicd_base: u64,
+    /// MMIO base of this vCPU's redistributor window (`0` = not wired).
+    gicr_base: u64,
 }
 
 /// GICv3 spurious INTID returned when no interrupt is pending.
 const GICV3_INTID_SPURIOUS: u32 = 1023;
+
+/// The EL1 virtual-timer PPI (CNTV → INTID 27), delivered through the software
+/// GIC when there is no managed GIC.
+const VTIMER_PPI: u32 = 27;
+
+impl UserGic {
+    /// Queue an INTID (SPI, PPI, or LPI) for delivery. Priority ordering is a
+    /// later refinement; today the pending set is drained FIFO. Deduplicated: an
+    /// INTID already pending or currently active is not re-queued, so a source
+    /// that can assert the same line from two paths (e.g. the virtual timer via
+    /// both the run-entry poll and a residual `VTIMER_ACTIVATED`) delivers it
+    /// exactly once — a second copy would desynchronize the guest's EOI count.
+    fn push_pending(&mut self, intid: u32) {
+        if self.active == Some(intid) || self.pending.contains(&intid) {
+            return;
+        }
+        self.pending.push(intid);
+    }
+
+    /// Model an `ICC_IAR1_EL1` read (interrupt acknowledge): take the next
+    /// pending INTID, mark it active, and return it — or the spurious INTID when
+    /// nothing is pending. A read while an interrupt is already active still
+    /// acknowledges the next pending one (nested), matching the architecture.
+    fn read_iar(&mut self) -> u32 {
+        if self.pending.is_empty() {
+            return GICV3_INTID_SPURIOUS;
+        }
+        let intid = self.pending.remove(0);
+        self.active = Some(intid);
+        intid
+    }
+
+    /// Model an `ICC_EOIR1_EL1` write (end of interrupt). With `EOImode=0`
+    /// (`ICC_CTLR_EL1.EOImode` clear) this drops priority AND deactivates; with
+    /// `EOImode=1` it drops priority only and the guest deactivates later via
+    /// `ICC_DIR_EL1`. Keeping `active` set until DIR when `EOImode=1` is what
+    /// prevents the next pending interrupt from being delivered while the
+    /// current one is still active.
+    fn write_eoir(&mut self) {
+        let eoimode = (self.ctlr >> 1) & 1 != 0;
+        if !eoimode {
+            self.active = None;
+        }
+    }
+
+    /// Model an `ICC_DIR_EL1` write (deactivate interrupt), used with
+    /// `EOImode=1` to complete the split priority-drop/deactivate cycle.
+    fn write_dir(&mut self) {
+        self.active = None;
+    }
+
+    /// Whether the raw virtual IRQ line should be asserted before a run entry:
+    /// there is pending work and no interrupt is currently active (an active
+    /// interrupt keeps the guest in its handler until it EOIs/deactivates).
+    fn should_assert(&self) -> bool {
+        !self.pending.is_empty() && self.active.is_none()
+    }
+}
+
+#[cfg(test)]
+mod usgic_tests {
+    use super::UserGic;
+
+    fn eoimode1() -> UserGic {
+        UserGic {
+            enabled: true,
+            ctlr: 0b10, // EOImode = 1
+            ..UserGic::default()
+        }
+    }
+
+    #[test]
+    fn iar_pops_pending_and_marks_active() {
+        let mut g = UserGic {
+            enabled: true,
+            ..UserGic::default()
+        };
+        g.push_pending(8192);
+        g.push_pending(8193);
+        assert!(g.should_assert(), "pending + idle should assert the line");
+        assert_eq!(g.read_iar(), 8192);
+        assert_eq!(g.active, Some(8192));
+        // While active, the line must not re-assert for the next pending one.
+        assert!(!g.should_assert(), "an active interrupt suppresses re-assert");
+    }
+
+    #[test]
+    fn spurious_when_empty() {
+        let mut g = UserGic {
+            enabled: true,
+            ..UserGic::default()
+        };
+        assert_eq!(g.read_iar(), super::GICV3_INTID_SPURIOUS);
+        assert_eq!(g.active, None);
+    }
+
+    #[test]
+    fn eoimode0_eoir_deactivates() {
+        let mut g = UserGic {
+            enabled: true,
+            ctlr: 0, // EOImode = 0
+            ..UserGic::default()
+        };
+        g.push_pending(8192);
+        g.push_pending(8193);
+        assert_eq!(g.read_iar(), 8192);
+        g.write_eoir(); // EOImode=0: drops priority AND deactivates
+        assert_eq!(g.active, None);
+        // Now the next pending one can be delivered.
+        assert!(g.should_assert());
+        assert_eq!(g.read_iar(), 8193);
+    }
+
+    #[test]
+    fn eoimode1_eoir_holds_active_until_dir() {
+        let mut g = eoimode1();
+        g.push_pending(8192);
+        g.push_pending(8193);
+        assert_eq!(g.read_iar(), 8192);
+        g.write_eoir(); // EOImode=1: priority drop ONLY; stays active
+        assert_eq!(g.active, Some(8192), "EOImode=1 EOIR must not deactivate");
+        assert!(
+            !g.should_assert(),
+            "next pending must be held while the first is still active"
+        );
+        g.write_dir(); // now deactivate
+        assert_eq!(g.active, None);
+        assert!(g.should_assert(), "after DIR the next pending is deliverable");
+        assert_eq!(g.read_iar(), 8193);
+    }
+}
 
 /// One HVF vCPU. Bound to the host thread that created it.
 pub struct HvfVcpu {
@@ -506,6 +651,16 @@ pub struct HvfVcpu {
     /// Experimental userspace GICv3 CPU interface (see [`UserGic`]). Active only
     /// when no managed GIC is used and `CHM_USERSPACE_GIC` is set.
     usgic: Mutex<UserGic>,
+    /// Cross-thread interrupt-injection queue for the userspace GIC. A device or
+    /// net-service thread (which does NOT own this vCPU) cannot call
+    /// [`hv_vcpu_set_pending_interrupt`] — that is owning-thread only — so it
+    /// enqueues the resolved INTID here and wakes the vCPU via [`Self::wake_handle`].
+    /// The owning thread drains this queue into `usgic` at the top of every
+    /// [`Self::run`] entry, applying the same distributor/redistributor gating a
+    /// direct [`Self::usgic_assert_spi`]/[`Self::usgic_inject`] would, then
+    /// re-asserts the raw IRQ line. This is how a stock ITS/LPI snapshot's virtio
+    /// completions (delivered from the device thread) reach the guest.
+    inject_queue: Arc<Mutex<Vec<u32>>>,
 }
 
 // SAFETY: HVF requires a vCPU to be created and run on the same thread; the VMM
@@ -745,6 +900,42 @@ impl HvfVcpu {
         self.usgic.lock().unwrap().enabled = on;
     }
 
+    /// Self-manage the guest's virtual timer on the userspace-GIC path.
+    ///
+    /// With no managed GIC, HVF surfaces the timer via `HV_EXIT_REASON_VTIMER_
+    /// ACTIVATED` and auto-masks it on that exit. Empirically, once that mask/
+    /// unmask cycle has run, HVF does NOT reliably re-surface the activation for
+    /// the guest's next armed deadline: an idle guest takes one tick, EOIs, arms
+    /// its next `CNTV_CVAL`, executes WFI, and then wedges inside `hv_vcpu_run`
+    /// with the overdue timer never redelivered. libkrun and QEMU's
+    /// `kernel-irqchip=off` avoid this by self-managing the timer instead of
+    /// trusting the activation exit.
+    ///
+    /// So at every run entry we sample the guest's `CNTV_CTL_EL0`/`CNTV_CVAL_EL0`
+    /// directly and, if the timer is enabled, not guest-masked, and its deadline
+    /// has passed against [`current_cntvct`], assert PPI 27 through the software
+    /// GIC ourselves. [`push_pending`] dedups, so a race with a still-delivered
+    /// `VTIMER_ACTIVATED` cannot double-inject. The WFI idle park already wakes
+    /// at the `CNTV_CVAL` deadline (see [`wfi_park_ms`]), so this poll fires
+    /// promptly on the re-entry after an idle park — restoring a steady tick.
+    /// No-op unless the userspace GIC is enabled.
+    fn usgic_poll_vtimer(&self) {
+        const CNTV_CTL_EL0: u16 = 0xDF19;
+        const CNTV_CVAL_EL0: u16 = 0xDF1A;
+        if !self.usgic_enabled() {
+            return;
+        }
+        let ctl = self.get_sysreg(CNTV_CTL_EL0).unwrap_or(0);
+        // ENABLE (bit0) set and IMASK (bit1) clear: the guest wants timer IRQs.
+        if ctl & 1 == 0 || ctl & 2 != 0 {
+            return;
+        }
+        let cval = self.get_sysreg(CNTV_CVAL_EL0).unwrap_or(u64::MAX);
+        if cval <= self.current_cntvct() {
+            let _ = self.usgic_assert_spi(VTIMER_PPI);
+        }
+    }
+
     /// Re-assert (or clear) the raw virtual IRQ line to match the emulated CPU
     /// interface's pending state before a run entry. Called at the top of
     /// [`Self::run`]. Asserts when an interrupt is pending and none is active;
@@ -756,7 +947,7 @@ impl HvfVcpu {
             if !g.enabled {
                 return;
             }
-            !g.pending.is_empty() && g.active.is_none()
+            g.should_assert()
         };
         if assert {
             let _ = self.set_irq_line(true);
@@ -791,9 +982,146 @@ impl HvfVcpu {
             if !g.enabled {
                 return Ok(());
             }
-            g.pending.push(intid);
+            g.push_pending(intid);
         }
         self.set_irq_line(true)
+    }
+
+    /// A clone of this vCPU's cross-thread injection queue. A device/net-service
+    /// thread pushes a resolved INTID (an ITS-resolved LPI, a line/message SPI)
+    /// here, then wakes the vCPU via [`Self::wake_handle`]; the owning thread
+    /// drains it at the next [`Self::run`] entry. This is the only cross-thread-
+    /// safe way to inject into the userspace GIC (the raw-line assert itself is
+    /// owning-thread only).
+    pub fn usgic_inject_queue(&self) -> Arc<Mutex<Vec<u32>>> {
+        self.inject_queue.clone()
+    }
+
+    /// Drain the cross-thread injection queue into the userspace GIC, applying
+    /// the same enable gating as the owning-thread inject paths: an LPI
+    /// (`>= 8192`) is always queued (LPI enable rides in the redistributor the
+    /// snapshot seeded); a PPI (`< 32`) is gated on the redistributor's per-vCPU
+    /// enable; an SPI on the distributor. Called at the top of [`Self::run`].
+    /// No-op unless the userspace GIC is enabled.
+    fn usgic_drain_injected(&self) {
+        let queued: Vec<u32> = {
+            let mut q = self.inject_queue.lock().unwrap();
+            if q.is_empty() {
+                return;
+            }
+            std::mem::take(&mut *q)
+        };
+        let mut g = self.usgic.lock().unwrap();
+        if !g.enabled {
+            return;
+        }
+        for intid in queued {
+            let enabled = if intid >= 8192 {
+                true
+            } else if intid < 32 {
+                g.redist.is_ppi_enabled(intid)
+            } else {
+                g.dist.assert_spi(intid)
+            };
+            if enabled {
+                g.push_pending(intid);
+            }
+        }
+    }
+
+    /// Wire this vCPU's software distributor/redistributor to their guest MMIO
+    /// bases (from the snapshot's GIC config) and size the distributor. After
+    /// this, guest accesses to those frames are serviced by the software GIC
+    /// instead of faulting to the device bus. `0` bases leave them unwired.
+    pub fn usgic_set_gic_bases(&self, gicd_base: u64, gicr_base: u64, num_irqs: u32) {
+        let mut g = self.usgic.lock().unwrap();
+        g.gicd_base = gicd_base;
+        g.gicr_base = gicr_base;
+        g.dist = crate::hvf::softgic::Distributor::new(num_irqs);
+    }
+
+    /// Seed the software distributor + redistributor from captured KVM GIC state
+    /// (the same `(offset, value)` pairs the managed-GIC path restores), so a
+    /// resumed guest keeps its interrupt configuration.
+    pub fn usgic_seed_gic(&self, dist_regs: &[(u32, u64)], redist_regs: &[(u32, u64)]) {
+        let mut g = self.usgic.lock().unwrap();
+        g.dist.seed_from_kvm(dist_regs);
+        g.redist.seed_from_kvm(redist_regs);
+    }
+
+    /// Seed the userspace CPU-interface bookkeeping (PMR, BPR1, CTLR, SRE,
+    /// IGRPEN1) from the captured managed-GIC ICC registers. On the userspace-GIC
+    /// path there is no managed GIC to write these into via `hv_gic_set_icc_reg`,
+    /// so a resumed guest's ICC reads (serviced by [`Self::handle_icc_trap`])
+    /// return these seeded values, keeping its CPU-interface view coherent with
+    /// what it had at capture. Delivery itself does not gate on them today.
+    pub fn usgic_seed_icc(&self, icc: &[(u16, u64)]) {
+        let mut g = self.usgic.lock().unwrap();
+        for &(reg, v) in icc {
+            match reg {
+                crate::hvf::ffi::GIC_ICC_PMR_EL1 => g.pmr = v,
+                crate::hvf::ffi::GIC_ICC_BPR1_EL1 => g.bpr1 = v,
+                crate::hvf::ffi::GIC_ICC_CTLR_EL1 => g.ctlr = v,
+                crate::hvf::ffi::GIC_ICC_SRE_EL1 => g.sre = v,
+                crate::hvf::ffi::GIC_ICC_IGRPEN1_EL1 => g.igrpen1 = v,
+                _ => {}
+            }
+        }
+    }
+
+    /// Service a GICD/GICR MMIO access via the software GIC. Returns `None` if
+    /// `ipa` is outside both frames (the caller falls through to the device
+    /// bus); `Some(read_value)` when handled (0 for writes).
+    fn usgic_mmio(&self, ipa: u64, is_write: bool, write_val: u32) -> Option<u64> {
+        let mut g = self.usgic.lock().unwrap();
+        if g.gicd_base != 0 && ipa >= g.gicd_base && ipa < g.gicd_base + 0x1_0000 {
+            let off = ipa - g.gicd_base;
+            if is_write {
+                g.dist.write(off, write_val);
+                Some(0)
+            } else {
+                Some(g.dist.read(off) as u64)
+            }
+        } else if g.gicr_base != 0 && ipa >= g.gicr_base && ipa < g.gicr_base + 0x2_0000 {
+            let off = ipa - g.gicr_base;
+            if is_write {
+                g.redist.write(off, write_val);
+                Some(0)
+            } else {
+                Some(g.redist.read(off) as u64)
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Assert an SPI (INTID >= 32) or PPI (16..31) into this vCPU: mark it
+    /// pending in the distributor/redistributor and, if enabled there, forward it
+    /// to the CPU interface and assert the raw IRQ line. This is the delivery
+    /// path for line/message SPIs (serial, virtio-INTx) and PPIs (the virtual
+    /// timer). Owning-thread only; a no-op unless the userspace GIC is enabled.
+    pub fn usgic_assert_spi(&self, intid: u32) -> CpuResult<()> {
+        let deliver = {
+            let mut g = self.usgic.lock().unwrap();
+            if !g.enabled {
+                return Ok(());
+            }
+            // PPIs gate on the redistributor's per-vCPU enable; SPIs on the
+            // distributor (which also latches the pending bit).
+            let enabled = if intid < 32 {
+                g.redist.is_ppi_enabled(intid)
+            } else {
+                g.dist.assert_spi(intid)
+            };
+            if enabled {
+                g.push_pending(intid);
+            }
+            enabled
+        };
+        if deliver {
+            self.set_irq_line(true)?;
+        }
+        Ok(())
     }
 
     /// Service an `EC=0x18` GICv3 CPU-interface sysreg trap: decode the ISS,
@@ -817,6 +1145,8 @@ impl HvfVcpu {
         let key = (crn, crm, op2);
         let mut deassert = false;
         let mut set_rt: Option<u64> = None;
+        let mut rearm_timer = false;
+        let mut sgi_intid: Option<u32> = None;
         let name: &str;
         {
             let mut g = self.usgic.lock().unwrap();
@@ -825,15 +1155,7 @@ impl HvfVcpu {
                     // ICC_IAR1_EL1 / ICC_IAR0_EL1 (interrupt acknowledge).
                     (12, 12, 0) | (12, 8, 0) => {
                         name = "ICC_IAR";
-                        let intid = if g.pending.is_empty() {
-                            GICV3_INTID_SPURIOUS
-                        } else {
-                            g.pending.remove(0)
-                        };
-                        if intid != GICV3_INTID_SPURIOUS {
-                            g.active = Some(intid);
-                        }
-                        intid as u64
+                        g.read_iar() as u64
                     }
                     // ICC_HPPIR1_EL1 (highest pending, no ack).
                     (12, 12, 2) | (12, 8, 2) => {
@@ -873,17 +1195,45 @@ impl HvfVcpu {
                 if rt < 31 {
                     set_rt = Some(val);
                 }
-                deassert = g.pending.is_empty();
+                deassert = !g.should_assert();
                 if trace {
                     eprintln!("[usgic] vcpu {} read  {name} -> {val:#x} (x{rt})", self.index);
                 }
             } else {
                 let val = if rt == 31 { 0 } else { self.get_reg(rt)? };
                 match key {
-                    // ICC_EOIR1/0 (end of interrupt) and ICC_DIR (deactivate).
-                    (12, 12, 1) | (12, 8, 1) | (12, 11, 1) => {
-                        name = "ICC_EOIR/DIR";
-                        g.active = None;
+                    // ICC_EOIR1_EL1 / ICC_EOIR0_EL1 (end of interrupt). With
+                    // EOImode=0 (ICC_CTLR_EL1.EOImode clear) this both drops
+                    // priority AND deactivates. With EOImode=1 it drops priority
+                    // only; the guest deactivates separately via ICC_DIR_EL1.
+                    // Keeping `active` set until DIR when EOImode=1 is what stops
+                    // a still-active interrupt's slot being reused by the next
+                    // pending one (correctness the rubber-duck flagged).
+                    (12, 12, 1) | (12, 8, 1) => {
+                        name = "ICC_EOIR";
+                        let was = g.active;
+                        g.write_eoir();
+                        // If the virtual-timer PPI just deactivated, re-arm the
+                        // HVF vtimer so the guest's next armed deadline fires.
+                        if was == Some(VTIMER_PPI) && g.active.is_none() {
+                            rearm_timer = true;
+                        }
+                    }
+                    // ICC_DIR_EL1 (deactivate interrupt) — used with EOImode=1.
+                    (12, 11, 1) => {
+                        name = "ICC_DIR";
+                        let was = g.active;
+                        g.write_dir();
+                        if was == Some(VTIMER_PPI) {
+                            rearm_timer = true;
+                        }
+                    }
+                    // ICC_SGI1R_EL1: software-generated interrupt (IPI). The INTID
+                    // is bits [27:24]. Single-vCPU delivers to self; multi-target
+                    // routing across vCPUs is future SMP work.
+                    (12, 11, 5) => {
+                        name = "ICC_SGI1R";
+                        sgi_intid = Some(((val >> 24) & 0xf) as u32);
                     }
                     (4, 6, 0) => {
                         name = "ICC_PMR";
@@ -919,6 +1269,15 @@ impl HvfVcpu {
         }
         if is_read && deassert {
             self.set_irq_line(false)?;
+        }
+        // The guest EOI'd/deactivated the virtual-timer PPI: unmask the HVF
+        // vtimer so its next armed deadline is delivered.
+        if rearm_timer {
+            let _ = gic::rearm_vtimer(self.id);
+        }
+        // A software-generated interrupt targets this vCPU: deliver it.
+        if let Some(intid) = sgi_intid {
+            self.usgic_inject(intid)?;
         }
         // Advance past the trapped MSR/MRS instruction.
         let pc = self.get_reg(HV_REG_PC)?;
@@ -1003,6 +1362,26 @@ impl HvfVcpu {
         let srt = ((iss >> 16) & 0x1f) as u32; // transfer register index
         let is_write = (iss >> 6) & 1 == 1;
         let access = 1usize << sas;
+
+        // Software GIC (userspace path): service GICD/GICR MMIO before falling
+        // through to the device bus. A resumed stock ITS/LPI snapshot runs with
+        // no managed GIC, so the guest's distributor/redistributor accesses land
+        // here as unmapped-IPA data aborts.
+        if self.usgic_enabled() {
+            let write_val = if is_write && srt != 31 {
+                self.get_reg(srt)? as u32
+            } else {
+                0
+            };
+            if let Some(read_val) = self.usgic_mmio(ipa, is_write, write_val) {
+                if !is_write && srt != 31 {
+                    self.set_reg(srt, read_val)?;
+                }
+                let pc = self.get_reg(HV_REG_PC)?;
+                self.set_reg(HV_REG_PC, pc.wrapping_add(4))?;
+                return Ok(());
+            }
+        }
 
         let Some(vm_ops) = self.vm_ops.as_ref() else {
             return Err(HypervisorCpuError::RunVcpu(anyhow!(
@@ -1234,8 +1613,14 @@ impl Vcpu for HvfVcpu {
         // enables, active priorities, ...). These are load-bearing for delivery
         // and live in the GIC, not in the vCPU sysreg file. They are restored
         // after MPIDR so the vCPU is already associated with its redistributor.
-        for &(reg, v) in &s.gic_icc {
-            self.set_icc_reg(reg, v)?;
+        // On the userspace-GIC path there is no managed GIC, so instead seed the
+        // emulated CPU interface's bookkeeping from the captured ICC values.
+        if self.usgic.lock().unwrap().enabled {
+            self.usgic_seed_icc(&s.gic_icc);
+        } else {
+            for &(reg, v) in &s.gic_icc {
+                self.set_icc_reg(reg, v)?;
+            }
         }
         Ok(())
     }
@@ -1269,12 +1654,33 @@ impl Vcpu for HvfVcpu {
         Some(self.run_gen.clone())
     }
 
+    fn usgic_inject_queue(&self) -> Option<Arc<Mutex<Vec<u32>>>> {
+        // Only expose the queue when the userspace GIC is actually in use — a
+        // managed-GIC vCPU delivers cross-thread interrupts through the GIC, not
+        // this queue.
+        if self.usgic.lock().unwrap().enabled {
+            Some(self.inject_queue.clone())
+        } else {
+            None
+        }
+    }
+
     fn run(&mut self) -> std::result::Result<VmExit, HypervisorCpuError> {
         // Signal forward progress to the host-side run watchdog: each entry into
         // run() bumps this. A vCPU wedged inside a single hv_vcpu_run call (e.g.
         // Apple's internal WFI wait not honouring its deadline) stops bumping it,
         // which the watchdog detects and breaks by forcing an exit.
         self.run_gen.fetch_add(1, Ordering::Relaxed);
+        // Drain any cross-thread injections (device/net-service completions) into
+        // the userspace GIC before we sample the line — they were enqueued off
+        // this vCPU's thread and can only be applied here, on the owning thread.
+        self.usgic_drain_injected();
+        // Self-manage the guest's virtual timer: if its armed CNTV deadline is
+        // due, assert PPI 27 now. HVF's own VTIMER_ACTIVATED delivery is
+        // unreliable across the mask/unmask cycle and wedges an idle guest, so
+        // we poll it here every entry (see usgic_poll_vtimer). The WFI idle park
+        // wakes at that deadline, so this fires promptly on the re-entry.
+        self.usgic_poll_vtimer();
         // Userspace CPU interface: HVF samples the raw virtual IRQ line at run
         // ENTRY (not continuously), so — like QEMU's hvf_inject_interrupts — we
         // must (re)assert it before every entry whenever an interrupt is pending
@@ -1347,10 +1753,64 @@ impl Vcpu for HvfVcpu {
                         // re-executes WFI and parks again.
                         let pc = self.get_reg(HV_REG_PC)?;
                         self.set_reg(HV_REG_PC, pc.wrapping_add(4))?;
-                        // Park until kicked or the virtual-timer deadline is due
-                        // (see wfi_park_ms); a failed wait just falls through to
-                        // a guest re-entry.
-                        let _ = self.kick.wait_timeout(self.wfi_park_ms());
+                        if self.usgic_enabled() {
+                            // Halt IN THE HOST until the software GIC has an
+                            // interrupt to deliver, then return so hv_vcpu_run
+                            // delivers it. Re-entering hv_vcpu_run with nothing
+                            // pending lets HVF service the WFI in-kernel and block
+                            // on a vtimer deadline it never redelivers (it only
+                            // surfaces VTIMER_ACTIVATED *inside* hv_vcpu_run) —
+                            // the idle-guest wedge.
+                            //
+                            // Capture the guest's timer deadline ONCE here, while
+                            // the values are fresh from the just-returned
+                            // hv_vcpu_run (CNTV_* / CNTVCT read unreliably once the
+                            // vCPU is parked out of run), then nap against the
+                            // host monotonic counter (current_cntvct, mach-based
+                            // and always valid) and self-deliver PPI 27 when the
+                            // captured deadline passes. A cross-thread injection
+                            // (drained each nap) also breaks the wait. A wall-clock
+                            // cap bounds the halt so VM teardown (which stops the
+                            // outer run loop) is observed even if nothing becomes
+                            // pending — on re-entry the guest simply re-WFIs and we
+                            // capture its next deadline.
+                            const CNTV_CTL_EL0: u16 = 0xDF19;
+                            const CNTV_CVAL_EL0: u16 = 0xDF1A;
+                            let ctl = self.get_sysreg(CNTV_CTL_EL0).unwrap_or(0);
+                            let timer_live = ctl & 1 != 0 && ctl & 2 == 0;
+                            let cval = self.get_sysreg(CNTV_CVAL_EL0).unwrap_or(u64::MAX);
+                            let halt_deadline =
+                                std::time::Instant::now() + std::time::Duration::from_secs(1);
+                            loop {
+                                if timer_live && self.current_cntvct() >= cval {
+                                    let _ = self.usgic_assert_spi(VTIMER_PPI);
+                                }
+                                self.usgic_drain_injected();
+                                if self.usgic.lock().unwrap().should_assert()
+                                    || std::time::Instant::now() >= halt_deadline
+                                {
+                                    break;
+                                }
+                                let nap_ms = if timer_live {
+                                    let now = self.current_cntvct();
+                                    if cval > now {
+                                        let tb = mach_timebase();
+                                        let ns = (cval - now) as u128 * tb.numer as u128
+                                            / tb.denom as u128;
+                                        ((ns / 1_000_000) as u64).clamp(1, 10)
+                                    } else {
+                                        1
+                                    }
+                                } else {
+                                    10
+                                };
+                                std::thread::sleep(std::time::Duration::from_millis(nap_ms));
+                            }
+                        } else {
+                            // Managed path: one bounded park; the outer loop
+                            // re-enters and the managed GIC redelivers.
+                            let _ = self.kick.wait_timeout(self.wfi_park_ms());
+                        }
                         Ok(VmExit::Ignore)
                     }
                     EC_HVC64 => {
@@ -1464,13 +1924,28 @@ impl Vcpu for HvfVcpu {
                 }
             }
             HV_EXIT_REASON_VTIMER_ACTIVATED => {
-                // The virtual timer fired and HVF auto-masked it on exit. With
-                // the managed GIC the timer is normally delivered as GIC PPI 27
-                // without this exit at all (see hvf_guest_takes_virtual_timer);
-                // this branch is the defensive path for when HVF does surface
-                // the activation. Re-arm the timer so the GIC re-evaluates and
-                // delivers PPI 27 — without asserting the raw IRQ line, which
-                // would bypass the GIC and deliver a spurious interrupt.
+                // The virtual timer fired and HVF auto-masked it on exit.
+                if self.usgic_enabled() {
+                    // No managed GIC: deliver the timer as PPI 27 through the
+                    // software GIC and leave HVF's vtimer masked until the guest
+                    // EOIs it (unmask in handle_icc_trap). This is the libkrun /
+                    // QEMU kernel-irqchip=off sequence; unmasking earlier storms
+                    // (HVF re-fires the activation before the guest can run its
+                    // handler to advance CNTV). The wedge where an idle guest
+                    // never gets its NEXT tick — because HVF only delivers
+                    // VTIMER_ACTIVATED inside hv_vcpu_run, not while we're parked
+                    // in the WFI idle wait — is handled by usgic_poll_vtimer,
+                    // which re-raises PPI 27 at the armed CNTV_CVAL deadline on
+                    // the run entry after the park wakes.
+                    self.usgic_assert_spi(VTIMER_PPI)?;
+                    return Ok(VmExit::Ignore);
+                }
+                // Managed GIC path: with the managed GIC the timer is normally
+                // delivered as GIC PPI 27 without this exit at all (see
+                // hvf_guest_takes_virtual_timer); this is the defensive path for
+                // when HVF does surface the activation. Re-arm so the GIC
+                // re-evaluates and delivers PPI 27 — without asserting the raw IRQ
+                // line, which would bypass the GIC and deliver a spurious IRQ.
                 if let Err(rc) = gic::rearm_vtimer(self.id) {
                     return Err(HypervisorCpuError::RunVcpu(anyhow!(
                         "failed to re-arm vtimer: {:#010x}",

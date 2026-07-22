@@ -572,6 +572,118 @@ fn rehydrate_inner(
     })
 }
 
+/// The pieces of a **userspace-GIC** rehydrated VM (NO managed GIC). Field order
+/// is drop order: `vm` (whose `Drop` calls `hv_vm_destroy`) is declared last so
+/// it drops after the vCPUs and RAM mappings, matching HVF's teardown order.
+pub struct UsgicVm {
+    /// Restored vCPUs, in id order. Each has its `usgic` enabled + seeded.
+    pub vcpus: Vec<Box<dyn Vcpu>>,
+    /// Host view of restored guest RAM (the virtio device model reads/writes the
+    /// guest's rings through this).
+    pub guest_mem: Arc<GuestMemory>,
+    /// Host-side guest-RAM backings (kept alive for the VM's lifetime).
+    _ram: Vec<GuestRam>,
+    /// The reconstructed VM. Dropped last (`hv_vm_destroy`).
+    pub vm: Arc<dyn Vm>,
+}
+
+/// Rehydrate a snapshot onto a **userspace GICv3** — the path for a stock
+/// ITS/LPI-routed snapshot, whose virtio completions Apple's managed GIC cannot
+/// deliver. Unlike [`rehydrate`], this creates NO managed GIC: it maps RAM,
+/// creates vCPUs, restores each register file, and seeds the per-vCPU software
+/// distributor/redistributor + CPU-interface bookkeeping from the captured KVM
+/// GIC state. The software GIC is wired at the guest's ORIGINAL GIC MMIO bases
+/// (the managed path relocates the GIC; the userspace path does not need to).
+///
+/// The caller must run each vCPU on its own thread (HVF binds a vCPU to its
+/// creating thread) and route device/serial completions through
+/// [`HvfVcpu::usgic_inject_queue`], waking the vCPU so its run-entry drain takes
+/// them. Gated by the caller (only used when `CHM_USERSPACE_GIC` + an ITS
+/// snapshot); the managed [`rehydrate`] path is unaffected.
+pub fn rehydrate_usgic(
+    hv: &dyn Hypervisor,
+    snap: &Snapshot,
+    memory_ranges: &Path,
+    vm_ops: &Arc<dyn VmOps>,
+) -> Result<UsgicVm, RehydrateError> {
+    let vm = hv
+        .create_vm(HypervisorVmConfig {
+            nested: false,
+            smt_enabled: false,
+        })
+        .map_err(|e| RehydrateError::Hv(anyhow!("create_vm: {e}")))?;
+
+    // --- guest RAM (same mapping as prepare_vm, but no managed GIC after) ---
+    let guest_mem = Arc::new(GuestMemory::new());
+    let mut ram = Vec::with_capacity(snap.mem_mappings.len());
+    for m in &snap.mem_mappings {
+        let backing = GuestRam::map_file(memory_ranges, m.file_offset, m.size as usize)?;
+        // SAFETY: `backing` outlives the VM (kept alive in `ram`).
+        unsafe {
+            vm.create_user_memory_region(m.slot, m.gpa, m.size as usize, backing.ptr, false, false)
+                .map_err(|e| RehydrateError::Hv(anyhow!("map RAM @ {:#x}: {e}", m.gpa)))?;
+            guest_mem.register(m.gpa, backing.ptr, m.size as usize);
+        }
+        ram.push(backing);
+    }
+
+    // The guest's original GIC MMIO bases (arch::aarch64::layout): distributor
+    // just below the mapped-IO window, per-vCPU redistributors stacked below it.
+    let gicd_base = MAPPED_IO_START - GIC_V3_DIST_SIZE;
+    let vcpu_count = snap.vcpus.len() as u64;
+    let gicr_region_base = gicd_base - vcpu_count * GIC_V3_REDIST_SIZE;
+
+    let dist_pairs = dist_to_hvf(&snap.gic_dist)
+        .ok_or_else(|| RehydrateError::Translate("distributor dump did not translate".into()))?;
+
+    let mut vcpus = Vec::with_capacity(snap.vcpus.len());
+    for id in 0..snap.vcpus.len() {
+        let mut vcpu = vm
+            .create_vcpu(id as u32, Some(vm_ops.clone()))
+            .map_err(|e| RehydrateError::Hv(anyhow!("create_vcpu {id}: {e}")))?;
+
+        let redist_pairs = redist_to_hvf(&snap.rdist_slice(id)).ok_or_else(|| {
+            RehydrateError::Translate(format!("vCPU {id} redistributor did not translate"))
+        })?;
+        let gicr_base = gicr_region_base + id as u64 * GIC_V3_REDIST_SIZE;
+        {
+            let concrete = vcpu
+                .as_any_concrete_mut()
+                .downcast_mut::<HvfVcpu>()
+                .ok_or_else(|| RehydrateError::Translate("vCPU is not an HVF vCPU".into()))?;
+            concrete.set_usgic_enabled(true);
+            // set_gic_bases (re)creates the distributor, so seed AFTER it.
+            concrete.usgic_set_gic_bases(gicd_base, gicr_base, snap.num_irq);
+            concrete.usgic_seed_gic(&dist_pairs, &redist_pairs);
+        }
+
+        // Restore the register file. Because usgic is enabled, set_state seeds the
+        // captured ICC bookkeeping into `usgic` instead of a (nonexistent) managed
+        // GIC.
+        vcpu.set_state(&CpuState::Hvf(snap.vcpus[id].clone()))
+            .map_err(|e| RehydrateError::Hv(anyhow!("restore vCPU {id} state: {e}")))?;
+
+        // One shared virtual-counter reference across cores (no-op for 1 vCPU).
+        if let Some(reference) = snap.reference_cntvct() {
+            let concrete = vcpu
+                .as_any_concrete_mut()
+                .downcast_mut::<HvfVcpu>()
+                .expect("HVF vCPU");
+            concrete
+                .restore_vtimer_offset(reference)
+                .map_err(|e| RehydrateError::Hv(anyhow!("vCPU {id} reseed vtimer: {e}")))?;
+        }
+        vcpus.push(vcpu);
+    }
+
+    Ok(UsgicVm {
+        vcpus,
+        guest_mem,
+        _ram: ram,
+        vm,
+    })
+}
+
 /// The pieces of a rehydrated VM that exist before any vCPU: the reconstructed
 /// VM handle, its mapped guest RAM, the restored-shell managed GIC, and a host
 /// view of guest memory.
