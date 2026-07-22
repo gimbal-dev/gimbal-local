@@ -264,12 +264,19 @@ pub(crate) fn its_lpi_guard(state_json: &str) -> Result<(), String> {
          ITS as LPIs ({wired_devices} MSI-wired device(s) + an enabled \
          gic-v3-its), which Apple's Hypervisor.framework managed GIC cannot \
          deliver. The guest would restore but then hang on its first disk/net \
-         I/O with no completion interrupt. Re-capture the snapshot with the \
-         guest's virtio MSIs routed as GICv3 message-based SPIs (MBI) or legacy \
-         INTx line SPIs rather than through a GIC ITS; the managed GIC delivers \
-         those via hv_gic_send_msi / hv_gic_set_spi. Set CHM_ALLOW_ITS_LPI=1 to \
-         bypass this guard and run anyway (the guest will likely stall on first \
-         I/O)."
+         I/O with no completion interrupt.\n\
+         \n\
+         To run it anyway, set CHM_USERSPACE_GIC=1: this rehydrates the snapshot \
+         on an experimental userspace GICv3 that CAN deliver LPIs, and boots a \
+         stock ITS/LPI guest to an interactive shell (single-vCPU; serial works, \
+         virtio-completion routing is in progress). See \
+         docs/hvf-compatible-snapshots.md.\n\
+         \n\
+         Alternatively, re-capture with the guest's virtio MSIs routed as GICv3 \
+         message-based SPIs (MBI) or legacy INTx line SPIs rather than through a \
+         GIC ITS; the managed GIC delivers those via hv_gic_send_msi / \
+         hv_gic_set_spi. (CHM_ALLOW_ITS_LPI=1 bypasses this guard on the managed \
+         path, but the guest will then stall on first I/O.)"
     ))
 }
 

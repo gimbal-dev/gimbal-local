@@ -29,10 +29,13 @@ chm: guest resumed — serial console follows.
 
 > **Status: real, and honestly bounded.** Captured `arm64` KVM snapshots
 > rehydrate onto HVF, run multi-vCPU Linux guests, service native virtio
-> block/rng/net, and expose an interactive serial console. Stock ITS/LPI-routed
-> snapshots remain blocked by Apple's managed-GIC limits; supported captures use
-> GICv2M/message-SPIs. There are no stubbed VMs or fake consoles here —
-> everything streamed above is the guest actually executing.
+> block/rng/net, and expose an interactive serial console. The default
+> managed-GIC path needs a GICv2M/message-SPI capture; **stock ITS/LPI-routed
+> snapshots — the ones Apple's managed GIC can't run — now boot to an interactive
+> shell on an experimental userspace GICv3** (`CHM_USERSPACE_GIC=1 chm run …`,
+> single-vCPU; see [`docs/hvf-compatible-snapshots.md`](docs/hvf-compatible-snapshots.md)).
+> There are no stubbed VMs or fake consoles here — everything streamed above is
+> the guest actually executing.
 
 ---
 
@@ -143,6 +146,7 @@ Milestones completed (all hardware-verified on Apple Silicon):
 | M29 | Durable per-sandbox audit trail (`audit.jsonl`: session start/stop, denied egress, bundle-verify), readable via `chm audit show`. |
 | M30 | Security hardening for untrusted snapshots + hostile guest agents: bundle/overlay confinement, daemon socket auth, no host-FS passthrough, resource + NAT limits, per-NIC fail-closed egress, CAS digest hardening, and Ed25519 signed-manifest verification. See [`docs/security-model.md`](docs/security-model.md). |
 | M31 | Network host-isolation: a reserved-address guard blocks the guest from reaching host loopback / private LAN / link-local metadata (`169.254.169.254`) regardless of policy (closing DNS rebinding), and new sandboxes default to firewall-on default-deny. |
+| M-USGIC | **Userspace GICv3 (experimental):** a stock upstream ITS/LPI-routed snapshot — the kind Apple's managed GIC can't run — rehydrates onto a software GICv3 (distributor/redistributor + trapped CPU interface delivering SPIs/PPIs/SGIs/**LPIs**, live ITS, self-managed vtimer) and boots to an interactive Ubuntu shell via `CHM_USERSPACE_GIC=1 chm run`. Single-vCPU + serial today. See [`docs/hvf-compatible-snapshots.md`](docs/hvf-compatible-snapshots.md). |
 
 Next:
 
