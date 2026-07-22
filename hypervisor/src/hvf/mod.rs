@@ -1654,6 +1654,17 @@ impl Vcpu for HvfVcpu {
         Some(self.run_gen.clone())
     }
 
+    fn usgic_inject_queue(&self) -> Option<Arc<Mutex<Vec<u32>>>> {
+        // Only expose the queue when the userspace GIC is actually in use — a
+        // managed-GIC vCPU delivers cross-thread interrupts through the GIC, not
+        // this queue.
+        if self.usgic.lock().unwrap().enabled {
+            Some(self.inject_queue.clone())
+        } else {
+            None
+        }
+    }
+
     fn run(&mut self) -> std::result::Result<VmExit, HypervisorCpuError> {
         // Signal forward progress to the host-side run watchdog: each entry into
         // run() bumps this. A vCPU wedged inside a single hv_vcpu_run call (e.g.

@@ -31,8 +31,8 @@ use hypervisor::hvf::checkpoint::{self as hvf_checkpoint, CheckpointState};
 use hypervisor::hvf::devices::{MmioBus, Pl011};
 use hypervisor::hvf::gic::GicMsiSink;
 use hypervisor::hvf::rehydrate::{
-    PreparedVm, Snapshot, enable_group1_spi_forwarding, prepare_vm, restore_distributor,
-    restore_vcpu_state,
+    PreparedVm, Snapshot, UsgicVm, enable_group1_spi_forwarding, prepare_vm, rehydrate_usgic,
+    restore_distributor, restore_vcpu_state,
 };
 use hypervisor::hvf::virtio::GuestMemory;
 use hypervisor::hvf::virtio::nat::{EgressPolicy, NatLimits};
@@ -1186,6 +1186,14 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     let dir = &args.snapshot_dir;
     let loaded = load_snapshot(dir)?;
 
+    // Userspace-GIC path (experimental, opt-in): rehydrate an ITS/LPI-routed
+    // snapshot — the kind Apple's managed GIC cannot deliver completions for, and
+    // which its_lpi_guard otherwise rejects — onto a software GICv3. This is the
+    // path that lifts the "GICv2M capture only" restriction; see issue #81.
+    if env::var_os("CHM_USERSPACE_GIC").is_some() {
+        return run_usgic(args, loaded);
+    }
+
     its_lpi_guard(&loaded.state_json)?;
 
     // Resume from a live checkpoint when one exists and checkpoints are enabled;
@@ -1212,7 +1220,7 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     };
 
     if !args.quiet {
-        banner(dir, &mem_ranges, loaded.num_vcpus, loaded.total_ram);
+        banner(dir, &mem_ranges, loaded.num_vcpus, loaded.total_ram, "managed GICv3");
         if resuming {
             eprintln!("chm: resuming from a saved checkpoint (restored, not cold-booted).");
         }
@@ -1334,6 +1342,204 @@ enum Outcome {
     /// string names the limit for the operator.
     LimitExceeded(String),
 }
+
+/// An [`MsiSink`] that delivers an SPI/LPI into a userspace-GIC vCPU from another
+/// thread. The console (and, later, virtio) threads run OFF the vCPU thread, and
+/// the raw IRQ-line assert is owning-thread only — so we enqueue the INTID on the
+/// vCPU's injection queue and wake it; the vCPU drains + delivers it through the
+/// software GIC at its next `run()` entry.
+struct UsgicMsiSink {
+    queue: Arc<Mutex<Vec<u32>>>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl MsiSink for UsgicMsiSink {
+    fn deliver_spi(&self, intid: u32) {
+        self.queue.lock().unwrap().push(intid);
+        (self.wake)();
+    }
+}
+
+/// Resume a snapshot onto the **userspace GICv3** (no managed GIC) with an
+/// interactive serial console. This is the path for a stock ITS/LPI-routed
+/// snapshot — the capture Apple's managed GIC cannot deliver completions for.
+///
+/// HVF binds a vCPU to the thread that created it, so the whole VM (rehydrate +
+/// run loop) lives on one dedicated thread; this thread hands its injection
+/// queue + wake handle back to the orchestrator, which wires the terminal, the
+/// stdin→serial pump, and the level-triggered serial re-assert, then drains the
+/// console until the session ends. Single-vCPU for now (the shipping SMP managed
+/// path is untouched); a multi-vCPU userspace-GIC resume is future work.
+fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
+    let dir = &args.snapshot_dir;
+
+    if loaded.num_vcpus != 1 {
+        return Err(format!(
+            "CHM_USERSPACE_GIC currently supports single-vCPU snapshots only \
+             (this one has {} vCPUs); the managed-GIC path handles SMP",
+            loaded.num_vcpus
+        ));
+    }
+    if !args.quiet {
+        banner(dir, &loaded.mem_ranges, loaded.num_vcpus, loaded.total_ram, "userspace GICv3");
+        eprintln!(
+            "chm: userspace GIC (experimental) — rehydrating an ITS/LPI snapshot \
+             the managed GIC cannot run.\n"
+        );
+    }
+
+    // Device model: a bus with a real PL011 at the guest's serial base, its
+    // line/interrupt state seeded from the snapshot so host keystrokes deliver.
+    let (uart, bus) = build_vm_ops(&loaded.state_json);
+    let vm_ops: Arc<dyn VmOps> = Arc::new(ChmVmOps::new(bus.clone()));
+
+    let mem_ranges = loaded.mem_ranges.clone();
+    let snap = loaded.snap;
+
+    let running = Arc::new(AtomicBool::new(true));
+    let outcome: Arc<Mutex<Option<Result<Outcome, String>>>> = Arc::new(Mutex::new(None));
+    // The vCPU thread hands these back to the orchestrator once the VM is built.
+    let (setup_tx, setup_rx) = mpsc::channel::<
+        Result<(Arc<Mutex<Vec<u32>>>, Arc<dyn Fn() + Send + Sync>, Arc<dyn Fn() + Send + Sync>), String>,
+    >();
+
+    let vm_ops_thread = vm_ops.clone();
+    let running_thread = running.clone();
+    let outcome_thread = outcome.clone();
+    let vcpu_thread = thread::Builder::new()
+        .name("chm-usgic-vcpu0".into())
+        .spawn(move || {
+            let hv = match hypervisor::new() {
+                Ok(hv) => hv,
+                Err(e) => {
+                    let _ = setup_tx.send(Err(format!("hypervisor::new(): {e}")));
+                    return;
+                }
+            };
+            let mut uvm: UsgicVm =
+                match rehydrate_usgic(hv.as_ref(), &snap, &mem_ranges, &vm_ops_thread) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        let _ = setup_tx.send(Err(format!("rehydrate_usgic: {e}")));
+                        return;
+                    }
+                };
+            let vcpu = uvm.vcpus[0].as_mut();
+            let queue = match vcpu.usgic_inject_queue() {
+                Some(q) => q,
+                None => {
+                    let _ = setup_tx.send(Err("vCPU exposed no userspace-GIC queue".into()));
+                    return;
+                }
+            };
+            let wake = vcpu
+                .wake_signal()
+                .unwrap_or_else(|| Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>);
+            let exit = vcpu
+                .exit_signal()
+                .unwrap_or_else(|| Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>);
+            if setup_tx.send(Ok((queue, wake, exit))).is_err() {
+                return;
+            }
+
+            // Run the guest until a host-side stop (running=false) or a guest
+            // power-off. The run() body handles the software GIC, the self-managed
+            // vtimer, and the WFI idle halt internally.
+            while running_thread.load(Ordering::Acquire) {
+                match vcpu.run() {
+                    Ok(VmExit::Ignore) => {}
+                    Ok(VmExit::Shutdown | VmExit::Reset) => {
+                        *outcome_thread.lock().unwrap() = Some(Ok(Outcome::PoweredOff));
+                        running_thread.store(false, Ordering::Release);
+                        break;
+                    }
+                    Ok(other) => {
+                        *outcome_thread.lock().unwrap() =
+                            Some(Err(format!("vCPU unexpected exit: {other:?}")));
+                        running_thread.store(false, Ordering::Release);
+                        break;
+                    }
+                    Err(e) => {
+                        *outcome_thread.lock().unwrap() = Some(Err(format!("vCPU run: {e}")));
+                        running_thread.store(false, Ordering::Release);
+                        break;
+                    }
+                }
+            }
+            // `uvm` (and its vCPU + VM) drops here, on the owning thread.
+        })
+        .map_err(|e| format!("spawn userspace-GIC vCPU thread: {e}"))?;
+
+    // Wait for the vCPU thread to build the VM and hand back its plumbing.
+    let (queue, wake, exit) = match setup_rx.recv() {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => {
+            running.store(false, Ordering::Release);
+            let _ = vcpu_thread.join();
+            return Err(e);
+        }
+        Err(_) => {
+            running.store(false, Ordering::Release);
+            let _ = vcpu_thread.join();
+            return Err("userspace-GIC vCPU thread exited before setup".into());
+        }
+    };
+
+    // Interactive console. The serial sink routes a keystroke's line SPI through
+    // the software GIC via the injection queue; the wake nudges the idle vCPU.
+    let raw_console = RawConsole::enable();
+    console::install_signal_handlers(raw_console.handle());
+    let serial_sink: Arc<dyn MsiSink> = Arc::new(UsgicMsiSink {
+        queue,
+        wake: wake.clone(),
+    });
+    let serial_wake: Option<Arc<dyn Fn() + Send + Sync>> = Some(wake);
+    console::spawn_stdin_pump(
+        uart.clone(),
+        serial_sink.clone(),
+        raw_console.handle(),
+        serial_wake.clone(),
+    );
+    let serial_reassert =
+        console::spawn_serial_reassert(uart.clone(), serial_sink, serial_wake, running.clone());
+    if !args.quiet {
+        eprintln!(
+            "chm: interactive console active — close this window or press Ctrl-A x \
+             to end the session.\n"
+        );
+    }
+
+    let (limits, _src) = limits::resolve_limits(dir, args.limits_file.as_deref());
+    let overlay_dir = dir.join(".chm-overlays");
+    let coordinator = run_console(&uart, &running, args, &limits, &overlay_dir);
+
+    // Stop: clear the flag, force the vCPU out of any in-flight run(), join.
+    running.store(false, Ordering::Release);
+    exit();
+    let _ = serial_reassert.join();
+    let _ = vcpu_thread.join();
+    drop(raw_console);
+
+    let vcpu_outcome = outcome.lock().unwrap().take();
+    let final_outcome = match vcpu_outcome {
+        Some(Ok(o)) => o,
+        Some(Err(e)) => return Err(e),
+        None => coordinator.unwrap_or(Outcome::Interrupted),
+    };
+    if !args.quiet {
+        match &final_outcome {
+            Outcome::PoweredOff => eprintln!("\nchm: guest powered off."),
+            Outcome::Interrupted => eprintln!("chm: session closed; VM shut down."),
+            Outcome::ConsoleClosed => eprintln!("chm: console closed; stopping."),
+            Outcome::MaxSeconds => eprintln!("chm: reached the maximum session time."),
+            Outcome::Idle(secs) => eprintln!("chm: guest idle for {secs}s — stopping."),
+            Outcome::LimitExceeded(reason) => eprintln!("chm: resource limit hit ({reason})."),
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+
 
 /// How a run should treat live checkpoints (suspend/resume).
 ///
@@ -2174,13 +2380,13 @@ fn run_console(
     Ok(Outcome::PoweredOff)
 }
 
-fn banner(dir: &Path, mem_ranges: &Path, num_vcpus: u32, total_ram: u64) {
+fn banner(dir: &Path, mem_ranges: &Path, num_vcpus: u32, total_ram: u64, backend: &str) {
     let mib = total_ram / (1024 * 1024);
     eprintln!("chm — Gimbal Local (Cloud Hypervisor on Apple Silicon)");
     eprintln!("  snapshot:  {}", dir.display());
     eprintln!("  memory:    {} ({mib} MiB)", mem_ranges.display());
     eprintln!("  vCPUs:     {num_vcpus}");
-    eprintln!("  backend:   Apple Hypervisor.framework (managed GICv3)");
+    eprintln!("  backend:   Apple Hypervisor.framework ({backend})");
 }
 
 #[cfg(test)]

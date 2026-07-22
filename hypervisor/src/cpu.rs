@@ -402,6 +402,16 @@ pub trait Vcpu: Send + Sync {
     fn run_progress(&self) -> Option<Arc<AtomicU64>> {
         None
     }
+    /// Return this vCPU's userspace-GIC cross-thread injection queue, if it has
+    /// one. A device or console thread pushes a resolved INTID (a line/message
+    /// SPI such as the serial console's, or an ITS-resolved LPI) and wakes the
+    /// vCPU (see [`Self::wake_signal`]); the owning thread drains it at the next
+    /// `run()` entry and delivers it through the software GIC. Backends without a
+    /// userspace GIC return `None` (the default); the macOS HVF backend returns
+    /// its queue only when the userspace GIC is in use.
+    fn usgic_inject_queue(&self) -> Option<Arc<std::sync::Mutex<Vec<u32>>>> {
+        None
+    }
     ///
     /// Returns StandardRegisters with default value set
     ///
