@@ -566,6 +566,316 @@ fn microvm_delta_rollback_removes_the_later_delta() {
     );
 }
 
+/// Probe the guest's toolchain + resources (M32 benchmark prep). Boots the
+/// snapshot, logs in, and dumps `which <tool>` for a set of build/CPU tools plus
+/// nproc/memory to the console + `CHM_E2E_LOG`, so we can pick a benchmark
+/// workload that is present in both the guest and the Docker baseline. Read-only:
+/// it runs no build and asserts nothing beyond reaching a shell.
+#[test]
+#[ignore = "needs a local HVF-compatible snapshot; run via scripts/hvf/e2e-microvm-loop.sh"]
+fn microvm_probe_toolchain() {
+    let Some(snapshot) = snapshot_from_env() else {
+        eprintln!("skipping: set CHM_E2E_SNAPSHOT to a snapshot dir to probe the guest toolchain");
+        return;
+    };
+    let overlays = snapshot.join(".chm-overlays");
+    if overlays.is_dir() {
+        for entry in fs::read_dir(&overlays).into_iter().flatten().flatten() {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    let chm = signed_chm_binary();
+    let mut s = PtySession::spawn(
+        &chm,
+        &[
+            "connect",
+            snapshot.to_str().unwrap(),
+            "--no-stop-daemon",
+            "--idle-exit",
+            "0",
+            "--max-seconds",
+            "120",
+        ],
+    );
+    let shell = "@ch-snap:~$";
+    let deadline = Instant::now() + OVERALL_BUDGET;
+    login_to_shell(&mut s, shell, deadline);
+    s.drain_for(Duration::from_secs(2));
+
+    let uniq = format!("{}_{}", process::id(), nanos());
+    // The command line the guest echoes back never contains "PROBE_END" as a
+    // contiguous executed-output token, so the sentinel is unambiguous.
+    let cmd = format!(
+        "echo PB_{uniq}_S; \
+         for t in cc gcc g++ make ld python3 gzip xz zstd openssl perl git tar; do \
+           printf '%s=' $t; command -v $t || echo none; done; \
+         echo NPROC=$(nproc); echo MEMMB=$(free -m 2>/dev/null | awk '/Mem:/{{print $2}}'); \
+         echo OSREL=$(. /etc/os-release; echo $VERSION_ID); \
+         echo PB_{uniq}_E\n"
+    );
+    s.send(&cmd);
+    s.wait_for(&[&format!("PB_{uniq}_E")], deadline);
+    let transcript = s.transcript();
+    s.shutdown();
+
+    if let Some(log) = env::var_os("CHM_E2E_LOG") {
+        let _ = fs::write(&log, &transcript);
+    }
+    // Surface the probe block on stderr for the operator.
+    for line in transcript.lines() {
+        if line.contains('=') || line.starts_with("NPROC") || line.starts_with("MEMMB") {
+            eprintln!("probe: {}", line.trim());
+        }
+    }
+    eprintln!("probe: captured {} bytes of console", transcript.len());
+}
+
+/// Reliability probe for #78 (interactive wedge after a long silent CPU burst).
+///
+/// In a single `chm connect` session, runs a long silent CPU burst then a
+/// follow-up burst, mirroring the back-to-back-compression case that wedged the
+/// benchmark. Because the underlying cause is Apple HVF's internal WFI wait not
+/// reliably waking a freshly-resumed guest (an intermittent, hard hypervisor-
+/// internals issue — see #78/#60), a single run can wedge by chance. So this
+/// retries whole sessions up to `WEDGE_ATTEMPTS` and reports the success rate,
+/// passing if the guest completes a back-to-back-burst session at least once
+/// (proving the path works) and failing only if EVERY attempt wedges (a true
+/// regression). Set `CHM_E2E_LOG` to capture the console of a wedged attempt.
+///
+/// Config (env): `CHM_E2E_SNAPSHOT` (the guest), `WEDGE_N` (burst seq size,
+/// default 16000000 ~ 20s on the 1-vCPU demo), `WEDGE_FOLLOWUPS` (default 2),
+/// `WEDGE_ATTEMPTS` (default 3). The run-progress watchdog (default on) bounds a
+/// wedge into a recoverable crawl; `CHM_DISABLE_RUN_WATCHDOG=1` compares without.
+#[test]
+#[ignore = "needs a local HVF-compatible snapshot; reliability probe for #78"]
+fn microvm_input_wedge_repro() {
+    let Some(snapshot) = snapshot_from_env() else {
+        eprintln!("skipping: set CHM_E2E_SNAPSHOT to a snapshot dir to run the wedge repro");
+        return;
+    };
+    let n: u64 = env::var("WEDGE_N").ok().and_then(|v| v.parse().ok()).unwrap_or(16_000_000);
+    let followups: usize =
+        env::var("WEDGE_FOLLOWUPS").ok().and_then(|v| v.parse().ok()).unwrap_or(2);
+    let attempts: usize =
+        env::var("WEDGE_ATTEMPTS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+
+    let mut successes = 0usize;
+    for attempt in 0..attempts {
+        if wedge_session(&snapshot, n, followups, attempt) {
+            successes += 1;
+        }
+    }
+    eprintln!("wedge-repro: {successes}/{attempts} sessions completed all bursts cleanly");
+    assert!(
+        successes > 0,
+        "guest wedged on EVERY one of {attempts} attempts running back-to-back \
+         CPU bursts in a session -- a real regression of the #78 interactive path"
+    );
+}
+
+/// Run one wedge-probe session: resume, run a burst, then `followups` more
+/// bursts. Returns true iff every burst completed. On a wedge, logs the console
+/// tail (and `CHM_E2E_LOG`, if set) for diagnosis.
+fn wedge_session(snapshot: &Path, n: u64, followups: usize, attempt: usize) -> bool {
+    let shell = "@ch-snap:~$";
+    let overlays = snapshot.join(".chm-overlays");
+    if overlays.is_dir() {
+        for entry in fs::read_dir(&overlays).into_iter().flatten().flatten() {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+    let chm = signed_chm_binary();
+    let mut s = PtySession::spawn(
+        &chm,
+        &[
+            "connect",
+            snapshot.to_str().unwrap(),
+            "--no-stop-daemon",
+            "--idle-exit",
+            "0",
+            "--max-seconds",
+            "600",
+        ],
+    );
+    let boot_deadline = Instant::now() + Duration::from_secs(150);
+    login_to_shell(&mut s, shell, boot_deadline);
+    s.drain_for(Duration::from_secs(2));
+
+    let mut wedged = false;
+    // The initial burst plus `followups` more, all back-to-back in one session.
+    // The tag is assembled from a shell var so the *echoed* command never
+    // contains the contiguous `done=<uniq>` string -- only the executed output.
+    for step in 0..=followups {
+        let tag = format!("BURST_{}_{}_{attempt}_{step}", process::id(), nanos());
+        let cmd = format!(
+            "B={tag}; seq 1 {n} | xz -6 -T1 -c >/dev/null 2>&1; echo \"done=${{B}}\"\n"
+        );
+        s.send(&cmd);
+        let ok = s
+            .wait_for(&[&format!("done={tag}")], Instant::now() + Duration::from_secs(120))
+            .is_some();
+        eprintln!("wedge-repro: attempt {} burst {}/{} ok={ok}", attempt + 1, step + 1, followups + 1);
+        if !ok {
+            if let Some(log) = env::var_os("CHM_E2E_LOG") {
+                let _ = fs::write(&log, s.transcript());
+            }
+            eprintln!("wedge-repro: WEDGED; console tail:\n{}", tail(&s.transcript()));
+            wedged = true;
+            break;
+        }
+    }
+    s.shutdown();
+    !wedged
+}
+
+/// M32.2 gimbal-side build/CPU benchmark. Boots the snapshot, logs in, and runs
+/// the SAME deterministic `xz` compression workload the Docker baseline runs
+/// (`scripts/bench/workloads/xz.sh`), timing the compression with the guest's own
+/// clock and parsing the `BENCH_RESULT` line off the console. Writes a results
+/// JSON compatible with `scripts/bench/report.py`.
+///
+/// Config (env): `CHM_E2E_SNAPSHOT` (the guest), `BENCH_TRIALS` (default 3),
+/// `BENCH_N` (seq payload size, default 24000000), `BENCH_OUT` (results path).
+/// The workload is inlined over the PTY (no shared FS / network needed), so it
+/// runs against the stock demo guest which has `xz` + coreutils but no toolchain.
+#[test]
+#[ignore = "needs a local HVF-compatible snapshot; run via scripts/bench/run-gimbal-e2e.sh"]
+fn microvm_xz_benchmark() {
+    let Some(snapshot) = snapshot_from_env() else {
+        eprintln!("skipping: set CHM_E2E_SNAPSHOT to a snapshot dir to run the xz benchmark");
+        return;
+    };
+    let trials: usize = env::var("BENCH_TRIALS").ok().and_then(|v| v.parse().ok()).unwrap_or(3);
+    let n: u64 = env::var("BENCH_N").ok().and_then(|v| v.parse().ok()).unwrap_or(16_000_000);
+    // The single-threaded compressor pipe to time; overridable so the same test
+    // drives the xz (default) or gzip workload for cross-runtime comparison.
+    let pipe = env::var("BENCH_PIPE").unwrap_or_else(|_| "xz -6 -T1 -c".to_string());
+    let workload = env::var("BENCH_WORKLOAD").unwrap_or_else(|_| "xz".to_string());
+    let out = env::var("BENCH_OUT")
+        .unwrap_or_else(|_| format!("{}/../scripts/bench/results/gimbal-{workload}.json", env!("CARGO_MANIFEST_DIR")));
+
+    let shell = "@ch-snap:~$";
+    let ncpu = "1"; // demo snapshot is a single vCPU; recorded for the report.
+
+    // Each trial runs in its OWN fresh `chm connect` session (boot -> one
+    // workload -> teardown). This mirrors Docker's per-run model (a fresh
+    // container each trial) and sidesteps an observed guest wedge where a second
+    // command issued after a long silent CPU burst does not wake the parked vCPU
+    // (tracked separately). `host_envelope_s` therefore includes this trial's
+    // boot; the in-guest `wall_s` is the directly-comparable compression time.
+    let mut trial_walls: Vec<(f64, u8, f64)> = Vec::new(); // (wall_s, ok, host_envelope_s)
+    for i in 0..trials {
+        let overlays = snapshot.join(".chm-overlays");
+        if overlays.is_dir() {
+            for entry in fs::read_dir(&overlays).into_iter().flatten().flatten() {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        let host_start = Instant::now();
+        // Fresh signed binary per trial: `shutdown()` deletes the binary it ran,
+        // so each per-session trial needs its own copy.
+        let chm = signed_chm_binary();
+        let mut s = PtySession::spawn(
+            &chm,
+            &[
+                "connect",
+                snapshot.to_str().unwrap(),
+                "--no-stop-daemon",
+                "--idle-exit",
+                "0",
+                "--max-seconds",
+                "300",
+            ],
+        );
+        let boot_deadline = Instant::now() + Duration::from_secs(150);
+        login_to_shell(&mut s, shell, boot_deadline);
+        s.drain_for(Duration::from_secs(2));
+
+        let uniq = format!("{}_{}", process::id(), nanos());
+        // The same piped workload the Docker/sbx sides run: a deterministic `seq`
+        // stream compressed by a single-threaded compressor ($BENCH_PIPE), output
+        // discarded. No temp file, so no tmpfs RAM pressure and no disk-overlay
+        // dependence -- pure CPU, identical work across runtimes. The completion
+        // tag is emitted via a shell var ($T) so the *echoed* command line never
+        // contains the contiguous `tag=<uniq>` string we wait on -- only the
+        // executed output does (same trick as the other tests).
+        let cmd = format!(
+            "T={uniq}; \
+             S=$(date +%s.%N); \
+             if seq 1 {n} | {pipe} >/dev/null 2>&1; then OK=1; else OK=0; fi; \
+             E=$(date +%s.%N); \
+             W=$(awk -v a=$S -v b=$E 'BEGIN{{printf \"%.3f\", b-a}}'); \
+             echo \"BENCH_RESULT workload={workload} wall_s=$W ok=$OK tag=${{T}}\"\n"
+        );
+        s.send(&cmd);
+        let trial_deadline = Instant::now() + Duration::from_secs(200);
+        let found = s.wait_for(&[&format!("tag={uniq}")], trial_deadline).is_some();
+        let host_env = host_start.elapsed().as_secs_f64();
+        let (wall, ok) = if found {
+            parse_bench_result(&s.transcript(), &uniq)
+        } else {
+            (0.0, 0)
+        };
+        s.shutdown();
+        eprintln!("gimbal {workload} trial {}/{}: wall_s={wall} ok={ok} host_envelope_s={host_env:.3}", i + 1, trials);
+        trial_walls.push((wall, ok, host_env));
+    }
+
+    // Write the results JSON (same shape run-gimbal.sh emits).
+    let mut trials_json = String::new();
+    for (idx, (wall, ok, env_s)) in trial_walls.iter().enumerate() {
+        if idx > 0 {
+            trials_json.push(',');
+        }
+        trials_json.push_str(&format!(
+            "{{\"wall_s\":{wall},\"host_envelope_s\":{env_s:.3},\"ok\":{ok}}}"
+        ));
+    }
+    let doc = format!(
+        "{{\n  \"runtime\": \"gimbal\",\n  \"workload\": \"{workload}\",\n  \
+         \"host\": {{\"ncpu\": {ncpu}, \"snapshot\": \"{}\"}},\n  \
+         \"trials\": [{trials_json}]\n}}\n",
+        snapshot.file_name().and_then(|s| s.to_str()).unwrap_or("snapshot")
+    );
+    if let Some(parent) = Path::new(&out).parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(&out, doc).unwrap_or_else(|e| panic!("write {out}: {e}"));
+    eprintln!("gimbal {workload} benchmark: wrote {out}");
+
+    assert!(
+        trial_walls.iter().any(|(_, ok, _)| *ok == 1),
+        "no {workload} trial succeeded in the guest"
+    );
+}
+
+/// Extract `(wall_s, ok)` from the `BENCH_RESULT ... tag=<uniq>` line in a
+/// console transcript. Returns `(0.0, 0)` if the tagged line is absent.
+fn parse_bench_result(transcript: &str, uniq: &str) -> (f64, u8) {
+    let tag = format!("tag={uniq}");
+    // Match the executed-output line (starts with BENCH_RESULT), not the echoed
+    // command (which contains the format string, never a real wall_s=<number>).
+    for line in transcript.lines() {
+        if line.contains(&tag) && line.contains("BENCH_RESULT") && line.contains("wall_s=") {
+            let wall = line
+                .split("wall_s=")
+                .nth(1)
+                .and_then(|r| r.split_whitespace().next())
+                .and_then(|v| v.parse::<f64>().ok());
+            let ok = line
+                .split("ok=")
+                .nth(1)
+                .and_then(|r| r.chars().next())
+                .and_then(|c| c.to_digit(10))
+                .map(|d| d as u8);
+            if let (Some(w), Some(o)) = (wall, ok) {
+                return (w, o);
+            }
+        }
+    }
+    (0.0, 0)
+}
+
 /// Drive a `chm connect` session from spawn to a shell prompt, logging in with
 /// `ubuntu` / `ubuntu` if a getty prompt is shown (autologin is also accepted).
 fn login_to_shell(session: &mut PtySession, shell: &str, deadline: Instant) {

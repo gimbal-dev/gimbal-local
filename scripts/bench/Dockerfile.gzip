@@ -1,0 +1,14 @@
+# Dockerfile.gzip — the Docker Desktop side of the toolchain-free gzip benchmark.
+# Minimal image with gzip + coreutils; runs the same workloads/gzip.sh the gimbal
+# guest and the sbx microVM run. Constrain to the guest's shape for fairness, e.g.
+#   docker run --rm --cpus 1 --memory 1g <image>
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends gzip coreutils \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY workloads/gzip.sh /opt/bench/gzip.sh
+RUN chmod +x /opt/bench/gzip.sh
+
+CMD ["/opt/bench/gzip.sh"]

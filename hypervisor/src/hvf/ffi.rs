@@ -27,6 +27,7 @@ pub const HV_MEMORY_EXEC: u64 = 1 << 2;
 
 // ESR_EL2 exception classes (syndrome >> 26).
 pub const EC_WFX: u64 = 0x01; // WFI/WFE trapped
+pub const EC_MSR_MRS_64: u64 = 0x18; // trapped AArch64 MSR/MRS/system-reg access
 pub const EC_HVC64: u64 = 0x16;
 pub const EC_DATA_ABORT_LOWER: u64 = 0x24; // from a lower EL (the guest)
 pub const EC_DATA_ABORT_SAME: u64 = 0x25; // from the current EL

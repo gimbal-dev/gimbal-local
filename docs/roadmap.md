@@ -62,7 +62,7 @@ then the cloud-integration work that followed. Grouped by theme:
 | Interrupts & GIC | M2, M10–M14 | Host→guest interrupt delivery; a user-space ITS translation engine; message-based SPI (GICv2M) delivery, with live virtio completion routed as message-SPIs. |
 | Devices | M5, M17, M18 | PL011 serial console (interactive login), virtio-blk with copy-on-write overlays, and virtio-net with a real host datapath. |
 | Snapshots | M15, M16 | A real SPI-routed cloud snapshot rehydrates on HVF and services real virtio I/O, resuming a settled guest to a usable login prompt. |
-| Guard rails | M13, M19 | A load-time guard rejects ITS/LPI snapshots HVF cannot deliver (boundary **R1**); stock ITS/LPI routing was researched and confirmed a hard platform limit. |
+| Guard rails | M13, M19 | A load-time guard rejects ITS/LPI snapshots the managed GIC cannot deliver (boundary **R1**). The managed GIC limit is real, but a userspace-GICv3 path that *can* deliver LPIs is now proven (M-USGIC / #81), so R1 is a current-default, not a permanent platform limit. |
 
 ### Tooling & app
 
@@ -118,6 +118,7 @@ from cache in 0.077 s).
 | **M27 · Plane-native edge** | ② | **push/pull shipped** (#7 core); postcopy memory + disk plane next (#5) | #5, #7 |
 | **M28 · Consistent controls** | ③ | **M28.1–M28.3 + M28.5 shipped** (policy plumbing + digest teleport; userspace egress NAT; allow-list gate at DNS + TCP-connect; fs mount refusal); enforced on every NIC + fail-closed (M30.9). Live demo (#52) blocked only on a net-enabled snapshot. | #20, #52 |
 | **M29 · Observability & cost** | ④ | Waits on the gctl telemetry contract | — |
+| **M-USGIC · Userspace GICv3 + ITS** | ① portability | **Delivery primitive PROVEN on hardware** — LPI delivered to a guest with no managed GIC (`hvf_userspace_gic_delivers_an_lpi`); live ITS + CPU-interface correctness + envelope remain | #81 |
 
 ### M25 · Live local lifecycle — suspend · resume · fork
 
@@ -316,23 +317,24 @@ platform compares to the incumbent (Docker Desktop's Linux VM) on the same Mac.
   guest image lacks (container runtime, disk headroom, DNS/egress allow-list for
   package registries under the new default-deny). This is the "actually put an
   agent to work" proof.
-- **M32.2 — benchmark vs Docker sandboxes.** Use an **existing, standardized**
-  build benchmark rather than a bespoke one — the **Phoronix Test Suite** timed
-  builds (`pts/build-linux-kernel`, `pts/build-llvm`, `build-gcc`, …) download →
-  configure → build → time reproducibly and publish to OpenBenchmarking.org, and
-  run *identically* inside a Docker container and a gimbal guest. Optionally add a
-  real `docker build` of a well-known OSS image for the "docker build
-  specifically" angle. A harness runs the same workload inside (a) Docker Desktop
-  and (b) a gimbal microVM on the same host, reporting **wall-clock, cold-start /
-  rehydrate time, CPU, memory, disk I/O**, mean ± stddev over N trials.
-  - *Honest expectations (prior art):* Firecracker/Kata microVMs run ~92–97% of
-    Docker's build throughput for CPU-bound builds, more overhead (~17–20%) for
-    IO/network-heavy multi-stage builds; watch the CoW-overlay I/O and NAT
-    throughput paths for anomalies.
-  - *Gimbal's angle:* the snapshot model can rehydrate a guest **already warm**
-    (deps loaded, caches primed, sitting right before the build) instantly and
-    repeatably, vs a cold container each run — a differentiator to measure, not
-    just a setup cost.
+- **M32.2 — benchmark vs Docker sandboxes. Harness shipped + first result
+  recorded (`scripts/bench/`, `RESULTS.md`).** A reproducible harness runs the
+  **same** inner workload inside a Docker Desktop container and a gimbal microVM
+  on the same Mac, N trials, and aggregates to markdown with mean ± stddev + a
+  gimbal/Docker ratio. The gimbal side runs the workload inside the stock demo
+  snapshot via a PTY-driven integration test (`microvm_xz_benchmark`), so it
+  needs no special snapshot. **First real result (Apple M3, matched 1 vCPU / 1
+  GiB, single-threaded `xz` compression):** gimbal 23.67 ± 0.82 s vs Docker
+  23.17 ± 0.83 s — **gimbal is 1.02x Docker (~2% slower, within noise)**, at or
+  better than the ~1.03–1.09x microVM prior-art band. Warm-checkpoint resume +
+  teardown adds only ~5 s.
+  - *Two findings surfaced:* the stock demo guest has **no C toolchain** (so a
+    real compile benchmark needs a toolchain-provisioned snapshot, M32.1), and a
+    **post-CPU-burst input wedge** where a second command after a long silent
+    compute does not wake the parked vCPU (filed as #78; the benchmark runs each
+    trial in a fresh session to sidestep it).
+  - *Still future:* multi-vCPU / parallel builds, and IO/network-heavy workloads
+    (where microVMs historically lose ~17–20%) to exercise the CoW overlay + NAT.
 
 **On the "snapshot dependency":** gimbal only *rehydrates a snapshot* — there is
 no boot-from-scratch path — so the microVM you build in **is** a snapshot; it is a

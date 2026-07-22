@@ -1,0 +1,19 @@
+# Dockerfile.xz — the Docker side of the toolchain-free xz compression benchmark.
+#
+# Minimal image with just xz + coreutils, so the container runs the SAME
+# `workloads/xz.sh` the gimbal guest runs. No network in the timed section (the
+# payload is generated deterministically with `seq`).
+#
+# Run the container constrained to the guest's shape for a fair comparison, e.g.
+#   docker run --rm --cpus 1 --memory 1g <image>
+# (run-docker.sh passes DOCKER_CPUS / DOCKER_MEMORY through).
+FROM debian:bookworm-slim
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends xz-utils coreutils \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY workloads/xz.sh /opt/bench/xz.sh
+RUN chmod +x /opt/bench/xz.sh
+
+CMD ["/opt/bench/xz.sh"]

@@ -9,7 +9,7 @@ use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use std::{env, fs, io, thread};
@@ -1415,6 +1415,53 @@ impl PhaseGate {
 /// Collected per-vCPU so the orchestrator can stop every thread at once.
 type ExitSignal = Arc<dyn Fn() + Send + Sync>;
 
+/// Re-evaluation cadence for the run-progress watchdog.
+const RUN_WATCHDOG_INTERVAL: Duration = Duration::from_millis(30);
+
+/// Spawn the run-progress watchdog. Every [`RUN_WATCHDOG_INTERVAL`] it samples
+/// each vCPU's run-progress counter (bumped once per `hv_vcpu_run` iteration). A
+/// counter that has not advanced across a full interval means the vCPU is wedged
+/// inside a single, non-returning `hv_vcpu_run` — the failure mode where Apple's
+/// internal WFI wait (`wait_for_interrupt`) fails to honour a due virtual-timer
+/// deadline during an idle transition (observed as the interactive-console
+/// wedge, #78/#60). The watchdog forces that vCPU out via its exit signal, so it
+/// re-enters `hv_vcpu_run`; the CANCELED path then unmasks an overdue vtimer and
+/// the guest's scheduler tick resumes.
+///
+/// Forcing a genuinely busy vCPU (a long in-guest compute burst never exits, so
+/// its counter is also static) out of the run loop is harmless: `hv_vcpus_exit`
+/// preserves register state and the guest resumes exactly where it left off. The
+/// bounded ~1 kick/interval overhead is negligible next to the wedge it prevents.
+fn spawn_run_watchdog(
+    progress: Vec<Arc<AtomicU64>>,
+    exits: Vec<ExitSignal>,
+    running: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::Builder::new()
+        .name("chm-run-watchdog".into())
+        .spawn(move || {
+            let trace = env::var("CHM_TRACE_WATCHDOG").is_ok();
+            let mut last: Vec<u64> = vec![u64::MAX; progress.len()];
+            while running.load(Ordering::Relaxed) {
+                thread::sleep(RUN_WATCHDOG_INTERVAL);
+                for (i, p) in progress.iter().enumerate() {
+                    let cur = p.load(Ordering::Relaxed);
+                    // A counter unchanged since the previous sample means no
+                    // run() iteration happened this interval: the vCPU is stuck
+                    // in one hv_vcpu_run. Force it out so it re-evaluates.
+                    if cur == last[i] && let Some(sig) = exits.get(i) {
+                        if trace {
+                            eprintln!("[watchdog] vcpu {i} stalled at gen={cur}; forcing exit");
+                        }
+                        sig();
+                    }
+                    last[i] = cur;
+                }
+            }
+        })
+        .expect("spawn run watchdog")
+}
+
 fn wait_for_cpu_on_request(slot: &CpuPowerSlot, running: &AtomicBool) -> Option<(u64, u64)> {
     let (lock, cv) = &**slot;
     let mut st = lock.lock().unwrap();
@@ -1508,6 +1555,11 @@ fn resume_smp(
     // serial input pump + re-assert tick can wake a parked vCPU the instant a
     // keystroke's interrupt is asserted, instead of waiting for its idle poll.
     let wakes: Arc<Mutex<Vec<ExitSignal>>> = Arc::new(Mutex::new(Vec::new()));
+    // Per-vCPU run-progress counters (bumped once per `run()` iteration). The run
+    // watchdog samples these to detect a vCPU wedged inside a single, non-
+    // returning `hv_vcpu_run` (Apple's internal WFI wait not honouring a due
+    // timer) and forces it out so it re-enters and redelivers the tick.
+    let progress: Arc<Mutex<Vec<Arc<AtomicU64>>>> = Arc::new(Mutex::new(Vec::new()));
     let outcome: Arc<Mutex<Option<Result<Outcome, String>>>> = Arc::new(Mutex::new(None));
     let (created_tx, created_rx) = mpsc::channel::<Result<(), String>>();
     let (restored_tx, restored_rx) = mpsc::channel::<Result<(), String>>();
@@ -1534,6 +1586,7 @@ fn resume_smp(
         let go_gate = go_gate.clone();
         let exits = exits.clone();
         let wakes = wakes.clone();
+        let progress = progress.clone();
         let outcome = outcome.clone();
         let created_tx = created_tx.clone();
         let restored_tx = restored_tx.clone();
@@ -1575,6 +1628,9 @@ fn resume_smp(
                 }
                 if let Some(wake) = vcpu.wake_signal() {
                     wakes.lock().unwrap().push(wake);
+                }
+                if let Some(p) = vcpu.run_progress() {
+                    progress.lock().unwrap().push(p);
                 }
                 let _ = created_tx.send(Ok(()));
 
@@ -1835,6 +1891,18 @@ fn resume_smp(
     // session can never wedge waiting for an edge that already passed.
     let serial_reassert =
         console::spawn_serial_reassert(uart.clone(), serial_sink, serial_wake, running.clone());
+    // Run-progress watchdog: bounds how long any vCPU can stay wedged inside a
+    // single `hv_vcpu_run` (Apple's internal WFI wait not honouring a due timer),
+    // forcing it out to re-enter and redeliver the tick. Snapshot the per-vCPU
+    // counters + exit signals now that every vCPU thread has registered them.
+    // Set CHM_DISABLE_RUN_WATCHDOG=1 to opt out (diagnostics / A-B comparison).
+    let run_watchdog = if env::var_os("CHM_DISABLE_RUN_WATCHDOG").is_none() {
+        let progress = progress.lock().unwrap().clone();
+        let exits_snapshot = exits.lock().unwrap().clone();
+        Some(spawn_run_watchdog(progress, exits_snapshot, running.clone()))
+    } else {
+        None
+    };
     if !args.quiet {
         eprintln!(
             "chm: interactive console active — close this window or press Ctrl-A x \
@@ -1863,6 +1931,10 @@ fn resume_smp(
     }
     // Stop the serial re-assert watchdog (also observes `running`).
     let _ = serial_reassert.join();
+    // Stop the run-progress watchdog (observes `running`).
+    if let Some(h) = run_watchdog {
+        let _ = h.join();
+    }
     for h in handles {
         let _ = h.join();
     }

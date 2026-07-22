@@ -10,6 +10,7 @@
 //
 //
 
+use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
 
 use thiserror::Error;
@@ -389,6 +390,16 @@ pub trait Vcpu: Send + Sync {
     /// Backends without a host-side idle park return `None` (the default); the
     /// macOS HVF backend implements it by writing the vCPU's WFI wake fd.
     fn wake_signal(&self) -> Option<Arc<dyn Fn() + Send + Sync>> {
+        None
+    }
+    /// Return a monotonic counter that the backend bumps once per `run()`
+    /// iteration. A host-side watchdog samples it to distinguish a vCPU that is
+    /// still making forward progress (the counter advances as `run()` returns for
+    /// each exit) from one wedged inside a single, non-returning `hv_vcpu_run`
+    /// call (e.g. blocked in the hypervisor's internal wait-for-interrupt on a
+    /// deadline it is not honouring). Backends that cannot be force-interrupted,
+    /// or do not need this, return `None` (the default).
+    fn run_progress(&self) -> Option<Arc<AtomicU64>> {
         None
     }
     ///

@@ -48,10 +48,23 @@ The limitation matches the prior art:
   such as `hv_gic_set_spi` and `hv_gic_send_msi`, but no public full ITS/LPI
   API has been found.
 
-There is a theoretical research path where Gimbal implements a userspace GICv3
-and ITS while still using HVF for CPU execution, but no public, proven VMM
-appears to have shipped that architecture for this use case. Treat it as deep
-research, not the production unblocker.
+There is a research path where Gimbal implements a userspace GICv3 (CPU
+interface + distributor/redistributor + ITS) while still using HVF for CPU
+execution. **The delivery half of this is now proven on hardware** (M3, see
+`hypervisor/tests/hvf_boot.rs::hvf_userspace_gic_delivers_an_lpi`): with no
+managed GIC, `ICC_*_EL1` accesses trap to the VMM as `EC=0x18`, and an injected
+LPI (INTID >= 8192) is acknowledged by the guest through `ICC_IAR1_EL1` — the
+interrupt class the managed GIC cannot deliver. The same architecture ships in
+libkrun, QEMU (`kernel-irqchip=off`), and RexPlayer on Apple Silicon, so it is a
+build problem rather than a feasibility question.
+
+What remains before this accepts a *stock* ITS/LPI snapshot is substantial and
+tracked as a milestone (M-USGIC): a full live ITS (runtime command-queue
+handling — `MAPD`/`MAPC`/`MAPTI`/`MOVI`/`INV`/... — plus LPI enable/pending
+tables) feeding the CPU interface; `EOImode`/`DIR`-correct priority handling;
+SMP/SGI and the virtual-timer PPI routed through the software GIC; and per-access
+trap performance kept acceptable. Until that lands, the capture-side
+`CH_GIC_V2M=1` contract below remains the supported path.
 
 ## Cloud agent contract
 
