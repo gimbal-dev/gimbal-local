@@ -118,7 +118,7 @@ from cache in 0.077 s).
 | **M27 · Plane-native edge** | ② | **push/pull shipped** (#7 core); postcopy memory + disk plane next (#5) | #5, #7 |
 | **M28 · Consistent controls** | ③ | **M28.1–M28.3 + M28.5 shipped** (policy plumbing + digest teleport; userspace egress NAT; allow-list gate at DNS + TCP-connect; fs mount refusal); enforced on every NIC + fail-closed (M30.9). Live demo (#52) blocked only on a net-enabled snapshot. | #20, #52 |
 | **M29 · Observability & cost** | ④ | Waits on the gctl telemetry contract | — |
-| **M-USGIC · Userspace GICv3 + ITS** | ① portability | **Delivery primitive PROVEN on hardware** — LPI delivered to a guest with no managed GIC (`hvf_userspace_gic_delivers_an_lpi`); live ITS + CPU-interface correctness + envelope remain | #81 |
+| **M-USGIC · Userspace GICv3 + ITS** | ① portability | **SHIPPED (experimental) — a stock ITS/LPI snapshot boots to an interactive shell on HVF.** `CHM_USERSPACE_GIC=1 chm run <snapshot>` rehydrates a stock upstream (ITS/LPI-routed) capture — the kind the managed GIC rejects — onto a software GICv3 and drops into a live Ubuntu console (`hvf_rehydrate_stock_its_snapshot_usgic_interactive_shell`). Software distributor/redistributor + trapped CPU interface (SPI/PPI/SGI/**LPI**), live ITS, cross-thread injection, self-managed vtimer. Single-vCPU; SMP + virtio-completion routing + `GITS_*` MMIO are the remaining scope. | #81 |
 
 ### M25 · Live local lifecycle — suspend · resume · fork
 
@@ -351,11 +351,15 @@ vs. real builds), so they double as end-to-end validation of M30/M31.
 
 ## Standing platform boundaries
 
-- **R1 — ITS/LPI (permanent).** Apple's managed GIC (`hv_gic`) delivers
-  message-based SPIs only, with no ITS/LPI path. A snapshot is only restorable on
-  HVF if it was captured `gicv2m-message-spi` (`CH_GIC_V2M=1`); stock ITS/LPI
-  snapshots are refused, at load time locally and at the `assign-run` 422 gate.
-  See [`hvf-compatible-snapshots.md`](hvf-compatible-snapshots.md).
+- **R1 — ITS/LPI (managed GIC only; no longer a hard wall).** Apple's *managed*
+  GIC (`hv_gic`) delivers message-based SPIs only, with no ITS/LPI path, so the
+  default managed-GIC path still requires a `gicv2m-message-spi` capture
+  (`CH_GIC_V2M=1`) and refuses stock ITS/LPI snapshots at load time and at the
+  `assign-run` 422 gate. **But a stock ITS/LPI snapshot IS now runnable on HVF via
+  the userspace GICv3** (`CHM_USERSPACE_GIC=1`, M-USGIC / #81): it rehydrates onto
+  a software GIC that delivers LPIs the managed GIC cannot, and boots to an
+  interactive shell. R1 is therefore a managed-path default, not a permanent
+  platform limit. See [`hvf-compatible-snapshots.md`](hvf-compatible-snapshots.md).
 - **arm64 KVM capacity.** Producing real snapshots needs a genuine arm64 `/dev/kvm`
   host (a Lima nested-KVM guest for $0, or Graviton bare metal); the Mac itself
   can only *run* snapshots, never capture them.

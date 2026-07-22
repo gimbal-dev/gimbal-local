@@ -21,7 +21,7 @@ CH_GIC_V2M=1
 
 when launching the patched Cloud Hypervisor binary from this repository.
 
-## Unsupported mode
+## Stock ITS/LPI mode — two paths
 
 Stock arm64 Cloud Hypervisor snapshots usually route virtio MSI/MSI-X
 completions through the GIC ITS as LPIs:
@@ -30,10 +30,29 @@ completions through the GIC ITS as LPIs:
 virtio device -> MSI/MSI-X -> GIC ITS -> LPI
 ```
 
-Apple's managed Hypervisor.framework GIC does not expose a deliverable ITS/LPI
-path. If a snapshot contains enabled `gic-v3-its` state plus MSI-wired virtio
-devices, `chm` rejects it early rather than restoring a guest that would hang on
-its first disk or network completion interrupt.
+Apple's *managed* Hypervisor.framework GIC does not expose a deliverable ITS/LPI
+path. On the **default managed-GIC path**, if a snapshot contains enabled
+`gic-v3-its` state plus MSI-wired virtio devices, `chm` rejects it early rather
+than restoring a guest that would hang on its first disk or network completion
+interrupt.
+
+**There is now a second path.** Setting `CHM_USERSPACE_GIC=1` runs the snapshot
+on a **userspace GICv3** instead of the managed GIC — a software
+distributor/redistributor + a trapped CPU interface that delivers LPIs the
+managed GIC cannot. This rehydrates a *stock* ITS/LPI snapshot and boots it to an
+interactive shell:
+
+```sh
+CHM_USERSPACE_GIC=1 chm run <stock-its-snapshot>
+#   backend:   Apple Hypervisor.framework (userspace GICv3)
+#   ubuntu@ch-snap:~$
+```
+
+This is experimental and currently single-vCPU; serial input works (the shell is
+fully usable), while virtio disk/net *completion* routing through the userspace
+ITS, `GITS_*` MMIO, and SMP are the remaining scope (tracked as M-USGIC / #81).
+For production captures today, the managed-GIC `CH_GIC_V2M=1` contract below is
+still the recommended path.
 
 ## Why this is not just a local-runner bug
 
@@ -48,23 +67,24 @@ The limitation matches the prior art:
   such as `hv_gic_set_spi` and `hv_gic_send_msi`, but no public full ITS/LPI
   API has been found.
 
-There is a research path where Gimbal implements a userspace GICv3 (CPU
-interface + distributor/redistributor + ITS) while still using HVF for CPU
-execution. **The delivery half of this is now proven on hardware** (M3, see
-`hypervisor/tests/hvf_boot.rs::hvf_userspace_gic_delivers_an_lpi`): with no
-managed GIC, `ICC_*_EL1` accesses trap to the VMM as `EC=0x18`, and an injected
-LPI (INTID >= 8192) is acknowledged by the guest through `ICC_IAR1_EL1` — the
-interrupt class the managed GIC cannot deliver. The same architecture ships in
-libkrun, QEMU (`kernel-irqchip=off`), and RexPlayer on Apple Silicon, so it is a
-build problem rather than a feasibility question.
+Gimbal implements a userspace GICv3 (CPU interface + distributor/redistributor +
+ITS) while still using HVF for CPU execution. **This now works end to end on
+hardware** (Apple M3): a stock ITS/LPI snapshot rehydrates onto the software GIC
+and boots to an interactive Ubuntu shell — see
+`hypervisor/tests/hvf_boot.rs::hvf_rehydrate_stock_its_snapshot_usgic_interactive_shell`
+and run it yourself with `CHM_USERSPACE_GIC=1 chm run <snapshot>`. With no managed
+GIC, `ICC_*_EL1` accesses trap to the VMM as `EC=0x18`; the software GIC delivers
+SPIs, PPIs, SGIs, and **LPIs** (INTID >= 8192 — the class the managed GIC cannot
+deliver); the virtual timer is self-managed across WFI so the guest keeps
+ticking. The same architecture ships in libkrun, QEMU (`kernel-irqchip=off`), and
+RexPlayer on Apple Silicon.
 
-What remains before this accepts a *stock* ITS/LPI snapshot is substantial and
-tracked as a milestone (M-USGIC): a full live ITS (runtime command-queue
-handling — `MAPD`/`MAPC`/`MAPTI`/`MOVI`/`INV`/... — plus LPI enable/pending
-tables) feeding the CPU interface; `EOImode`/`DIR`-correct priority handling;
-SMP/SGI and the virtual-timer PPI routed through the software GIC; and per-access
-trap performance kept acceptable. Until that lands, the capture-side
-`CH_GIC_V2M=1` contract below remains the supported path.
+What remains to make this the *default* path (rather than the `CHM_USERSPACE_GIC`
+opt-in) is scope, not feasibility: routing virtio disk/net **completions** through
+the userspace ITS (serial already works, so the shell is usable now), `GITS_*`
+MMIO for guests that re-program the ITS live, SMP, and per-access trap
+performance. Until that lands, the capture-side `CH_GIC_V2M=1` contract below
+remains the recommended production path.
 
 ## Cloud agent contract
 
@@ -80,9 +100,11 @@ ships_disks = true
 gimbal_local_commit = <commit that built the capture binary>
 ```
 
-Do not present `its-lpi` snapshots as locally runnable on macOS. They may still
-be useful for Linux/KVM restore, but Gimbal Local should label them
-incompatible and explain the interrupt-mode mismatch.
+Do not present `its-lpi` snapshots as runnable on the **default managed-GIC**
+path — they are refused there. They ARE runnable on the userspace-GICv3 path
+(`CHM_USERSPACE_GIC=1`, experimental), and remain useful for Linux/KVM restore.
+Label them `its-lpi` and note the managed-GIC mismatch + the userspace-GIC
+opt-in, rather than a flat "incompatible".
 
 Implementation note: older Cloud Hypervisor code names the serialized GIC
 snapshot node `gic-v3-its` even when the actual ITS is disabled. Do not classify
