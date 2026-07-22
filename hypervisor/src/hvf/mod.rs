@@ -47,6 +47,8 @@ pub mod devices;
 pub mod rehydrate;
 pub mod translate;
 pub mod checkpoint;
+
+pub mod softgic;
 #[cfg(feature = "kvm-snapshot")]
 pub mod virtio;
 
