@@ -2689,6 +2689,109 @@ fn hvf_userspace_gic_distributor_gates_disabled_spi() {
 }
 
 // ---------------------------------------------------------------------------
+// PATH A, brick 6: the WHOLE seed-from-real-snapshot -> delivery stack composed.
+// This is the resume scenario, not a synthetic one: the software GIC is seeded
+// from a GENUINE captured cloud-hypervisor KVM distributor/redistributor dump
+// (the same `data/kvm_arm64_gic.json` fixture the managed per-register
+// rehydration test uses) via `dist_to_hvf`/`redist_to_hvf` -> `usgic_seed_gic`.
+// The guest NEVER programs the GICD; its interrupt enable/priority/group state
+// comes purely from the seed. The host then asserts an SPI the SEED marked
+// enabled, and the guest takes it -- proving the seed path a rehydrated guest
+// depends on (it does not re-configure the GIC on resume) actually delivers.
+#[cfg(feature = "kvm-snapshot")]
+#[test]
+fn hvf_userspace_gic_delivers_seeded_spi_from_real_snapshot() {
+    use hypervisor::hvf::softgic::Distributor;
+    use hypervisor::hvf::translate::gic_ingest::{dist_to_hvf, redist_to_hvf};
+
+    // Parse the REAL captured GIC node and translate it to the (offset, value)
+    // pairs both the managed path and the software GIC restore from.
+    let gic_json = include_str!("data/kvm_arm64_gic.json");
+    let v: serde_json::Value = serde_json::from_str(gic_json).expect("parse gic fixture");
+    let to_u32 = |k: &str| -> Vec<u32> {
+        v["Kvm"][k]
+            .as_array()
+            .expect("array field")
+            .iter()
+            .map(|n| n.as_u64().expect("u64") as u32)
+            .collect()
+    };
+    let dist = to_u32("dist");
+    let rdist = to_u32("rdist");
+    let dist_pairs = dist_to_hvf(&dist).expect("translate distributor dump");
+    let redist_pairs = redist_to_hvf(&rdist).expect("translate redistributor dump");
+
+    // Discover a genuinely-enabled SPI from the REAL seed (self-validating: we
+    // do not hardcode which INTID the captured guest had enabled). Seed a
+    // throwaway distributor identically and scan the SPI range.
+    let mut probe = Distributor::new(256);
+    probe.seed_from_kvm(&dist_pairs);
+    let seeded_spi = (32u32..256)
+        .find(|&i| probe.is_enabled(i))
+        .expect("the real snapshot's distributor dump has at least one enabled SPI");
+    eprintln!("seed exposes enabled SPI {seeded_spi} (from real KVM dump)");
+
+    let ram = HostRam::new(RAM_SIZE);
+    ram.load(0, include_bytes!("data/seed_deliver.bin"));
+    let ops = Arc::new(ProbeVmOps { marks: Mutex::new(Vec::new()) });
+    let hv = hypervisor::new().expect("hypervisor::new() — codesigned?");
+    let vm = hv
+        .create_vm(HypervisorVmConfig { nested: false, smt_enabled: false })
+        .expect("create_vm");
+    // NO managed GIC.
+    // SAFETY: ram outlives the mapping.
+    unsafe {
+        vm.create_user_memory_region(0, RAM_BASE, ram.size, ram.ptr, false, false)
+            .expect("map ram");
+    }
+    let ops_dyn: Arc<dyn VmOps> = ops.clone();
+    let mut vcpu = vm.create_vcpu(0, Some(ops_dyn)).expect("create_vcpu");
+    vcpu.setup_regs(0, RAM_BASE, 0).expect("setup_regs");
+    {
+        let hvcpu = vcpu.as_any_concrete_mut().downcast_mut::<HvfVcpu>().unwrap();
+        hvcpu.set_usgic_enabled(true);
+        // Order matters: setting the bases (re)creates the distributor, so seed
+        // AFTER, exactly as the resume path will.
+        hvcpu.usgic_set_gic_bases(GICD_BASE, GICR_BASE, 256);
+        hvcpu.usgic_seed_gic(&dist_pairs, &redist_pairs);
+    }
+
+    let seen = |v: u32, ops: &ProbeVmOps| ops.marks.lock().unwrap().iter().any(|(_, x)| *x == v);
+    let mut outcome = String::new();
+    let mut asserted = false;
+    for _ in 0..200 {
+        match vcpu.run() {
+            Ok(VmExit::Ignore) => {
+                if !asserted && seen(0x1100_0000, &ops) {
+                    let hvcpu = vcpu.as_any_concrete_mut().downcast_mut::<HvfVcpu>().unwrap();
+                    // Assert the SPI the SEED enabled — the guest never touched
+                    // the distributor, so delivery can only come from the seed.
+                    hvcpu.usgic_assert_spi(seeded_spi).expect("assert seeded SPI");
+                    asserted = true;
+                }
+                continue;
+            }
+            Ok(VmExit::Shutdown) => { outcome = "Shutdown".into(); break; }
+            Ok(other) => { outcome = format!("{other:?}"); break; }
+            Err(e) => { outcome = format!("Err: {e}"); break; }
+        }
+    }
+
+    let recorded: Vec<u32> = ops.marks.lock().unwrap().iter().map(|(_, v)| *v).collect();
+    eprintln!("=== seeded-from-real-snapshot SPI === recorded={recorded:x?} outcome={outcome}");
+    assert!(recorded.contains(&0x1100_0000), "guest never signaled READY");
+    assert!(
+        recorded.contains(&seeded_spi),
+        "guest did not take SPI {seeded_spi} seeded from the real snapshot; got {recorded:x?}"
+    );
+    assert_eq!(outcome, "Shutdown");
+    eprintln!(
+        "PROVEN: real KVM GIC dump -> dist_to_hvf/redist_to_hvf -> usgic_seed_gic \
+         -> guest takes a seeded SPI with NO guest GICD programming (the resume path)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // PATH A, brick 4: the virtual-timer PPI through the software GIC -- the
 // scheduler tick a real guest needs. With no managed GIC the guest enables PPI
 // 27 in its redistributor (GICR MMIO -> softgic) and arms CNTV; HVF surfaces

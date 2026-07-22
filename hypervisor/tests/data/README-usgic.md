@@ -11,6 +11,18 @@ the GICv3 CPU-interface system registers (`ICC_*_EL1`, EC=0x18) and deliver an
 - `lpi_deliver.S` / `lpi_deliver.bin` — waits, then its IRQ handler acknowledges
   two host-injected LPIs (8192, 8193) via `ICC_IAR1_EL1`/`ICC_EOIR1_EL1`; used by
   `hvf_userspace_gic_delivers_an_lpi`.
+- `spi_deliver.S` / `spi_deliver.bin` — programs the software distributor over
+  MMIO to enable an SPI, then takes it; used by the software-distributor SPI
+  tests.
+- `vtimer_deliver.S` / `vtimer_deliver.bin` — enables PPI 27 in its
+  redistributor and arms CNTV; used by `hvf_userspace_gic_delivers_vtimer_ppi`.
+- `seed_deliver.S` / `seed_deliver.bin` — brings up ONLY the CPU interface and
+  waits; it NEVER programs the distributor. Used by
+  `hvf_userspace_gic_delivers_seeded_spi_from_real_snapshot` to prove the resume
+  path: the software GIC is seeded from a REAL captured KVM dump
+  (`data/kvm_arm64_gic.json` via `dist_to_hvf`/`redist_to_hvf` ->
+  `usgic_seed_gic`) and the guest takes a seeded-enabled SPI without touching the
+  GICD.
 
 Regenerate a `.bin` from its `.S` on Apple Silicon:
 
