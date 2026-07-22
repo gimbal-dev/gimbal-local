@@ -478,6 +478,126 @@ struct UserGic {
 /// GICv3 spurious INTID returned when no interrupt is pending.
 const GICV3_INTID_SPURIOUS: u32 = 1023;
 
+impl UserGic {
+    /// Queue an INTID (SPI, PPI, or LPI) for delivery. Priority ordering is a
+    /// later refinement; today the pending set is drained FIFO.
+    fn push_pending(&mut self, intid: u32) {
+        self.pending.push(intid);
+    }
+
+    /// Model an `ICC_IAR1_EL1` read (interrupt acknowledge): take the next
+    /// pending INTID, mark it active, and return it — or the spurious INTID when
+    /// nothing is pending. A read while an interrupt is already active still
+    /// acknowledges the next pending one (nested), matching the architecture.
+    fn read_iar(&mut self) -> u32 {
+        if self.pending.is_empty() {
+            return GICV3_INTID_SPURIOUS;
+        }
+        let intid = self.pending.remove(0);
+        self.active = Some(intid);
+        intid
+    }
+
+    /// Model an `ICC_EOIR1_EL1` write (end of interrupt). With `EOImode=0`
+    /// (`ICC_CTLR_EL1.EOImode` clear) this drops priority AND deactivates; with
+    /// `EOImode=1` it drops priority only and the guest deactivates later via
+    /// `ICC_DIR_EL1`. Keeping `active` set until DIR when `EOImode=1` is what
+    /// prevents the next pending interrupt from being delivered while the
+    /// current one is still active.
+    fn write_eoir(&mut self) {
+        let eoimode = (self.ctlr >> 1) & 1 != 0;
+        if !eoimode {
+            self.active = None;
+        }
+    }
+
+    /// Model an `ICC_DIR_EL1` write (deactivate interrupt), used with
+    /// `EOImode=1` to complete the split priority-drop/deactivate cycle.
+    fn write_dir(&mut self) {
+        self.active = None;
+    }
+
+    /// Whether the raw virtual IRQ line should be asserted before a run entry:
+    /// there is pending work and no interrupt is currently active (an active
+    /// interrupt keeps the guest in its handler until it EOIs/deactivates).
+    fn should_assert(&self) -> bool {
+        !self.pending.is_empty() && self.active.is_none()
+    }
+}
+
+#[cfg(test)]
+mod usgic_tests {
+    use super::UserGic;
+
+    fn eoimode1() -> UserGic {
+        UserGic {
+            enabled: true,
+            ctlr: 0b10, // EOImode = 1
+            ..UserGic::default()
+        }
+    }
+
+    #[test]
+    fn iar_pops_pending_and_marks_active() {
+        let mut g = UserGic {
+            enabled: true,
+            ..UserGic::default()
+        };
+        g.push_pending(8192);
+        g.push_pending(8193);
+        assert!(g.should_assert(), "pending + idle should assert the line");
+        assert_eq!(g.read_iar(), 8192);
+        assert_eq!(g.active, Some(8192));
+        // While active, the line must not re-assert for the next pending one.
+        assert!(!g.should_assert(), "an active interrupt suppresses re-assert");
+    }
+
+    #[test]
+    fn spurious_when_empty() {
+        let mut g = UserGic {
+            enabled: true,
+            ..UserGic::default()
+        };
+        assert_eq!(g.read_iar(), super::GICV3_INTID_SPURIOUS);
+        assert_eq!(g.active, None);
+    }
+
+    #[test]
+    fn eoimode0_eoir_deactivates() {
+        let mut g = UserGic {
+            enabled: true,
+            ctlr: 0, // EOImode = 0
+            ..UserGic::default()
+        };
+        g.push_pending(8192);
+        g.push_pending(8193);
+        assert_eq!(g.read_iar(), 8192);
+        g.write_eoir(); // EOImode=0: drops priority AND deactivates
+        assert_eq!(g.active, None);
+        // Now the next pending one can be delivered.
+        assert!(g.should_assert());
+        assert_eq!(g.read_iar(), 8193);
+    }
+
+    #[test]
+    fn eoimode1_eoir_holds_active_until_dir() {
+        let mut g = eoimode1();
+        g.push_pending(8192);
+        g.push_pending(8193);
+        assert_eq!(g.read_iar(), 8192);
+        g.write_eoir(); // EOImode=1: priority drop ONLY; stays active
+        assert_eq!(g.active, Some(8192), "EOImode=1 EOIR must not deactivate");
+        assert!(
+            !g.should_assert(),
+            "next pending must be held while the first is still active"
+        );
+        g.write_dir(); // now deactivate
+        assert_eq!(g.active, None);
+        assert!(g.should_assert(), "after DIR the next pending is deliverable");
+        assert_eq!(g.read_iar(), 8193);
+    }
+}
+
 /// One HVF vCPU. Bound to the host thread that created it.
 pub struct HvfVcpu {
     id: u64,
@@ -756,7 +876,7 @@ impl HvfVcpu {
             if !g.enabled {
                 return;
             }
-            !g.pending.is_empty() && g.active.is_none()
+            g.should_assert()
         };
         if assert {
             let _ = self.set_irq_line(true);
@@ -791,7 +911,7 @@ impl HvfVcpu {
             if !g.enabled {
                 return Ok(());
             }
-            g.pending.push(intid);
+            g.push_pending(intid);
         }
         self.set_irq_line(true)
     }
@@ -825,15 +945,7 @@ impl HvfVcpu {
                     // ICC_IAR1_EL1 / ICC_IAR0_EL1 (interrupt acknowledge).
                     (12, 12, 0) | (12, 8, 0) => {
                         name = "ICC_IAR";
-                        let intid = if g.pending.is_empty() {
-                            GICV3_INTID_SPURIOUS
-                        } else {
-                            g.pending.remove(0)
-                        };
-                        if intid != GICV3_INTID_SPURIOUS {
-                            g.active = Some(intid);
-                        }
-                        intid as u64
+                        g.read_iar() as u64
                     }
                     // ICC_HPPIR1_EL1 (highest pending, no ack).
                     (12, 12, 2) | (12, 8, 2) => {
@@ -873,17 +985,28 @@ impl HvfVcpu {
                 if rt < 31 {
                     set_rt = Some(val);
                 }
-                deassert = g.pending.is_empty();
+                deassert = !g.should_assert();
                 if trace {
                     eprintln!("[usgic] vcpu {} read  {name} -> {val:#x} (x{rt})", self.index);
                 }
             } else {
                 let val = if rt == 31 { 0 } else { self.get_reg(rt)? };
                 match key {
-                    // ICC_EOIR1/0 (end of interrupt) and ICC_DIR (deactivate).
-                    (12, 12, 1) | (12, 8, 1) | (12, 11, 1) => {
-                        name = "ICC_EOIR/DIR";
-                        g.active = None;
+                    // ICC_EOIR1_EL1 / ICC_EOIR0_EL1 (end of interrupt). With
+                    // EOImode=0 (ICC_CTLR_EL1.EOImode clear) this both drops
+                    // priority AND deactivates. With EOImode=1 it drops priority
+                    // only; the guest deactivates separately via ICC_DIR_EL1.
+                    // Keeping `active` set until DIR when EOImode=1 is what stops
+                    // a still-active interrupt's slot being reused by the next
+                    // pending one (correctness the rubber-duck flagged).
+                    (12, 12, 1) | (12, 8, 1) => {
+                        name = "ICC_EOIR";
+                        g.write_eoir();
+                    }
+                    // ICC_DIR_EL1 (deactivate interrupt) — used with EOImode=1.
+                    (12, 11, 1) => {
+                        name = "ICC_DIR";
+                        g.write_dir();
                     }
                     (4, 6, 0) => {
                         name = "ICC_PMR";
