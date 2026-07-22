@@ -62,7 +62,7 @@ then the cloud-integration work that followed. Grouped by theme:
 | Interrupts & GIC | M2, M10–M14 | Host→guest interrupt delivery; a user-space ITS translation engine; message-based SPI (GICv2M) delivery, with live virtio completion routed as message-SPIs. |
 | Devices | M5, M17, M18 | PL011 serial console (interactive login), virtio-blk with copy-on-write overlays, and virtio-net with a real host datapath. |
 | Snapshots | M15, M16 | A real SPI-routed cloud snapshot rehydrates on HVF and services real virtio I/O, resuming a settled guest to a usable login prompt. |
-| Guard rails | M13, M19 | A load-time guard rejects ITS/LPI snapshots HVF cannot deliver (boundary **R1**); stock ITS/LPI routing was researched and confirmed a hard platform limit. |
+| Guard rails | M13, M19 | A load-time guard rejects ITS/LPI snapshots the managed GIC cannot deliver (boundary **R1**). The managed GIC limit is real, but a userspace-GICv3 path that *can* deliver LPIs is now proven (M-USGIC / #81), so R1 is a current-default, not a permanent platform limit. |
 
 ### Tooling & app
 
@@ -118,6 +118,7 @@ from cache in 0.077 s).
 | **M27 · Plane-native edge** | ② | **push/pull shipped** (#7 core); postcopy memory + disk plane next (#5) | #5, #7 |
 | **M28 · Consistent controls** | ③ | **M28.1–M28.3 + M28.5 shipped** (policy plumbing + digest teleport; userspace egress NAT; allow-list gate at DNS + TCP-connect; fs mount refusal); enforced on every NIC + fail-closed (M30.9). Live demo (#52) blocked only on a net-enabled snapshot. | #20, #52 |
 | **M29 · Observability & cost** | ④ | Waits on the gctl telemetry contract | — |
+| **M-USGIC · Userspace GICv3 + ITS** | ① portability | **Delivery primitive PROVEN on hardware** — LPI delivered to a guest with no managed GIC (`hvf_userspace_gic_delivers_an_lpi`); live ITS + CPU-interface correctness + envelope remain | #81 |
 
 ### M25 · Live local lifecycle — suspend · resume · fork
 
