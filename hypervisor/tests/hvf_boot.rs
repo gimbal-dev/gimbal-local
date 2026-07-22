@@ -2461,3 +2461,105 @@ fn hvf_userspace_gic_delivers_an_lpi() {
     assert_eq!(outcome, "Shutdown", "guest did not power off cleanly");
     eprintln!("PROVEN: delivered LPIs {LPI_A} and {LPI_B} to a guest with no managed GIC");
 }
+
+// ---------------------------------------------------------------------------
+// PATH A, brick 2: the full virtio-completion chain a stock ITS/LPI snapshot
+// needs -- resolve a (DeviceID, EventID) through the user-space ITS translator
+// (walking real KVM-format tables in the guest's RAM) into an LPI INTID, then
+// DELIVER that LPI to the guest via the userspace CPU interface. This ties the
+// existing ITS resolver (its.rs) to the proven delivery primitive: it is the
+// end-to-end path by which a resumed stock snapshot's virtio interrupts reach
+// the guest with no managed GIC. Uses the real captured `gic-v3-its` KVM state.
+#[test]
+fn hvf_userspace_gic_delivers_its_resolved_lpi() {
+    use hypervisor::hvf::virtio::its::Its;
+    use hypervisor::hvf::virtio::GuestMemory;
+
+    // Real gic-v3-its KVM register state from the captured arm64 cloud snapshot:
+    // device table (indirect) @ 0x40240000, collection table (flat) @ 0x40250000.
+    const KVM_ITS_STATE: &str = r#"{"Kvm":{"its_ctlr":2147483649,"its_iidr":1258292283,"its_cbaser":13258597304054776847,"its_cwriter":608,"its_creadr":608,"its_baser":[17944311241357133312,13548798005043594752,0,0,0,0,0,0]}}"#;
+
+    // 4 MiB guest RAM so the ITS table GPAs (0x40240000..0x40310000) fit.
+    let ram = HostRam::new(0x40_0000);
+    ram.load(0, include_bytes!("data/lpi_deliver.bin"));
+
+    // A host-side view over the SAME guest RAM the VM runs on, so the ITS walks
+    // the actual guest memory (as it would for a resumed snapshot).
+    let gmem = GuestMemory::new();
+    // SAFETY: ram outlives gmem and the VM; the region is exactly the mapping.
+    unsafe { gmem.register(RAM_BASE, ram.ptr, ram.size) };
+
+    // Lay a KVM-format ITS table image into guest RAM: indirect device table,
+    // flat collection table, per-device ITTs. Dev 0x8 events 0/1 -> LPI 8192/8193.
+    let devt = 0x4024_0000u64;
+    let colt = 0x4025_0000u64;
+    let itt = 0x4030_0000u64;
+    gmem.write_u64(colt, 1u64 << 63).unwrap(); // collection 0 -> rdbase 0, valid
+    let l2 = devt + 0x1_0000;
+    gmem.write_u64(devt, (1u64 << 63) | l2).unwrap(); // L1[0] -> L2, valid
+    let dte = (1u64 << 63) | (((itt >> 8) & ((1 << 44) - 1)) << 5) | 1; // valid|itt|evbits-1=1
+    gmem.write_u64(l2 + 0x8 * 8, dte).unwrap(); // device 0x8
+    gmem.write_u64(itt + 0 * 8, (8192u64 << 16) | 0).unwrap(); // event 0 -> LPI 8192
+    gmem.write_u64(itt + 1 * 8, (8193u64 << 16) | 0).unwrap(); // event 1 -> LPI 8193
+
+    // Build the ITS from the real captured state and RESOLVE via table walk.
+    let its = Its::from_snapshot_state(&format!(
+        r#"{{"snapshots":{{"device-manager":{{"snapshots":{{"gic-v3-its":{{"snapshot_data":{{"state":{}}}}}}}}}}}}}"#,
+        serde_json::to_string(KVM_ITS_STATE).unwrap()
+    ))
+    .expect("build ITS");
+    let lpi_a = its.translate(&gmem, 0x8, 0).unwrap().expect("resolve dev 0x8 ev 0");
+    let lpi_b = its.translate(&gmem, 0x8, 1).unwrap().expect("resolve dev 0x8 ev 1");
+    assert_eq!(lpi_a.intid, 8192, "ITS should resolve dev 0x8 ev 0 -> LPI 8192");
+    assert_eq!(lpi_b.intid, 8193, "ITS should resolve dev 0x8 ev 1 -> LPI 8193");
+
+    // Now DELIVER the ITS-resolved LPIs to the guest via the userspace GIC.
+    let hv = hypervisor::new().expect("hypervisor::new() — codesigned?");
+    let vm = hv
+        .create_vm(HypervisorVmConfig { nested: false, smt_enabled: false })
+        .expect("create_vm");
+    // SAFETY: ram outlives the mapping.
+    unsafe {
+        vm.create_user_memory_region(0, RAM_BASE, ram.size, ram.ptr, false, false)
+            .expect("map ram");
+    }
+    let ops = Arc::new(ProbeVmOps { marks: Mutex::new(Vec::new()) });
+    let ops_dyn: Arc<dyn VmOps> = ops.clone();
+    let mut vcpu = vm.create_vcpu(0, Some(ops_dyn)).expect("create_vcpu");
+    vcpu.setup_regs(0, RAM_BASE, 0).expect("setup_regs");
+    {
+        let hvcpu = vcpu.as_any_concrete_mut().downcast_mut::<HvfVcpu>().unwrap();
+        hvcpu.set_usgic_enabled(true);
+    }
+
+    let seen = |v: u32, ops: &ProbeVmOps| ops.marks.lock().unwrap().iter().any(|(_, x)| *x == v);
+    let mut outcome = String::new();
+    let mut injected = false;
+    for _ in 0..120 {
+        match vcpu.run() {
+            Ok(VmExit::Ignore) => {
+                if !injected && seen(0x1100_0000, &ops) {
+                    let hvcpu = vcpu.as_any_concrete_mut().downcast_mut::<HvfVcpu>().unwrap();
+                    // Inject exactly what the ITS resolved -- not hardcoded values.
+                    hvcpu.usgic_inject(lpi_a.intid).expect("inject A");
+                    hvcpu.usgic_inject(lpi_b.intid).expect("inject B");
+                    injected = true;
+                }
+                continue;
+            }
+            Ok(VmExit::Shutdown) => { outcome = "Shutdown".into(); break; }
+            Ok(other) => { outcome = format!("{other:?}"); break; }
+            Err(e) => { outcome = format!("Err: {e}"); break; }
+        }
+    }
+
+    let recorded: Vec<u32> = ops.marks.lock().unwrap().iter().map(|(_, v)| *v).collect();
+    eprintln!("=== ITS-resolved LPI delivery === resolved=({},{}) recorded={recorded:x?} outcome={outcome}",
+        lpi_a.intid, lpi_b.intid);
+    assert!(
+        recorded.contains(&lpi_a.intid) && recorded.contains(&lpi_b.intid),
+        "guest did not acknowledge the ITS-resolved LPIs; got {recorded:x?}"
+    );
+    assert_eq!(outcome, "Shutdown");
+    eprintln!("PROVEN: ITS resolve -> userspace LPI delivery (virtio completion path)");
+}
