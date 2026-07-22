@@ -1006,6 +1006,26 @@ impl HvfVcpu {
         g.redist.seed_from_kvm(redist_regs);
     }
 
+    /// Seed the userspace CPU-interface bookkeeping (PMR, BPR1, CTLR, SRE,
+    /// IGRPEN1) from the captured managed-GIC ICC registers. On the userspace-GIC
+    /// path there is no managed GIC to write these into via `hv_gic_set_icc_reg`,
+    /// so a resumed guest's ICC reads (serviced by [`Self::handle_icc_trap`])
+    /// return these seeded values, keeping its CPU-interface view coherent with
+    /// what it had at capture. Delivery itself does not gate on them today.
+    pub fn usgic_seed_icc(&self, icc: &[(u16, u64)]) {
+        let mut g = self.usgic.lock().unwrap();
+        for &(reg, v) in icc {
+            match reg {
+                crate::hvf::ffi::GIC_ICC_PMR_EL1 => g.pmr = v,
+                crate::hvf::ffi::GIC_ICC_BPR1_EL1 => g.bpr1 = v,
+                crate::hvf::ffi::GIC_ICC_CTLR_EL1 => g.ctlr = v,
+                crate::hvf::ffi::GIC_ICC_SRE_EL1 => g.sre = v,
+                crate::hvf::ffi::GIC_ICC_IGRPEN1_EL1 => g.igrpen1 = v,
+                _ => {}
+            }
+        }
+    }
+
     /// Service a GICD/GICR MMIO access via the software GIC. Returns `None` if
     /// `ipa` is outside both frames (the caller falls through to the device
     /// bus); `Some(read_value)` when handled (0 for writes).
@@ -1550,8 +1570,14 @@ impl Vcpu for HvfVcpu {
         // enables, active priorities, ...). These are load-bearing for delivery
         // and live in the GIC, not in the vCPU sysreg file. They are restored
         // after MPIDR so the vCPU is already associated with its redistributor.
-        for &(reg, v) in &s.gic_icc {
-            self.set_icc_reg(reg, v)?;
+        // On the userspace-GIC path there is no managed GIC, so instead seed the
+        // emulated CPU interface's bookkeeping from the captured ICC values.
+        if self.usgic.lock().unwrap().enabled {
+            self.usgic_seed_icc(&s.gic_icc);
+        } else {
+            for &(reg, v) in &s.gic_icc {
+                self.set_icc_reg(reg, v)?;
+            }
         }
         Ok(())
     }

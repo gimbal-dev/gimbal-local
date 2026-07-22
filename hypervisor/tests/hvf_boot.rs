@@ -2105,6 +2105,143 @@ fn hvf_rehydrate_real_cloud_snapshot_emits_console() {
     );
 }
 
+/// USGIC END-TO-END: rehydrate a GENUINE stock ITS/LPI-routed cloud-hypervisor
+/// snapshot onto a userspace GICv3 (NO managed GIC) and observe the restored
+/// guest EXECUTE real code. This is the snapshot the shipping managed path
+/// REJECTS (its_lpi_guard: LPI completions the managed GIC cannot deliver); the
+/// userspace-GIC path is the whole point of M-USGIC. Point CH_SNAPSHOT_DIR at a
+/// stock (CH_GIC_V2M=0) capture, e.g. snapshots/ch-arm-stock-its.
+///
+/// Ignored by default (needs a multi-GB local snapshot + a codesigned bin). Run:
+///   CH_SNAPSHOT_DIR=snapshots/ch-arm-stock-its <bin> \
+///     hvf_rehydrate_stock_its_snapshot_usgic_executes --exact --ignored --nocapture
+#[cfg(feature = "kvm-snapshot")]
+#[ignore = "needs a local multi-GB stock ITS snapshot via CH_SNAPSHOT_DIR"]
+#[test]
+fn hvf_rehydrate_stock_its_snapshot_usgic_executes() {
+    use std::path::PathBuf;
+
+    use hypervisor::hvf::devices::{MmioBus, Pl011};
+    use hypervisor::hvf::rehydrate::{rehydrate_usgic, Snapshot};
+
+    const PL011_BASE: u64 = 0x0900_0000;
+    const PL011_SIZE: u64 = 0x1000;
+
+    let Ok(dir) = env::var("CH_SNAPSHOT_DIR") else {
+        eprintln!("CH_SNAPSHOT_DIR unset; skipping stock-ITS USGIC test");
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let state_json = fs::read_to_string(dir.join("state.json")).expect("read state.json");
+    let snap = Snapshot::from_state_json(&state_json).expect("parse snapshot");
+    eprintln!(
+        "stock snapshot: {} vCPU(s), {} IRQs, {} mem region(s)",
+        snap.vcpus.len(),
+        snap.num_irq,
+        snap.mem_mappings.len()
+    );
+    drop(snap);
+
+    // Run the guest in a child thread that the main thread ABANDONS after a hard
+    // timeout, so a WFI-wedged idle guest (Apple's internal wait not honouring a
+    // deadline — the #78 class, orthogonal to the userspace GIC) can never hang
+    // the suite. The child bumps a shared exit counter per run() return; the main
+    // thread samples it and asserts on the evidence of live execution. HVF binds
+    // a vCPU to its creating thread, so the whole VM is built inside the child.
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    let exits = Arc::new(AtomicU64::new(0));
+    let console_bytes = Arc::new(AtomicU64::new(0));
+    let powered_off = Arc::new(AtomicBool::new(false));
+    let faulted = Arc::new(AtomicBool::new(false));
+    let dir_c = dir.clone();
+    let exits_c = exits.clone();
+    let console_c = console_bytes.clone();
+    let off_c = powered_off.clone();
+    let fault_c = faulted.clone();
+    let child = thread::spawn(move || {
+        let state_json = fs::read_to_string(dir_c.join("state.json")).expect("read state.json");
+        let mem_ranges = dir_c.join("snapshot").join("memory-ranges");
+        let snap = Snapshot::from_state_json(&state_json).expect("parse snapshot");
+        let uart = Arc::new(Pl011::new());
+        let bus = MmioBus::new();
+        bus.add(PL011_BASE, PL011_SIZE, uart.clone());
+        let vm_ops: Arc<dyn VmOps> = Arc::new(bus);
+        let hv = hypervisor::new().expect("hypervisor::new() — codesigned?");
+        // Rehydrate onto the userspace GIC (no managed GIC) — the thing the
+        // shipping managed path cannot do for an ITS/LPI snapshot.
+        let mut uvm = rehydrate_usgic(hv.as_ref(), &snap, &mem_ranges, &vm_ops)
+            .expect("rehydrate_usgic the stock ITS snapshot");
+        eprintln!("rehydrated {} vCPU(s) onto the userspace GIC", uvm.vcpus.len());
+        let vcpu = uvm.vcpus[0].as_mut();
+        for _ in 0..2000 {
+            match vcpu.run() {
+                Ok(VmExit::Ignore) => {
+                    exits_c.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(VmExit::Shutdown | VmExit::Reset) => {
+                    off_c.store(true, Ordering::Relaxed);
+                    break;
+                }
+                Ok(_) | Err(_) => {
+                    fault_c.store(true, Ordering::Relaxed);
+                    break;
+                }
+            }
+            let out = uart.take_output();
+            if !out.is_empty() {
+                console_c.fetch_add(out.len() as u64, Ordering::Relaxed);
+            }
+            if exits_c.load(Ordering::Relaxed) >= 40 || console_c.load(Ordering::Relaxed) >= 200 {
+                break;
+            }
+        }
+    });
+
+    // Main thread: wait up to 25s for evidence of execution, then proceed
+    // regardless (the child is abandoned; process exit reclaims the HVF VM).
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(25) {
+        if exits.load(Ordering::Relaxed) >= 3
+            || console_bytes.load(Ordering::Relaxed) > 0
+            || powered_off.load(Ordering::Relaxed)
+            || faulted.load(Ordering::Relaxed)
+            || child.is_finished()
+        {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let n_exits = exits.load(Ordering::Relaxed);
+    let n_console = console_bytes.load(Ordering::Relaxed);
+    let off = powered_off.load(Ordering::Relaxed);
+    let fault = faulted.load(Ordering::Relaxed);
+    eprintln!(
+        "stock-ITS USGIC guest: {n_exits} run() exits, {n_console} console byte(s), \
+         powered_off={off}, faulted={fault}"
+    );
+
+    // The core proof is rehydrate_usgic() succeeding (asserted inside the child):
+    // the snapshot the MANAGED path REJECTS loads onto the userspace GIC with all
+    // state restored. Execution evidence: the restored kernel takes real run()
+    // exits (GIC ICC-register traps + virtual-timer ticks — see CHM_TRACE_EXIT)
+    // without faulting. A mis-restored guest would fault on the first entry. Note:
+    // an idle guest then wedges in Apple's internal WFI wait (the #78 class) and,
+    // lacking virtio-completion delivery here, has no I/O to make further
+    // progress; open-ended boot needs the resume-path wiring (ITS translate ->
+    // usgic_inject_queue, already proven cross-thread) — a distinct milestone.
+    assert!(!fault, "rehydrated guest faulted — state restore is wrong");
+    assert!(
+        n_exits >= 1 || n_console > 0 || off,
+        "stock-ITS USGIC guest showed no signs of execution \
+         ({n_exits} exits, {n_console} console bytes)"
+    );
+    eprintln!(
+        "PROVEN: a STOCK ITS/LPI snapshot (managed path rejects it) rehydrates onto \
+         the userspace GIC and executes real restored guest code"
+    );
+}
+
 /// Proves the rehydrated cloud guest **resumes real timed userspace** on HVF —
 /// the payoff of restoring virtual-counter continuity.
 ///
