@@ -475,6 +475,17 @@ struct UserGic {
     ctlr: u64,
     igrpen1: u64,
     sre: u64,
+    /// The GICv3 distributor model (SPI config + routing). VM-global in the
+    /// architecture; kept per-vCPU here for the single-vCPU path (SMP sharing is
+    /// a later refinement). Serviced when the guest hits the GICD MMIO frame.
+    dist: crate::hvf::softgic::Distributor,
+    /// This vCPU's redistributor model (SGI/PPI frame + LPI control registers).
+    redist: crate::hvf::softgic::Redistributor,
+    /// MMIO base of the distributor frame (`0` = not wired; MMIO falls through to
+    /// the device bus). Set on resume from the snapshot's GIC config.
+    gicd_base: u64,
+    /// MMIO base of this vCPU's redistributor window (`0` = not wired).
+    gicr_base: u64,
 }
 
 /// GICv3 spurious INTID returned when no interrupt is pending.
@@ -918,6 +929,81 @@ impl HvfVcpu {
         self.set_irq_line(true)
     }
 
+    /// Wire this vCPU's software distributor/redistributor to their guest MMIO
+    /// bases (from the snapshot's GIC config) and size the distributor. After
+    /// this, guest accesses to those frames are serviced by the software GIC
+    /// instead of faulting to the device bus. `0` bases leave them unwired.
+    pub fn usgic_set_gic_bases(&self, gicd_base: u64, gicr_base: u64, num_irqs: u32) {
+        let mut g = self.usgic.lock().unwrap();
+        g.gicd_base = gicd_base;
+        g.gicr_base = gicr_base;
+        g.dist = crate::hvf::softgic::Distributor::new(num_irqs);
+    }
+
+    /// Seed the software distributor + redistributor from captured KVM GIC state
+    /// (the same `(offset, value)` pairs the managed-GIC path restores), so a
+    /// resumed guest keeps its interrupt configuration.
+    pub fn usgic_seed_gic(&self, dist_regs: &[(u32, u64)], redist_regs: &[(u32, u64)]) {
+        let mut g = self.usgic.lock().unwrap();
+        g.dist.seed_from_kvm(dist_regs);
+        g.redist.seed_from_kvm(redist_regs);
+    }
+
+    /// Service a GICD/GICR MMIO access via the software GIC. Returns `None` if
+    /// `ipa` is outside both frames (the caller falls through to the device
+    /// bus); `Some(read_value)` when handled (0 for writes).
+    fn usgic_mmio(&self, ipa: u64, is_write: bool, write_val: u32) -> Option<u64> {
+        let mut g = self.usgic.lock().unwrap();
+        if g.gicd_base != 0 && ipa >= g.gicd_base && ipa < g.gicd_base + 0x1_0000 {
+            let off = ipa - g.gicd_base;
+            if is_write {
+                g.dist.write(off, write_val);
+                Some(0)
+            } else {
+                Some(g.dist.read(off) as u64)
+            }
+        } else if g.gicr_base != 0 && ipa >= g.gicr_base && ipa < g.gicr_base + 0x2_0000 {
+            let off = ipa - g.gicr_base;
+            if is_write {
+                g.redist.write(off, write_val);
+                Some(0)
+            } else {
+                Some(g.redist.read(off) as u64)
+            }
+        } else {
+            None
+        }
+    }
+
+    /// Assert an SPI (INTID >= 32) or PPI (16..31) into this vCPU: mark it
+    /// pending in the distributor/redistributor and, if enabled there, forward it
+    /// to the CPU interface and assert the raw IRQ line. This is the delivery
+    /// path for line/message SPIs (serial, virtio-INTx) and PPIs (the virtual
+    /// timer). Owning-thread only; a no-op unless the userspace GIC is enabled.
+    pub fn usgic_assert_spi(&self, intid: u32) -> CpuResult<()> {
+        let deliver = {
+            let mut g = self.usgic.lock().unwrap();
+            if !g.enabled {
+                return Ok(());
+            }
+            // PPIs gate on the redistributor's per-vCPU enable; SPIs on the
+            // distributor (which also latches the pending bit).
+            let enabled = if intid < 32 {
+                g.redist.is_ppi_enabled(intid)
+            } else {
+                g.dist.assert_spi(intid)
+            };
+            if enabled {
+                g.push_pending(intid);
+            }
+            enabled
+        };
+        if deliver {
+            self.set_irq_line(true)?;
+        }
+        Ok(())
+    }
+
     /// Service an `EC=0x18` GICv3 CPU-interface sysreg trap: decode the ISS,
     /// emulate the `ICC_*_EL1` access against [`UserGic`], advance PC past the
     /// trapped instruction. Returns `Ok(true)` when handled, `Ok(false)` for a
@@ -1128,6 +1214,26 @@ impl HvfVcpu {
         let srt = ((iss >> 16) & 0x1f) as u32; // transfer register index
         let is_write = (iss >> 6) & 1 == 1;
         let access = 1usize << sas;
+
+        // Software GIC (userspace path): service GICD/GICR MMIO before falling
+        // through to the device bus. A resumed stock ITS/LPI snapshot runs with
+        // no managed GIC, so the guest's distributor/redistributor accesses land
+        // here as unmapped-IPA data aborts.
+        if self.usgic_enabled() {
+            let write_val = if is_write && srt != 31 {
+                self.get_reg(srt)? as u32
+            } else {
+                0
+            };
+            if let Some(read_val) = self.usgic_mmio(ipa, is_write, write_val) {
+                if !is_write && srt != 31 {
+                    self.set_reg(srt, read_val)?;
+                }
+                let pc = self.get_reg(HV_REG_PC)?;
+                self.set_reg(HV_REG_PC, pc.wrapping_add(4))?;
+                return Ok(());
+            }
+        }
 
         let Some(vm_ops) = self.vm_ops.as_ref() else {
             return Err(HypervisorCpuError::RunVcpu(anyhow!(

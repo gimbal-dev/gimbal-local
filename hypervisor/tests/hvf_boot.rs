@@ -2563,3 +2563,127 @@ fn hvf_userspace_gic_delivers_its_resolved_lpi() {
     assert_eq!(outcome, "Shutdown");
     eprintln!("PROVEN: ITS resolve -> userspace LPI delivery (virtio completion path)");
 }
+
+// ---------------------------------------------------------------------------
+// PATH A, brick 3: the software distributor in the loop. A guest with no
+// managed GIC programs the GICv3 distributor over MMIO (GICD_CTLR +
+// GICD_ISENABLER, serviced by hvf::softgic) to enable SPI 32, then the host
+// asserts that SPI; the distributor forwards it (it is enabled) to the
+// userspace CPU interface, and the guest takes it. Proves the full
+// guest-MMIO-config -> software distributor -> CPU-interface delivery pipeline,
+// the path serial/line SPIs use on a rehydrated snapshot.
+const GICD_BASE: u64 = 0x0800_0000;
+const GICR_BASE: u64 = 0x0801_0000;
+
+#[test]
+fn hvf_userspace_gic_delivers_spi_via_distributor() {
+    let ram = HostRam::new(RAM_SIZE);
+    ram.load(0, include_bytes!("data/spi_deliver.bin"));
+    let ops = Arc::new(ProbeVmOps { marks: Mutex::new(Vec::new()) });
+    let hv = hypervisor::new().expect("hypervisor::new() — codesigned?");
+    let vm = hv
+        .create_vm(HypervisorVmConfig { nested: false, smt_enabled: false })
+        .expect("create_vm");
+    // NO managed GIC.
+    // SAFETY: ram outlives the mapping.
+    unsafe {
+        vm.create_user_memory_region(0, RAM_BASE, ram.size, ram.ptr, false, false)
+            .expect("map ram");
+    }
+    let ops_dyn: Arc<dyn VmOps> = ops.clone();
+    let mut vcpu = vm.create_vcpu(0, Some(ops_dyn)).expect("create_vcpu");
+    vcpu.setup_regs(0, RAM_BASE, 0).expect("setup_regs");
+    {
+        let hvcpu = vcpu.as_any_concrete_mut().downcast_mut::<HvfVcpu>().unwrap();
+        hvcpu.set_usgic_enabled(true);
+        // Wire the software distributor/redistributor to their MMIO frames.
+        hvcpu.usgic_set_gic_bases(GICD_BASE, GICR_BASE, 256);
+    }
+
+    const SPI: u32 = 32;
+    let seen = |v: u32, ops: &ProbeVmOps| ops.marks.lock().unwrap().iter().any(|(_, x)| *x == v);
+    let mut outcome = String::new();
+    let mut asserted = false;
+    for _ in 0..200 {
+        match vcpu.run() {
+            Ok(VmExit::Ignore) => {
+                if !asserted && seen(0x1100_0000, &ops) {
+                    let hvcpu = vcpu.as_any_concrete_mut().downcast_mut::<HvfVcpu>().unwrap();
+                    // Assert the SPI; the distributor only forwards it because the
+                    // guest enabled it via GICD_ISENABLER.
+                    hvcpu.usgic_assert_spi(SPI).expect("assert SPI");
+                    asserted = true;
+                }
+                continue;
+            }
+            Ok(VmExit::Shutdown) => { outcome = "Shutdown".into(); break; }
+            Ok(other) => { outcome = format!("{other:?}"); break; }
+            Err(e) => { outcome = format!("Err: {e}"); break; }
+        }
+    }
+
+    let recorded: Vec<u32> = ops.marks.lock().unwrap().iter().map(|(_, v)| *v).collect();
+    eprintln!("=== software-distributor SPI === recorded={recorded:x?} outcome={outcome}");
+    assert!(recorded.contains(&0x1100_0000), "guest never signaled READY");
+    assert!(
+        recorded.contains(&SPI),
+        "guest did not acknowledge SPI {SPI} via the software distributor; got {recorded:x?}"
+    );
+    assert_eq!(outcome, "Shutdown");
+    eprintln!("PROVEN: guest GICD MMIO -> software distributor -> CPU-interface SPI delivery");
+}
+
+/// A guest programs its distributor with SPI 40 DISABLED; asserting it must NOT
+/// reach the guest (the distributor gates it). Proves the enable gate is real,
+/// not that we deliver everything unconditionally.
+#[test]
+fn hvf_userspace_gic_distributor_gates_disabled_spi() {
+    // Reuse the same guest but assert a DIFFERENT SPI (40) the guest never
+    // enabled; it should never be acknowledged, and the guest keeps polling.
+    let ram = HostRam::new(RAM_SIZE);
+    ram.load(0, include_bytes!("data/spi_deliver.bin"));
+    let ops = Arc::new(ProbeVmOps { marks: Mutex::new(Vec::new()) });
+    let hv = hypervisor::new().expect("hypervisor::new() — codesigned?");
+    let vm = hv
+        .create_vm(HypervisorVmConfig { nested: false, smt_enabled: false })
+        .expect("create_vm");
+    // SAFETY: ram outlives the mapping.
+    unsafe {
+        vm.create_user_memory_region(0, RAM_BASE, ram.size, ram.ptr, false, false)
+            .expect("map ram");
+    }
+    let ops_dyn: Arc<dyn VmOps> = ops.clone();
+    let mut vcpu = vm.create_vcpu(0, Some(ops_dyn)).expect("create_vcpu");
+    vcpu.setup_regs(0, RAM_BASE, 0).expect("setup_regs");
+    {
+        let hvcpu = vcpu.as_any_concrete_mut().downcast_mut::<HvfVcpu>().unwrap();
+        hvcpu.set_usgic_enabled(true);
+        hvcpu.usgic_set_gic_bases(GICD_BASE, GICR_BASE, 256);
+    }
+
+    let seen = |v: u32, ops: &ProbeVmOps| ops.marks.lock().unwrap().iter().any(|(_, x)| *x == v);
+    let mut asserted = false;
+    // Bounded: after asserting the disabled SPI, spin a while; the guest must
+    // NOT acknowledge it (it stays in its poll loop).
+    for _ in 0..80 {
+        match vcpu.run() {
+            Ok(VmExit::Ignore) => {
+                if !asserted && seen(0x1100_0000, &ops) {
+                    let hvcpu = vcpu.as_any_concrete_mut().downcast_mut::<HvfVcpu>().unwrap();
+                    hvcpu.usgic_assert_spi(40).expect("assert disabled SPI");
+                    asserted = true;
+                }
+                continue;
+            }
+            Ok(other) => panic!("unexpected exit {other:?} (guest should keep polling)"),
+            Err(e) => panic!("unexpected error {e}"),
+        }
+    }
+    let recorded: Vec<u32> = ops.marks.lock().unwrap().iter().map(|(_, v)| *v).collect();
+    assert!(recorded.contains(&0x1100_0000), "guest never signaled READY");
+    assert!(
+        !recorded.contains(&40),
+        "a DISABLED SPI 40 was wrongly delivered; got {recorded:x?}"
+    );
+    eprintln!("PROVEN: the software distributor gates a disabled SPI");
+}

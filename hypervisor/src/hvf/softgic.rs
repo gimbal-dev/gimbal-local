@@ -51,8 +51,7 @@ impl Distributor {
     /// A distributor sized for `num_irqs` interrupts (rounded up to a multiple of
     /// 32, clamped to `[32, INTID_LIMIT]`). All interrupts start disabled,
     /// Group1, priority 0xA0 — the reset-ish state a fresh guest reprograms.
-    pub fn new(num_irqs: u32) -> Self {
-        let n = num_irqs.next_multiple_of(32).clamp(32, INTID_LIMIT) as usize;
+    pub fn new(num_irqs: u32) -> Self {        let n = num_irqs.next_multiple_of(32).clamp(32, INTID_LIMIT) as usize;
         Self {
             ctlr: 0,
             num_irqs: n as u32,
@@ -288,6 +287,14 @@ enum BitField {
     Enable,
     Group,
     Pending,
+}
+
+impl Default for Distributor {
+    /// A 256-INTID distributor (SGIs + PPIs + 224 SPIs) — the default shape a
+    /// vCPU starts with before the snapshot's captured state is seeded in.
+    fn default() -> Self {
+        Self::new(256)
+    }
 }
 
 /// The per-vCPU GICv3 redistributor (GICR): the SGI/PPI frame plus the LPI
