@@ -2254,3 +2254,210 @@ fn hvf_gic_requires_redist_above_dist() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// EXPERIMENT (Path A de-risk): does HVF trap the guest's GICv3 CPU-interface
+// system registers (ICC_*_EL1) when NO managed GIC is created? If yes, a fully
+// userspace GICv3 (delivering LPIs via our own emulated CPU interface) becomes
+// possible, which would let us rehydrate stock ITS/LPI snapshots. This runs a
+// bare-metal guest that, with no hv_gic, reads ICC_SRE_EL1, enables SRE, and
+// reads ICC_IAR1_EL1 -- recording each step to a marker MMIO -- so the run
+// outcome (sysreg-trap exit vs guest fault vs silent silicon read) is observed
+// as data. Not an assertion test; it prints its findings.
+const PROBE_MARKER: u64 = 0x0900_0000;
+
+struct ProbeVmOps {
+    marks: Mutex<Vec<(u64, u32)>>,
+}
+impl VmOps for ProbeVmOps {
+    fn guest_mem_write(&self, _gpa: u64, buf: &[u8]) -> VmOpsResult<usize> {
+        Ok(buf.len())
+    }
+    fn guest_mem_read(&self, _gpa: u64, buf: &mut [u8]) -> VmOpsResult<usize> {
+        Ok(buf.len())
+    }
+    fn mmio_read(&self, _gpa: u64, data: &mut [u8]) -> VmOpsResult<()> {
+        data.fill(0);
+        Ok(())
+    }
+    fn mmio_write(&self, gpa: u64, data: &[u8]) -> VmOpsResult<()> {
+        // Only record marker writes; a guest may also poll a scratch MMIO
+        // address to yield to the host without flooding the record.
+        if gpa == PROBE_MARKER {
+            let n = data.len().min(4);
+            let mut v = [0u8; 4];
+            v[..n].copy_from_slice(&data[..n]);
+            self.marks.lock().unwrap().push((gpa, u32::from_le_bytes(v)));
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn hvf_probe_icc_cpu_interface_trap_without_managed_gic() {
+    let probe = include_bytes!("data/icc_probe.bin");
+    let ram = HostRam::new(RAM_SIZE);
+    ram.load(0, probe);
+    let ops = Arc::new(ProbeVmOps {
+        marks: Mutex::new(Vec::new()),
+    });
+    // Inline VM build so we can pass ProbeVmOps (build_vm is typed to
+    // RecordingVmOps) and, crucially, so we NEVER create a managed GIC.
+    let hv = hypervisor::new().expect("hypervisor::new() — is the test binary codesigned?");
+    let vm = hv
+        .create_vm(HypervisorVmConfig {
+            nested: false,
+            smt_enabled: false,
+        })
+        .expect("create_vm");
+    // SAFETY: ram outlives the mapping.
+    unsafe {
+        vm.create_user_memory_region(0, RAM_BASE, ram.size, ram.ptr, false, false)
+            .expect("map ram");
+    }
+    let ops_dyn: Arc<dyn VmOps> = ops.clone();
+    let mut vcpu = vm.create_vcpu(0, Some(ops_dyn)).expect("create_vcpu");
+    vcpu.setup_regs(0, RAM_BASE, 0).expect("setup_regs");
+
+    let mut outcome = String::new();
+    for _ in 0..100_000 {
+        match vcpu.run() {
+            Ok(VmExit::Ignore) => continue,
+            Ok(VmExit::Shutdown) => {
+                outcome = "Shutdown (guest PSCI-off, no VMM trap)".into();
+                break;
+            }
+            Ok(other) => {
+                outcome = format!("Ok({other:?})");
+                break;
+            }
+            Err(e) => {
+                // The HVF run loop returns Err for any guest exception it does
+                // not itself handle -- INCLUDING an EC=0x18 MSR/MRS sysreg trap.
+                // That is exactly the Path-A-viable signal.
+                outcome = format!("Err: {e}");
+                break;
+            }
+        }
+    }
+
+    let marks = ops.marks.lock().unwrap();
+    eprintln!("=== ICC CPU-interface probe (no managed GIC) ===");
+    eprintln!("marker writes ({}):", marks.len());
+    for (gpa, v) in marks.iter() {
+        let tag = v >> 24;
+        let label = match tag {
+            0xAA => "START",
+            0xB0..=0xBF => "ICC_SRE_EL1 read value",
+            0xCC => "about to read ICC_IAR1_EL1",
+            0xD0..=0xDF => "ICC_IAR1_EL1 read value",
+            0xEE => "DONE (all ICC access succeeded in-guest)",
+            0xFA => "FAULT sentinel (guest took a sync exception)",
+            _ => "raw (ESR/FAR or INTID low bits)",
+        };
+        eprintln!("  [{gpa:#010x}] = {v:#010x}  ({label})");
+    }
+    eprintln!("run outcome: {outcome}");
+    eprintln!("=== end probe ===");
+}
+
+// ---------------------------------------------------------------------------
+// PATH A demonstration: deliver an LPI (INTID >= 8192) to a guest with NO
+// managed GIC, via the experimental userspace CPU interface. Apple's managed
+// GIC can only deliver SPIs (proven: ICH list-register LPI injection returns
+// HV_UNSUPPORTED). Here we skip hv_gic entirely, inject INTID 8192 with the raw
+// virtual IRQ line, and let the guest's IRQ handler read ICC_IAR1_EL1 -- which
+// traps to our userspace CPU interface, which returns 8192. If the guest records
+// 8192, we have delivered an LPI on HVF: the delivery half the dream needs to
+// rehydrate stock ITS/LPI snapshots. Mirrors libkrun / QEMU kernel-irqchip=off.
+#[test]
+fn hvf_userspace_gic_delivers_an_lpi() {
+    let guest = include_bytes!("data/lpi_deliver.bin");
+    let ram = HostRam::new(RAM_SIZE);
+    ram.load(0, guest);
+    let ops = Arc::new(ProbeVmOps {
+        marks: Mutex::new(Vec::new()),
+    });
+    let hv = hypervisor::new().expect("hypervisor::new() — is the test binary codesigned?");
+    let vm = hv
+        .create_vm(HypervisorVmConfig {
+            nested: false,
+            smt_enabled: false,
+        })
+        .expect("create_vm");
+    // NOTE: deliberately NO create_vgic — this is the no-managed-GIC path.
+    // SAFETY: ram outlives the mapping.
+    unsafe {
+        vm.create_user_memory_region(0, RAM_BASE, ram.size, ram.ptr, false, false)
+            .expect("map ram");
+    }
+    let ops_dyn: Arc<dyn VmOps> = ops.clone();
+    let mut vcpu = vm.create_vcpu(0, Some(ops_dyn)).expect("create_vcpu");
+    vcpu.setup_regs(0, RAM_BASE, 0).expect("setup_regs");
+
+    // Enable the userspace CPU interface. Inject LPI 8192 after the guest
+    // signals READY, then LPI 8193 after it acknowledges the first -- proving
+    // the CPU interface handles back-to-back active/pending cycles, not just a
+    // one-shot. Injection is on this (owning) thread, between run() calls.
+    const LPI_A: u32 = 8192;
+    const LPI_B: u32 = 8193;
+    {
+        let hvcpu = vcpu
+            .as_any_concrete_mut()
+            .downcast_mut::<HvfVcpu>()
+            .expect("HvfVcpu");
+        hvcpu.set_usgic_enabled(true);
+    }
+
+    let seen = |v: u32, ops: &ProbeVmOps| ops.marks.lock().unwrap().iter().any(|(_, x)| *x == v);
+    let mut outcome = String::new();
+    let mut injected = false;
+    for _iter in 0..120 {
+        match vcpu.run() {
+            Ok(VmExit::Ignore) => {
+                // Once the guest is set up (READY) and wfi-spinning, queue BOTH
+                // LPIs and assert the line once. The CPU interface keeps the line
+                // asserted while `pending` is non-empty, so the guest drains
+                // 8192 then 8193 back-to-back (IAR/EOIR/eret/IAR/EOIR) with no
+                // host re-injection -- exercising active/pending transitions.
+                if !injected && seen(0x1100_0000, &ops) {
+                    let hvcpu = vcpu.as_any_concrete_mut().downcast_mut::<HvfVcpu>().unwrap();
+                    hvcpu.usgic_inject(LPI_A).expect("inject LPI A");
+                    hvcpu.usgic_inject(LPI_B).expect("inject LPI B");
+                    injected = true;
+                }
+                continue;
+            }
+            Ok(VmExit::Shutdown) => {
+                outcome = "Shutdown".into();
+                break;
+            }
+            Ok(other) => {
+                outcome = format!("{other:?}");
+                break;
+            }
+            Err(e) => {
+                outcome = format!("Err: {e}");
+                break;
+            }
+        }
+    }
+
+    let marks = ops.marks.lock().unwrap();
+    eprintln!("=== userspace-GIC LPI delivery ===");
+    for (gpa, v) in marks.iter() {
+        eprintln!("  [{gpa:#010x}] = {v:#010x}");
+    }
+    eprintln!("outcome: {outcome}");
+    let recorded: Vec<u32> = marks.iter().map(|(_, v)| *v).collect();
+    assert!(
+        recorded.contains(&0x1100_0000),
+        "guest never signaled READY; got {recorded:x?}"
+    );
+    assert!(
+        recorded.contains(&LPI_A) && recorded.contains(&LPI_B),
+        "guest did not acknowledge both injected LPIs {LPI_A}/{LPI_B}; got {recorded:x?}"
+    );
+    assert_eq!(outcome, "Shutdown", "guest did not power off cleanly");
+    eprintln!("PROVEN: delivered LPIs {LPI_A} and {LPI_B} to a guest with no managed GIC");
+}

@@ -281,6 +281,10 @@ impl Vm for HvfVm {
             kick,
             vtimer_offset: AtomicU64::new(0),
             run_gen: Arc::new(AtomicU64::new(0)),
+            usgic: Mutex::new(UserGic {
+                enabled: std::env::var_os("CHM_USERSPACE_GIC").is_some(),
+                ..UserGic::default()
+            }),
         }))
     }
 
@@ -434,6 +438,46 @@ impl Vm for HvfVm {
 // Vcpu
 // ---------------------------------------------------------------------------
 
+/// Minimal userspace GICv3 **CPU interface** (experimental, Path A / M-USGIC).
+///
+/// When Apple's managed GIC is NOT created, guest accesses to the GICv3 CPU
+/// interface system registers (`ICC_*_EL1`) trap to the VMM as `EC=0x18`
+/// MSR/MRS exceptions (proven on Apple Silicon; also how libkrun, QEMU
+/// `kernel-irqchip=off`, and RexPlayer run arm64 guests without `hv_gic`). This
+/// struct is the emulated CPU-interface state that services those traps, so the
+/// VMM controls exactly which INTID the guest acknowledges — INCLUDING an LPI
+/// (`>= 8192`) that the managed GIC can never deliver. Interrupts are asserted
+/// into the vCPU with the raw virtual IRQ line
+/// (`hv_vcpu_set_pending_interrupt`); the guest then reads `ICC_IAR1_EL1` to
+/// learn the INTID (we return it), services it, and writes `ICC_EOIR1_EL1`.
+///
+/// This is the delivery half that the existing user-space ITS translator
+/// ([`crate::hvf::virtio::its`]) has been missing: the ITS resolves a virtio
+/// completion to an LPI INTID; this interface hands that INTID to the guest.
+#[derive(Default)]
+struct UserGic {
+    /// Whether the userspace CPU interface is active (no managed GIC; opt-in via
+    /// `CHM_USERSPACE_GIC`). When false the `EC=0x18` arm falls through to the
+    /// normal unhandled-exception error, preserving default behavior.
+    enabled: bool,
+    /// Pending INTIDs awaiting acknowledgement (FIFO; priority ordering is a
+    /// later refinement). Popped by an `ICC_IAR1_EL1` read.
+    pending: Vec<u32>,
+    /// The INTID currently between `ICC_IAR1_EL1` (ack) and `ICC_EOIR1_EL1`
+    /// (EOI). `None` when the guest is not in an interrupt.
+    active: Option<u32>,
+    /// Last-written CPU-interface control values (bookkeeping so reads are
+    /// coherent; they do not gate the raw-line delivery in this experiment).
+    pmr: u64,
+    bpr1: u64,
+    ctlr: u64,
+    igrpen1: u64,
+    sre: u64,
+}
+
+/// GICv3 spurious INTID returned when no interrupt is pending.
+const GICV3_INTID_SPURIOUS: u32 = 1023;
+
 /// One HVF vCPU. Bound to the host thread that created it.
 pub struct HvfVcpu {
     id: u64,
@@ -459,6 +503,9 @@ pub struct HvfVcpu {
     /// stalls the watchdog forces the vCPU out via [`Self::exit_signal`] so it
     /// re-enters and Apple re-evaluates pending interrupts / the timer deadline.
     run_gen: Arc<AtomicU64>,
+    /// Experimental userspace GICv3 CPU interface (see [`UserGic`]). Active only
+    /// when no managed GIC is used and `CHM_USERSPACE_GIC` is set.
+    usgic: Mutex<UserGic>,
 }
 
 // SAFETY: HVF requires a vCPU to be created and run on the same thread; the VMM
@@ -683,6 +730,200 @@ impl HvfVcpu {
             );
         }
         let _ = gic::rearm_vtimer(self.id);
+    }
+
+    // --- Experimental userspace GICv3 CPU interface (Path A / M-USGIC) --------
+
+    /// True when the userspace CPU interface is active for this vCPU.
+    fn usgic_enabled(&self) -> bool {
+        self.usgic.lock().unwrap().enabled
+    }
+
+    /// Enable/disable the experimental userspace CPU interface at runtime (used
+    /// by tests; production enables it at creation via `CHM_USERSPACE_GIC`).
+    pub fn set_usgic_enabled(&self, on: bool) {
+        self.usgic.lock().unwrap().enabled = on;
+    }
+
+    /// Re-assert (or clear) the raw virtual IRQ line to match the emulated CPU
+    /// interface's pending state before a run entry. Called at the top of
+    /// [`Self::run`]. Asserts when an interrupt is pending and none is active;
+    /// otherwise leaves the line as-is (an active interrupt keeps the guest in
+    /// its handler). No-op unless the userspace GIC is enabled.
+    fn usgic_refresh_irq_line(&self) {
+        let assert = {
+            let g = self.usgic.lock().unwrap();
+            if !g.enabled {
+                return;
+            }
+            !g.pending.is_empty() && g.active.is_none()
+        };
+        if assert {
+            let _ = self.set_irq_line(true);
+        }
+    }
+
+    /// Assert or deassert this vCPU's raw virtual IRQ line. Delivery of a queued
+    /// interrupt to a guest running the userspace CPU interface is a raw-line
+    /// assert; the guest then reads `ICC_IAR1_EL1` (serviced by
+    /// [`Self::handle_icc_trap`]) to learn the INTID. Owning-thread only.
+    fn set_irq_line(&self, level: bool) -> CpuResult<()> {
+        // SAFETY: FFI on the owning thread; sets/clears the virtual IRQ line.
+        let rc = unsafe { hv_vcpu_set_pending_interrupt(self.id, HV_INTERRUPT_TYPE_IRQ, level) };
+        if rc != HV_SUCCESS {
+            return Err(HypervisorCpuError::RunVcpu(anyhow!(
+                "hv_vcpu_set_pending_interrupt(irq={level}) failed: {:#010x}",
+                rc as u32
+            )));
+        }
+        Ok(())
+    }
+
+    /// Inject an interrupt `intid` (SPI, PPI, or an **LPI** `>= 8192`) into this
+    /// vCPU through the userspace CPU interface: queue it and assert the raw IRQ
+    /// line. This is the delivery path the managed GIC cannot provide for LPIs;
+    /// paired with the user-space ITS translator it lets a stock ITS/LPI-routed
+    /// snapshot's virtio completions actually reach the guest. Owning-thread
+    /// only; a no-op unless the userspace GIC is enabled.
+    pub fn usgic_inject(&self, intid: u32) -> CpuResult<()> {
+        {
+            let mut g = self.usgic.lock().unwrap();
+            if !g.enabled {
+                return Ok(());
+            }
+            g.pending.push(intid);
+        }
+        self.set_irq_line(true)
+    }
+
+    /// Service an `EC=0x18` GICv3 CPU-interface sysreg trap: decode the ISS,
+    /// emulate the `ICC_*_EL1` access against [`UserGic`], advance PC past the
+    /// trapped instruction. Returns `Ok(true)` when handled, `Ok(false)` for a
+    /// sysreg we do not model (caller turns that into an error).
+    fn handle_icc_trap(&self, esr: u64) -> CpuResult<bool> {
+        let iss = esr & 0x1ff_ffff;
+        let is_read = (iss & 1) == 1;
+        let crm = ((iss >> 1) & 0xf) as u8;
+        let rt = ((iss >> 5) & 0x1f) as u32;
+        let crn = ((iss >> 10) & 0xf) as u8;
+        let op1 = ((iss >> 14) & 0x7) as u8;
+        let op2 = ((iss >> 17) & 0x7) as u8;
+        let op0 = ((iss >> 20) & 0x3) as u8;
+        // Every GICv3 CPU-interface register is encoded op0=3, op1=0.
+        if op0 != 3 || op1 != 0 {
+            return Ok(false);
+        }
+        let trace = std::env::var_os("CHM_TRACE_USGIC").is_some();
+        let key = (crn, crm, op2);
+        let mut deassert = false;
+        let mut set_rt: Option<u64> = None;
+        let name: &str;
+        {
+            let mut g = self.usgic.lock().unwrap();
+            if is_read {
+                let val: u64 = match key {
+                    // ICC_IAR1_EL1 / ICC_IAR0_EL1 (interrupt acknowledge).
+                    (12, 12, 0) | (12, 8, 0) => {
+                        name = "ICC_IAR";
+                        let intid = if g.pending.is_empty() {
+                            GICV3_INTID_SPURIOUS
+                        } else {
+                            g.pending.remove(0)
+                        };
+                        if intid != GICV3_INTID_SPURIOUS {
+                            g.active = Some(intid);
+                        }
+                        intid as u64
+                    }
+                    // ICC_HPPIR1_EL1 (highest pending, no ack).
+                    (12, 12, 2) | (12, 8, 2) => {
+                        name = "ICC_HPPIR";
+                        g.pending.first().copied().unwrap_or(GICV3_INTID_SPURIOUS) as u64
+                    }
+                    (4, 6, 0) => {
+                        name = "ICC_PMR";
+                        g.pmr
+                    }
+                    (12, 12, 3) => {
+                        name = "ICC_BPR1";
+                        g.bpr1
+                    }
+                    (12, 12, 4) => {
+                        name = "ICC_CTLR";
+                        g.ctlr
+                    }
+                    // Always report SRE=1 so the guest keeps the sysreg interface.
+                    (12, 12, 5) => {
+                        name = "ICC_SRE";
+                        g.sre | 1
+                    }
+                    (12, 12, 7) => {
+                        name = "ICC_IGRPEN1";
+                        g.igrpen1
+                    }
+                    (12, 11, 3) => {
+                        name = "ICC_RPR";
+                        if g.active.is_some() { 0 } else { 0xff }
+                    }
+                    _ => {
+                        name = "ICC_?rd";
+                        0
+                    }
+                };
+                if rt < 31 {
+                    set_rt = Some(val);
+                }
+                deassert = g.pending.is_empty();
+                if trace {
+                    eprintln!("[usgic] vcpu {} read  {name} -> {val:#x} (x{rt})", self.index);
+                }
+            } else {
+                let val = if rt == 31 { 0 } else { self.get_reg(rt)? };
+                match key {
+                    // ICC_EOIR1/0 (end of interrupt) and ICC_DIR (deactivate).
+                    (12, 12, 1) | (12, 8, 1) | (12, 11, 1) => {
+                        name = "ICC_EOIR/DIR";
+                        g.active = None;
+                    }
+                    (4, 6, 0) => {
+                        name = "ICC_PMR";
+                        g.pmr = val;
+                    }
+                    (12, 12, 3) => {
+                        name = "ICC_BPR1";
+                        g.bpr1 = val;
+                    }
+                    (12, 12, 4) => {
+                        name = "ICC_CTLR";
+                        g.ctlr = val;
+                    }
+                    (12, 12, 5) => {
+                        name = "ICC_SRE";
+                        g.sre = val | 1;
+                    }
+                    (12, 12, 7) => {
+                        name = "ICC_IGRPEN1";
+                        g.igrpen1 = val;
+                    }
+                    _ => {
+                        name = "ICC_?wr";
+                    }
+                }
+                if trace {
+                    eprintln!("[usgic] vcpu {} write {name} <- {val:#x} (x{rt})", self.index);
+                }
+            }
+        }
+        if let Some(v) = set_rt {
+            self.set_reg(rt, v)?;
+        }
+        if is_read && deassert {
+            self.set_irq_line(false)?;
+        }
+        // Advance past the trapped MSR/MRS instruction.
+        let pc = self.get_reg(HV_REG_PC)?;
+        self.set_reg(HV_REG_PC, pc.wrapping_add(4))?;
+        Ok(true)
     }
 
     fn set_icc_reg(&self, reg: u16, val: u64) -> CpuResult<()> {
@@ -1034,6 +1275,12 @@ impl Vcpu for HvfVcpu {
         // Apple's internal WFI wait not honouring its deadline) stops bumping it,
         // which the watchdog detects and breaks by forcing an exit.
         self.run_gen.fetch_add(1, Ordering::Relaxed);
+        // Userspace CPU interface: HVF samples the raw virtual IRQ line at run
+        // ENTRY (not continuously), so — like QEMU's hvf_inject_interrupts — we
+        // must (re)assert it before every entry whenever an interrupt is pending
+        // and none is currently active. This is what makes an injected LPI get
+        // taken once the guest clears PSTATE.I, regardless of intervening exits.
+        self.usgic_refresh_irq_line();
         // SAFETY: FFI on the owning thread.
         let ret = unsafe { hv_vcpu_run(self.id) };
         if ret != HV_SUCCESS {
@@ -1194,6 +1441,20 @@ impl Vcpu for HvfVcpu {
                                 self.set_reg(0, 0)?;
                                 Ok(VmExit::Ignore)
                             }
+                        }
+                    }
+                    EC_MSR_MRS_64 if self.usgic_enabled() => {
+                        // Userspace GICv3 CPU interface: the guest touched an
+                        // ICC_*_EL1 register with no managed GIC present, so HVF
+                        // trapped it to us. Emulate it (this is what lets us hand
+                        // the guest an LPI the managed GIC could never deliver).
+                        if self.handle_icc_trap(esr)? {
+                            Ok(VmExit::Ignore)
+                        } else {
+                            Err(HypervisorCpuError::RunVcpu(anyhow!(
+                                "usgic: unhandled sysreg trap ESR={esr:#x} (vcpu {})",
+                                self.index
+                            )))
                         }
                     }
                     _ => Err(HypervisorCpuError::RunVcpu(anyhow!(
