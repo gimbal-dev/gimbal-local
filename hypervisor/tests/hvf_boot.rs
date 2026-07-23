@@ -2115,6 +2115,10 @@ fn hvf_rehydrate_real_cloud_snapshot_emits_console() {
 /// Ignored by default (needs a multi-GB local snapshot + a codesigned bin). Run:
 ///   CH_SNAPSHOT_DIR=snapshots/ch-arm-stock-its <bin> \
 ///     hvf_rehydrate_stock_its_snapshot_usgic_executes --exact --ignored --nocapture
+///
+/// Run this test ONE AT A TIME (not alongside the other ignored snapshot proof):
+/// `hv_vm_create` is process-global (one VM per process), so two VM-creating
+/// tests in the same binary process fail the second with `HV_BUSY`.
 #[cfg(feature = "kvm-snapshot")]
 #[ignore = "needs a local multi-GB stock ITS snapshot via CH_SNAPSHOT_DIR"]
 #[test]
@@ -2261,6 +2265,10 @@ fn hvf_rehydrate_stock_its_snapshot_usgic_executes() {
 /// to 43 (cloud-hypervisor arm64 PL011); override with CHM_SERIAL_SPI. Run:
 ///   CH_SNAPSHOT_DIR=snapshots/ch-arm-stock-its <bin> \
 ///     hvf_rehydrate_stock_its_snapshot_usgic_interactive_shell --exact --ignored --nocapture
+///
+/// Run this test ONE AT A TIME (not alongside the other ignored snapshot proof):
+/// `hv_vm_create` is process-global (one VM per process), so two VM-creating
+/// tests in the same binary process fail the second with `HV_BUSY`.
 #[cfg(feature = "kvm-snapshot")]
 #[ignore = "needs a local stock ITS snapshot with a serial getty via CH_SNAPSHOT_DIR"]
 #[test]

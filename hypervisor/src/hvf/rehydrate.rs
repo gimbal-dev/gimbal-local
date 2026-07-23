@@ -107,6 +107,22 @@ pub enum RehydrateError {
     Hv(#[from] anyhow::Error),
 }
 
+/// Format an error together with its full `source()` chain. Our backends stash
+/// the actionable detail (e.g. the decoded `hv_return_t` + the entitlement fix
+/// for `HV_DENIED`) in the error *source*; a caller that prints only the
+/// top-level `Display` (`{e}`) would otherwise drop it and show a bare "Failed
+/// to create Vm". This flattens the chain so the remedy always surfaces.
+fn full_chain(e: &dyn std::error::Error) -> String {
+    let mut s = e.to_string();
+    let mut src = e.source();
+    while let Some(inner) = src {
+        s.push_str(": ");
+        s.push_str(&inner.to_string());
+        src = inner.source();
+    }
+    s
+}
+
 /// One guest-RAM region: where it maps in guest-physical space and where its
 /// bytes live inside the `memory-ranges` file.
 #[derive(Debug, Clone)]
@@ -679,7 +695,7 @@ pub fn rehydrate_usgic(
             nested: false,
             smt_enabled: false,
         })
-        .map_err(|e| RehydrateError::Hv(anyhow!("create_vm: {e}")))?;
+        .map_err(|e| RehydrateError::Hv(anyhow!("create_vm: {}", full_chain(&e))))?;
 
     // --- guest RAM (same mapping as prepare_vm, but no managed GIC after) ---
     let t_ram = std::time::Instant::now();
@@ -794,7 +810,7 @@ pub fn prepare_vm(
             nested: false,
             smt_enabled: false,
         })
-        .map_err(|e| RehydrateError::Hv(anyhow!("create_vm: {e}")))?;
+        .map_err(|e| RehydrateError::Hv(anyhow!("create_vm: {}", full_chain(&e))))?;
 
     // --- guest RAM ----------------------------------------------------------
     let guest_mem = Arc::new(GuestMemory::new());

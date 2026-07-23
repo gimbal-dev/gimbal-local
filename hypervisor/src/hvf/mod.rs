@@ -195,8 +195,9 @@ impl crate::Hypervisor for HvfHypervisor {
         let ret = unsafe { hv_vm_create(ptr::null_mut()) };
         if ret != HV_SUCCESS {
             return Err(crate::HypervisorError::VmCreate(anyhow!(
-                "hv_vm_create failed: {:#010x}",
-                ret as u32
+                "hv_vm_create failed: {:#010x} — {}",
+                ret as u32,
+                hv_return_str(ret)
             )));
         }
         Ok(Arc::new(HvfVm {
