@@ -11,6 +11,45 @@ use std::ffi::c_void;
 /// `hv_return_t` success value (`HV_SUCCESS`).
 pub const HV_SUCCESS: i32 = 0;
 
+// hv_return_t failure codes (from `<Hypervisor/hv_error.h>`). These are the
+// values `hv_vm_create` and friends return so we can turn an opaque failure into
+// an actionable diagnostic instead of a bare "operation failed".
+pub const HV_ERROR: i32 = 0xfae94001u32 as i32;
+pub const HV_BUSY: i32 = 0xfae94002u32 as i32;
+pub const HV_BAD_ARGUMENT: i32 = 0xfae94003u32 as i32;
+pub const HV_ILLEGAL_GUEST_STATE: i32 = 0xfae94004u32 as i32;
+pub const HV_NO_RESOURCES: i32 = 0xfae94005u32 as i32;
+pub const HV_NO_DEVICE: i32 = 0xfae94006u32 as i32;
+pub const HV_DENIED: i32 = 0xfae94007u32 as i32;
+pub const HV_UNSUPPORTED: i32 = 0xfae9400fu32 as i32;
+
+/// A human, actionable description of an `hv_return_t` code. The load-bearing
+/// case is [`HV_DENIED`]: on macOS that is what `hv_vm_create` returns when the
+/// running binary lacks the `com.apple.security.hypervisor` entitlement — the
+/// single most common local-dev failure, and one a bare code makes look like a
+/// kernel/VM-slot problem. Naming it directly (with the fix) turns an hour of
+/// misdiagnosis into a one-line remedy.
+pub fn hv_return_str(code: i32) -> &'static str {
+    match code {
+        HV_SUCCESS => "HV_SUCCESS",
+        HV_ERROR => "HV_ERROR (unexpected internal error)",
+        HV_BUSY => "HV_BUSY (another VM already exists in this process; hv_vm_create is process-global)",
+        HV_BAD_ARGUMENT => "HV_BAD_ARGUMENT (invalid argument)",
+        HV_ILLEGAL_GUEST_STATE => "HV_ILLEGAL_GUEST_STATE (illegal guest state)",
+        HV_NO_RESOURCES => "HV_NO_RESOURCES (out of resources; a host reboot may be needed to reclaim leaked VMs)",
+        HV_NO_DEVICE => "HV_NO_DEVICE (no hypervisor device; not an Apple-silicon/VM-capable host?)",
+        HV_DENIED => {
+            "HV_DENIED — the binary is not signed with the \
+             'com.apple.security.hypervisor' entitlement (every `cargo build` \
+             STRIPS it). Re-sign it: `codesign --sign - --entitlements \
+             hypervisor/tests/data/hv.entitlements --force <binary>` (or build \
+             chm via scripts/build-chm.sh, which signs)"
+        }
+        HV_UNSUPPORTED => "HV_UNSUPPORTED (operation not supported on this host)",
+        _ => "unknown hv_return_t",
+    }
+}
+
 // hv_reg_t — general-purpose and special core registers.
 pub const HV_REG_PC: u32 = 31;
 pub const HV_REG_CPSR: u32 = 34;
@@ -256,3 +295,26 @@ unsafe extern "C" {
     pub fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hv_denied_names_the_entitlement_and_the_fix() {
+        // The load-bearing diagnostic: HV_DENIED means the binary lost its
+        // hypervisor entitlement (every cargo build strips it). The message must
+        // name the entitlement and how to re-sign, or it reads as a VM-slot leak.
+        let msg = hv_return_str(HV_DENIED);
+        assert!(msg.contains("com.apple.security.hypervisor"), "got: {msg}");
+        assert!(msg.contains("codesign") || msg.contains("scripts/build-chm.sh"), "got: {msg}");
+    }
+
+    #[test]
+    fn known_codes_have_distinct_descriptions() {
+        for code in [HV_ERROR, HV_BUSY, HV_NO_RESOURCES, HV_NO_DEVICE, HV_DENIED] {
+            assert_ne!(hv_return_str(code), "unknown hv_return_t", "code {code:#010x}");
+        }
+        assert_eq!(hv_return_str(0x1234_5678), "unknown hv_return_t");
+    }
+}
