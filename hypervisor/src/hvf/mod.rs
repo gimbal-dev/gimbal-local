@@ -488,6 +488,21 @@ struct UserGic {
     gicd_base: u64,
     /// MMIO base of this vCPU's redistributor window (`0` = not wired).
     gicr_base: u64,
+    /// SMP: handles to every vCPU's cross-thread injection queue + wake, indexed
+    /// by vCPU id, so a software-generated interrupt (SGI / IPI) raised on this
+    /// core can be routed to the target core(s). `None` on the single-vCPU path
+    /// (an SGI is delivered to self). Set once, after all vCPUs are created.
+    cpu_table: Option<Arc<Vec<UsgicCpuHandle>>>,
+}
+
+/// One vCPU's cross-thread delivery handles, used to route an SGI (IPI) from any
+/// core to this core: push the INTID into its injection queue, then wake its
+/// thread so the run-entry drain picks it up.
+pub struct UsgicCpuHandle {
+    /// This vCPU's cross-thread injection queue ([`HvfVcpu::usgic_inject_queue`]).
+    pub inject: Arc<Mutex<Vec<u32>>>,
+    /// A wake handle for this vCPU's idle-park fd ([`HvfVcpu::wake_handle`]).
+    pub wake: EventFd,
 }
 
 /// GICv3 spurious INTID returned when no interrupt is pending.
@@ -496,6 +511,23 @@ const GICV3_INTID_SPURIOUS: u32 = 1023;
 /// The EL1 virtual-timer PPI (CNTV → INTID 27), delivered through the software
 /// GIC when there is no managed GIC.
 const VTIMER_PPI: u32 = 27;
+
+/// Whether an `ICC_SGI1R_EL1` write targets the core `cand_id`, given the raw
+/// register value and the writing core's id. The register encodes the routing
+/// mode in bit [40] (1 = all cores except the writer / "broadcast but self") and
+/// otherwise an Aff0 target-list in bits [15:0] (bit i selects the core whose
+/// MPIDR Aff0 == i — the linear per-core affinity cloud-hypervisor assigns for
+/// the small vCPU counts we resume). Extracted as a pure function so the SGI
+/// routing is unit-testable without a live VM.
+fn sgi_targets_core(sgi: u64, self_id: usize, cand_id: usize) -> bool {
+    let irm_all_but_self = (sgi >> 40) & 1 != 0;
+    if irm_all_but_self {
+        cand_id != self_id
+    } else {
+        let target_list = (sgi & 0xffff) as u16;
+        cand_id < 16 && (target_list >> cand_id) & 1 != 0
+    }
+}
 
 impl UserGic {
     /// Queue an INTID (SPI, PPI, or LPI) for delivery. Priority ordering is a
@@ -586,6 +618,28 @@ mod usgic_tests {
         };
         assert_eq!(g.read_iar(), super::GICV3_INTID_SPURIOUS);
         assert_eq!(g.active, None);
+    }
+
+    #[test]
+    fn sgi_target_list_selects_named_cores() {
+        use super::sgi_targets_core;
+        // INTID 0, IRM=0, target list = cores 0 and 2 (bits 0 and 2 set). The
+        // writer is core 1; targeting is by the list, independent of the writer.
+        let sgi = (0u64 << 24) | 0b101;
+        assert!(sgi_targets_core(sgi, 1, 0), "core 0 is in the list");
+        assert!(!sgi_targets_core(sgi, 1, 1), "core 1 is not in the list");
+        assert!(sgi_targets_core(sgi, 1, 2), "core 2 is in the list");
+        assert!(!sgi_targets_core(sgi, 1, 3), "core 3 is not in the list");
+    }
+
+    #[test]
+    fn sgi_broadcast_targets_all_but_the_writer() {
+        use super::sgi_targets_core;
+        // IRM (bit 40) = 1: deliver to every core except the writer (core 0).
+        let sgi = (1u64 << 40) | (3u64 << 24);
+        assert!(!sgi_targets_core(sgi, 0, 0), "the writer is excluded");
+        assert!(sgi_targets_core(sgi, 0, 1), "every other core is targeted");
+        assert!(sgi_targets_core(sgi, 0, 2), "every other core is targeted");
     }
 
     #[test]
@@ -998,6 +1052,54 @@ impl HvfVcpu {
         self.inject_queue.clone()
     }
 
+    /// This vCPU's cross-thread delivery handle (its injection queue + a wake fd),
+    /// for the SMP SGI routing table. Collected for every vCPU after creation and
+    /// handed back to each via [`Self::usgic_set_cpu_table`].
+    pub fn usgic_cpu_handle(&self) -> UsgicCpuHandle {
+        UsgicCpuHandle {
+            inject: self.inject_queue.clone(),
+            wake: self.wake_handle(),
+        }
+    }
+
+    /// Install the SMP cross-vCPU delivery table (every vCPU's inject queue +
+    /// wake, indexed by vCPU id). After this, an SGI raised on this core routes
+    /// to the target core(s) instead of being delivered only to self. Thread-safe
+    /// (guards the `UserGic` mutex), so the orchestrator can set it on every vCPU
+    /// from its own thread once all vCPUs exist.
+    pub fn usgic_set_cpu_table(&self, table: Arc<Vec<UsgicCpuHandle>>) {
+        self.usgic.lock().unwrap().cpu_table = Some(table);
+    }
+
+    /// Route a software-generated interrupt (SGI / IPI) decoded from an
+    /// `ICC_SGI1R_EL1` write to its target vCPU(s). `sgi` is the raw register
+    /// value; the INTID is bits [27:24], the routing mode bit [40] (1 = all cores
+    /// except self), and the Aff0 target list bits [15:0] (bit i = the core whose
+    /// MPIDR Aff0 == i, the linear layout cloud-hypervisor uses for small vCPU
+    /// counts). For each target this pushes the INTID into that core's injection
+    /// queue and wakes it; the target's run-entry drain gates it on its own
+    /// redistributor SGI-enable and delivers. Falls back to self-delivery when no
+    /// cross-vCPU table is installed (single-vCPU path).
+    fn usgic_route_sgi(&self, sgi: u64) -> CpuResult<()> {
+        let intid = ((sgi >> 24) & 0xf) as u32;
+        let table = self.usgic.lock().unwrap().cpu_table.clone();
+        let Some(table) = table else {
+            // Single-vCPU: deliver to self, preserving prior behaviour.
+            return self.usgic_inject(intid);
+        };
+        let self_id = self.index as usize;
+        for id in 0..table.len() {
+            if !sgi_targets_core(sgi, self_id, id) {
+                continue;
+            }
+            table[id].inject.lock().unwrap().push(intid);
+            // Wake the target's idle-park fd so it drains promptly. A best-effort
+            // write; a full pipe already means a wake is pending.
+            let _ = table[id].wake.write(1);
+        }
+        Ok(())
+    }
+
     /// Drain the cross-thread injection queue into the userspace GIC, applying
     /// the same enable gating as the owning-thread inject paths: an LPI
     /// (`>= 8192`) is always queued (LPI enable rides in the redistributor the
@@ -1147,7 +1249,7 @@ impl HvfVcpu {
         let mut deassert = false;
         let mut set_rt: Option<u64> = None;
         let mut rearm_timer = false;
-        let mut sgi_intid: Option<u32> = None;
+        let mut sgi_intid: Option<u64> = None;
         let name: &str;
         {
             let mut g = self.usgic.lock().unwrap();
@@ -1230,11 +1332,12 @@ impl HvfVcpu {
                         }
                     }
                     // ICC_SGI1R_EL1: software-generated interrupt (IPI). The INTID
-                    // is bits [27:24]. Single-vCPU delivers to self; multi-target
-                    // routing across vCPUs is future SMP work.
+                    // is bits [27:24]; the full register (target list / routing
+                    // mode) is decoded by `usgic_route_sgi` so an SMP guest can
+                    // IPI another core.
                     (12, 11, 5) => {
                         name = "ICC_SGI1R";
-                        sgi_intid = Some(((val >> 24) & 0xf) as u32);
+                        sgi_intid = Some(val);
                     }
                     (4, 6, 0) => {
                         name = "ICC_PMR";
@@ -1276,9 +1379,10 @@ impl HvfVcpu {
         if rearm_timer {
             let _ = gic::rearm_vtimer(self.id);
         }
-        // A software-generated interrupt targets this vCPU: deliver it.
-        if let Some(intid) = sgi_intid {
-            self.usgic_inject(intid)?;
+        // A software-generated interrupt was raised: route it to its target
+        // core(s) (or self on the single-vCPU path).
+        if let Some(sgi) = sgi_intid {
+            self.usgic_route_sgi(sgi)?;
         }
         // Advance past the trapped MSR/MRS instruction.
         let pc = self.get_reg(HV_REG_PC)?;
