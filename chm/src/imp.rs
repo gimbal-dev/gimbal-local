@@ -318,6 +318,7 @@ pub(crate) fn wire_virtio(
     cli_egress: Option<&Path>,
     net_limits: &NatLimits,
     allow_local_egress: bool,
+    lpi_sink_override: Option<Arc<dyn its::LpiSink>>,
 ) -> Result<WiredVirtio, String> {
     let descs =
         devmgr::parse_devices(state_json).map_err(|e| format!("parse virtio devices: {e}"))?;
@@ -335,16 +336,18 @@ pub(crate) fn wire_virtio(
     // deliverable message-SPI path; the logging ITS fallback has nothing to
     // deliver). Drained after the whole tree is wired and the GIC is live.
     let mut drainable: Vec<Arc<VirtioPciDevice>> = Vec::new();
-    // An enabled gic-v3-its means completions are LPI-routed (only reachable
-    // under the CHM_ALLOW_ITS_LPI bypass, since its_lpi_guard otherwise hard
-    // fails first). Those resolve through the ITS but cannot be delivered, so
-    // they fall back to the logging sink. Anything else is message-SPI routed
-    // and delivered live through the GIC.
+    // An enabled gic-v3-its means completions are LPI-routed. On the managed GIC
+    // those resolve through the ITS but cannot be delivered, so they fall back to
+    // the logging sink; on the userspace GIC the caller passes a deliverable LPI
+    // sink (`lpi_sink_override`) that injects the resolved LPI into the software
+    // GIC. Anything else is message-SPI routed and delivered live through the GIC.
     let its_engine = its::Its::from_snapshot_state(state_json)
         .ok()
         .filter(|its| its.enabled())
         .map(Arc::new);
-    let lpi_sink: Arc<dyn its::LpiSink> = Arc::new(its::LoggingLpiSink::default());
+    let lpi_deliverable = lpi_sink_override.is_some();
+    let lpi_sink: Arc<dyn its::LpiSink> =
+        lpi_sink_override.unwrap_or_else(|| Arc::new(its::LoggingLpiSink::default()));
     let msi_sink: Option<Arc<dyn MsiSink>> =
         gic.map(|g| Arc::new(GicMsiSink::new(g.clone())) as Arc<dyn MsiSink>);
 
@@ -400,8 +403,11 @@ pub(crate) fn wire_virtio(
         .map_err(|e| format!("build device {}: {e}", desc.name))?;
         if !desc.vector_events.is_empty() {
             if let Some(its) = &its_engine {
-                // LPI-routed (bypass mode): resolve to the guest's real LPI and
-                // log it -- undeliverable on the managed GIC.
+                // LPI-routed. Resolve each MSI-X vector to the guest's real LPI
+                // through the captured ITS tables and hand it to the LPI sink. On
+                // the userspace GIC that sink delivers it (deliverable); on the
+                // managed GIC it only logs. Devices with a deliverable sink are
+                // drained on resume so pre-snapshot in-flight I/O completes.
                 if desc.device_id != 0 {
                     dev.set_injector(Box::new(its::ItsInjector::new(
                         desc.name.clone(),
@@ -411,6 +417,9 @@ pub(crate) fn wire_virtio(
                         desc.vector_events.clone(),
                         lpi_sink.clone(),
                     )));
+                    if lpi_deliverable {
+                        drainable.push(dev.clone());
+                    }
                 }
             } else if let Some(sink) = &msi_sink {
                 // Deliverable: each MSI-X vector's msg_data is its target SPI
@@ -1367,6 +1376,24 @@ impl MsiSink for UsgicMsiSink {
     }
 }
 
+/// An [`its::LpiSink`] that delivers an ITS-resolved LPI into a userspace-GIC
+/// vCPU from a device thread. A virtio completion resolves `(DeviceID, EventID)`
+/// through the captured ITS tables into a physical LPI INTID (>= 8192); we
+/// enqueue it on the vCPU's injection queue and wake it, and the vCPU drains +
+/// delivers it through the software GIC at its next `run()` entry. This is the
+/// disk/net-completion path a stock ITS/LPI snapshot needs.
+struct UsgicLpiSink {
+    queue: Arc<Mutex<Vec<u32>>>,
+    wake: Arc<dyn Fn() + Send + Sync>,
+}
+
+impl its::LpiSink for UsgicLpiSink {
+    fn deliver(&self, lpi: its::Lpi) {
+        self.queue.lock().unwrap().push(lpi.intid);
+        (self.wake)();
+    }
+}
+
 /// Resume a snapshot onto the **userspace GICv3** (no managed GIC) with an
 /// interactive serial console. This is the path for a stock ITS/LPI-routed
 /// snapshot — the capture Apple's managed GIC cannot deliver completions for.
@@ -1405,10 +1432,20 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
 
     let running = Arc::new(AtomicBool::new(true));
     let outcome: Arc<Mutex<Option<Result<Outcome, String>>>> = Arc::new(Mutex::new(None));
-    // The vCPU thread hands these back to the orchestrator once the VM is built.
-    let (setup_tx, setup_rx) = mpsc::channel::<
-        Result<(Arc<Mutex<Vec<u32>>>, Arc<dyn Fn() + Send + Sync>, Arc<dyn Fn() + Send + Sync>), String>,
-    >();
+    // The vCPU thread hands these back to the orchestrator once the VM is built:
+    // the injection queue + wake + exit handles, and a host view of guest RAM (so
+    // the orchestrator can wire the virtio device model against it).
+    type UsgicSetup = (
+        Arc<Mutex<Vec<u32>>>,
+        Arc<dyn Fn() + Send + Sync>,
+        Arc<dyn Fn() + Send + Sync>,
+        Arc<GuestMemory>,
+    );
+    let (setup_tx, setup_rx) = mpsc::channel::<Result<UsgicSetup, String>>();
+    // A one-shot gate: the vCPU thread waits on it after handing back its plumbing
+    // so the orchestrator can wire the device model onto the shared bus BEFORE the
+    // guest runs (and races a virtio BAR access).
+    let (go_tx, go_rx) = mpsc::channel::<()>();
 
     let vm_ops_thread = vm_ops.clone();
     let running_thread = running.clone();
@@ -1431,6 +1468,7 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
                         return;
                     }
                 };
+            let guest_mem = uvm.guest_mem.clone();
             let vcpu = uvm.vcpus[0].as_mut();
             let queue = match vcpu.usgic_inject_queue() {
                 Some(q) => q,
@@ -1445,9 +1483,12 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
             let exit = vcpu
                 .exit_signal()
                 .unwrap_or_else(|| Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>);
-            if setup_tx.send(Ok((queue, wake, exit))).is_err() {
+            if setup_tx.send(Ok((queue, wake, exit, guest_mem))).is_err() {
                 return;
             }
+            // Wait until the orchestrator has wired the device model + console
+            // (or dropped go_tx on an error path) before entering the guest.
+            let _ = go_rx.recv();
 
             // Run the guest until a host-side stop (running=false) or a guest
             // power-off. The run() body handles the software GIC, the self-managed
@@ -1478,7 +1519,7 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
         .map_err(|e| format!("spawn userspace-GIC vCPU thread: {e}"))?;
 
     // Wait for the vCPU thread to build the VM and hand back its plumbing.
-    let (queue, wake, exit) = match setup_rx.recv() {
+    let (queue, wake, exit, guest_mem) = match setup_rx.recv() {
         Ok(Ok(v)) => v,
         Ok(Err(e)) => {
             running.store(false, Ordering::Release);
@@ -1489,6 +1530,49 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
             running.store(false, Ordering::Release);
             let _ = vcpu_thread.join();
             return Err("userspace-GIC vCPU thread exited before setup".into());
+        }
+    };
+
+    let (limits, _src) = limits::resolve_limits(dir, args.limits_file.as_deref());
+    let overlay_dir = dir.join(".chm-overlays");
+    let audit = audit::AuditLog::open(dir);
+
+    // Wire the virtio device model onto the shared bus, routing each device's
+    // completions through the captured ITS to a deliverable LPI sink that injects
+    // into the software GIC — so a resumed stock ITS/LPI guest's disk/net I/O
+    // actually completes. Net devices additionally need an off-thread NAT service.
+    let usgic_lpi_sink: Arc<dyn its::LpiSink> = Arc::new(UsgicLpiSink {
+        queue: queue.clone(),
+        wake: wake.clone(),
+    });
+    let net_service = match wire_virtio(
+        &bus,
+        &guest_mem,
+        &loaded.state_json,
+        &overlay_dir,
+        None, // no managed GIC
+        true, // resume: drain in-flight completions
+        args.egress_policy.as_deref(),
+        &NatLimits {
+            max_connections: limits.max_connections.map(|n| n as usize),
+            max_bytes_per_sec: limits.max_bandwidth_kbps.map(|kbps| kbps * 125),
+        },
+        args.allow_local_egress,
+        Some(usgic_lpi_sink),
+    ) {
+        Ok(wired) => {
+            if !wired.summary.is_empty() && !args.quiet {
+                eprintln!("chm: virtio device model restored:");
+                for d in &wired.summary {
+                    eprintln!("chm:   - {d}");
+                }
+            }
+            let exits: Arc<Mutex<Vec<ExitSignal>>> = Arc::new(Mutex::new(vec![exit.clone()]));
+            spawn_net_service(wired.net_devices, running.clone(), exits, audit.clone())
+        }
+        Err(e) => {
+            eprintln!("chm: warning: virtio device model not wired: {e}");
+            None
         }
     };
 
@@ -1516,14 +1600,18 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
         );
     }
 
-    let (limits, _src) = limits::resolve_limits(dir, args.limits_file.as_deref());
-    let overlay_dir = dir.join(".chm-overlays");
+    // Release the vCPU thread now that the device model + console are wired.
+    let _ = go_tx.send(());
+
     let coordinator = run_console(&uart, &running, args, &limits, &overlay_dir);
 
     // Stop: clear the flag, force the vCPU out of any in-flight run(), join.
     running.store(false, Ordering::Release);
     exit();
     let _ = serial_reassert.join();
+    if let Some(h) = net_service {
+        let _ = h.join();
+    }
     let _ = vcpu_thread.join();
     drop(raw_console);
 
@@ -2033,6 +2121,7 @@ fn resume_smp(
             max_bytes_per_sec: limits.max_bandwidth_kbps.map(|kbps| kbps * 125),
         },
         args.allow_local_egress,
+        None,
     ) {
         Ok(wired) => {
             if !wired.summary.is_empty() && !args.quiet {
