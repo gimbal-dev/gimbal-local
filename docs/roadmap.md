@@ -222,7 +222,8 @@ break even without filesystem access. Full findings + plan:
   boundary (security-model § "Out of scope" + the BYO capture runbook).
   **Shipped.**
 - **M31.5 (P1)** — signing fail-closed default + digest recompute enforcement
-  (folds into #36).
+  (folds into #36). **Posture shipped** (`CHM_REQUIRE_SIGNED`); gctl-signed
+  production manifests are the remaining half.
 
 
 
@@ -393,11 +394,14 @@ enforced identically on both substrates.
   **default-deny** (M31.2), so there is no public egress until allow-listed; the
   network docs were corrected (M31.3) and the cloud/capture-harness boundary
   documented (M31.4). Opt out of the host guard with `--allow-local-egress`. The
-  only remaining M31 item is the signing fail-closed default (M31.5), which folds
-  into #36.
+  signing fail-closed **posture** (M31.5) now ships: `CHM_REQUIRE_SIGNED` makes
+  verification mandatory on the plane ingest path and enforces the policy-digest
+  recompute; the remaining M31.5 half is gctl producing signed production
+  manifests (#36).
 - **Security (also open):** M30.4 signed manifest + trust root (#36, P1) —
-  `chm` verification ships; gctl signing + a fail-closed default (M31.5) is the
-  remaining half. Distribution notarisation is still unchecked.
+  `chm` verification + the `CHM_REQUIRE_SIGNED` fail-closed default (M31.5) ship;
+  gctl signing production manifests is the remaining half. Distribution
+  notarisation is still unchecked.
 - **Demo gap:** the live in-guest firewall demo (#52) is blocked only on a
   net-enabled snapshot; authoring + enforcement already ship. A cloud-side
   capture-capability request is filed (`gimbal-cloud-control#4`).

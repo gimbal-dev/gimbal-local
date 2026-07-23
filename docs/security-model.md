@@ -116,7 +116,7 @@ test/guard so a regression is caught, not discovered.
 | I3 | **Overlays are private.** Writable overlays/checkpoints are created by `chm` in a fresh `0700` dir it owns, refusing a symlinked overlay/dir shipped in the bundle. | Private `0700` overlay dir + no-follow overlay opens. | **Holds today** (M30.1) |
 | I4 | **The daemon is local-and-owner-only.** Only the same-uid user can drive the control socket; the socket lives in a private `0700` dir with `0600` perms and validates peer credentials. | Private socket dir + `0600` perms + `getpeereid` peer-uid check. | **Holds today** (M30.2) |
 | I5 | **The app never builds host shell code from data.** Snapshot/sandbox names and paths never become shell tokens. | Centralised single-quote builder + control-char rejection; adversarial-input tests. | **Holds today** (M30.3) |
-| I6 | **Only verified, provenance-known snapshots run.** A bundle is checksum-verified **and** signature-verified against a trusted key before import or run; provenance is recorded. | Ed25519 signed-manifest verification with a `CHM_TRUST_STORE` trust root; fails closed when configured. | **Verification holds** (M30.4); gctl signing pending (#36) |
+| I6 | **Only verified, provenance-known snapshots run.** A bundle is checksum-verified **and** signature-verified against a trusted key before import or run; provenance is recorded. | Ed25519 signed-manifest verification with a `CHM_TRUST_STORE` trust root; fails closed when configured, and `CHM_REQUIRE_SIGNED` makes fail-closed the default (M31.5). | **Verification + fail-closed posture hold** (M30.4/M31.5); gctl signing pending (#36) |
 | I7 | **Undeliverable snapshots are refused, not mis-run.** ITS/LPI snapshots fail loudly at the load guard and the `assign-run` 422 gate. | `its_lpi_guard` + plane gate. | **Holds today** |
 | I8 | **The content store cannot select a host file.** A manifest checksum is only ever used as a CAS path after it is validated as a canonical sha256 hex digest, and every CAS object (including cache hits) is re-hashed before it is linked into a guest. | Digest-shape gate + re-hash on hit in `materialize_bundle`. | **Holds today** (M30.8) |
 | I9 | **A governed session's egress is enforced on every NIC and fails closed.** The resolved policy applies to all virtio-net NICs, and a session whose policy source is present but unresolvable denies all egress rather than running open. | Per-NIC policy clone + `EgressResolution::FailClosed` deny-all. | **Holds today** (M30.9) |
@@ -251,6 +251,13 @@ signature** (authenticity), so a tampered bundle with a recomputed
 - **Fail closed:** with a trust root configured, a missing/invalid signature or
   unknown key id is refused. Without a trust root, the unsigned `checksum_tree`
   is used so pre-signing flows keep working during rollout.
+- **Fail-closed posture (`CHM_REQUIRE_SIGNED`, M31.5):** setting it makes
+  verification *mandatory* on the plane ingest path — a bundle that cannot be
+  authenticated (no trust root, or an unsigned/invalid manifest) is refused
+  rather than accepted unsigned, and the independent **policy-digest recompute**
+  becomes enforced (a governed policy whose doc does not re-hash to its stated
+  digest is refused, not just logged). Local `chm run <dir>` rehydration never
+  routes through this gate, so the stock-snapshot path is unaffected.
 - **Reference implementation + local signer:** `chm manifest keygen | sign |
   verify` produces and checks exactly this format, so the contract is testable
   end to end and gctl has a concrete target.
@@ -470,11 +477,15 @@ name at connect time).
   with EC2/S3 permissions and a reachable instance-metadata endpoint. This
   boundary is now stated explicitly in §1 "Out of scope" and in the BYO capture
   runbook; auditing the harness itself is tracked cross-repo.
-- **M31.5 (P1) — signing default + digest recompute.** Signing fails *open* when
-  `CHM_TRUST_STORE` is unset (by-design back-compat, #36); the policy-digest
-  cross-field check fails closed, but the independent recompute is advisory. Once
-  gctl signs production manifests, make fail-closed the default (a
-  `CHM_REQUIRE_SIGNED` posture) and enforce the recompute. Folds into #36.
+- **M31.5 (P1) — signing default + digest recompute. SHIPPED (posture).** Signing
+  still fails *open* when neither `CHM_TRUST_STORE` nor `CHM_REQUIRE_SIGNED` is
+  set (by-design back-compat, #36). Setting **`CHM_REQUIRE_SIGNED`** now flips the
+  default to fail-closed: the plane ingest path refuses any bundle it cannot
+  authenticate (no trust root, or unsigned/invalid manifest), and the
+  policy-digest recompute — previously advisory — is **enforced** (a governed
+  policy whose doc does not re-hash to its stated digest is refused). The
+  operator-set posture is the shipped half; gctl signing production manifests
+  (#36) is the remaining cross-repo half.
 
 ---
 

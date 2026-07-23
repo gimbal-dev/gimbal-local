@@ -113,7 +113,15 @@ impl GovernedPolicy {
 /// behave exactly as today. Returns `Err` only when a policy IS present but its
 /// teleport integrity fails (the digest references disagree or are malformed),
 /// which must not be run blindly.
-pub(crate) fn parse_and_verify(assignment: &Value) -> Result<Option<GovernedPolicy>, String> {
+///
+/// `strict` is the M31.5 fail-closed posture (`CHM_REQUIRE_SIGNED`): when set,
+/// the independent policy-digest recompute is **enforced** — a governed policy
+/// whose document does not re-hash to its stated digest (or cannot be
+/// recomputed) is refused rather than merely logged as unverified.
+pub(crate) fn parse_and_verify(
+    assignment: &Value,
+    strict: bool,
+) -> Result<Option<GovernedPolicy>, String> {
     let Some(enforcement) = assignment.get("enforcement").filter(|e| !e.is_null()) else {
         return Ok(None);
     };
@@ -163,12 +171,32 @@ pub(crate) fn parse_and_verify(assignment: &Value) -> Result<Option<GovernedPoli
     }
 
     // Cryptographic cross-check: recompute the digest over the normalized policy
-    // doc and compare. A match upgrades the log to "verified"; a mismatch is a
-    // chm-side canonicalization drift (not a guest-reachable boundary), so it is
-    // recorded but does not fail the run — the plane digest stays authoritative.
-    let digest_recomputed = policy_doc
-        .and_then(|p| recompute_digest(p).ok())
-        .is_some_and(|computed| &computed == authoritative);
+    // doc and compare. A match upgrades the log to "verified". Advisory by
+    // default (a mismatch is usually chm-side canonicalization drift, not a
+    // guest-reachable boundary, so the plane digest stays authoritative); under
+    // the fail-closed posture (`strict`, M31.5) the recompute is *enforced* — a
+    // present policy doc that does not re-hash to its stated digest is refused.
+    let recompute = policy_doc.map(recompute_digest);
+    let digest_recomputed = matches!(&recompute, Some(Ok(c)) if c == authoritative);
+    if strict {
+        match &recompute {
+            Some(Ok(c)) if c == authoritative => {}
+            Some(Ok(c)) => {
+                return Err(format!(
+                    "policy digest recompute mismatch (authoritative={authoritative}, \
+                     recomputed={c}); the policy did not teleport intact — refusing \
+                     to run (fail closed, CHM_REQUIRE_SIGNED)"
+                ));
+            }
+            Some(Err(e)) => {
+                return Err(format!(
+                    "cannot recompute policy digest to verify it ({e}); refusing to \
+                     run under an unverifiable policy (fail closed, CHM_REQUIRE_SIGNED)"
+                ));
+            }
+            None => {}
+        }
+    }
 
     let egress_rule_count = profile.egress.allow.len() + profile.egress.deny.len();
     Ok(Some(GovernedPolicy {
@@ -352,7 +380,7 @@ mod tests {
     #[test]
     fn parse_and_verify_accepts_the_real_assignment() {
         let assignment: Value = serde_json::from_str(ASSIGNMENT).unwrap();
-        let governed = parse_and_verify(&assignment).unwrap().expect("policy present");
+        let governed = parse_and_verify(&assignment, false).unwrap().expect("policy present");
         assert_eq!(governed.digest, REAL_DIGEST);
         assert!(governed.digest_recomputed, "digest independently verified");
         assert_eq!(governed.profile.egress.default, "deny");
@@ -362,9 +390,44 @@ mod tests {
     }
 
     #[test]
+    fn strict_posture_accepts_a_correctly_recomputing_policy() {
+        // Under the fail-closed posture the real assignment (whose doc re-hashes
+        // to its digest) is still accepted — enforcement must not break valid runs.
+        let assignment: Value = serde_json::from_str(ASSIGNMENT).unwrap();
+        let governed = parse_and_verify(&assignment, true).unwrap().expect("policy present");
+        assert!(governed.digest_recomputed);
+    }
+
+    #[test]
+    fn strict_posture_rejects_a_policy_doc_that_does_not_recompute() {
+        // A policy doc whose contents were altered so it no longer re-hashes to
+        // its (matching-everywhere) stated digest: advisory by default, fatal
+        // under CHM_REQUIRE_SIGNED.
+        let digest = "sha256:".to_string() + &"a".repeat(64);
+        let assignment = json!({
+            "policy_digest": digest,
+            "policy": { "version": 1, "default_egress": "deny", "digest": digest },
+            "enforcement": {
+                "substrate": "apple-hvf",
+                "policy_digest": digest,
+                "chm_profile": { "egress": { "default": "deny" } }
+            }
+        });
+        // Advisory: accepted, but flagged unverified.
+        let governed = parse_and_verify(&assignment, false).unwrap().expect("policy present");
+        assert!(!governed.digest_recomputed, "recompute drift is surfaced");
+        // Strict: refused.
+        let err = parse_and_verify(&assignment, true).unwrap_err();
+        assert!(err.contains("recompute mismatch"), "{err}");
+        assert!(err.contains("fail closed"), "{err}");
+    }
+
+    #[test]
     fn unbound_sandbox_has_no_policy() {
         let assignment = json!({ "snapshot_id": "snap-x", "download_uri": "file:///x" });
-        assert!(parse_and_verify(&assignment).unwrap().is_none());
+        assert!(parse_and_verify(&assignment, false).unwrap().is_none());
+        // An unbound sandbox is unaffected by the strict posture: nothing to verify.
+        assert!(parse_and_verify(&assignment, true).unwrap().is_none());
     }
 
     #[test]
@@ -379,7 +442,7 @@ mod tests {
                 "chm_profile": { "egress": { "default": "deny" } }
             }
         });
-        let err = parse_and_verify(&assignment).unwrap_err();
+        let err = parse_and_verify(&assignment, false).unwrap_err();
         assert!(err.contains("did not teleport intact"), "{err}");
     }
 
@@ -389,7 +452,7 @@ mod tests {
             "enforcement": { "substrate": "apple-hvf", "policy_digest": "not-a-digest",
                              "chm_profile": {} }
         });
-        assert!(parse_and_verify(&assignment).unwrap_err().contains("malformed"));
+        assert!(parse_and_verify(&assignment, false).unwrap_err().contains("malformed"));
     }
 
     #[test]
