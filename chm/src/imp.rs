@@ -31,9 +31,10 @@ use hypervisor::hvf::checkpoint::{self as hvf_checkpoint, CheckpointState};
 use hypervisor::hvf::devices::{MmioBus, Pl011};
 use hypervisor::hvf::gic::GicMsiSink;
 use hypervisor::hvf::rehydrate::{
-    PreparedVm, Snapshot, UsgicVm, enable_group1_spi_forwarding, prepare_vm, rehydrate_usgic,
-    restore_distributor, restore_vcpu_state,
+    self, PreparedVm, Snapshot, enable_group1_spi_forwarding, prepare_vm, restore_distributor,
+    restore_vcpu_state,
 };
+use hypervisor::hvf::UsgicCpuHandle;
 use hypervisor::hvf::virtio::GuestMemory;
 use hypervisor::hvf::virtio::nat::{EgressPolicy, NatLimits};
 use hypervisor::hvf::virtio::pci::{MsiSink, MsiSpiInjector, VirtioPciDevice};
@@ -1398,27 +1399,27 @@ impl its::LpiSink for UsgicLpiSink {
 /// interactive serial console. This is the path for a stock ITS/LPI-routed
 /// snapshot — the capture Apple's managed GIC cannot deliver completions for.
 ///
-/// HVF binds a vCPU to the thread that created it, so the whole VM (rehydrate +
-/// run loop) lives on one dedicated thread; this thread hands its injection
-/// queue + wake handle back to the orchestrator, which wires the terminal, the
-/// stdin→serial pump, and the level-triggered serial re-assert, then drains the
-/// console until the session ends. Single-vCPU for now (the shipping SMP managed
-/// path is untouched); a multi-vCPU userspace-GIC resume is future work.
+/// HVF binds a vCPU to the thread that created it, so each vCPU is created + run
+/// on its own thread; this function creates the VM + maps RAM on the orchestrator
+/// thread, spawns one thread per vCPU (each restores its vCPU and hands its
+/// injection queue + wake back), then builds the cross-vCPU SGI table, wires the
+/// virtio device model + interactive console, releases the vCPU threads, and
+/// drains the console until the session ends. Handles single- and multi-vCPU
+/// (SMP) snapshots; live checkpoint/suspend is currently single-vCPU only (an
+/// SMP checkpoint is future work), so a multi-vCPU resume is always a cold
+/// rehydrate. The shipping managed-GIC path is untouched.
 fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
     let dir = &args.snapshot_dir;
-
-    if loaded.num_vcpus != 1 {
-        return Err(format!(
-            "CHM_USERSPACE_GIC currently supports single-vCPU snapshots only \
-             (this one has {} vCPUs); the managed-GIC path handles SMP",
-            loaded.num_vcpus
-        ));
+    let n = loaded.num_vcpus as usize;
+    if n == 0 {
+        return Err("snapshot declares no vCPUs".into());
     }
-    // Resume from a live checkpoint when one exists and checkpoints are enabled
-    // (same policy as the managed path); a malformed/incompatible one is
-    // discarded so we cold-rehydrate cleanly.
+
+    // Resume from a live checkpoint when one exists and checkpoints are enabled.
+    // Single-vCPU only: the userspace-GIC checkpoint captures one vCPU's software
+    // GIC, so an SMP checkpoint is future work; a multi-vCPU run cold-rehydrates.
     let resume_state: Option<Arc<CheckpointState>> =
-        if args.checkpoint && checkpoint::has_checkpoint(dir) {
+        if n == 1 && args.checkpoint && checkpoint::has_checkpoint(dir) {
             match checkpoint::read_checkpoint(dir) {
                 Ok(state) if state.usgic.is_some() => Some(Arc::new(state)),
                 Ok(_) => {
@@ -1440,8 +1441,6 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
     let resuming = resume_state.is_some();
 
     if !args.quiet {
-        // On resume the guest RAM comes from the checkpoint's dump; otherwise
-        // from the parent snapshot's base memory-ranges.
         let shown_ranges = if resuming {
             checkpoint::memory_ranges_path(dir)
         } else {
@@ -1452,8 +1451,8 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
             eprintln!("chm: resuming a userspace-GIC checkpoint (restored, not cold-booted).\n");
         } else {
             eprintln!(
-                "chm: userspace GIC (experimental) — rehydrating an ITS/LPI snapshot \
-                 the managed GIC cannot run.\n"
+                "chm: userspace GIC (experimental) — rehydrating a {n}-vCPU ITS/LPI \
+                 snapshot the managed GIC cannot run.\n"
             );
         }
     }
@@ -1468,169 +1467,224 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
     } else {
         loaded.mem_ranges.clone()
     };
-    let snap = loaded.snap;
-    // The orchestrator keeps a copy of the memory layout so it can dump guest
-    // RAM into a fresh checkpoint on suspend (snap itself moves into the vCPU
-    // thread).
+    let snap = Arc::new(loaded.snap);
+    // The orchestrator keeps the memory layout so vCPU 0 can dump guest RAM into
+    // a checkpoint on suspend (single-vCPU).
     let mem_mappings = snap.mem_mappings.clone();
+    let snap_num_irq = snap.num_irq;
+
+    // Create the VM + map guest RAM on THIS thread; each vCPU is then created and
+    // run on its own thread (HVF binds a vCPU to its creating thread). `hv` and
+    // `prepared` (RAM backings + VM) are kept alive for the whole session.
+    let hv = hypervisor::new().map_err(|e| {
+        format!(
+            "hypervisor::new() failed: {e}\n\
+             (is the binary code-signed with the hypervisor entitlement? \
+             see scripts/build-chm.sh)"
+        )
+    })?;
+    let prepared = rehydrate::prepare_usgic_vm(hv.as_ref(), &snap, &mem_ranges)
+        .map_err(|e| format!("prepare userspace-GIC VM: {e}"))?;
+    let guest_mem = prepared.guest_mem.clone();
+    let vm = prepared.vm.clone();
+    let seed = prepared.seed();
 
     let running = Arc::new(AtomicBool::new(true));
     let outcome: Arc<Mutex<Option<Result<Outcome, String>>>> = Arc::new(Mutex::new(None));
-    // The vCPU thread hands these back to the orchestrator once the VM is built:
-    // the injection queue + wake + exit handles, and a host view of guest RAM (so
-    // the orchestrator can wire the virtio device model against it).
-    type UsgicSetup = (
-        Arc<Mutex<Vec<u32>>>,
-        Arc<dyn Fn() + Send + Sync>,
-        Arc<dyn Fn() + Send + Sync>,
-        Arc<GuestMemory>,
-    );
-    let (setup_tx, setup_rx) = mpsc::channel::<Result<UsgicSetup, String>>();
-    // A one-shot gate: the vCPU thread waits on it after handing back its plumbing
-    // so the orchestrator can wire the device model onto the shared bus BEFORE the
-    // guest runs (and races a virtio BAR access).
-    let (go_tx, go_rx) = mpsc::channel::<()>();
-    // On a clean external stop the vCPU thread captures its live state AND writes
-    // the checkpoint (RAM dump included) on its OWN thread: HVF binds a vCPU to
-    // its creating thread, and — critically — the guest RAM is a COW mmap owned
-    // by `uvm`, which this thread unmaps when it ends. Dumping RAM here, before
-    // `uvm` drops, avoids a use-after-munmap the orchestrator would otherwise hit.
-    // It reports back only the outcome: `None` = nothing captured (power-off /
-    // error), `Some(Ok)` = saved, `Some(Err)` = capture/write failed.
+
+    // Per-vCPU setup handshake: each thread creates + restores its vCPU, then
+    // sends back its id and delivery handles. Once every vCPU reports in, the
+    // orchestrator builds the cross-vCPU SGI table + wires the device model, then
+    // releases each thread through its go channel (which carries the completed
+    // SGI table). A one-shot capture channel reports vCPU 0's suspend result.
+    struct CpuSetup {
+        id: usize,
+        inject: Arc<Mutex<Vec<u32>>>,
+        wake: Arc<dyn Fn() + Send + Sync>,
+        exit: Arc<dyn Fn() + Send + Sync>,
+        handle: UsgicCpuHandle,
+    }
+    let (setup_tx, setup_rx) = mpsc::channel::<Result<CpuSetup, String>>();
     let (capture_tx, capture_rx) = mpsc::channel::<Option<Result<(), String>>>();
-    let want_capture = args.checkpoint;
-    let snap_num_irq = snap.num_irq;
-    let ckpt_dir = dir.clone();
-    let mem_mappings_thread = mem_mappings;
+    let mut go_txs: Vec<mpsc::Sender<Arc<Vec<UsgicCpuHandle>>>> = Vec::with_capacity(n);
 
-    let vm_ops_thread = vm_ops.clone();
-    let running_thread = running.clone();
-    let outcome_thread = outcome.clone();
-    let resume_thread = resume_state.clone();
-    let vcpu_thread = thread::Builder::new()
-        .name("chm-usgic-vcpu0".into())
-        .spawn(move || {
-            let hv = match hypervisor::new() {
-                Ok(hv) => hv,
-                Err(e) => {
-                    let _ = setup_tx.send(Err(format!("hypervisor::new(): {e}")));
-                    return;
-                }
-            };
-            let mut uvm: UsgicVm = match rehydrate_usgic(
-                hv.as_ref(),
-                &snap,
-                &mem_ranges,
-                &vm_ops_thread,
-                resume_thread.as_deref(),
-            ) {
-                Ok(v) => v,
-                Err(e) => {
-                    let _ = setup_tx.send(Err(format!("rehydrate_usgic: {e}")));
-                    return;
-                }
-            };
-            let guest_mem = uvm.guest_mem.clone();
-            // A second handle the vCPU thread keeps for its own suspend RAM dump
-            // (the first is handed to the orchestrator for the virtio wiring).
-            let guest_mem_capture = uvm.guest_mem.clone();
-            let vcpu = uvm.vcpus[0].as_mut();
-            let queue = match vcpu.usgic_inject_queue() {
-                Some(q) => q,
-                None => {
-                    let _ = setup_tx.send(Err("vCPU exposed no userspace-GIC queue".into()));
-                    return;
-                }
-            };
-            let wake = vcpu
-                .wake_signal()
-                .unwrap_or_else(|| Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>);
-            let exit = vcpu
-                .exit_signal()
-                .unwrap_or_else(|| Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>);
-            if setup_tx.send(Ok((queue, wake, exit, guest_mem))).is_err() {
-                return;
-            }
-            // Wait until the orchestrator has wired the device model + console
-            // (or dropped go_tx on an error path) before entering the guest.
-            let _ = go_rx.recv();
+    let mut threads = Vec::with_capacity(n);
+    for id in 0..n {
+        let (go_tx, go_rx) = mpsc::channel::<Arc<Vec<UsgicCpuHandle>>>();
+        go_txs.push(go_tx);
 
-            // Run the guest until a host-side stop (running=false) or a guest
-            // power-off. The run() body handles the software GIC, the self-managed
-            // vtimer, and the WFI idle halt internally.
-            while running_thread.load(Ordering::Acquire) {
-                match vcpu.run() {
-                    Ok(VmExit::Ignore) => {}
-                    Ok(VmExit::Shutdown | VmExit::Reset) => {
-                        *outcome_thread.lock().unwrap() = Some(Ok(Outcome::PoweredOff));
-                        running_thread.store(false, Ordering::Release);
-                        break;
-                    }
-                    Ok(other) => {
-                        *outcome_thread.lock().unwrap() =
-                            Some(Err(format!("vCPU unexpected exit: {other:?}")));
-                        running_thread.store(false, Ordering::Release);
-                        break;
-                    }
+        let vm = vm.clone();
+        let seed = seed.clone();
+        let snap = snap.clone();
+        let vm_ops = vm_ops.clone();
+        let running = running.clone();
+        let outcome = outcome.clone();
+        let setup_tx = setup_tx.clone();
+        let resume = resume_state.clone();
+        // Checkpoint capture is single-vCPU: only vCPU 0 on an n==1 run captures.
+        let want_capture = args.checkpoint && n == 1 && id == 0;
+        let capture_tx = capture_tx.clone();
+        let ckpt_dir = dir.clone();
+        let mem_mappings_thread = mem_mappings.clone();
+        let guest_mem_capture = guest_mem.clone();
+
+        let t = thread::Builder::new()
+            .name(format!("chm-usgic-vcpu{id}"))
+            .spawn(move || {
+                // Create + restore this vCPU on its own thread.
+                let mut vcpu = match rehydrate::restore_usgic_vcpu(
+                    &vm,
+                    &seed,
+                    &snap,
+                    resume.as_deref(),
+                    id,
+                    &vm_ops,
+                ) {
+                    Ok(v) => v,
                     Err(e) => {
-                        *outcome_thread.lock().unwrap() = Some(Err(format!("vCPU run: {e}")));
-                        running_thread.store(false, Ordering::Release);
-                        break;
+                        let _ = setup_tx.send(Err(format!("restore_usgic_vcpu {id}: {e}")));
+                        return;
+                    }
+                };
+                let inject = match vcpu.usgic_inject_queue() {
+                    Some(q) => q,
+                    None => {
+                        let _ =
+                            setup_tx.send(Err(format!("vCPU {id} exposed no userspace-GIC queue")));
+                        return;
+                    }
+                };
+                let wake = vcpu
+                    .wake_signal()
+                    .unwrap_or_else(|| Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>);
+                let exit = vcpu
+                    .exit_signal()
+                    .unwrap_or_else(|| Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>);
+                let handle = match rehydrate::usgic_cpu_handle(&mut vcpu) {
+                    Some(h) => h,
+                    None => {
+                        let _ = setup_tx.send(Err(format!("vCPU {id} is not an HVF vCPU")));
+                        return;
+                    }
+                };
+                if setup_tx.send(Ok(CpuSetup { id, inject, wake, exit, handle })).is_err() {
+                    return;
+                }
+
+                // Wait for the completed cross-vCPU SGI table (also the go signal)
+                // before entering the guest, so the device model + console + SGI
+                // routing are all wired first. A dropped sender means the
+                // orchestrator aborted setup; exit cleanly.
+                let table = match go_rx.recv() {
+                    Ok(t) => t,
+                    Err(_) => return,
+                };
+                rehydrate::usgic_set_cpu_table(&mut vcpu, table);
+
+                // Run the guest until a host-side stop (running=false) or a guest
+                // power-off. The run() body handles the software GIC, the self-
+                // managed vtimer, the WFI idle halt, and draining cross-thread
+                // (including cross-vCPU SGI) injections internally.
+                while running.load(Ordering::Acquire) {
+                    match vcpu.run() {
+                        Ok(VmExit::Ignore) => {}
+                        Ok(VmExit::Shutdown | VmExit::Reset) => {
+                            *outcome.lock().unwrap() = Some(Ok(Outcome::PoweredOff));
+                            running.store(false, Ordering::Release);
+                            break;
+                        }
+                        Ok(other) => {
+                            *outcome.lock().unwrap() =
+                                Some(Err(format!("vCPU {id} unexpected exit: {other:?}")));
+                            running.store(false, Ordering::Release);
+                            break;
+                        }
+                        Err(e) => {
+                            *outcome.lock().unwrap() = Some(Err(format!("vCPU {id} run: {e}")));
+                            running.store(false, Ordering::Release);
+                            break;
+                        }
                     }
                 }
+
+                // Suspend capture (single-vCPU only): on a clean external stop,
+                // capture + write the checkpoint on this owning thread, where the
+                // guest RAM is still mapped (the COW mmap unmaps when the vCPU
+                // drops at the end of this closure — dumping RAM after that would
+                // be a use-after-munmap).
+                if want_capture {
+                    let outcome_is_none = outcome.lock().unwrap().is_none();
+                    let captured: Option<Result<(), String>> = if outcome_is_none {
+                        match hvf_checkpoint::capture_usgic_vcpu(&mut vcpu) {
+                            Ok((vcpu_cp, usgic_cp)) => {
+                                let state = CheckpointState {
+                                    version: hvf_checkpoint::CHECKPOINT_VERSION,
+                                    vcpus: vec![vcpu_cp],
+                                    gic_dist: Vec::new(),
+                                    num_irq: snap_num_irq,
+                                    usgic: Some(usgic_cp),
+                                };
+                                Some(checkpoint::write_checkpoint(
+                                    &ckpt_dir,
+                                    &state,
+                                    &guest_mem_capture,
+                                    &mem_mappings_thread,
+                                    "connect",
+                                ))
+                            }
+                            Err(e) => Some(Err(format!("capture: {e}"))),
+                        }
+                    } else {
+                        None
+                    };
+                    let _ = capture_tx.send(captured);
+                }
+                // `vcpu` (and its VM ref) drops here, on the owning thread.
+            })
+            .map_err(|e| format!("spawn userspace-GIC vCPU thread {id}: {e}"))?;
+        threads.push(t);
+    }
+    // Drop the orchestrator's spare senders so the collectors below terminate.
+    drop(setup_tx);
+    drop(capture_tx);
+
+    // Collect every vCPU's setup, indexed by id. Abort (stop + join) on failure.
+    let mut collected: Vec<Option<CpuSetup>> = (0..n).map(|_| None).collect();
+    for _ in 0..n {
+        match setup_rx.recv() {
+            Ok(Ok(s)) => {
+                let id = s.id;
+                collected[id] = Some(s);
             }
-
-            // Suspend capture: only on a clean EXTERNAL stop (the orchestrator
-            // cleared `running`; the guest did not power off or error, so
-            // `outcome` is still None). A finished/errored box must cold-boot
-            // next time, so we capture nothing.
-            let outcome_is_none = outcome_thread.lock().unwrap().is_none();
-            let captured: Option<Result<(), String>> = if want_capture && outcome_is_none {
-                match hvf_checkpoint::capture_usgic_vcpu(&mut uvm.vcpus[0]) {
-                    Ok((vcpu_cp, usgic_cp)) => {
-                        let state = CheckpointState {
-                            version: hvf_checkpoint::CHECKPOINT_VERSION,
-                            vcpus: vec![vcpu_cp],
-                            gic_dist: Vec::new(),
-                            num_irq: snap_num_irq,
-                            usgic: Some(usgic_cp),
-                        };
-                        // Dump RAM + write the checkpoint HERE, while `uvm` (and
-                        // thus the COW guest-RAM mmap `guest_mem` points into) is
-                        // still alive. Doing it after `uvm` drops would read
-                        // unmapped memory. `guest_mem` was cloned at setup.
-                        Some(checkpoint::write_checkpoint(
-                            &ckpt_dir,
-                            &state,
-                            &guest_mem_capture,
-                            &mem_mappings_thread,
-                            "connect",
-                        ))
-                    }
-                    Err(e) => Some(Err(format!("capture: {e}"))),
+            Ok(Err(e)) => {
+                running.store(false, Ordering::Release);
+                drop(go_txs); // release any threads still waiting at the gate
+                for t in threads {
+                    let _ = t.join();
                 }
-            } else {
-                None
-            };
-            let _ = capture_tx.send(captured);
-            // `uvm` (and its vCPU + VM) drops here, on the owning thread.
-        })
-        .map_err(|e| format!("spawn userspace-GIC vCPU thread: {e}"))?;
+                return Err(e);
+            }
+            Err(_) => {
+                running.store(false, Ordering::Release);
+                drop(go_txs);
+                for t in threads {
+                    let _ = t.join();
+                }
+                return Err("a userspace-GIC vCPU thread exited before setup".into());
+            }
+        }
+    }
+    let setups: Vec<CpuSetup> = collected.into_iter().map(|s| s.expect("all ids present")).collect();
 
-    // Wait for the vCPU thread to build the VM and hand back its plumbing.
-    let (queue, wake, exit, guest_mem) = match setup_rx.recv() {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => {
-            running.store(false, Ordering::Release);
-            let _ = vcpu_thread.join();
-            return Err(e);
-        }
-        Err(_) => {
-            running.store(false, Ordering::Release);
-            let _ = vcpu_thread.join();
-            return Err("userspace-GIC vCPU thread exited before setup".into());
-        }
-    };
+    // vCPU 0's handles drive the device sinks (SPIs/LPIs are delivered to the
+    // boot CPU) and the serial console; collect every vCPU's exit signal so the
+    // stop can force each out of `hv_vcpu_run`. The SGI table takes ownership of
+    // each vCPU's delivery handle, indexed by id.
+    let inject0 = setups[0].inject.clone();
+    let wake0 = setups[0].wake.clone();
+    let all_exits: Vec<Arc<dyn Fn() + Send + Sync>> = setups.iter().map(|s| s.exit.clone()).collect();
+    let sgi_table: Arc<Vec<UsgicCpuHandle>> =
+        Arc::new(setups.into_iter().map(|s| s.handle).collect());
 
     let (limits, _src) = limits::resolve_limits(dir, args.limits_file.as_deref());
     let overlay_dir = dir.join(".chm-overlays");
@@ -1638,11 +1692,11 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
 
     // Wire the virtio device model onto the shared bus, routing each device's
     // completions through the captured ITS to a deliverable LPI sink that injects
-    // into the software GIC — so a resumed stock ITS/LPI guest's disk/net I/O
+    // into vCPU 0's software GIC — so a resumed stock ITS/LPI guest's disk/net I/O
     // actually completes. Net devices additionally need an off-thread NAT service.
     let usgic_lpi_sink: Arc<dyn its::LpiSink> = Arc::new(UsgicLpiSink {
-        queue: queue.clone(),
-        wake: wake.clone(),
+        queue: inject0.clone(),
+        wake: wake0.clone(),
     });
     let net_service = match wire_virtio(
         &bus,
@@ -1666,7 +1720,7 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
                     eprintln!("chm:   - {d}");
                 }
             }
-            let exits: Arc<Mutex<Vec<ExitSignal>>> = Arc::new(Mutex::new(vec![exit.clone()]));
+            let exits: Arc<Mutex<Vec<ExitSignal>>> = Arc::new(Mutex::new(all_exits.clone()));
             spawn_net_service(wired.net_devices, running.clone(), exits, audit.clone())
         }
         Err(e) => {
@@ -1676,14 +1730,14 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
     };
 
     // Interactive console. The serial sink routes a keystroke's line SPI through
-    // the software GIC via the injection queue; the wake nudges the idle vCPU.
+    // vCPU 0's software GIC via its injection queue; the wake nudges the idle vCPU.
     let raw_console = RawConsole::enable();
     console::install_signal_handlers(raw_console.handle());
     let serial_sink: Arc<dyn MsiSink> = Arc::new(UsgicMsiSink {
-        queue,
-        wake: wake.clone(),
+        queue: inject0,
+        wake: wake0.clone(),
     });
-    let serial_wake: Option<Arc<dyn Fn() + Send + Sync>> = Some(wake);
+    let serial_wake: Option<Arc<dyn Fn() + Send + Sync>> = Some(wake0);
     console::spawn_stdin_pump(
         uart.clone(),
         serial_sink.clone(),
@@ -1699,23 +1753,33 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
         );
     }
 
-    // Release the vCPU thread now that the device model + console are wired.
-    let _ = go_tx.send(());
+    // Release every vCPU thread now that the device model + console + SGI table
+    // are ready: hand each the completed cross-vCPU delivery table.
+    for go_tx in &go_txs {
+        let _ = go_tx.send(sgi_table.clone());
+    }
 
     let coordinator = run_console(&uart, &running, args, &limits, &overlay_dir);
 
-    // Stop: clear the flag, force the vCPU out of any in-flight run(), join.
+    // Stop: clear the flag, force every vCPU out of any in-flight run(), join.
     running.store(false, Ordering::Release);
-    exit();
+    for exit in &all_exits {
+        exit();
+    }
     let _ = serial_reassert.join();
     if let Some(h) = net_service {
         let _ = h.join();
     }
-    // Receive the vCPU thread's suspend outcome (it captures + writes the
-    // checkpoint on its own thread — where the guest RAM is still mapped — then
-    // sends the result). `None` = nothing captured (power-off/error).
-    let capture_result = capture_rx.recv().unwrap_or(None);
-    let _ = vcpu_thread.join();
+    // Receive vCPU 0's suspend outcome (single-vCPU capture only). `None` when
+    // nothing was captured (power-off/error, SMP, or checkpoints disabled).
+    let capture_result = if args.checkpoint && n == 1 {
+        capture_rx.recv().unwrap_or(None)
+    } else {
+        None
+    };
+    for t in threads {
+        let _ = t.join();
+    }
     drop(raw_console);
 
     let vcpu_outcome = outcome.lock().unwrap().take();
@@ -1725,11 +1789,10 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
         None => coordinator.unwrap_or(Outcome::Interrupted),
     };
 
-    // Suspend/resume bookkeeping: the vCPU thread already wrote the checkpoint on
-    // a clean external stop; here we just report + keep the checkpoint consistent.
-    // Nothing captured (power-off/error) means the box is finished, so clear any
-    // stale checkpoint to force a cold rehydrate next time.
-    if args.checkpoint {
+    // Suspend/resume bookkeeping (single-vCPU): the vCPU thread already wrote the
+    // checkpoint on a clean external stop; report + keep it consistent. Nothing
+    // captured means the box is finished, so clear any stale checkpoint.
+    if args.checkpoint && n == 1 {
         match capture_result {
             Some(Ok(())) => {
                 if !args.quiet {
@@ -1756,6 +1819,10 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
             Outcome::LimitExceeded(reason) => eprintln!("chm: resource limit hit ({reason})."),
         }
     }
+    // `prepared` (guest-RAM backings + VM) and `hv` are dropped here, after every
+    // vCPU thread has joined (so every vCPU is destroyed before `hv_vm_destroy`).
+    drop(prepared);
+    drop(hv);
     Ok(ExitCode::SUCCESS)
 }
 

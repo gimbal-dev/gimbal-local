@@ -57,6 +57,7 @@ use crate::hvf::translate::gic_ingest::{
 use crate::hvf::translate::kvm_ingest::snapshot_json_to_hvf;
 use crate::hvf::virtio::GuestMemory;
 use crate::hvf::HvfVcpu;
+use crate::hvf::UsgicCpuHandle;
 use crate::hvf::VcpuHvfState;
 use crate::hypervisor::Hypervisor;
 use crate::vm::{Vm, VmOps};
@@ -691,6 +692,90 @@ pub fn rehydrate_usgic(
 ) -> Result<UsgicVm, RehydrateError> {
     let timing = std::env::var_os("CHM_TRACE_TIMING").is_some();
     let t_start = std::time::Instant::now();
+    let prepared = prepare_usgic_vm(hv, snap, memory_ranges)?;
+
+    // Create + restore every vCPU on this (single) thread. For SMP the caller
+    // uses `prepare_usgic_vm` + `restore_usgic_vcpu` directly, one per thread,
+    // because HVF binds a vCPU to its creating thread.
+    let seed = prepared.seed();
+    let mut vcpus = Vec::with_capacity(snap.vcpus.len());
+    for id in 0..snap.vcpus.len() {
+        vcpus.push(restore_usgic_vcpu(
+            &prepared.vm,
+            &seed,
+            snap,
+            resume,
+            id,
+            vm_ops,
+        )?);
+    }
+    if timing {
+        eprintln!("[timing] rehydrate_usgic total {:?}", t_start.elapsed());
+    }
+
+    let UsgicPrepared {
+        guest_mem, ram, vm, ..
+    } = prepared;
+    Ok(UsgicVm {
+        vcpus,
+        guest_mem,
+        _ram: ram,
+        vm,
+    })
+}
+
+/// The pieces of a **userspace-GIC** VM that exist before any vCPU: the VM
+/// handle, its mapped guest RAM, the guest's GIC MMIO bases, and the translated
+/// distributor dump. Like [`PreparedVm`] for the managed path, this split lets
+/// an SMP resume create each vCPU on its own thread (HVF binds a vCPU to its
+/// creating thread) after the VM-global RAM mapping is done once here.
+pub struct UsgicPrepared {
+    /// Host view of restored guest RAM (the virtio device model reads/writes the
+    /// guest's rings through this).
+    pub guest_mem: Arc<GuestMemory>,
+    /// Host-side guest-RAM backings (kept alive for the VM's lifetime).
+    ram: Vec<GuestRam>,
+    /// The reconstructed VM (shared to each vCPU thread via `.clone()`).
+    pub vm: Arc<dyn Vm>,
+    /// The per-vCPU seed (GIC bases + translated distributor dump), cheaply
+    /// clonable + `Send` so each vCPU thread can carry a copy.
+    seed: UsgicSeed,
+}
+
+impl UsgicPrepared {
+    /// The `Send`-friendly seed each vCPU thread needs to create + restore its
+    /// vCPU (GIC MMIO bases + the shared translated distributor dump).
+    pub fn seed(&self) -> UsgicSeed {
+        self.seed.clone()
+    }
+}
+
+/// The GIC seed shared by every userspace-GIC vCPU: the MMIO bases and the
+/// translated distributor dump. `Clone` + `Send` so an SMP orchestrator can hand
+/// a copy to each per-vCPU thread.
+#[derive(Clone)]
+pub struct UsgicSeed {
+    /// MMIO base of the VM-global distributor frame.
+    gicd_base: u64,
+    /// MMIO base of vCPU 0's redistributor window; vCPU `i` sits one
+    /// `GIC_V3_REDIST_SIZE` above.
+    gicr_region_base: u64,
+    /// The interrupt-line width the software GIC is sized to.
+    num_irq: u32,
+    /// The translated distributor dump, seeded into every vCPU's software GIC
+    /// (shared read-only, so behind an `Arc` to avoid copying per vCPU).
+    dist_pairs: Arc<Vec<(u32, u64)>>,
+}
+
+/// Create the userspace-GIC VM and map its guest RAM (no managed GIC, no vCPUs).
+/// The VM-global work; each vCPU is then created + restored via
+/// [`restore_usgic_vcpu`] on its own thread.
+pub fn prepare_usgic_vm(
+    hv: &dyn Hypervisor,
+    snap: &Snapshot,
+    memory_ranges: &Path,
+) -> Result<UsgicPrepared, RehydrateError> {
+    let timing = std::env::var_os("CHM_TRACE_TIMING").is_some();
     let vm = hv
         .create_vm(HypervisorVmConfig {
             nested: false,
@@ -725,77 +810,105 @@ pub fn rehydrate_usgic(
     let dist_pairs = dist_to_hvf(&snap.gic_dist)
         .ok_or_else(|| RehydrateError::Translate("distributor dump did not translate".into()))?;
 
-    let mut vcpus = Vec::with_capacity(snap.vcpus.len());
-    for id in 0..snap.vcpus.len() {
-        let mut vcpu = vm
-            .create_vcpu(id as u32, Some(vm_ops.clone()))
-            .map_err(|e| RehydrateError::Hv(anyhow!("create_vcpu {id}: {e}")))?;
-
-        let redist_pairs = redist_to_hvf(&snap.rdist_slice(id)).ok_or_else(|| {
-            RehydrateError::Translate(format!("vCPU {id} redistributor did not translate"))
-        })?;
-        let gicr_base = gicr_region_base + id as u64 * GIC_V3_REDIST_SIZE;
-        {
-            let concrete = vcpu
-                .as_any_concrete_mut()
-                .downcast_mut::<HvfVcpu>()
-                .ok_or_else(|| RehydrateError::Translate("vCPU is not an HVF vCPU".into()))?;
-            concrete.set_usgic_enabled(true);
-            // set_gic_bases (re)creates the distributor, so seed AFTER it.
-            concrete.usgic_set_gic_bases(gicd_base, gicr_base, snap.num_irq);
-            match resume.and_then(|cp| cp.usgic.as_ref()) {
-                // Resume: restore the live software-GIC models captured at
-                // suspend (SPI/PPI config the guest may have reprogrammed since
-                // the parent snapshot, plus any in-flight interrupt), overriding
-                // the cold seed.
-                Some(usgic_cp) => concrete.usgic_restore_softgic(usgic_cp),
-                // Cold: seed from the parent snapshot's captured KVM GIC state.
-                None => concrete.usgic_seed_gic(&dist_pairs, &redist_pairs),
-            }
-        }
-
-        // Restore the register file. On resume this is the checkpoint's captured
-        // vCPU state; cold it is the parent snapshot's. Because usgic is enabled,
-        // set_state seeds the captured ICC bookkeeping into `usgic` instead of a
-        // (nonexistent) managed GIC.
-        let vcpu_state = match resume {
-            Some(cp) => &cp.vcpus[id].state,
-            None => &snap.vcpus[id],
-        };
-        vcpu.set_state(&CpuState::Hvf(vcpu_state.clone()))
-            .map_err(|e| RehydrateError::Hv(anyhow!("restore vCPU {id} state: {e}")))?;
-
-        // One shared virtual-counter reference across cores (no-op for 1 vCPU).
-        // On resume the reference is the checkpoint's captured CNTVCT so the
-        // guest's virtual clock stays continuous across the suspend.
-        let reference_cntvct = match resume {
-            Some(cp) => cp.reference_cntvct(),
-            None => snap.reference_cntvct(),
-        };
-        if let Some(reference) = reference_cntvct {
-            let concrete = vcpu
-                .as_any_concrete_mut()
-                .downcast_mut::<HvfVcpu>()
-                .expect("HVF vCPU");
-            concrete
-                .restore_vtimer_offset(reference)
-                .map_err(|e| RehydrateError::Hv(anyhow!("vCPU {id} reseed vtimer: {e}")))?;
-        }
-        vcpus.push(vcpu);
-    }
-    if timing {
-        eprintln!("[timing] rehydrate_usgic total {:?}", t_start.elapsed());
-    }
-
-    Ok(UsgicVm {
-        vcpus,
+    Ok(UsgicPrepared {
         guest_mem,
-        _ram: ram,
+        ram,
         vm,
+        seed: UsgicSeed {
+            gicd_base,
+            gicr_region_base,
+            num_irq: snap.num_irq,
+            dist_pairs: Arc::new(dist_pairs),
+        },
     })
 }
 
-/// The pieces of a rehydrated VM that exist before any vCPU: the reconstructed
+/// Create and restore one userspace-GIC vCPU on the CURRENT thread (HVF binds a
+/// vCPU to its creating thread). Seeds the per-vCPU software distributor +
+/// redistributor + CPU-interface bookkeeping and restores the register file, on
+/// a cold rehydrate from `snap` or (when `resume` is set) from the checkpoint.
+/// For SMP the caller runs this once per thread after [`prepare_usgic_vm`], then
+/// installs the cross-vCPU SGI table via [`HvfVcpu::usgic_set_cpu_table`].
+pub fn restore_usgic_vcpu(
+    vm: &Arc<dyn Vm>,
+    seed: &UsgicSeed,
+    snap: &Snapshot,
+    resume: Option<&crate::hvf::checkpoint::CheckpointState>,
+    id: usize,
+    vm_ops: &Arc<dyn VmOps>,
+) -> Result<Box<dyn Vcpu>, RehydrateError> {
+    let mut vcpu = vm
+        .create_vcpu(id as u32, Some(vm_ops.clone()))
+        .map_err(|e| RehydrateError::Hv(anyhow!("create_vcpu {id}: {e}")))?;
+
+    let redist_pairs = redist_to_hvf(&snap.rdist_slice(id)).ok_or_else(|| {
+        RehydrateError::Translate(format!("vCPU {id} redistributor did not translate"))
+    })?;
+    let gicr_base = seed.gicr_region_base + id as u64 * GIC_V3_REDIST_SIZE;
+    {
+        let concrete = vcpu
+            .as_any_concrete_mut()
+            .downcast_mut::<HvfVcpu>()
+            .ok_or_else(|| RehydrateError::Translate("vCPU is not an HVF vCPU".into()))?;
+        concrete.set_usgic_enabled(true);
+        // set_gic_bases (re)creates the distributor, so seed AFTER it.
+        concrete.usgic_set_gic_bases(seed.gicd_base, gicr_base, seed.num_irq);
+        match resume.and_then(|cp| cp.usgic.as_ref()) {
+            // Resume: restore the live software-GIC models captured at suspend
+            // (SPI/PPI config the guest may have reprogrammed since the parent
+            // snapshot, plus any in-flight interrupt), overriding the cold seed.
+            Some(usgic_cp) => concrete.usgic_restore_softgic(usgic_cp),
+            // Cold: seed from the parent snapshot's captured KVM GIC state.
+            None => concrete.usgic_seed_gic(&seed.dist_pairs, &redist_pairs),
+        }
+    }
+
+    // Restore the register file. On resume this is the checkpoint's captured
+    // vCPU state; cold it is the parent snapshot's. Because usgic is enabled,
+    // set_state seeds the captured ICC bookkeeping into `usgic` instead of a
+    // (nonexistent) managed GIC.
+    let vcpu_state = match resume {
+        Some(cp) => &cp.vcpus[id].state,
+        None => &snap.vcpus[id],
+    };
+    vcpu.set_state(&CpuState::Hvf(vcpu_state.clone()))
+        .map_err(|e| RehydrateError::Hv(anyhow!("restore vCPU {id} state: {e}")))?;
+
+    // One shared virtual-counter reference across cores (no-op for 1 vCPU).
+    // On resume the reference is the checkpoint's captured CNTVCT so the guest's
+    // virtual clock stays continuous across the suspend.
+    let reference_cntvct = match resume {
+        Some(cp) => cp.reference_cntvct(),
+        None => snap.reference_cntvct(),
+    };
+    if let Some(reference) = reference_cntvct {
+        let concrete = vcpu
+            .as_any_concrete_mut()
+            .downcast_mut::<HvfVcpu>()
+            .expect("HVF vCPU");
+        concrete
+            .restore_vtimer_offset(reference)
+            .map_err(|e| RehydrateError::Hv(anyhow!("vCPU {id} reseed vtimer: {e}")))?;
+    }
+    Ok(vcpu)
+}
+
+/// This vCPU's SMP cross-delivery handle (its injection queue + wake), for the
+/// userspace-GIC SGI routing table. `None` if the vCPU is not an HVF vCPU.
+pub fn usgic_cpu_handle(vcpu: &mut Box<dyn Vcpu>) -> Option<UsgicCpuHandle> {
+    vcpu.as_any_concrete_mut()
+        .downcast_mut::<HvfVcpu>()
+        .map(|c| c.usgic_cpu_handle())
+}
+
+/// Install the cross-vCPU SGI delivery table (every vCPU's inject queue + wake,
+/// indexed by vCPU id) on this vCPU, so an SGI it raises routes to the target
+/// core(s). A no-op if the vCPU is not an HVF vCPU.
+pub fn usgic_set_cpu_table(vcpu: &mut Box<dyn Vcpu>, table: Arc<Vec<UsgicCpuHandle>>) {
+    if let Some(c) = vcpu.as_any_concrete_mut().downcast_mut::<HvfVcpu>() {
+        c.usgic_set_cpu_table(table);
+    }
+}
 /// VM handle, its mapped guest RAM, the restored-shell managed GIC, and a host
 /// view of guest memory.
 ///

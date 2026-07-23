@@ -2375,6 +2375,154 @@ fn hvf_rehydrate_stock_its_snapshot_usgic_interactive_shell() {
     );
 }
 
+/// SMP regression guard for the userspace-GIC hypervisor primitives: rehydrate a
+/// multi-vCPU stock ITS snapshot with one thread per vCPU (`prepare_usgic_vm` +
+/// `restore_usgic_vcpu`), wire the cross-vCPU SGI table, and assert every core
+/// takes live run() exits. The full interactive SMP proof (cross-core IPIs
+/// advancing `/proc/interrupts` on the secondary CPU) is driven end-to-end by
+/// `chm run` on the multi-vCPU fixture; this test locks in the hypervisor half.
+///
+/// Ignored: needs a local multi-GB *multi-vCPU* stock ITS snapshot via
+/// CH_SNAPSHOT_SMP_DIR. Run this ONE AT A TIME (`hv_vm_create` is process-global).
+#[cfg(feature = "kvm-snapshot")]
+#[ignore = "needs a local multi-vCPU stock ITS snapshot via CH_SNAPSHOT_SMP_DIR"]
+#[test]
+fn hvf_rehydrate_stock_its_snapshot_usgic_smp() {
+    use std::path::PathBuf;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::mpsc;
+
+    use hypervisor::hvf::UsgicCpuHandle;
+    use hypervisor::hvf::devices::{MmioBus, Pl011};
+    use hypervisor::hvf::rehydrate::{
+        Snapshot, prepare_usgic_vm, restore_usgic_vcpu, usgic_cpu_handle, usgic_set_cpu_table,
+    };
+
+    const PL011_BASE: u64 = 0x0900_0000;
+    const PL011_SIZE: u64 = 0x1000;
+
+    let Ok(dir) = env::var("CH_SNAPSHOT_SMP_DIR") else {
+        eprintln!("CH_SNAPSHOT_SMP_DIR unset; skipping SMP userspace-GIC test");
+        return;
+    };
+    let dir = PathBuf::from(dir);
+    let state_json = fs::read_to_string(dir.join("state.json")).expect("read state.json");
+    let mem_ranges = dir.join("snapshot").join("memory-ranges");
+    let snap = Arc::new(Snapshot::from_state_json(&state_json).expect("parse snapshot"));
+    let n = snap.vcpus.len();
+    eprintln!("SMP stock snapshot: {n} vCPU(s), {} IRQs", snap.num_irq);
+    assert!(n >= 2, "this test needs a multi-vCPU snapshot; got {n}");
+
+    // Build the VM + map RAM on this thread; each vCPU is created + run on its own
+    // thread (HVF binds a vCPU to its creating thread).
+    let uart = Arc::new(Pl011::new());
+    let bus = MmioBus::new();
+    bus.add(PL011_BASE, PL011_SIZE, uart.clone());
+    let vm_ops: Arc<dyn VmOps> = Arc::new(bus);
+    let hv = hypervisor::new().expect("hypervisor::new() — codesigned?");
+    let prepared = prepare_usgic_vm(hv.as_ref(), &snap, &mem_ranges).expect("prepare_usgic_vm");
+    let vm = prepared.vm.clone();
+    let seed = prepared.seed();
+
+    // Per-vCPU run counters, so the main thread can prove EVERY core executes.
+    let exits: Vec<Arc<AtomicU64>> = (0..n).map(|_| Arc::new(AtomicU64::new(0))).collect();
+    let faulted = Arc::new(AtomicBool::new(false));
+    let running = Arc::new(AtomicBool::new(true));
+
+    let (setup_tx, setup_rx) = mpsc::channel::<(usize, UsgicCpuHandle)>();
+    let mut go_txs = Vec::with_capacity(n);
+    let mut threads = Vec::with_capacity(n);
+    for id in 0..n {
+        let (go_tx, go_rx) = mpsc::channel::<Arc<Vec<UsgicCpuHandle>>>();
+        go_txs.push(go_tx);
+        let vm = vm.clone();
+        let seed = seed.clone();
+        let snap = snap.clone();
+        let vm_ops = vm_ops.clone();
+        let setup_tx = setup_tx.clone();
+        let exits_c = exits[id].clone();
+        let fault_c = faulted.clone();
+        let running_c = running.clone();
+        threads.push(thread::spawn(move || {
+            let mut vcpu = restore_usgic_vcpu(&vm, &seed, &snap, None, id, &vm_ops)
+                .unwrap_or_else(|e| panic!("restore_usgic_vcpu {id}: {e}"));
+            let handle = usgic_cpu_handle(&mut vcpu).expect("usgic cpu handle");
+            setup_tx.send((id, handle)).expect("send setup");
+            let table = match go_rx.recv() {
+                Ok(t) => t,
+                Err(_) => return,
+            };
+            usgic_set_cpu_table(&mut vcpu, table);
+            for _ in 0..2_000_000 {
+                if !running_c.load(Ordering::Relaxed) {
+                    break;
+                }
+                match vcpu.run() {
+                    Ok(VmExit::Ignore) => {
+                        exits_c.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Ok(VmExit::Shutdown | VmExit::Reset) => break,
+                    Ok(_) | Err(_) => {
+                        fault_c.store(true, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                if exits_c.load(Ordering::Relaxed) >= 300 {
+                    break;
+                }
+            }
+        }));
+    }
+    drop(setup_tx);
+
+    // Collect every vCPU's delivery handle (index == id), build the SGI table,
+    // and release the threads.
+    let mut handles: Vec<Option<UsgicCpuHandle>> = (0..n).map(|_| None).collect();
+    for _ in 0..n {
+        let (id, h) = setup_rx.recv().expect("a vCPU thread exited before setup");
+        handles[id] = Some(h);
+    }
+    let table: Arc<Vec<UsgicCpuHandle>> =
+        Arc::new(handles.into_iter().map(|h| h.expect("all ids")).collect());
+    for go_tx in &go_txs {
+        let _ = go_tx.send(table.clone());
+    }
+
+    // Wait up to 25s for EVERY core to show sustained execution, then stop.
+    let start = std::time::Instant::now();
+    while start.elapsed() < std::time::Duration::from_secs(25) {
+        let all_live = exits.iter().all(|e| e.load(Ordering::Relaxed) >= 100);
+        if all_live || faulted.load(Ordering::Relaxed) {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(100));
+    }
+    running.store(false, Ordering::Relaxed);
+
+    let counts: Vec<u64> = exits.iter().map(|e| e.load(Ordering::Relaxed)).collect();
+    eprintln!("SMP USGIC per-vCPU run() exits: {counts:?}, faulted={}", faulted.load(Ordering::Relaxed));
+
+    // Abandon the run threads (a WFI-wedged idle core must not hang the suite;
+    // process exit reclaims the VM). The proof is the evidence already gathered.
+    for (id, t) in threads.into_iter().enumerate() {
+        if start.elapsed() < std::time::Duration::from_secs(2) {
+            let _ = t.join();
+        } else {
+            let _ = id; // abandoned
+        }
+    }
+
+    assert!(!faulted.load(Ordering::Relaxed), "an SMP vCPU faulted — state restore is wrong");
+    // EVERY core must take live exits: a secondary that never ran would sit at 0.
+    for (id, &c) in counts.iter().enumerate() {
+        assert!(c >= 50, "vCPU {id} did not sustain execution (only {c} exits) — SMP delivery broken");
+    }
+    eprintln!(
+        "PROVEN: a {n}-vCPU STOCK ITS/LPI snapshot rehydrated on the userspace GIC \
+         runs EVERY core (per-vCPU exits: {counts:?})"
+    );
+}
+
 /// Proves the rehydrated cloud guest **resumes real timed userspace** on HVF —
 /// the payoff of restoring virtual-counter continuity.
 ///
