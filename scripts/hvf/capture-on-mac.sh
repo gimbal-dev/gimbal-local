@@ -122,7 +122,8 @@ limactl shell "$VM_NAME" sh -lc '
 log "running capture-arm-snapshot.sh inside the guest (this downloads ~600MB \
 and boots a real Ubuntu guest; expect several minutes)"
 limactl shell "$VM_NAME" env OUT_DIR="$GUEST_OUT" WORK_DIR="$GUEST_WORK" \
-  CH_GIC_V2M="${CH_GIC_V2M:-1}" GUEST_CPUS="${GUEST_CPUS:-1}" "${CH_BIN_ENV[@]}" \
+  CH_GIC_V2M="${CH_GIC_V2M:-1}" GUEST_CPUS="${GUEST_CPUS:-1}" GUEST_NET="${GUEST_NET:-0}" \
+  "${CH_BIN_ENV[@]}" \
   bash -s < "$HERE/capture-arm-snapshot.sh"
 
 # --- collect the artifact -------------------------------------------------- #

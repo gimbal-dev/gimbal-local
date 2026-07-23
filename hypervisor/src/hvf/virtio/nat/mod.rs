@@ -293,16 +293,36 @@ impl NatResponder {
 
     /// Answer any pending guest DNS queries under the egress policy.
     fn service_dns(&mut self) {
+        let trace = std::env::var_os("CHM_TRACE_NAT").is_some();
         loop {
             let sock = self.sockets.get_mut::<udp::Socket>(self.dns);
             let (query_bytes, meta) = match sock.recv() {
                 Ok((data, meta)) => (data.to_vec(), meta),
                 Err(_) => break,
             };
+            if trace {
+                eprintln!(
+                    "chm[nat] dns recv {} byte(s) from {:?}",
+                    query_bytes.len(),
+                    meta.endpoint
+                );
+            }
             let Some(query) = dns::parse_query(&query_bytes) else {
+                if trace {
+                    eprintln!("chm[nat] dns parse failed ({} bytes)", query_bytes.len());
+                }
                 continue;
             };
             let outcome = self.resolve(&query);
+            if trace {
+                let kind = match &outcome {
+                    dns::Outcome::Answers(a) => format!("Answers({a:?})"),
+                    dns::Outcome::Refused => "Refused".to_string(),
+                    dns::Outcome::NoData => "NoData".to_string(),
+                    dns::Outcome::NxDomain => "NxDomain".to_string(),
+                };
+                eprintln!("chm[nat] dns query {:?} -> {kind}", query.name);
+            }
             let reply = dns::build_response(&query, &outcome);
             // Reply from the address the guest asked (its configured resolver).
             let sock = self.sockets.get_mut::<udp::Socket>(self.dns);
@@ -568,6 +588,9 @@ impl NatResponder {
 
 impl NetResponder for NatResponder {
     fn handle(&mut self, frame: &[u8]) -> Vec<Vec<u8>> {
+        if std::env::var_os("CHM_TRACE_NAT").is_some() {
+            trace_frame("guest->nat", frame);
+        }
         // Pre-arm/enforce on a fresh TCP SYN before smoltcp sees it.
         if let Some(dst) = parse_tcp_syn_dst(frame) {
             self.admit_syn(dst);
@@ -582,6 +605,43 @@ impl NetResponder for NatResponder {
 
     fn drain_egress_events(&mut self) -> Vec<EgressEvent> {
         self.drain_events()
+    }
+}
+
+/// Log a parsed summary of an Ethernet frame for NAT debugging (ethertype, and
+/// for IPv4 the protocol + src/dst ip:port). Behind `CHM_TRACE_NAT`.
+fn trace_frame(dir: &str, frame: &[u8]) {
+    if frame.len() < 14 {
+        eprintln!("chm[nat] {dir} short frame ({} bytes)", frame.len());
+        return;
+    }
+    let et = u16::from_be_bytes([frame[12], frame[13]]);
+    if et == 0x0806 {
+        eprintln!("chm[nat] {dir} ARP");
+        return;
+    }
+    if et != 0x0800 || frame.len() < 34 {
+        eprintln!("chm[nat] {dir} ethertype {et:#06x}");
+        return;
+    }
+    let ip = &frame[14..];
+    let ihl = (ip[0] & 0x0f) as usize * 4;
+    let proto = ip[9];
+    let src = Ipv4Addr::new(ip[12], ip[13], ip[14], ip[15]);
+    let dst = Ipv4Addr::new(ip[16], ip[17], ip[18], ip[19]);
+    let pname = match proto {
+        1 => "ICMP",
+        6 => "TCP",
+        17 => "UDP",
+        _ => "IP",
+    };
+    if (proto == 6 || proto == 17) && ip.len() >= ihl + 4 {
+        let l4 = &ip[ihl..];
+        let sp = u16::from_be_bytes([l4[0], l4[1]]);
+        let dp = u16::from_be_bytes([l4[2], l4[3]]);
+        eprintln!("chm[nat] {dir} {pname} {src}:{sp} -> {dst}:{dp}");
+    } else {
+        eprintln!("chm[nat] {dir} {pname} {src} -> {dst}");
     }
 }
 
