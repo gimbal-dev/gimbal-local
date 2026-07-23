@@ -35,6 +35,7 @@ use hypervisor::hvf::rehydrate::{
     restore_vcpu_state,
 };
 use hypervisor::hvf::UsgicCpuHandle;
+use hypervisor::hvf::UsgicSpiRouter;
 use hypervisor::hvf::virtio::GuestMemory;
 use hypervisor::hvf::virtio::nat::{EgressPolicy, NatLimits};
 use hypervisor::hvf::virtio::pci::{MsiSink, MsiSpiInjector, VirtioPciDevice};
@@ -1366,14 +1367,14 @@ enum Outcome {
 /// vCPU's injection queue and wake it; the vCPU drains + delivers it through the
 /// software GIC at its next `run()` entry.
 struct UsgicMsiSink {
-    queue: Arc<Mutex<Vec<u32>>>,
-    wake: Arc<dyn Fn() + Send + Sync>,
+    router: Arc<UsgicSpiRouter>,
 }
 
 impl MsiSink for UsgicMsiSink {
     fn deliver_spi(&self, intid: u32) {
-        self.queue.lock().unwrap().push(intid);
-        (self.wake)();
+        // Route the SPI to the vCPU its GICD_IROUTER affinity names (not always
+        // the boot CPU), then wake that core. Single-vCPU resolves to vCPU 0.
+        self.router.deliver_spi(intid);
     }
 }
 
@@ -1729,13 +1730,15 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
         }
     };
 
-    // Interactive console. The serial sink routes a keystroke's line SPI through
-    // vCPU 0's software GIC via its injection queue; the wake nudges the idle vCPU.
+    // Interactive console. The serial sink routes a keystroke's line SPI to the
+    // vCPU its GICD_IROUTER affinity names (via the shared distributor) and wakes
+    // that core — so moving the serial IRQ's affinity (e.g. to CPU1) actually
+    // delivers there. Single-vCPU routes to vCPU 0, unchanged.
+    let spi_router = Arc::new(prepared.spi_router(sgi_table.clone()));
     let raw_console = RawConsole::enable();
     console::install_signal_handlers(raw_console.handle());
     let serial_sink: Arc<dyn MsiSink> = Arc::new(UsgicMsiSink {
-        queue: inject0,
-        wake: wake0.clone(),
+        router: spi_router,
     });
     let serial_wake: Option<Arc<dyn Fn() + Send + Sync>> = Some(wake0);
     console::spawn_stdin_pump(

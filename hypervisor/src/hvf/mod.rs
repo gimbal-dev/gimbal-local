@@ -478,9 +478,12 @@ struct UserGic {
     igrpen1: u64,
     sre: u64,
     /// The GICv3 distributor model (SPI config + routing). VM-global in the
-    /// architecture; kept per-vCPU here for the single-vCPU path (SMP sharing is
-    /// a later refinement). Serviced when the guest hits the GICD MMIO frame.
-    dist: crate::hvf::softgic::Distributor,
+    /// architecture: behind an `Arc<Mutex<>>` shared across every vCPU of the VM,
+    /// so a reprogram (enable/priority/affinity) on any core is visible to all
+    /// and an SPI routes to the target vCPU its `GICD_IROUTER` names. Serviced
+    /// when the guest hits the GICD MMIO frame. On the single-vCPU path this is
+    /// simply that vCPU's own distributor.
+    dist: Arc<Mutex<crate::hvf::softgic::Distributor>>,
     /// This vCPU's redistributor model (SGI/PPI frame + LPI control registers).
     redist: crate::hvf::softgic::Redistributor,
     /// MMIO base of the distributor frame (`0` = not wired; MMIO falls through to
@@ -503,6 +506,60 @@ pub struct UsgicCpuHandle {
     pub inject: Arc<Mutex<Vec<u32>>>,
     /// A wake handle for this vCPU's idle-park fd ([`HvfVcpu::wake_handle`]).
     pub wake: EventFd,
+}
+
+/// Cross-thread SPI delivery with affinity routing. A device or console thread
+/// (which does not own any vCPU) delivers a line/message SPI here; the router
+/// reads the shared distributor's `GICD_IROUTER` for that INTID, resolves the
+/// target vCPU, and pushes the INTID into that vCPU's injection queue + wakes
+/// it. This is what lets an SPI land on the core its affinity names (e.g. after
+/// the guest writes `/proc/irq/<n>/smp_affinity`), instead of always the boot
+/// CPU. On the single-vCPU path there is one target, so it is a no-op change.
+#[derive(Clone)]
+pub struct UsgicSpiRouter {
+    dist: Arc<Mutex<crate::hvf::softgic::Distributor>>,
+    cpus: Arc<Vec<UsgicCpuHandle>>,
+}
+
+impl UsgicSpiRouter {
+    /// Build a router over the VM-global distributor and the per-vCPU delivery
+    /// table.
+    pub fn new(
+        dist: Arc<Mutex<crate::hvf::softgic::Distributor>>,
+        cpus: Arc<Vec<UsgicCpuHandle>>,
+    ) -> Self {
+        Self { dist, cpus }
+    }
+
+    /// Deliver an SPI to the vCPU its `GICD_IROUTER` targets: resolve the target
+    /// (affinity Aff0 == vCPU id in the layout we resume; 1-of-N routes to the
+    /// boot CPU), push the INTID into that vCPU's injection queue, and wake it.
+    pub fn deliver_spi(&self, intid: u32) {
+        let target = {
+            let d = self.dist.lock().unwrap();
+            resolve_spi_target(d.spi_target_affinity(intid), self.cpus.len())
+        };
+        if let Some(h) = self.cpus.get(target) {
+            h.inject.lock().unwrap().push(intid);
+            let _ = h.wake.write(1);
+        }
+    }
+}
+
+/// Resolve an SPI's `GICD_IROUTER` affinity to a target vCPU id. The guests we
+/// resume assign `MPIDR.Aff0 == vCPU index` with Aff1..3 == 0 (verified against
+/// captured snapshots), so the target is `affinity & 0xff` clamped to the vCPU
+/// count. `None` affinity is `GICD_IROUTER.IRM == 1` (1-of-N: any participating
+/// PE) — we deliver to the boot CPU (0), a valid choice for 1-of-N. Extracted as
+/// a pure function so the routing is unit-testable without a live VM.
+fn resolve_spi_target(affinity: Option<u64>, n: usize) -> usize {
+    match affinity {
+        None => 0,
+        Some(aff) => {
+            let id = (aff & 0xff) as usize;
+            if id < n { id } else { 0 }
+        }
+    }
 }
 
 /// GICv3 spurious INTID returned when no interrupt is pending.
@@ -640,6 +697,21 @@ mod usgic_tests {
         assert!(!sgi_targets_core(sgi, 0, 0), "the writer is excluded");
         assert!(sgi_targets_core(sgi, 0, 1), "every other core is targeted");
         assert!(sgi_targets_core(sgi, 0, 2), "every other core is targeted");
+    }
+
+    #[test]
+    fn spi_affinity_resolves_to_the_named_core() {
+        use super::resolve_spi_target;
+        // Aff0 == vCPU id (verified against captured snapshots): an SPI routed to
+        // affinity Aff0=1 targets vCPU 1.
+        assert_eq!(resolve_spi_target(Some(0x0000), 2), 0);
+        assert_eq!(resolve_spi_target(Some(0x0001), 2), 1);
+        // 1-of-N (IRM=1, affinity None) delivers to the boot CPU.
+        assert_eq!(resolve_spi_target(None, 2), 0);
+        // An out-of-range affinity (e.g. a stale/foreign Aff0) falls back to boot.
+        assert_eq!(resolve_spi_target(Some(0x0005), 2), 0);
+        // Higher affinity fields are ignored (Aff1..3 are 0 in our layout).
+        assert_eq!(resolve_spi_target(Some(0x01_0000_0001), 2), 1);
     }
 
     #[test]
@@ -1124,7 +1196,8 @@ impl HvfVcpu {
             } else if intid < 32 {
                 g.redist.is_ppi_enabled(intid)
             } else {
-                g.dist.assert_spi(intid)
+                // SPI: latch pending + read enable in the shared distributor.
+                g.dist.lock().unwrap().assert_spi(intid)
             };
             if enabled {
                 g.push_pending(intid);
@@ -1133,22 +1206,39 @@ impl HvfVcpu {
     }
 
     /// Wire this vCPU's software distributor/redistributor to their guest MMIO
-    /// bases (from the snapshot's GIC config) and size the distributor. After
-    /// this, guest accesses to those frames are serviced by the software GIC
-    /// instead of faulting to the device bus. `0` bases leave them unwired.
-    pub fn usgic_set_gic_bases(&self, gicd_base: u64, gicr_base: u64, num_irqs: u32) {
+    /// bases (from the snapshot's GIC config). After this, guest accesses to those
+    /// frames are serviced by the software GIC instead of faulting to the device
+    /// bus. `0` bases leave them unwired. The distributor itself (VM-global) is
+    /// sized + installed via [`Self::usgic_install_shared_dist`].
+    pub fn usgic_set_gic_bases(&self, gicd_base: u64, gicr_base: u64) {
         let mut g = self.usgic.lock().unwrap();
         g.gicd_base = gicd_base;
         g.gicr_base = gicr_base;
-        g.dist = crate::hvf::softgic::Distributor::new(num_irqs);
+    }
+
+    /// Install the VM-global distributor shared by every vCPU (so a reprogram on
+    /// any core is visible to all and SPIs route by affinity). On the single-vCPU
+    /// path this is that vCPU's own freshly-sized distributor.
+    pub fn usgic_install_shared_dist(
+        &self,
+        dist: Arc<Mutex<crate::hvf::softgic::Distributor>>,
+    ) {
+        self.usgic.lock().unwrap().dist = dist;
+    }
+
+    /// A clone of the shared distributor handle, for the SPI router (which reads
+    /// `GICD_IROUTER` to pick an SPI's target vCPU).
+    pub fn usgic_shared_dist(&self) -> Arc<Mutex<crate::hvf::softgic::Distributor>> {
+        self.usgic.lock().unwrap().dist.clone()
     }
 
     /// Seed the software distributor + redistributor from captured KVM GIC state
     /// (the same `(offset, value)` pairs the managed-GIC path restores), so a
-    /// resumed guest keeps its interrupt configuration.
+    /// resumed guest keeps its interrupt configuration. The distributor is shared,
+    /// so on SMP this seeds identical values under its mutex (idempotent).
     pub fn usgic_seed_gic(&self, dist_regs: &[(u32, u64)], redist_regs: &[(u32, u64)]) {
         let mut g = self.usgic.lock().unwrap();
-        g.dist.seed_from_kvm(dist_regs);
+        g.dist.lock().unwrap().seed_from_kvm(dist_regs);
         g.redist.seed_from_kvm(redist_regs);
     }
 
@@ -1179,11 +1269,16 @@ impl HvfVcpu {
         let mut g = self.usgic.lock().unwrap();
         if g.gicd_base != 0 && ipa >= g.gicd_base && ipa < g.gicd_base + 0x1_0000 {
             let off = ipa - g.gicd_base;
+            // The distributor is VM-global (shared): a GICD write from ANY core
+            // (e.g. reprogramming an SPI's enable or IROUTER affinity) updates the
+            // one shared model, so it is visible to every core and to the SPI
+            // router.
+            let mut d = g.dist.lock().unwrap();
             if is_write {
-                g.dist.write(off, write_val);
+                d.write(off, write_val);
                 Some(0)
             } else {
-                Some(g.dist.read(off) as u64)
+                Some(d.read(off) as u64)
             }
         } else if g.gicr_base != 0 && ipa >= g.gicr_base && ipa < g.gicr_base + 0x2_0000 {
             let off = ipa - g.gicr_base;
@@ -1210,11 +1305,11 @@ impl HvfVcpu {
                 return Ok(());
             }
             // PPIs gate on the redistributor's per-vCPU enable; SPIs on the
-            // distributor (which also latches the pending bit).
+            // shared distributor (which also latches the pending bit).
             let enabled = if intid < 32 {
                 g.redist.is_ppi_enabled(intid)
             } else {
-                g.dist.assert_spi(intid)
+                g.dist.lock().unwrap().assert_spi(intid)
             };
             if enabled {
                 g.push_pending(intid);
@@ -1481,7 +1576,7 @@ impl HvfVcpu {
             (crate::hvf::ffi::GIC_ICC_IGRPEN1_EL1, g.igrpen1),
         ];
         let usgic = crate::hvf::checkpoint::UsgicCheckpoint {
-            dist: g.dist.clone(),
+            dist: g.dist.lock().unwrap().clone(),
             redist: g.redist.clone(),
             pending: g.pending.clone(),
             active: g.active,
@@ -1502,7 +1597,7 @@ impl HvfVcpu {
     /// are wired, in place of the cold [`Self::usgic_seed_gic`].
     pub fn usgic_restore_softgic(&self, cp: &crate::hvf::checkpoint::UsgicCheckpoint) {
         let mut g = self.usgic.lock().unwrap();
-        g.dist = cp.dist.clone();
+        *g.dist.lock().unwrap() = cp.dist.clone();
         g.redist = cp.redist.clone();
         g.pending = cp.pending.clone();
         g.active = cp.active;

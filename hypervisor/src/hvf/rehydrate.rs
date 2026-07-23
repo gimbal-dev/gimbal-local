@@ -58,6 +58,8 @@ use crate::hvf::translate::kvm_ingest::snapshot_json_to_hvf;
 use crate::hvf::virtio::GuestMemory;
 use crate::hvf::HvfVcpu;
 use crate::hvf::UsgicCpuHandle;
+use crate::hvf::UsgicSpiRouter;
+use crate::hvf::softgic::Distributor;
 use crate::hvf::VcpuHvfState;
 use crate::hypervisor::Hypervisor;
 use crate::vm::{Vm, VmOps};
@@ -744,15 +746,22 @@ pub struct UsgicPrepared {
 
 impl UsgicPrepared {
     /// The `Send`-friendly seed each vCPU thread needs to create + restore its
-    /// vCPU (GIC MMIO bases + the shared translated distributor dump).
+    /// vCPU (GIC MMIO bases + the shared distributor + translated dump).
     pub fn seed(&self) -> UsgicSeed {
         self.seed.clone()
     }
+
+    /// Build an SPI router over the VM-global distributor + the per-vCPU delivery
+    /// table, so a device/console thread's SPI lands on the core its
+    /// `GICD_IROUTER` affinity names (not always the boot CPU).
+    pub fn spi_router(&self, cpus: Arc<Vec<UsgicCpuHandle>>) -> UsgicSpiRouter {
+        UsgicSpiRouter::new(self.seed.shared_dist.clone(), cpus)
+    }
 }
 
-/// The GIC seed shared by every userspace-GIC vCPU: the MMIO bases and the
-/// translated distributor dump. `Clone` + `Send` so an SMP orchestrator can hand
-/// a copy to each per-vCPU thread.
+/// The GIC seed shared by every userspace-GIC vCPU: the MMIO bases, the VM-global
+/// distributor, and the translated distributor dump. `Clone` + `Send` so an SMP
+/// orchestrator can hand a copy to each per-vCPU thread.
 #[derive(Clone)]
 pub struct UsgicSeed {
     /// MMIO base of the VM-global distributor frame.
@@ -760,11 +769,12 @@ pub struct UsgicSeed {
     /// MMIO base of vCPU 0's redistributor window; vCPU `i` sits one
     /// `GIC_V3_REDIST_SIZE` above.
     gicr_region_base: u64,
-    /// The interrupt-line width the software GIC is sized to.
-    num_irq: u32,
-    /// The translated distributor dump, seeded into every vCPU's software GIC
+    /// The translated distributor dump, seeded into the shared distributor
     /// (shared read-only, so behind an `Arc` to avoid copying per vCPU).
     dist_pairs: Arc<Vec<(u32, u64)>>,
+    /// The VM-global software distributor, installed into every vCPU so a
+    /// reprogram on any core is visible to all and SPIs route by affinity.
+    shared_dist: Arc<Mutex<Distributor>>,
 }
 
 /// Create the userspace-GIC VM and map its guest RAM (no managed GIC, no vCPUs).
@@ -810,6 +820,10 @@ pub fn prepare_usgic_vm(
     let dist_pairs = dist_to_hvf(&snap.gic_dist)
         .ok_or_else(|| RehydrateError::Translate("distributor dump did not translate".into()))?;
 
+    // The VM-global distributor, sized once and shared by every vCPU, so a
+    // reprogram on any core is visible to all and SPIs route by affinity.
+    let shared_dist = Arc::new(Mutex::new(Distributor::new(snap.num_irq)));
+
     Ok(UsgicPrepared {
         guest_mem,
         ram,
@@ -817,8 +831,8 @@ pub fn prepare_usgic_vm(
         seed: UsgicSeed {
             gicd_base,
             gicr_region_base,
-            num_irq: snap.num_irq,
             dist_pairs: Arc::new(dist_pairs),
+            shared_dist,
         },
     })
 }
@@ -851,14 +865,18 @@ pub fn restore_usgic_vcpu(
             .downcast_mut::<HvfVcpu>()
             .ok_or_else(|| RehydrateError::Translate("vCPU is not an HVF vCPU".into()))?;
         concrete.set_usgic_enabled(true);
-        // set_gic_bases (re)creates the distributor, so seed AFTER it.
-        concrete.usgic_set_gic_bases(seed.gicd_base, gicr_base, seed.num_irq);
+        // Install the VM-global distributor (shared across vCPUs) + set the MMIO
+        // bases, then seed. Every vCPU shares the one distributor, so a GICD
+        // reprogram on any core is visible to all and SPIs route by affinity.
+        concrete.usgic_install_shared_dist(seed.shared_dist.clone());
+        concrete.usgic_set_gic_bases(seed.gicd_base, gicr_base);
         match resume.and_then(|cp| cp.usgic.as_ref()) {
             // Resume: restore the live software-GIC models captured at suspend
             // (SPI/PPI config the guest may have reprogrammed since the parent
             // snapshot, plus any in-flight interrupt), overriding the cold seed.
             Some(usgic_cp) => concrete.usgic_restore_softgic(usgic_cp),
-            // Cold: seed from the parent snapshot's captured KVM GIC state.
+            // Cold: seed from the parent snapshot's captured KVM GIC state. On SMP
+            // this seeds the shared distributor identically per vCPU (idempotent).
             None => concrete.usgic_seed_gic(&seed.dist_pairs, &redist_pairs),
         }
     }
