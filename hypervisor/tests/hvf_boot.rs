@@ -3102,7 +3102,7 @@ fn hvf_userspace_gic_delivers_spi_via_distributor() {
         let hvcpu = vcpu.as_any_concrete_mut().downcast_mut::<HvfVcpu>().unwrap();
         hvcpu.set_usgic_enabled(true);
         // Wire the software distributor/redistributor to their MMIO frames.
-        hvcpu.usgic_set_gic_bases(GICD_BASE, GICR_BASE, 256);
+        hvcpu.usgic_set_gic_bases(GICD_BASE, GICR_BASE);
     }
 
     const SPI: u32 = 32;
@@ -3163,7 +3163,7 @@ fn hvf_userspace_gic_distributor_gates_disabled_spi() {
     {
         let hvcpu = vcpu.as_any_concrete_mut().downcast_mut::<HvfVcpu>().unwrap();
         hvcpu.set_usgic_enabled(true);
-        hvcpu.usgic_set_gic_bases(GICD_BASE, GICR_BASE, 256);
+        hvcpu.usgic_set_gic_bases(GICD_BASE, GICR_BASE);
     }
 
     let seen = |v: u32, ops: &ProbeVmOps| ops.marks.lock().unwrap().iter().any(|(_, x)| *x == v);
@@ -3257,7 +3257,7 @@ fn hvf_userspace_gic_delivers_seeded_spi_from_real_snapshot() {
         hvcpu.set_usgic_enabled(true);
         // Order matters: setting the bases (re)creates the distributor, so seed
         // AFTER, exactly as the resume path will.
-        hvcpu.usgic_set_gic_bases(GICD_BASE, GICR_BASE, 256);
+        hvcpu.usgic_set_gic_bases(GICD_BASE, GICR_BASE);
         hvcpu.usgic_seed_gic(&dist_pairs, &redist_pairs);
     }
 
@@ -3323,7 +3323,7 @@ fn hvf_userspace_gic_delivers_vtimer_ppi() {
     {
         let hvcpu = vcpu.as_any_concrete_mut().downcast_mut::<HvfVcpu>().unwrap();
         hvcpu.set_usgic_enabled(true);
-        hvcpu.usgic_set_gic_bases(GICD_BASE, GICR_BASE, 256);
+        hvcpu.usgic_set_gic_bases(GICD_BASE, GICR_BASE);
     }
 
     const VTIMER: u32 = 27;
