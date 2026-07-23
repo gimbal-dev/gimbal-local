@@ -371,6 +371,17 @@ unsafe impl Sync for GuestRam {}
 
 impl GuestRam {
     /// Map `size` bytes at `file_offset` of `path` copy-on-write.
+    ///
+    /// Fast path (default): a **file-backed `MAP_PRIVATE` mmap** — the guest's
+    /// RAM pages fault in lazily from the snapshot file only as the guest touches
+    /// them, and any guest write copies-on-write to a private anonymous page
+    /// (leaving the snapshot file immutable). A resumed guest touches only its
+    /// working set immediately, so this turns a full eager read of the whole
+    /// image (hundreds of ms for a 1 GiB snapshot — the dominant startup cost,
+    /// #79) into a near-instant mmap plus on-demand faults. `file_offset` must be
+    /// page-aligned for a file-backed mmap; when it is not (rare), or if the
+    /// mmap is rejected, we fall back to the eager anon+read path. Set
+    /// `CHM_EAGER_RAM=1` to force the eager path (A/B comparison / diagnostics).
     fn map_file(path: &Path, file_offset: u64, size: usize) -> Result<Self, RehydrateError> {
         use std::os::unix::fs::FileExt;
         // Open and validate the region is within the file.
@@ -392,9 +403,56 @@ impl GuestRam {
             )));
         }
 
-        // Anonymous, wired-capable backing for the hypervisor, filled from the
-        // file. (An anonymous mapping is the most portable choice for
-        // `hv_vm_map`; the file is read into it once.)
+        let timing = std::env::var_os("CHM_TRACE_TIMING").is_some();
+        let eager = std::env::var_os("CHM_EAGER_RAM").is_some();
+        // mmap requires a page-aligned file offset; Apple Silicon uses 16 KiB
+        // pages. `page_size` is queried rather than hard-coded so this stays
+        // correct on any host.
+        // SAFETY: sysconf with a valid name returns a positive page size.
+        let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
+        let aligned = page != 0 && file_offset.is_multiple_of(page);
+
+        if !eager && aligned {
+            use std::os::unix::io::AsRawFd;
+            let t0 = std::time::Instant::now();
+            // File-backed copy-on-write mapping: lazy fault-in from the file,
+            // private (COW) so guest writes never touch the snapshot on disk.
+            // SAFETY: fd is valid for the call; size/offset validated above.
+            let ptr = unsafe {
+                mmap(
+                    std::ptr::null_mut(),
+                    size,
+                    PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE,
+                    file.as_raw_fd(),
+                    file_offset as libc::off_t,
+                )
+            };
+            if ptr != MAP_FAILED {
+                if timing {
+                    eprintln!(
+                        "[timing] map_file mmap(COW) {:.1} MiB in {:?} (lazy fault-in)",
+                        size as f64 / (1024.0 * 1024.0),
+                        t0.elapsed()
+                    );
+                }
+                return Ok(GuestRam {
+                    ptr: ptr as *mut u8,
+                    size,
+                });
+            }
+            // Fall through to the eager path if the file-backed mmap was rejected.
+            if timing {
+                eprintln!(
+                    "[timing] map_file file-backed mmap rejected ({}); eager read",
+                    std::io::Error::last_os_error()
+                );
+            }
+        }
+
+        // Eager path: anonymous backing filled from the file once. Used when the
+        // offset is unaligned, the file-backed mmap was rejected, or CHM_EAGER_RAM
+        // forces it.
         // SAFETY: standard anonymous read/write mapping; checked below.
         let ptr = unsafe {
             mmap(
@@ -419,11 +477,19 @@ impl GuestRam {
 
         // SAFETY: ptr is valid for `size` bytes; we fill it exactly once.
         let buf = unsafe { std::slice::from_raw_parts_mut(ram.ptr, size) };
+        let t0 = std::time::Instant::now();
         file.read_exact_at(buf, file_offset)
             .map_err(|e| RehydrateError::Mmap {
                 path: path.display().to_string(),
                 source: e,
             })?;
+        if std::env::var_os("CHM_TRACE_TIMING").is_some() {
+            eprintln!(
+                "[timing] map_file read {:.1} MiB in {:?}",
+                size as f64 / (1024.0 * 1024.0),
+                t0.elapsed()
+            );
+        }
         Ok(ram)
     }
 
@@ -606,6 +672,8 @@ pub fn rehydrate_usgic(
     memory_ranges: &Path,
     vm_ops: &Arc<dyn VmOps>,
 ) -> Result<UsgicVm, RehydrateError> {
+    let timing = std::env::var_os("CHM_TRACE_TIMING").is_some();
+    let t_start = std::time::Instant::now();
     let vm = hv
         .create_vm(HypervisorVmConfig {
             nested: false,
@@ -614,6 +682,7 @@ pub fn rehydrate_usgic(
         .map_err(|e| RehydrateError::Hv(anyhow!("create_vm: {e}")))?;
 
     // --- guest RAM (same mapping as prepare_vm, but no managed GIC after) ---
+    let t_ram = std::time::Instant::now();
     let guest_mem = Arc::new(GuestMemory::new());
     let mut ram = Vec::with_capacity(snap.mem_mappings.len());
     for m in &snap.mem_mappings {
@@ -625,6 +694,9 @@ pub fn rehydrate_usgic(
             guest_mem.register(m.gpa, backing.ptr, m.size as usize);
         }
         ram.push(backing);
+    }
+    if timing {
+        eprintln!("[timing] RAM map total {:?}", t_ram.elapsed());
     }
 
     // The guest's original GIC MMIO bases (arch::aarch64::layout): distributor
@@ -674,6 +746,9 @@ pub fn rehydrate_usgic(
                 .map_err(|e| RehydrateError::Hv(anyhow!("vCPU {id} reseed vtimer: {e}")))?;
         }
         vcpus.push(vcpu);
+    }
+    if timing {
+        eprintln!("[timing] rehydrate_usgic total {:?}", t_start.elapsed());
     }
 
     Ok(UsgicVm {
