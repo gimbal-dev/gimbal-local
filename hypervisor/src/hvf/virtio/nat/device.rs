@@ -10,7 +10,7 @@
 //! Checksums are computed in software (the guest and smoltcp both expect valid
 //! checksums; there is no hardware offload on this synthetic link).
 
-use smoltcp::phy::{self, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
+use smoltcp::phy::{self, Checksum, ChecksumCapabilities, Device, DeviceCapabilities, Medium};
 use smoltcp::time::Instant;
 use std::collections::VecDeque;
 
@@ -45,9 +45,18 @@ impl Device for FrameDevice {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ethernet;
         caps.max_transmission_unit = NAT_MTU;
-        // Compute/verify checksums in software: this is not a real offloading
-        // NIC, and the guest posts frames expecting valid checksums.
-        caps.checksum = ChecksumCapabilities::default();
+        // The guest's virtio-net negotiated TCP/UDP checksum OFFLOAD (the standard
+        // VIRTIO_NET_F_CSUM), so it posts TCP/UDP segments with BLANK/partial L4
+        // checksums, expecting the "NIC" to complete them. This synthetic link is
+        // that NIC, so we must NOT verify those checksums on receive (smoltcp's
+        // default would drop them as corrupt — the exact symptom of DNS/TCP
+        // silently timing out while ICMP, which virtio-net does not offload,
+        // works). Compute valid checksums on transmit so our replies are accepted.
+        // IPv4 header + ICMPv4 are not offloaded, so keep verifying those.
+        let mut checksum = ChecksumCapabilities::default();
+        checksum.tcp = Checksum::Tx;
+        checksum.udp = Checksum::Tx;
+        caps.checksum = checksum;
         caps
     }
 
@@ -116,6 +125,22 @@ mod tests {
         tx.consume(2, |buf| buf.copy_from_slice(&[9, 9]));
         assert_eq!(dev.pop_to_guest().unwrap(), vec![9, 9]);
         assert!(dev.receive(Instant::from_millis(0)).is_none());
+    }
+
+    #[test]
+    fn tcp_udp_rx_checksums_are_not_verified() {
+        // The guest's virtio-net offloads TCP/UDP checksums, so it posts segments
+        // with blank/partial L4 checksums. If we verified them on receive, smoltcp
+        // would silently drop every TCP/UDP frame (DNS + connections time out
+        // while ICMP works). Assert we only COMPUTE them (Tx), never verify (Rx),
+        // for TCP/UDP — while IPv4 + ICMPv4 (not offloaded) stay fully checked.
+        let caps = FrameDevice::default().capabilities();
+        assert!(!caps.checksum.tcp.rx(), "must not verify guest TCP checksums");
+        assert!(caps.checksum.tcp.tx(), "must compute TCP checksums on reply");
+        assert!(!caps.checksum.udp.rx(), "must not verify guest UDP checksums");
+        assert!(caps.checksum.udp.tx(), "must compute UDP checksums on reply");
+        assert!(caps.checksum.ipv4.rx(), "IPv4 header is not offloaded; verify it");
+        assert!(caps.checksum.icmpv4.rx(), "ICMPv4 is not offloaded; verify it");
     }
 
     #[test]

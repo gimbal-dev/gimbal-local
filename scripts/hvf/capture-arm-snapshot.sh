@@ -42,6 +42,25 @@ GUEST_MEM_MB="${GUEST_MEM_MB:-1024}"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-300}"   # seconds to wait for the in-guest marker
 CH_GIC_V2M="${CH_GIC_V2M:-1}"         # 1 = HVF-compatible message-SPI capture
 REUSE_GUEST_RAW="${REUSE_GUEST_RAW:-0}" # 1 = reuse cached guest.raw; default fresh
+# Networking: when GUEST_NET=1 the guest is given a virtio-net NIC and a STATIC
+# address matching the Mac's userspace NAT contract (guest 192.168.249.2, gateway
+# + DNS 192.168.249.1 — see hypervisor/src/hvf/virtio/nat/mod.rs). At capture time
+# a host tap + MASQUERADE gives the guest real egress so the virtio-net device
+# initializes warm; at rehydration time the Mac's userspace NAT answers as
+# 192.168.249.1. This is what makes a captured snapshot able to run real
+# networked workloads (apt/docker/curl) on the Mac.
+GUEST_NET="${GUEST_NET:-0}"
+GUEST_TAP="${GUEST_TAP:-chtap0}"
+GUEST_MAC="${GUEST_MAC:-12:34:56:78:9a:bc}"
+# The gateway (tap) MAC MUST match the Mac userspace NAT's synthetic gateway MAC
+# (02:00:00:00:00:01, see hypervisor/src/hvf/virtio/nat/devmgr.rs) so the guest's
+# CAPTURED ARP entry for 192.168.249.1 already points at the right MAC on
+# rehydration — otherwise the resumed guest sends to a stale MAC until it
+# re-ARPs (~30s of no egress).
+GUEST_GW_MAC="${GUEST_GW_MAC:-02:00:00:00:00:01}"
+GUEST_IP="${GUEST_IP:-192.168.249.2}"
+GUEST_GW="${GUEST_GW:-192.168.249.1}"
+GUEST_NET_PREFIX="${GUEST_NET_PREFIX:-24}"
 # NOTE: default is a *fresh* guest.raw on every capture. Reusing a cached disk is
 # what previously baked a chatty `chm-heartbeat` service into the snapshot, which
 # then floods the serial console after an HVF resume. Keep this 0 unless you have
@@ -132,21 +151,101 @@ write_files:
       [Service]
       ExecStart=
       ExecStart=-/sbin/agetty --autologin ubuntu --noclear %I $TERM
-# No datasource network wait; just announce readiness on the serial console so
-# the host knows the guest fully booted and the GIC/vCPU state is "interesting".
+# Bring the box to a clean idle, (optionally) verify egress, then announce
+# readiness on the serial console so the host knows the guest fully booted and
+# the GIC/vCPU/net state is "interesting" and warm.
 runcmd:
   - [ systemctl, daemon-reload ]
   - [ sh, -c, "systemctl disable --now chm-heartbeat.service chm-heartbeat.timer 2>/dev/null || true" ]
   - [ sh, -c, "rm -f /etc/systemd/system/chm-heartbeat.service /etc/systemd/system/chm-heartbeat.timer /lib/systemd/system/chm-heartbeat.service /lib/systemd/system/chm-heartbeat.timer" ]
   - [ systemctl, daemon-reload ]
   - [ systemctl, restart, serial-getty@ttyAMA0.service ]
-  - [ sh, -c, "echo $MARKER > /dev/ttyAMA0" ]
 EOF
 cat > meta-data <<EOF
 instance-id: ch-snap-$$
 local-hostname: ch-snap
 EOF
-cloud-localds seed.img user-data meta-data
+
+# When networking is requested, hand the guest a STATIC config matching the Mac
+# NAT contract (guest 192.168.249.2, gw+DNS 192.168.249.1) via a NoCloud
+# network-config, and add a connectivity check to the runcmd so the serial log
+# proves egress worked at capture time.
+NETCFG_ARG=()
+if [ "$GUEST_NET" = "1" ]; then
+  cat > network-config <<EOF
+version: 2
+ethernets:
+  guestnet:
+    match:
+      name: "e*"
+    dhcp4: false
+    addresses: [$GUEST_IP/$GUEST_NET_PREFIX]
+    routes:
+      - to: default
+        via: $GUEST_GW
+    nameservers:
+      addresses: [$GUEST_GW]
+EOF
+  NETCFG_ARG=(--network-config network-config)
+  # Prove egress from inside the guest (logged to serial) BEFORE the readiness
+  # marker, so the host only snapshots once networking is verified + warm.
+  cat >> user-data <<'EOF'
+  - [ sh, -c, "ip -4 addr show > /dev/ttyAMA0 2>&1 || true" ]
+  - [ sh, -c, "getent hosts archive.ubuntu.com > /dev/ttyAMA0 2>&1 && echo CH_NET_DNS_OK > /dev/ttyAMA0 || echo CH_NET_DNS_FAIL > /dev/ttyAMA0" ]
+  - [ sh, -c, "curl -sS -m 15 -o /dev/null -w 'CH_NET_HTTP_%{http_code}\\n' http://connectivity-check.ubuntu.com/ > /dev/ttyAMA0 2>&1 || echo CH_NET_HTTP_FAIL > /dev/ttyAMA0" ]
+EOF
+fi
+# The readiness marker is ALWAYS the last runcmd, so the host waits for a fully
+# settled (and, with GUEST_NET, network-verified) guest before snapshotting.
+cat >> user-data <<EOF
+  - [ sh, -c, "echo $MARKER > /dev/ttyAMA0" ]
+EOF
+cloud-localds "${NETCFG_ARG[@]}" seed.img user-data meta-data
+
+# --- optional guest networking (a host tap + MASQUERADE) ------------------- #
+# When GUEST_NET=1, create a tap the guest's virtio-net binds to and NAT the
+# guest subnet out the host's default route, so the guest has real egress and
+# the virtio-net device initializes warm before the snapshot.
+NET_TEARDOWN=()
+setup_guest_net() {
+  [ "$GUEST_NET" = "1" ] || return 0
+  log "setting up guest networking: tap=$GUEST_TAP gw=$GUEST_GW guest=$GUEST_IP"
+  # Creating a tap + NAT always needs CAP_NET_ADMIN, independent of whether
+  # /dev/kvm is user-accessible, so use sudo unconditionally here.
+  local S=(sudo)
+  command -v sudo >/dev/null 2>&1 || S=()
+  "${S[@]}" ip link del "$GUEST_TAP" 2>/dev/null || true
+  "${S[@]}" ip tuntap add dev "$GUEST_TAP" mode tap user "$(id -un)" \
+    || "${S[@]}" ip tuntap add dev "$GUEST_TAP" mode tap \
+    || die "could not create tap $GUEST_TAP (need root / CAP_NET_ADMIN)"
+  # Pin the tap (gateway) MAC to the Mac NAT's gateway MAC so the guest's captured
+  # ARP for the gateway is already correct on rehydration.
+  "${S[@]}" ip link set dev "$GUEST_TAP" address "$GUEST_GW_MAC" 2>/dev/null || true
+  "${S[@]}" ip addr add "$GUEST_GW/$GUEST_NET_PREFIX" dev "$GUEST_TAP" 2>/dev/null || true
+  "${S[@]}" ip link set "$GUEST_TAP" up \
+    || die "could not bring tap $GUEST_TAP up"
+  NET_TEARDOWN=("${S[@]}" ip link del "$GUEST_TAP")
+  # Forward + MASQUERADE the guest subnet out the default interface.
+  local defif
+  defif="$(ip route show default 2>/dev/null | awk '/default/{print $5; exit}')"
+  "${S[@]}" sysctl -w net.ipv4.ip_forward=1 >/dev/null 2>&1 || true
+  if [ -n "$defif" ]; then
+    "${S[@]}" iptables -t nat -A POSTROUTING -s "$GUEST_GW/$GUEST_NET_PREFIX" \
+      -o "$defif" -j MASQUERADE 2>/dev/null || true
+    "${S[@]}" iptables -A FORWARD -i "$GUEST_TAP" -o "$defif" -j ACCEPT 2>/dev/null || true
+    "${S[@]}" iptables -A FORWARD -i "$defif" -o "$GUEST_TAP" \
+      -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    log "MASQUERADE $GUEST_GW/$GUEST_NET_PREFIX -> $defif"
+  else
+    warn "no default route found; guest egress at capture time may not work \
+(the snapshot is still valid — the Mac NAT provides egress on rehydration)"
+  fi
+}
+teardown_guest_net() {
+  [ "${#NET_TEARDOWN[@]}" -gt 0 ] || return 0
+  "${NET_TEARDOWN[@]}" 2>/dev/null || true
+}
+
 
 # --- boot under cloud-hypervisor ------------------------------------------- #
 API_SOCK="$WORK_DIR/ch.sock"
@@ -162,11 +261,19 @@ cleanup() {
     sleep 1
     kill "$CH_PID" 2>/dev/null || true
   fi
+  teardown_guest_net
 }
 trap cleanup EXIT
 
+setup_guest_net
+NET_ARG=()
+if [ "$GUEST_NET" = "1" ]; then
+  NET_ARG=(--net "tap=$GUEST_TAP,mac=$GUEST_MAC")
+fi
+
 log "booting guest (${GUEST_CPUS} vCPU, ${GUEST_MEM_MB} MiB) under cloud-hypervisor"
 log "GIC capture mode: CH_GIC_V2M=${CH_GIC_V2M} (1 means message-SPI, not ITS/LPI)"
+[ "$GUEST_NET" = "1" ] && log "guest networking: virtio-net on $GUEST_TAP (guest $GUEST_IP -> gw $GUEST_GW)"
 CH_ENV=(env "CH_GIC_V2M=$CH_GIC_V2M")
 if [ "${#KVM_PREFIX[@]}" -gt 0 ]; then
   CH_ENV=(sudo env "CH_GIC_V2M=$CH_GIC_V2M")
@@ -179,6 +286,7 @@ fi
   --memory "size=${GUEST_MEM_MB}M" \
   --serial "file=$SERIAL_LOG" \
   --console off \
+  "${NET_ARG[@]}" \
   >"$WORK_DIR/ch.stdout" 2>"$WORK_DIR/ch.stderr" &
 CH_PID=$!
 
