@@ -1414,12 +1414,48 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
             loaded.num_vcpus
         ));
     }
+    // Resume from a live checkpoint when one exists and checkpoints are enabled
+    // (same policy as the managed path); a malformed/incompatible one is
+    // discarded so we cold-rehydrate cleanly.
+    let resume_state: Option<Arc<CheckpointState>> =
+        if args.checkpoint && checkpoint::has_checkpoint(dir) {
+            match checkpoint::read_checkpoint(dir) {
+                Ok(state) if state.usgic.is_some() => Some(Arc::new(state)),
+                Ok(_) => {
+                    eprintln!(
+                        "chm: warning: checkpoint is not a userspace-GIC capture; cold-booting"
+                    );
+                    checkpoint::clear_checkpoint(dir);
+                    None
+                }
+                Err(e) => {
+                    eprintln!("chm: warning: ignoring checkpoint ({e}); cold-booting");
+                    checkpoint::clear_checkpoint(dir);
+                    None
+                }
+            }
+        } else {
+            None
+        };
+    let resuming = resume_state.is_some();
+
     if !args.quiet {
-        banner(dir, &loaded.mem_ranges, loaded.num_vcpus, loaded.total_ram, "userspace GICv3");
-        eprintln!(
-            "chm: userspace GIC (experimental) — rehydrating an ITS/LPI snapshot \
-             the managed GIC cannot run.\n"
-        );
+        // On resume the guest RAM comes from the checkpoint's dump; otherwise
+        // from the parent snapshot's base memory-ranges.
+        let shown_ranges = if resuming {
+            checkpoint::memory_ranges_path(dir)
+        } else {
+            loaded.mem_ranges.clone()
+        };
+        banner(dir, &shown_ranges, loaded.num_vcpus, loaded.total_ram, "userspace GICv3");
+        if resuming {
+            eprintln!("chm: resuming a userspace-GIC checkpoint (restored, not cold-booted).\n");
+        } else {
+            eprintln!(
+                "chm: userspace GIC (experimental) — rehydrating an ITS/LPI snapshot \
+                 the managed GIC cannot run.\n"
+            );
+        }
     }
 
     // Device model: a bus with a real PL011 at the guest's serial base, its
@@ -1427,8 +1463,16 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
     let (uart, bus) = build_vm_ops(&loaded.state_json);
     let vm_ops: Arc<dyn VmOps> = Arc::new(ChmVmOps::new(bus.clone()));
 
-    let mem_ranges = loaded.mem_ranges.clone();
+    let mem_ranges = if resuming {
+        checkpoint::memory_ranges_path(dir)
+    } else {
+        loaded.mem_ranges.clone()
+    };
     let snap = loaded.snap;
+    // The orchestrator keeps a copy of the memory layout so it can dump guest
+    // RAM into a fresh checkpoint on suspend (snap itself moves into the vCPU
+    // thread).
+    let mem_mappings = snap.mem_mappings.clone();
 
     let running = Arc::new(AtomicBool::new(true));
     let outcome: Arc<Mutex<Option<Result<Outcome, String>>>> = Arc::new(Mutex::new(None));
@@ -1446,10 +1490,23 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
     // so the orchestrator can wire the device model onto the shared bus BEFORE the
     // guest runs (and races a virtio BAR access).
     let (go_tx, go_rx) = mpsc::channel::<()>();
+    // On a clean external stop the vCPU thread captures its live state AND writes
+    // the checkpoint (RAM dump included) on its OWN thread: HVF binds a vCPU to
+    // its creating thread, and — critically — the guest RAM is a COW mmap owned
+    // by `uvm`, which this thread unmaps when it ends. Dumping RAM here, before
+    // `uvm` drops, avoids a use-after-munmap the orchestrator would otherwise hit.
+    // It reports back only the outcome: `None` = nothing captured (power-off /
+    // error), `Some(Ok)` = saved, `Some(Err)` = capture/write failed.
+    let (capture_tx, capture_rx) = mpsc::channel::<Option<Result<(), String>>>();
+    let want_capture = args.checkpoint;
+    let snap_num_irq = snap.num_irq;
+    let ckpt_dir = dir.clone();
+    let mem_mappings_thread = mem_mappings;
 
     let vm_ops_thread = vm_ops.clone();
     let running_thread = running.clone();
     let outcome_thread = outcome.clone();
+    let resume_thread = resume_state.clone();
     let vcpu_thread = thread::Builder::new()
         .name("chm-usgic-vcpu0".into())
         .spawn(move || {
@@ -1460,15 +1517,23 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
                     return;
                 }
             };
-            let mut uvm: UsgicVm =
-                match rehydrate_usgic(hv.as_ref(), &snap, &mem_ranges, &vm_ops_thread) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = setup_tx.send(Err(format!("rehydrate_usgic: {e}")));
-                        return;
-                    }
-                };
+            let mut uvm: UsgicVm = match rehydrate_usgic(
+                hv.as_ref(),
+                &snap,
+                &mem_ranges,
+                &vm_ops_thread,
+                resume_thread.as_deref(),
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    let _ = setup_tx.send(Err(format!("rehydrate_usgic: {e}")));
+                    return;
+                }
+            };
             let guest_mem = uvm.guest_mem.clone();
+            // A second handle the vCPU thread keeps for its own suspend RAM dump
+            // (the first is handed to the orchestrator for the virtio wiring).
+            let guest_mem_capture = uvm.guest_mem.clone();
             let vcpu = uvm.vcpus[0].as_mut();
             let queue = match vcpu.usgic_inject_queue() {
                 Some(q) => q,
@@ -1514,6 +1579,40 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
                     }
                 }
             }
+
+            // Suspend capture: only on a clean EXTERNAL stop (the orchestrator
+            // cleared `running`; the guest did not power off or error, so
+            // `outcome` is still None). A finished/errored box must cold-boot
+            // next time, so we capture nothing.
+            let outcome_is_none = outcome_thread.lock().unwrap().is_none();
+            let captured: Option<Result<(), String>> = if want_capture && outcome_is_none {
+                match hvf_checkpoint::capture_usgic_vcpu(&mut uvm.vcpus[0]) {
+                    Ok((vcpu_cp, usgic_cp)) => {
+                        let state = CheckpointState {
+                            version: hvf_checkpoint::CHECKPOINT_VERSION,
+                            vcpus: vec![vcpu_cp],
+                            gic_dist: Vec::new(),
+                            num_irq: snap_num_irq,
+                            usgic: Some(usgic_cp),
+                        };
+                        // Dump RAM + write the checkpoint HERE, while `uvm` (and
+                        // thus the COW guest-RAM mmap `guest_mem` points into) is
+                        // still alive. Doing it after `uvm` drops would read
+                        // unmapped memory. `guest_mem` was cloned at setup.
+                        Some(checkpoint::write_checkpoint(
+                            &ckpt_dir,
+                            &state,
+                            &guest_mem_capture,
+                            &mem_mappings_thread,
+                            "connect",
+                        ))
+                    }
+                    Err(e) => Some(Err(format!("capture: {e}"))),
+                }
+            } else {
+                None
+            };
+            let _ = capture_tx.send(captured);
             // `uvm` (and its vCPU + VM) drops here, on the owning thread.
         })
         .map_err(|e| format!("spawn userspace-GIC vCPU thread: {e}"))?;
@@ -1612,6 +1711,10 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
     if let Some(h) = net_service {
         let _ = h.join();
     }
+    // Receive the vCPU thread's suspend outcome (it captures + writes the
+    // checkpoint on its own thread — where the guest RAM is still mapped — then
+    // sends the result). `None` = nothing captured (power-off/error).
+    let capture_result = capture_rx.recv().unwrap_or(None);
     let _ = vcpu_thread.join();
     drop(raw_console);
 
@@ -1621,6 +1724,28 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
         Some(Err(e)) => return Err(e),
         None => coordinator.unwrap_or(Outcome::Interrupted),
     };
+
+    // Suspend/resume bookkeeping: the vCPU thread already wrote the checkpoint on
+    // a clean external stop; here we just report + keep the checkpoint consistent.
+    // Nothing captured (power-off/error) means the box is finished, so clear any
+    // stale checkpoint to force a cold rehydrate next time.
+    if args.checkpoint {
+        match capture_result {
+            Some(Ok(())) => {
+                if !args.quiet {
+                    eprintln!(
+                        "\nchm: suspended — userspace-GIC checkpoint saved (resume to continue)."
+                    );
+                }
+            }
+            Some(Err(e)) => {
+                eprintln!("chm: warning: could not write checkpoint: {e}");
+                checkpoint::clear_checkpoint(dir);
+            }
+            None => checkpoint::clear_checkpoint(dir),
+        }
+    }
+
     if !args.quiet {
         match &final_outcome {
             Outcome::PoweredOff => eprintln!("\nchm: guest powered off."),
@@ -2335,6 +2460,7 @@ fn collect_checkpoint(
         vcpus,
         gic_dist,
         num_irq,
+        usgic: None,
     })
 }
 

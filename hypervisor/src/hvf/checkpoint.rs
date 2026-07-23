@@ -70,6 +70,30 @@ pub struct CheckpointState {
     /// Interrupt-line width the GIC was built with (carried from the parent
     /// snapshot so the distributor offset walk matches on resume).
     pub num_irq: u32,
+    /// Userspace-GIC live state, when this checkpoint was taken on the software
+    /// GICv3 path (M-USGIC). `None` on the managed-GIC path, where `gic_dist` +
+    /// the per-vCPU `rdist` carry the interrupt state instead. Kept `#[serde(
+    /// default)]` so a managed checkpoint (which never emits it) still
+    /// deserializes, and an older reader ignores it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usgic: Option<UsgicCheckpoint>,
+}
+
+/// The live software-GIC state for one userspace-GIC vCPU (M-USGIC). The managed
+/// path reads its GIC state back through `hv_gic_*`; the software path instead
+/// owns the whole GICv3 model in userspace, so a checkpoint serializes those
+/// models directly — losslessly, unlike round-tripping through the MMIO register
+/// read view (which cannot observe write-only/derived fields like ICFGR).
+#[derive(Clone, Serialize, Deserialize)]
+pub struct UsgicCheckpoint {
+    /// The VM-global distributor model (SPI enable/priority/group/config/route).
+    pub dist: super::softgic::Distributor,
+    /// This vCPU's redistributor model (SGI/PPI frame + LPI control registers).
+    pub redist: super::softgic::Redistributor,
+    /// INTIDs pending delivery at capture (drained FIFO on resume).
+    pub pending: Vec<u32>,
+    /// The INTID acknowledged but not yet EOId at capture, if any.
+    pub active: Option<u32>,
 }
 
 impl CheckpointState {
@@ -96,6 +120,24 @@ pub fn capture_vcpu(vcpu: &mut Box<dyn Vcpu>) -> anyhow::Result<VcpuCheckpoint> 
     concrete
         .capture_checkpoint()
         .map_err(|e| anyhow!("capture vCPU: {e}"))
+}
+
+/// Capture a userspace-GIC vCPU: its register file (with `CNTVCT_EL0` and the
+/// software CPU-interface bookkeeping folded into `gic_icc`) plus the software
+/// distributor/redistributor models and in-flight interrupt state. Unlike
+/// [`capture_vcpu`], this does NOT read a managed redistributor (there is none),
+/// so it works on the GIC-less software path. MUST run on the vCPU's owning host
+/// thread.
+pub fn capture_usgic_vcpu(
+    vcpu: &mut Box<dyn Vcpu>,
+) -> anyhow::Result<(VcpuCheckpoint, UsgicCheckpoint)> {
+    let concrete = vcpu
+        .as_any_concrete_mut()
+        .downcast_mut::<HvfVcpu>()
+        .ok_or_else(|| anyhow!("vCPU is not an HVF vCPU"))?;
+    concrete
+        .capture_usgic_checkpoint()
+        .map_err(|e| anyhow!("capture userspace-GIC vCPU: {e}"))
 }
 
 /// Capture the global GIC distributor. Safe to call from the orchestrator thread
@@ -139,6 +181,7 @@ pub fn capture_all(
         vcpus: out,
         gic_dist,
         num_irq,
+        usgic: None,
     })
 }
 
@@ -239,6 +282,7 @@ mod tests {
             }],
             gic_dist: vec![(0x0100, 0x1), (0x6000, 0x8000_0000)],
             num_irq: 64,
+            usgic: None,
         };
         let json = serde_json::to_string(&cp).unwrap();
         let back: CheckpointState = serde_json::from_str(&json).unwrap();
@@ -248,5 +292,67 @@ mod tests {
         assert_eq!(back.vcpus[0].rdist, vec![(0x10100, 0xffff), (0x10400, 0xa0a0_a0a0)]);
         assert_eq!(back.gic_dist, vec![(0x0100, 0x1), (0x6000, 0x8000_0000)]);
         assert_eq!(back.reference_cntvct(), Some(99));
+        assert!(back.usgic.is_none());
+    }
+
+    #[test]
+    fn usgic_checkpoint_round_trips_losslessly_through_json() {
+        // Program some non-default software-GIC state through the MMIO write
+        // path, capture it into a UsgicCheckpoint, JSON round-trip, and confirm
+        // the model reads back identically — the lossless capture the resume
+        // path depends on (the MMIO read view alone cannot observe every field).
+        let mut dist = super::super::softgic::Distributor::new(64);
+        dist.write(0x0000, 0b11); // GICD_CTLR group enables
+        dist.write(0x0100, 0x0000_0002); // ISENABLER0: enable INTID 33 (SPI 1)
+        dist.write(0x0104, 0x0000_0001); // ISENABLER1: enable INTID 32? (bit 0 of reg 1 => INTID 32)
+        let mut redist = super::super::softgic::Redistributor::new();
+        redist.write(0x0000, 0x1); // GICR_CTLR.EnableLPIs
+        redist.write(super::super::softgic::GICR_SGI_OFFSET + 0x0100, 1 << 27); // enable PPI 27
+
+        let usgic = UsgicCheckpoint {
+            dist: dist.clone(),
+            redist: redist.clone(),
+            pending: vec![43, 27],
+            active: Some(43),
+        };
+        let cp = CheckpointState {
+            version: CHECKPOINT_VERSION,
+            vcpus: vec![VcpuCheckpoint {
+                state: VcpuHvfState::default(),
+                rdist: Vec::new(),
+            }],
+            gic_dist: Vec::new(),
+            num_irq: 64,
+            usgic: Some(usgic),
+        };
+        let json = serde_json::to_string(&cp).unwrap();
+        let back: CheckpointState = serde_json::from_str(&json).unwrap();
+        let u = back.usgic.expect("usgic state present");
+        assert_eq!(u.pending, vec![43, 27]);
+        assert_eq!(u.active, Some(43));
+        // The distributor/redistributor models survive byte-for-byte: compare via
+        // the MMIO read view at the programmed registers.
+        assert_eq!(u.dist.read(0x0100), dist.read(0x0100), "ISENABLER0 preserved");
+        assert_eq!(u.dist.read(0x0104), dist.read(0x0104), "ISENABLER1 preserved");
+        assert!(u.redist.lpis_enabled(), "GICR_CTLR.EnableLPIs preserved");
+        assert!(u.redist.is_ppi_enabled(27), "PPI 27 enable preserved");
+    }
+
+    #[test]
+    fn managed_checkpoint_json_without_usgic_field_deserializes() {
+        // Back-compat: a checkpoint written before the `usgic` field existed (the
+        // managed path never emits it) must still deserialize, with usgic = None.
+        let legacy = r#"{"version":1,"vcpus":[],"gic_dist":[],"num_irq":64}"#;
+        let cp: CheckpointState = serde_json::from_str(legacy).unwrap();
+        assert_eq!(cp.num_irq, 64);
+        assert!(cp.usgic.is_none());
+        // And a managed capture omits the field entirely (skip_serializing_if).
+        let managed = CheckpointState {
+            version: CHECKPOINT_VERSION,
+            num_irq: 64,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&managed).unwrap();
+        assert!(!json.contains("usgic"), "managed checkpoint must not emit usgic: {json}");
     }
 }

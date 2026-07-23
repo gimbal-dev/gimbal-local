@@ -1350,6 +1350,60 @@ impl HvfVcpu {
         Ok(crate::hvf::checkpoint::VcpuCheckpoint { state, rdist })
     }
 
+    /// Capture this vCPU's live state for a **userspace-GIC** checkpoint: the
+    /// architectural register file (plus a fresh `CNTVCT_EL0`), the software
+    /// CPU-interface bookkeeping folded into `gic_icc` so the resume's
+    /// [`Self::usgic_seed_icc`] re-seeds it, and the software distributor /
+    /// redistributor models with the in-flight interrupt set. No managed
+    /// redistributor is read (there is none on this path). Owning-thread only.
+    pub fn capture_usgic_checkpoint(
+        &self,
+    ) -> CpuResult<(
+        crate::hvf::checkpoint::VcpuCheckpoint,
+        crate::hvf::checkpoint::UsgicCheckpoint,
+    )> {
+        let CpuState::Hvf(mut state) = <Self as Vcpu>::state(self)?;
+        state
+            .sysregs
+            .push((SYSREG_CNTVCT_EL0, self.current_cntvct()));
+        let g = self.usgic.lock().unwrap();
+        // On the software path `state()` records no managed ICC (there is none);
+        // fold in the values we track so resume restores the CPU-interface view.
+        state.gic_icc = vec![
+            (crate::hvf::ffi::GIC_ICC_PMR_EL1, g.pmr),
+            (crate::hvf::ffi::GIC_ICC_BPR1_EL1, g.bpr1),
+            (crate::hvf::ffi::GIC_ICC_CTLR_EL1, g.ctlr),
+            (crate::hvf::ffi::GIC_ICC_SRE_EL1, g.sre),
+            (crate::hvf::ffi::GIC_ICC_IGRPEN1_EL1, g.igrpen1),
+        ];
+        let usgic = crate::hvf::checkpoint::UsgicCheckpoint {
+            dist: g.dist.clone(),
+            redist: g.redist.clone(),
+            pending: g.pending.clone(),
+            active: g.active,
+        };
+        Ok((
+            crate::hvf::checkpoint::VcpuCheckpoint {
+                state,
+                rdist: Vec::new(),
+            },
+            usgic,
+        ))
+    }
+
+    /// Restore a captured software-GIC state onto this vCPU's userspace GIC,
+    /// overwriting the distributor/redistributor models and the in-flight
+    /// interrupt set while leaving `enabled` and the MMIO bases (set by
+    /// [`Self::usgic_set_gic_bases`]) intact. Applied on resume after the bases
+    /// are wired, in place of the cold [`Self::usgic_seed_gic`].
+    pub fn usgic_restore_softgic(&self, cp: &crate::hvf::checkpoint::UsgicCheckpoint) {
+        let mut g = self.usgic.lock().unwrap();
+        g.dist = cp.dist.clone();
+        g.redist = cp.redist.clone();
+        g.pending = cp.pending.clone();
+        g.active = cp.active;
+    }
+
     /// Service a stage-2 data abort (MMIO) by decoding ESR and calling VmOps.
     fn handle_data_abort(&self, esr: u64, ipa: u64) -> CpuResult<()> {
         let iss = esr & 0x01ff_ffff;

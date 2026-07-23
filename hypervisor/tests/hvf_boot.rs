@@ -2173,7 +2173,7 @@ fn hvf_rehydrate_stock_its_snapshot_usgic_executes() {
         let hv = hypervisor::new().expect("hypervisor::new() — codesigned?");
         // Rehydrate onto the userspace GIC (no managed GIC) — the thing the
         // shipping managed path cannot do for an ITS/LPI snapshot.
-        let mut uvm = rehydrate_usgic(hv.as_ref(), &snap, &mem_ranges, &vm_ops)
+        let mut uvm = rehydrate_usgic(hv.as_ref(), &snap, &mem_ranges, &vm_ops, None)
             .expect("rehydrate_usgic the stock ITS snapshot");
         eprintln!("rehydrated {} vCPU(s) onto the userspace GIC", uvm.vcpus.len());
         let vcpu = uvm.vcpus[0].as_mut();
@@ -2309,7 +2309,7 @@ fn hvf_rehydrate_stock_its_snapshot_usgic_interactive_shell() {
         bus.add(PL011_BASE, PL011_SIZE, uart.clone());
         let vm_ops: Arc<dyn VmOps> = Arc::new(bus);
         let hv = hypervisor::new().expect("hypervisor::new() — codesigned?");
-        let mut uvm = rehydrate_usgic(hv.as_ref(), &snap, &mem_ranges, &vm_ops)
+        let mut uvm = rehydrate_usgic(hv.as_ref(), &snap, &mem_ranges, &vm_ops, None)
             .expect("rehydrate_usgic the stock ITS snapshot");
         let vcpu = uvm.vcpus[0].as_mut();
 

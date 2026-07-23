@@ -687,6 +687,7 @@ pub fn rehydrate_usgic(
     snap: &Snapshot,
     memory_ranges: &Path,
     vm_ops: &Arc<dyn VmOps>,
+    resume: Option<&crate::hvf::checkpoint::CheckpointState>,
 ) -> Result<UsgicVm, RehydrateError> {
     let timing = std::env::var_os("CHM_TRACE_TIMING").is_some();
     let t_start = std::time::Instant::now();
@@ -742,17 +743,36 @@ pub fn rehydrate_usgic(
             concrete.set_usgic_enabled(true);
             // set_gic_bases (re)creates the distributor, so seed AFTER it.
             concrete.usgic_set_gic_bases(gicd_base, gicr_base, snap.num_irq);
-            concrete.usgic_seed_gic(&dist_pairs, &redist_pairs);
+            match resume.and_then(|cp| cp.usgic.as_ref()) {
+                // Resume: restore the live software-GIC models captured at
+                // suspend (SPI/PPI config the guest may have reprogrammed since
+                // the parent snapshot, plus any in-flight interrupt), overriding
+                // the cold seed.
+                Some(usgic_cp) => concrete.usgic_restore_softgic(usgic_cp),
+                // Cold: seed from the parent snapshot's captured KVM GIC state.
+                None => concrete.usgic_seed_gic(&dist_pairs, &redist_pairs),
+            }
         }
 
-        // Restore the register file. Because usgic is enabled, set_state seeds the
-        // captured ICC bookkeeping into `usgic` instead of a (nonexistent) managed
-        // GIC.
-        vcpu.set_state(&CpuState::Hvf(snap.vcpus[id].clone()))
+        // Restore the register file. On resume this is the checkpoint's captured
+        // vCPU state; cold it is the parent snapshot's. Because usgic is enabled,
+        // set_state seeds the captured ICC bookkeeping into `usgic` instead of a
+        // (nonexistent) managed GIC.
+        let vcpu_state = match resume {
+            Some(cp) => &cp.vcpus[id].state,
+            None => &snap.vcpus[id],
+        };
+        vcpu.set_state(&CpuState::Hvf(vcpu_state.clone()))
             .map_err(|e| RehydrateError::Hv(anyhow!("restore vCPU {id} state: {e}")))?;
 
         // One shared virtual-counter reference across cores (no-op for 1 vCPU).
-        if let Some(reference) = snap.reference_cntvct() {
+        // On resume the reference is the checkpoint's captured CNTVCT so the
+        // guest's virtual clock stays continuous across the suspend.
+        let reference_cntvct = match resume {
+            Some(cp) => cp.reference_cntvct(),
+            None => snap.reference_cntvct(),
+        };
+        if let Some(reference) = reference_cntvct {
             let concrete = vcpu
                 .as_any_concrete_mut()
                 .downcast_mut::<HvfVcpu>()

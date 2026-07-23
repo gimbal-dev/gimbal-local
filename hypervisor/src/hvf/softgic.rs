@@ -26,8 +26,10 @@ pub const SPI_BASE: u32 = 32;
 /// Highest architected SPI INTID + 1 we model (1020; 1020..1023 are special).
 pub const INTID_LIMIT: u32 = 1020;
 
+use serde::{Deserialize, Serialize};
+
 /// The GICv3 distributor (GICD): VM-global SPI configuration + routing.
-#[derive(Clone)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct Distributor {
     /// GICD_CTLR (group enables + ARE). Stored; ARE_NS is forced on for GICv3.
     ctlr: u32,
@@ -301,7 +303,7 @@ impl Default for Distributor {
 /// control registers. Enough state so a guest can enable LPIs and program its
 /// PPIs (e.g. the virtual timer PPI 27) without faulting, and so we can honour
 /// `GICR_CTLR.EnableLPIs` when deciding whether an LPI is deliverable.
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Serialize, Deserialize)]
 pub struct Redistributor {
     /// GICR_CTLR (bit0 = EnableLPIs).
     ctlr: u32,
