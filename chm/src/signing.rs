@@ -31,6 +31,7 @@
 //! digests already used across the bundle format.
 
 use std::collections::BTreeMap;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -43,6 +44,30 @@ use serde::{Deserialize, Serialize};
 pub const SIG_ALG: &str = "ed25519";
 /// Ed25519 public keys are 32 bytes.
 const ED25519_PUBLIC_KEY_LEN: usize = 32;
+
+/// The environment switch that turns on the fail-closed signing posture.
+pub const REQUIRE_SIGNED_ENV: &str = "CHM_REQUIRE_SIGNED";
+
+/// Whether the operator demands **fail-closed** authenticity enforcement on the
+/// control-plane ingest path (M31.5). Setting [`REQUIRE_SIGNED_ENV`] flips two
+/// defaults from advisory to mandatory:
+///
+///  1. **Signature is required.** A bundle that cannot be authenticated — no
+///     trust root configured, or an unsigned / invalid manifest — is refused
+///     rather than accepted unsigned.
+///  2. **The policy-digest recompute is enforced.** A governed sandbox whose
+///     policy document does not independently re-hash to its stated digest is
+///     refused rather than merely logged.
+///
+/// Default (unset) preserves back-compat during the gctl signing rollout (#36):
+/// unsigned bundles are still accepted, and a recompute drift is advisory. This
+/// posture governs the **plane** paths only — a local `chm run <dir>` rehydrating
+/// a stock snapshot never routes through it, so the rehydration dream is
+/// unaffected. Presence-based to match the other `CHM_*` switches: any value
+/// (e.g. `CHM_REQUIRE_SIGNED=1`) enables it; unset it to disable.
+pub fn require_signed_posture() -> bool {
+    env::var_os(REQUIRE_SIGNED_ENV).is_some()
+}
 
 /// Lowercase-hex encode a byte slice.
 pub fn to_hex(bytes: &[u8]) -> String {

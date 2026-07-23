@@ -33,7 +33,7 @@ use serde_json::{Value, json};
 
 use crate::audit;
 use crate::policy;
-use crate::signing::{DetachedSignature, TrustStore};
+use crate::signing::{self, DetachedSignature, TrustStore};
 
 /// Default control-plane base URL (overridable via `GCTL_API`).
 const DEFAULT_API: &str = "http://127.0.0.1:8080";
@@ -844,7 +844,7 @@ fn run_assignment(cp: &ControlPlane, runner_id: &str, opts: &RunOpts) -> Result<
     // present-but-unverifiable policy is fatal (we must not run a governed
     // sandbox ungoverned); an unbound sandbox is unaffected. Egress is not yet
     // enforced on the datapath — that is M28.2/M28.3.
-    match policy::parse_and_verify(&assign) {
+    match policy::parse_and_verify(&assign, signing::require_signed_posture()) {
         Ok(Some(governed)) => {
             eprintln!("chm runner: {}", governed.summary());
             // Hand the egress profile down to the `chm run` subprocess (which
@@ -1183,8 +1183,10 @@ fn cmd_policy_show(raw: &[String]) -> Result<(), String> {
         return Ok(());
     }
     // The effective-policy response carries the same fields an assignment does
-    // (policy, policy_digest, enforcement), so reuse the teleport verifier.
-    match policy::parse_and_verify(&effective)? {
+    // (policy, policy_digest, enforcement), so reuse the teleport verifier. This
+    // is a read-only diagnostic (`chm policy show`), so it stays advisory
+    // (strict=false) and simply surfaces `digest_verified` rather than refusing.
+    match policy::parse_and_verify(&effective, false)? {
         Some(governed) => {
             if as_json {
                 println!(
@@ -1851,18 +1853,38 @@ fn resolve_trust_store() -> Result<Option<TrustStore>, String> {
 /// the *signed* manifest's `checksum_tree` is used — so a tampered bundle whose
 /// loose `manifest.checksum_tree` was recomputed cannot be trusted. A missing or
 /// invalid signature **fails closed**. Without a trust root, the unsigned
-/// `manifest.checksum_tree` is used so existing (pre-signing) flows keep working.
+/// `manifest.checksum_tree` is used so existing (pre-signing) flows keep working
+/// — unless the fail-closed posture (`CHM_REQUIRE_SIGNED`, M31.5) is set, which
+/// refuses any bundle that cannot be authenticated.
 fn trusted_checksum_tree(assign: &Value) -> Result<(BTreeMap<String, String>, String), String> {
-    authenticate_checksum_tree(assign, resolve_trust_store()?)
+    authenticate_checksum_tree(
+        assign,
+        resolve_trust_store()?,
+        signing::require_signed_posture(),
+    )
 }
 
-/// The authenticity gate proper, with the trust store passed in (so it is
-/// testable without touching process env). See [`trusted_checksum_tree`].
+/// The authenticity gate proper, with the trust store + fail-closed posture
+/// passed in (so it is testable without touching process env). See
+/// [`trusted_checksum_tree`].
+///
+/// `require_signed` is the M31.5 fail-closed posture: when set, an
+/// unauthenticatable bundle (no trust root, or an unsigned/invalid manifest) is
+/// refused instead of accepted unsigned.
 fn authenticate_checksum_tree(
     assign: &Value,
     trust: Option<TrustStore>,
+    require_signed: bool,
 ) -> Result<(BTreeMap<String, String>, String), String> {
     let Some(store) = trust else {
+        if require_signed {
+            return Err(format!(
+                "{} is set (fail-closed signing posture) but no trust root is \
+                 configured (CHM_TRUST_STORE) — a bundle cannot be authenticated; \
+                 refusing to run (fail closed)",
+                signing::REQUIRE_SIGNED_ENV
+            ));
+        }
         return Ok((
             parse_checksum_tree(assign)?,
             "unsigned (no trust root configured)".to_string(),
@@ -2220,9 +2242,38 @@ mod tests {
         let assign = json!({
             "manifest": { "checksum_tree": { "state.json": "abc" } }
         });
-        let (tree, note) = authenticate_checksum_tree(&assign, None).unwrap();
+        let (tree, note) = authenticate_checksum_tree(&assign, None, false).unwrap();
         assert_eq!(tree.get("state.json").map(String::as_str), Some("abc"));
         assert!(note.contains("unsigned"), "note: {note}");
+    }
+
+    #[test]
+    fn strict_posture_refuses_an_unsigned_bundle_with_no_trust_root() {
+        // M31.5 fail-closed default: CHM_REQUIRE_SIGNED set but nothing can verify
+        // the bundle => refuse rather than accept it unsigned.
+        let assign = json!({
+            "manifest": { "checksum_tree": { "state.json": "abc" } }
+        });
+        let err = authenticate_checksum_tree(&assign, None, true).unwrap_err();
+        assert!(err.contains("fail closed"), "must fail closed, got: {err}");
+        assert!(err.contains("CHM_REQUIRE_SIGNED"), "names the posture, got: {err}");
+    }
+
+    #[test]
+    fn strict_posture_still_verifies_a_properly_signed_bundle() {
+        // The fail-closed posture must not break a correctly signed bundle.
+        let (pkcs8, pub_hex) = crate::signing::generate_keypair().unwrap();
+        let mut store = TrustStore::default();
+        store.insert_hex("gctl-2026", &pub_hex);
+        let canonical = r#"{"version":1,"checksum_tree":{"state.json":"deadbeef"}}"#;
+        let sig = crate::signing::sign(&pkcs8, "gctl-2026", canonical.as_bytes()).unwrap();
+        let assign = json!({
+            "manifest_canonical": canonical,
+            "manifest_signature": { "alg": sig.alg, "key_id": sig.key_id, "sig": sig.sig },
+        });
+        let (tree, note) = authenticate_checksum_tree(&assign, Some(store), true).unwrap();
+        assert_eq!(tree.get("state.json").map(String::as_str), Some("deadbeef"));
+        assert!(note.contains("verified"), "note: {note}");
     }
 
     #[test]
@@ -2234,7 +2285,7 @@ mod tests {
         let assign = json!({
             "manifest": { "checksum_tree": { "state.json": "abc" } }
         });
-        let err = authenticate_checksum_tree(&assign, Some(store)).unwrap_err();
+        let err = authenticate_checksum_tree(&assign, Some(store), false).unwrap_err();
         assert!(err.contains("fail closed"), "must fail closed, got: {err}");
     }
 
@@ -2254,7 +2305,7 @@ mod tests {
             "manifest_canonical": canonical,
             "manifest_signature": { "alg": sig.alg, "key_id": sig.key_id, "sig": sig.sig },
         });
-        let (tree, note) = authenticate_checksum_tree(&assign, Some(store)).unwrap();
+        let (tree, note) = authenticate_checksum_tree(&assign, Some(store), false).unwrap();
         assert_eq!(
             tree.get("state.json").map(String::as_str),
             Some("deadbeef"),
@@ -2277,7 +2328,7 @@ mod tests {
             "manifest_canonical": tampered,
             "manifest_signature": { "alg": sig.alg, "key_id": sig.key_id, "sig": sig.sig },
         });
-        authenticate_checksum_tree(&assign, Some(store))
+        authenticate_checksum_tree(&assign, Some(store), false)
             .expect_err("a tampered signed manifest must be rejected");
     }
 
