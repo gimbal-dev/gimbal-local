@@ -842,6 +842,7 @@ fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Resu
         None,
         &net_limits,
         allow_local_egress,
+        None,
     ) {
         eprintln!("chm serve: warning: virtio device model not wired: {e}");
     }
