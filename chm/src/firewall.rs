@@ -233,12 +233,20 @@ fn set(raw: &[String]) -> Result<(), String> {
         deny,
         label: label.or_else(|| Some("local".to_string())),
     };
-    doc.validate()?;
-
-    let path = policy_path(&dir);
-    fs::write(&path, doc.to_json()).map_err(|e| format!("write {}: {e}", path.display()))?;
+    let path = write_policy_doc(&dir, &doc)?;
     println!("wrote {} — {}", path.display(), doc.summary());
     Ok(())
+}
+
+/// Validate `doc` and write it as `<dir>/egress-policy.json`, returning the path.
+/// Shared by `chm firewall set` (local authoring) and `chm policy bind` (bringing
+/// a control-plane policy down), so both land byte-identical documents that the
+/// same enforcement seam consumes.
+pub(crate) fn write_policy_doc(dir: &Path, doc: &EgressPolicyDoc) -> Result<PathBuf, String> {
+    doc.validate()?;
+    let path = policy_path(dir);
+    fs::write(&path, doc.to_json()).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(path)
 }
 
 /// `chm firewall clear <WORKSPACE_DIR>` — remove the policy file so the sandbox
