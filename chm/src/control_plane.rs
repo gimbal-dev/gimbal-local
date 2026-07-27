@@ -32,6 +32,7 @@ use std::{env, thread};
 use serde_json::{Value, json};
 
 use crate::audit;
+use crate::firewall;
 use crate::policy;
 use crate::signing::{self, DetachedSignature, TrustStore};
 
@@ -1125,6 +1126,116 @@ pub fn push_main(raw: &[String]) -> ExitCode {
 /// `chm policy show --sandbox ID [--substrate S] [--json]` — fetch a sandbox's
 /// effective policy from the plane, verify the digest, and print the governed
 /// summary. The read-only operator view of Pillar ③ governance (M28.1).
+/// Compile a verified control-plane profile into the local egress document.
+///
+/// The digest becomes the document's label, which is what threads through to
+/// [`crate::firewall`]'s enforcement seam and out to the audit trail, so a local
+/// denial is attributable to the exact policy the plane issued.
+fn egress_doc_from_profile(
+    profile: &policy::ChmProfile,
+    digest: &str,
+) -> firewall::EgressPolicyDoc {
+    firewall::EgressPolicyDoc {
+        // An absent default is "allow" in the plane's schema; spell it out so the
+        // local document is never ambiguous about its posture.
+        default: if profile.egress.default.is_empty() {
+            "allow".to_string()
+        } else {
+            profile.egress.default.clone()
+        },
+        allow: profile.egress.allow.clone(),
+        deny: profile.egress.deny.clone(),
+        label: Some(digest.to_string()),
+    }
+}
+
+/// `chm policy bind --sandbox ID <WORKSPACE_DIR>` — bring a control-plane-bound
+/// policy DOWN so it governs a local sandbox. This is the policy half of the
+/// bring-down story: the plane authors a policy for a cloud sandbox, and the
+/// same policy — identified by the same digest — enforces on the Mac.
+///
+/// It fetches the sandbox's effective policy, verifies the digest teleported
+/// intact through the exact same [`policy::parse_and_verify`] path the runner
+/// uses for a cloud assignment, and writes the compiled egress profile into the
+/// workspace's `egress-policy.json` labelled with that digest. Any subsequent
+/// `chm run` / `resume` / `connect` / `serve` on that workspace then enforces it
+/// through the userspace NAT, and every denial is audited under the cloud's
+/// digest — so a refusal on the Mac is provably attributable to the policy the
+/// control plane issued.
+///
+/// Refuses to write anything if the policy cannot be authenticated: binding a
+/// policy is an enforcement action, so an unverifiable one must not be applied.
+fn cmd_policy_bind(raw: &[String]) -> Result<(), String> {
+    let mut api = None;
+    let mut sandbox = None;
+    let mut substrate = "apple-hvf".to_string();
+    let mut dir: Option<PathBuf> = None;
+    let mut i = 0;
+    while i < raw.len() {
+        match raw[i].as_str() {
+            "--api" => api = Some(take_value(raw, &mut i, "--api")?),
+            "--sandbox" => sandbox = Some(take_value(raw, &mut i, "--sandbox")?),
+            "--substrate" => substrate = take_value(raw, &mut i, "--substrate")?,
+            "--workspace" => dir = Some(PathBuf::from(take_value(
+                raw,
+                &mut i,
+                "--workspace",
+            )?)),
+            other if other.starts_with('-') => return Err(format!("unknown flag `{other}`")),
+            other => {
+                if dir.is_some() {
+                    return Err(format!("unexpected extra argument `{other}`"));
+                }
+                dir = Some(PathBuf::from(other));
+            }
+        }
+        i += 1;
+    }
+    let sandbox = sandbox.ok_or("--sandbox ID is required")?;
+    let dir = dir.ok_or("usage: chm policy bind --sandbox ID <WORKSPACE_DIR>")?;
+    if !dir.is_dir() {
+        return Err(format!("{} is not a directory", dir.display()));
+    }
+
+    let cp = ControlPlane::from_env_or(api);
+    let effective = cp.effective_policy(&sandbox, &substrate)?;
+    if !effective.get("restricted").and_then(Value::as_bool).unwrap_or(false) {
+        return Err(format!(
+            "sandbox {sandbox} is unrestricted (no policy bound on the plane); \
+             nothing to enforce locally"
+        ));
+    }
+    // Strict follows the same fail-closed posture the runner uses, so a locally
+    // bound policy is held to exactly the standard a cloud assignment is.
+    let governed = policy::parse_and_verify(&effective, signing::require_signed_posture())?
+        .ok_or("the plane reported a restricted sandbox but returned no enforcement profile")?;
+
+    let doc = egress_doc_from_profile(&governed.profile, &governed.digest);
+    let path = firewall::write_policy_doc(&dir, &doc)?;
+
+    println!("chm policy bind: {}", governed.summary());
+    println!(
+        "  wrote {} — the same digest now governs this local sandbox",
+        path.display()
+    );
+    if !governed.profile.fs.ro.is_empty() || !governed.profile.fs.rw.is_empty() {
+        println!(
+            "  note: fs scopes ({} ro / {} rw) are surfaced but not locally enforced \
+             — chm has no host-FS passthrough, so the guest cannot reach host paths at all",
+            governed.profile.fs.ro.len(),
+            governed.profile.fs.rw.len()
+        );
+    }
+    let mounts = governed.requested_mounts();
+    if !mounts.is_empty() {
+        println!(
+            "  note: {} requested host mount(s) are REFUSED (no host-FS passthrough)",
+            mounts.len()
+        );
+    }
+    Ok(())
+}
+
 pub fn policy_main(raw: &[String]) -> ExitCode {
     match raw.first().map(String::as_str) {
         Some("show") => match cmd_policy_show(&raw[1..]) {
@@ -1134,15 +1245,28 @@ pub fn policy_main(raw: &[String]) -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("bind") => match cmd_policy_bind(&raw[1..]) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("chm policy bind: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Some("-h") | Some("--help") | None => {
             print!(
                 "chm policy — inspect the control plane's per-sandbox governance\n\
                  \n\
                  USAGE:\n    \
-                     chm policy show --sandbox ID [--substrate apple-hvf] [--json] [--api URL]\n\
+                     chm policy show --sandbox ID [--substrate apple-hvf] [--json] [--api URL]\n    \
+                     chm policy bind --sandbox ID <WORKSPACE_DIR> [--substrate S] [--api URL]\n\
                  \n\
-                 Fetches the sandbox's effective policy, verifies the policy_digest,\n    \
-                 and prints the compiled egress/fs posture chm would enforce.\n"
+                 `show` fetches the sandbox's effective policy, verifies the policy_digest,\n\
+                 and prints the compiled egress/fs posture chm would enforce.\n\
+                 \n\
+                 `bind` brings that policy DOWN: it verifies the digest the same way the\n\
+                 runner does, then writes the workspace's egress-policy.json labelled with\n\
+                 that digest, so a local `chm run` enforces the plane's allow-list and every\n\
+                 denial is audited under the control plane's policy digest.\n"
             );
             ExitCode::SUCCESS
         }
@@ -2427,5 +2551,64 @@ mod tests {
         fs::write(dir.join("snapshot").join("memory-ranges"), &mem).unwrap();
         assert_eq!(read_flight_marker(&dir).unwrap().value, "from-ram-head");
         let _ = fs::remove_dir_all(&dir);
+    }
+}
+
+#[cfg(test)]
+mod policy_bind_tests {
+    use super::*;
+    use std::env::temp_dir;
+    use std::fs;
+    use std::process;
+
+    fn profile(default: &str, allow: &[&str], deny: &[&str]) -> policy::ChmProfile {
+        policy::ChmProfile {
+            egress: policy::ChmEgress {
+                default: default.to_string(),
+                allow: allow.iter().map(|s| s.to_string()).collect(),
+                deny: deny.iter().map(|s| s.to_string()).collect(),
+            },
+            ..Default::default()
+        }
+    }
+
+    /// The whole point of `bind`: the plane's digest becomes the local policy's
+    /// identity, so a denial on the Mac names the policy the cloud issued.
+    #[test]
+    fn bound_document_is_labelled_with_the_plane_digest() {
+        let digest = "sha256:f857c2f0a16e67106334b82660dc217b62b99c41fcda39481bfedead169bf44f";
+        let doc = egress_doc_from_profile(
+            &profile("deny", &["api.github.com:443"], &["169.254.169.254"]),
+            digest,
+        );
+        assert_eq!(doc.label.as_deref(), Some(digest));
+        assert_eq!(doc.default, "deny");
+        assert_eq!(doc.allow, vec!["api.github.com:443".to_string()]);
+        assert_eq!(doc.deny, vec!["169.254.169.254".to_string()]);
+    }
+
+    /// The plane omits `default` when it means "allow"; the local document must
+    /// spell the posture out rather than write an empty, ambiguous stance.
+    #[test]
+    fn absent_plane_default_is_written_as_allow() {
+        let doc = egress_doc_from_profile(&profile("", &[], &[]), "sha256:abc");
+        assert_eq!(doc.default, "allow");
+    }
+
+    /// A bound document has to survive the same validation `chm firewall set`
+    /// applies, or enforcement would reject it at run time instead of bind time.
+    #[test]
+    fn bound_document_passes_local_policy_validation() {
+        let dir = temp_dir().join(format!("chm-bind-test-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let doc = egress_doc_from_profile(
+            &profile("deny", &["api.github.com:443", "10.0.0.0/8:443"], &[]),
+            "sha256:abc",
+        );
+        let path = firewall::write_policy_doc(&dir, &doc)
+            .expect("a plane-authored profile must be a valid local policy");
+        let written = fs::read_to_string(&path).unwrap();
+        assert!(written.contains("sha256:abc"), "digest must be in the written doc");
+        fs::remove_dir_all(&dir).ok();
     }
 }

@@ -89,6 +89,12 @@ pub struct EgressEvent {
     pub allowed: bool,
     /// The policy rule that decided it.
     pub rule: String,
+    /// The label (digest) of the policy that governed this decision. Carried on
+    /// the event itself — rather than re-read at audit time — so the durable
+    /// record names the exact policy that made *this* call and cannot drift
+    /// from it. This is what proves a cloud-issued policy digest is the same
+    /// one enforcing the flow on the Mac.
+    pub policy: String,
 }
 
 /// The host-connection state of one accepted guest TCP flow.
@@ -224,11 +230,13 @@ impl NatResponder {
     fn admit_syn(&mut self, dst: SocketAddrV4) -> bool {
         let decision = self.policy.decide_connect(*dst.ip(), dst.port());
         let allowed = decision.is_allow();
+        let policy = self.policy.label().to_string();
         self.events.push(EgressEvent {
             domain: "tcp",
             target: dst.to_string(),
             allowed,
             rule: decision.rule().to_string(),
+            policy: policy.clone(),
         });
         if !allowed {
             self.note_denial("tcp", &dst.to_string(), decision.rule());
@@ -247,6 +255,7 @@ impl NatResponder {
                 target: dst.to_string(),
                 allowed: false,
                 rule: "connection-limit".to_string(),
+                policy,
             });
             self.note_denial("tcp", &dst.to_string(), "connection-limit");
             return false;
@@ -342,11 +351,13 @@ impl NatResponder {
         }
         let decision = self.policy.decide_dns(&query.name);
         let allowed = decision.is_allow();
+        let policy = self.policy.label().to_string();
         self.events.push(EgressEvent {
             domain: "dns",
             target: query.name.clone(),
             allowed,
             rule: decision.rule().to_string(),
+            policy: policy.clone(),
         });
         if !allowed {
             self.note_denial("dns", &query.name, decision.rule());
@@ -369,6 +380,7 @@ impl NatResponder {
                         target: query.name.clone(),
                         allowed: false,
                         rule: "reserved-address".to_string(),
+                        policy,
                     });
                     self.note_denial("dns", &query.name, "reserved-address");
                     return dns::Outcome::NoData;
@@ -809,8 +821,33 @@ mod tests {
     }
 
     #[test]
-    fn allowed_syn_arms_a_listener() {
-        let mut nat = NatResponder::new(
+    fn egress_events_name_the_governing_policy() {
+        // M28.4: the durable audit record must name the policy that actually
+        // made the call, so a denial on the Mac can be tied back to the exact
+        // digest the control plane issued. Both enforcement points (DNS resolve
+        // and TCP connect) must carry it.
+        let policy =
+            EgressPolicy::from_profile("deny", &["example.com".to_string()], &[], "sha256:cafe");
+        let mut nat =
+            NatResponder::new([192, 168, 249, 1], [0x02, 0, 0, 0, 0, 1], policy, NatLimits::default());
+        assert!(!nat.admit_syn(SocketAddrV4::new(Ipv4Addr::new(140, 82, 112, 6), 443)));
+        nat.resolve(&dns::Query {
+            id: 1,
+            recursion_desired: true,
+            name: "blocked.example.net".to_string(),
+            qtype: dns::QTYPE_A,
+            qclass: 1,
+        });
+        let events = nat.drain_events();
+        assert!(events.iter().any(|e| e.domain == "tcp" && !e.allowed));
+        assert!(events.iter().any(|e| e.domain == "dns" && !e.allowed));
+        for ev in &events {
+            assert_eq!(ev.policy, "sha256:cafe", "{} {} names the policy", ev.domain, ev.target);
+        }
+    }
+
+    #[test]
+    fn allowed_syn_arms_a_listener() {        let mut nat = NatResponder::new(
             [192, 168, 249, 1],
             [0x02, 0, 0, 0, 0, 1],
             EgressPolicy::allow_all(),

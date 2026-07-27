@@ -178,17 +178,33 @@ unlisted one is refused with a recorded denial. `chm` unit tests cover the
 plane's audit log (cross-process), and the live guest demo (needs a net-enabled
 snapshot).
 
-### M28.4 · The demo + provenance proof  **[the product acceptance]**
+### M28.4 · The demo + provenance proof  **[the product acceptance — SHIPPED]**
 
-Wire it end-to-end and make it demoable + tested:
+Both halves are wired end to end and proven on real hardware, scripted so they
+are repeatable rather than a one-off demo.
 
-- Bind the policy in the plane → pull sandbox N → guest reaches the allowed host,
-  is blocked from the rest, denials appear in the plane's audit/insights.
-- Prove the **teleport**: the *same* `policy_digest` that governed the cloud run
-  governs the Mac resume (surface it both sides).
-- A scripted `$0` local reproduction (like the e2e microvm loop) + docs.
+- **Allow-list enforcement** (`scripts/hvf/egress-allowlist-demo.sh`): a
+  default-deny policy with one allowed host. The allow-listed host returns
+  HTTP 200, a denied host is refused at the **DNS gate** (curl rc 6), and the
+  same host dialled by **literal IP** — bypassing DNS entirely — is refused at
+  the **TCP-connect gate** (curl rc 7). That third probe is what makes the claim
+  load-bearing: `chm` is the process that calls `connect()`, so a guest that
+  hardcodes an address still cannot get out.
+- **The teleport** (`scripts/hvf/policy-teleport-demo.sh`): `chm policy bind`
+  fetches a plane-bound policy, verifies the digest through the same
+  `parse_and_verify` path (and `CHM_REQUIRE_SIGNED` posture) the runner uses, and
+  writes the workspace policy **labelled with the plane's digest**. A local run is
+  then governed by the cloud's policy: its allow rule lets `api.github.com:443`
+  through, an un-allow-listed host is refused, and the plane's **explicit deny of
+  the cloud metadata service** (`169.254.169.254`) fires **by name** — proving the
+  specific cloud-authored rule travelled, not just the default-deny stance.
+- **Attribution**: the governing policy label rides on the egress event itself, so
+  it cannot drift from the decision that produced it. Every denial lands in the
+  durable audit trail as `policy=sha256:…` — the control plane's digest, named on
+  the Mac.
 
-*Acceptance:* the demo at the top of this doc runs green, reproducibly.
+*Acceptance:* both scripts run green, reproducibly, on a real rehydrated stock
+ITS snapshot. See the runbook in [`networking.md`](networking.md).
 
 ### M28.5 · Filesystem scopes  **[smaller, separate — modest by design — SHIPPED]**
 
