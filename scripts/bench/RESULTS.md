@@ -102,3 +102,94 @@ gimbal 1.02x Docker -- within run-to-run noise (stddev bands overlap).
 3. **Startup latency is the weak spot (#79).** ~5s warm resume beats Docker
    Sandbox's ~12.7s microVM create, but is still slow versus Firecracker-class
    (~200ms) cold boot, and gimbal has no cold boot-from-image path at all.
+
+---
+
+# I/O and network vs Docker Desktop (2026-07-28, Apple M3)
+
+The compute comparison above deliberately avoided disk and network, and named
+that as the more interesting stress. With networking shipped (#91) it became
+testable, so this is that run.
+
+Matched 1 vCPU / 1 GiB on both sides, median of five trials, inner command
+byte-identical across runners (`scripts/bench/workloads/commands.sh`).
+
+| Workload | Docker | gimbal before | gimbal after | after / Docker |
+| --- | --- | --- | --- | --- |
+| `fsyncsmall` — 200 x 4 KiB `O_DSYNC` | 0.120s | 6.23s | **0.175s** | 1.5x |
+| `diskwrite` — 256 MiB `conv=fsync` | 0.266s | 1.74s | **1.528s** | 5.7x |
+| `netget` — 64 MiB over HTTP | 0.155s | 1.93s | 1.982s | 12.8x |
+
+`fsyncsmall` improved 36x. The other two are characterised below rather than
+claimed as wins.
+
+## What was actually wrong
+
+**`fsync` was a hardware barrier.** Rust's `File::sync_data()` maps to
+`fcntl(F_FULLFSYNC)` on macOS, which asks the SSD to flush its write cache to
+physical media. A host micro-benchmark measured plain `fsync(2)` at 0.05ms
+against roughly 5ms for the barrier. We were paying that on every guest flush,
+and comparing ourselves against Docker Desktop and QEMU `cache=writeback`, which
+do not take it. Default is now plain `fsync(2)`; `CHM_FULL_BARRIER=1` restores
+the barrier.
+
+Durability, stated plainly: plain `fsync(2)` survives a guest, VMM or host OS
+crash, but not host power loss. For the per-run copy-on-write overlay that is
+the right trade, because durable state is captured by the checkpoint path.
+
+**The bitmap sidecar was rewritten whole on every flush** — 2 MiB for an 8 GiB
+disk — and reopened each time. Now incremental over 4 KiB chunks, with the
+handle cached.
+
+**A blocking `EventFd`.** `fcntl(F_SETFL, O_NONBLOCK | O_CLOEXEC)` mixed a
+descriptor flag into a file-status call, so the whole request failed and
+`O_NONBLOCK` was never applied. Any waiter that reached `drain_pipe()` wedged.
+
+**`WRITE_ZEROES` was silently corrupting data.** Acknowledged without being
+performed, which is safe on a zero overlay but not on a copy-on-write one, where
+an unwritten sector reads through to the base image. Not hit by these workloads
+(3 discards, 36 KiB) but a real latent risk.
+
+## Where I was wrong
+
+Recorded because the wrong turns were more instructive than the fixes.
+
+1. **The WFI park was not the bottleneck.** I was confident enough to change it
+   first. Instrumenting the exits showed 195 WFI exits in 24s. The change was
+   kept because it is the correct primitive, not because it bought anything.
+2. **"The bitmap is a red herring at 0.7ms" was a bad measurement.** Isolated,
+   the page cache absorbed a 2 MiB write with nothing competing. Interleaved
+   with a real guest fsync workload the same write cost 11.87ms. Micro-benchmarks
+   of one component of a contended path are worth very little.
+3. **"Only 35.7 MiB of 256 MiB reached the backend" was a mid-stream artefact,**
+   not a bug. Two theories were chased and eliminated before it was settled by
+   writing the data, dropping caches, and comparing an `md5sum` against a
+   host-computed hash. It matched exactly.
+
+## The remaining gaps, honestly
+
+**`diskwrite` (5.7x) is mostly not the device model.** Instrumenting the
+transport showed the entire run spends about 120ms inside virtio. Running the
+identical command three times in one session gives 1.615s, then 0.634s, then
+0.391s — so the bulk of the cold cost is allocating blocks in the freshly
+created sparse overlay, which every run gets by design. Worth fixing, but it is
+an allocation cost rather than a per-request one.
+
+The comparison also flatters Docker here: without a forced flush its 256 MiB
+never leaves the page cache (2.7 GB/s), whereas our guest has 1 GiB of RAM and
+begins writing back part way through. Same command, different amount of actual
+disk work.
+
+**`netget` (12.8x) is untouched.** `NAT_MTU` is 1500 with no offloads
+negotiated, so 64 MiB is roughly 45k packets, each a userspace round trip.
+Raising the MTU and negotiating checksum/GSO offloads is the fix and is not
+attempted here.
+
+## Caveats
+
+- Single vCPU throughout. Neither side is doing parallel I/O.
+- Different guests and kernels, as with the compute run above.
+- `netget` needs `--allow-local-egress`, because the host is on RFC1918 and the
+  reserved-address guard (M31.1) otherwise refuses it. Benchmark-only.
+- gimbal's ~10s per-trial host envelope is startup, excluded from the numbers
+  above and tracked separately in #79.
