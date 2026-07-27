@@ -38,6 +38,7 @@ use hypervisor::hvf::UsgicCpuHandle;
 use hypervisor::hvf::UsgicSpiRouter;
 use hypervisor::hvf::virtio::GuestMemory;
 use hypervisor::hvf::virtio::nat::{EgressPolicy, NatLimits};
+use hypervisor::hvf::virtio::net::NetKick;
 use hypervisor::hvf::virtio::pci::{MsiSink, MsiSpiInjector, VirtioPciDevice};
 use hypervisor::hvf::virtio::{devmgr, its};
 use hypervisor::{HypervisorVmError, StandardRegisters, Vcpu, VmExit, VmOps};
@@ -555,16 +556,21 @@ pub(crate) struct WiredVirtio {
     pub net_devices: Vec<Arc<VirtioPciDevice>>,
 }
 
-/// How often the net service thread polls each net device's NAT for host-socket
-/// activity. 2 ms keeps interactive latency low without busy-spinning; a fully
-/// idle guest still re-evaluates its GIC on the vCPU's WFI poll interval, so a
-/// delivered frame is never stranded longer than that.
+/// How long the net service thread waits for a guest transmit before servicing
+/// anyway. A guest transmit wakes it immediately (see [`NetKick`]), so this only
+/// bounds how long host-side arrivals — which have no readiness signal we can
+/// wait on — can sit unnoticed on an otherwise silent link.
 const NET_SERVICE_INTERVAL: Duration = Duration::from_millis(2);
 
 /// Spawn the net service thread: it advances each net device's userspace NAT
 /// (relaying host-socket bytes into the guest's RX queue) and nudges the vCPUs
 /// out of `hv_vcpu_run` when a frame was delivered, so the guest takes the RX
-/// completion promptly. Returns `None` when there are no net devices to serve.
+/// completion promptly.
+///
+/// This thread does all of the stack work. A guest transmit only enqueues the
+/// frame and wakes this thread, so the vCPU returns to the guest immediately
+/// instead of running the NAT inside its MMIO exit. Returns `None` when there
+/// are no net devices to serve.
 fn spawn_net_service(
     net_devices: Vec<Arc<VirtioPciDevice>>,
     running: Arc<AtomicBool>,
@@ -573,6 +579,10 @@ fn spawn_net_service(
 ) -> Option<thread::JoinHandle<()>> {
     if net_devices.is_empty() {
         return None;
+    }
+    let kick = Arc::new(NetKick::default());
+    for dev in &net_devices {
+        dev.set_net_kick(kick.clone());
     }
     thread::Builder::new()
         .name("chm-net-service".into())
@@ -604,8 +614,14 @@ fn spawn_net_service(
                     for sig in exits.lock().unwrap().iter() {
                         sig();
                     }
+                    // A pass that reached the guest means the host had data
+                    // ready, so go straight round again. Waiting here would cap
+                    // a bulk transfer at one chain per interval — and the better
+                    // our receive coalescing gets, the fewer guest transmits
+                    // there are to wake us early.
+                    continue;
                 }
-                thread::sleep(NET_SERVICE_INTERVAL);
+                kick.wait(NET_SERVICE_INTERVAL);
             }
         })
         .ok()
