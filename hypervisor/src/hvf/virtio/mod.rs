@@ -149,6 +149,42 @@ impl GuestMemory {
         Err(GuestMemError { gpa, len })
     }
 
+    /// Run `f` with a shared slice over `[gpa, gpa+len)` of guest RAM.
+    ///
+    /// This lets a device consume a guest buffer in place — e.g. writing a
+    /// virtio-blk payload straight to the backing file — instead of copying it
+    /// into a temporary. On a bulk write that removes one full copy of the data
+    /// plus a heap allocation per descriptor segment.
+    ///
+    /// As everywhere else in this module, the caller must only use it for a
+    /// buffer the guest has handed to the device (an in-flight descriptor),
+    /// which the guest must not touch until the request is completed.
+    pub fn with_slice<R>(
+        &self,
+        gpa: u64,
+        len: usize,
+        f: impl FnOnce(&[u8]) -> R,
+    ) -> Result<R, GuestMemError> {
+        // SAFETY: `with_ptr` bounds-checks `[gpa, gpa+len)` against a registered
+        // region, so the pointer is valid for `len` bytes for the call's life.
+        self.with_ptr(gpa, len, |p| f(unsafe { std::slice::from_raw_parts(p, len) }))
+    }
+
+    /// Mutable counterpart of [`Self::with_slice`], for filling a guest buffer
+    /// (e.g. a virtio-blk read) directly from the backing store.
+    pub fn with_slice_mut<R>(
+        &self,
+        gpa: u64,
+        len: usize,
+        f: impl FnOnce(&mut [u8]) -> R,
+    ) -> Result<R, GuestMemError> {
+        self.with_ptr(gpa, len, |p| {
+            // SAFETY: as `with_slice`; the range is checked to lie in one region
+            // and the device owns the buffer for the duration of the request.
+            f(unsafe { std::slice::from_raw_parts_mut(p, len) })
+        })
+    }
+
     /// Read `buf.len()` bytes starting at `gpa`.
     pub fn read(&self, gpa: u64, buf: &mut [u8]) -> Result<(), GuestMemError> {
         let n = buf.len();

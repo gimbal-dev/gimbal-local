@@ -28,6 +28,39 @@ const VIRTIO_BLK_S_UNSUPP: u8 = 2;
 /// Logical block size assumed by the request encoding.
 const SECTOR_SIZE: u64 = 512;
 
+/// Flush a guest write barrier to the host filesystem.
+///
+/// Rust's [`std::fs::File::sync_data`] maps to `fcntl(F_FULLFSYNC)` on macOS,
+/// which asks the drive to flush its own write cache to physical media. That is
+/// a genuine hardware barrier and measures ~5 ms on Apple SSDs versus ~0.05 ms
+/// for `fsync(2)` — a 100x cost paid on every guest fsync, on the synchronous
+/// completion path.
+///
+/// A guest flush here means "make this durable against the VMM, the guest, and
+/// the host OS crashing", which plain `fsync(2)` provides: the data is in the
+/// host filesystem, not just our process. It does NOT survive host power loss
+/// with the drive cache unwritten. That matches the default of every mainstream
+/// VMM (QEMU `cache=writeback`, and Docker Desktop's virtual disk), so a guest
+/// gets the durability it would get anywhere else — and, for the disk overlay
+/// specifically, durable state is captured by the checkpoint path, not by the
+/// per-run overlay.
+///
+/// Set `CHM_FULL_BARRIER=1` to opt back into the full media barrier.
+fn flush_to_host(file: &std::fs::File) -> io::Result<()> {
+    use std::os::unix::io::AsRawFd;
+    let full = std::env::var_os("CHM_FULL_BARRIER").is_some_and(|v| v != "0");
+    if full {
+        return file.sync_data();
+    }
+    // SAFETY: `file` owns a valid open descriptor for the duration of the call.
+    let rc = unsafe { libc::fsync(file.as_raw_fd()) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
 /// Backing store for a [`BlockDevice`]: a flat, sector-addressed byte array.
 pub trait BlockBackend: Send {
     /// Read into `buf` starting at byte `offset`.
@@ -113,10 +146,15 @@ impl BlockDevice {
                 0,
             ),
             VIRTIO_BLK_T_GET_ID => self.do_get_id(mem, chain),
-            // Discard / write-zeroes carry a descriptor payload we accept and
-            // acknowledge but do not need to physically punch for correctness on
-            // a sparse overlay; report OK so the guest's fstrim/mkfs proceeds.
-            VIRTIO_BLK_T_DISCARD | VIRTIO_BLK_T_WRITE_ZEROES => (VIRTIO_BLK_S_OK, 0),
+            // DISCARD is only a hint that a range is no longer needed, so
+            // acknowledging without punching it is correct.
+            //
+            // WRITE_ZEROES is NOT a hint: the guest requires the range to read
+            // back as zeroes. On a copy-on-write overlay an untouched sector
+            // reads *through to the base image*, so acknowledging without
+            // zeroing would silently hand the guest stale base content.
+            VIRTIO_BLK_T_DISCARD => (VIRTIO_BLK_S_OK, 0),
+            VIRTIO_BLK_T_WRITE_ZEROES => (self.do_write_zeroes(mem, chain), 0),
             _ => (VIRTIO_BLK_S_UNSUPP, 0),
         })
     }
@@ -127,8 +165,13 @@ impl BlockDevice {
         let writable: Vec<_> = chain.writable().copied().collect();
         let data_segs = writable.split_last().map_or(&[][..], |(_, d)| d);
         for seg in data_segs {
-            let mut buf = vec![0u8; seg.len as usize];
-            if self.backend.read_at(offset, &mut buf).is_err() || mem.write(seg.gpa, &buf).is_err() {
+            // Fill the guest buffer in place: no temporary, no copy.
+            let ok = mem
+                .with_slice_mut(seg.gpa, seg.len as usize, |buf| {
+                    self.backend.read_at(offset, buf).is_ok()
+                })
+                .unwrap_or(false);
+            if !ok {
                 return (VIRTIO_BLK_S_IOERR, written);
             }
             offset += seg.len as u64;
@@ -142,8 +185,13 @@ impl BlockDevice {
         let mut readable = chain.readable();
         let _hdr = readable.next();
         for seg in readable {
-            let mut buf = vec![0u8; seg.len as usize];
-            if mem.read(seg.gpa, &mut buf).is_err() || self.backend.write_at(offset, &buf).is_err() {
+            // Write straight out of guest RAM: no temporary, no copy.
+            let ok = mem
+                .with_slice(seg.gpa, seg.len as usize, |buf| {
+                    self.backend.write_at(offset, buf).is_ok()
+                })
+                .unwrap_or(false);
+            if !ok {
                 return VIRTIO_BLK_S_IOERR;
             }
             offset += seg.len as u64;
@@ -151,8 +199,48 @@ impl BlockDevice {
         VIRTIO_BLK_S_OK
     }
 
-    fn do_get_id(&mut self, mem: &GuestMemory, chain: &DescChain) -> (u8, u32) {
-        let writable: Vec<_> = chain.writable().copied().collect();
+    /// Zero the sector ranges named by a `VIRTIO_BLK_T_WRITE_ZEROES` request.
+    ///
+    /// The payload segments each carry a 16-byte
+    /// `{ u64 sector, u32 num_sectors, u32 flags }` descriptor. `flags` bit 0 is
+    /// UNMAP, a hint that the range may be deallocated; either way the range
+    /// must subsequently read back as zeroes, which is what we guarantee by
+    /// writing zeroes through the normal backend path.
+    fn do_write_zeroes(&mut self, mem: &GuestMemory, chain: &DescChain) -> u8 {
+        let mut readable = chain.readable();
+        let _hdr = readable.next();
+        let mut zeros = Vec::new();
+        for seg in readable {
+            let mut at = seg.gpa;
+            let end = seg.gpa + seg.len as u64;
+            while at + 16 <= end {
+                let (Ok(sector), Ok(count)) = (mem.read_u64(at), mem.read_u32(at + 8)) else {
+                    return VIRTIO_BLK_S_IOERR;
+                };
+                at += 16;
+                let Some(mut offset) = sector.checked_mul(SECTOR_SIZE) else {
+                    return VIRTIO_BLK_S_IOERR;
+                };
+                let mut remaining = count as u64 * SECTOR_SIZE;
+                // Chunked so a large range cannot balloon host memory.
+                const CHUNK: u64 = 1 << 20;
+                while remaining > 0 {
+                    let n = remaining.min(CHUNK) as usize;
+                    if zeros.len() < n {
+                        zeros.resize(n, 0);
+                    }
+                    if self.backend.write_at(offset, &zeros[..n]).is_err() {
+                        return VIRTIO_BLK_S_IOERR;
+                    }
+                    offset += n as u64;
+                    remaining -= n as u64;
+                }
+            }
+        }
+        VIRTIO_BLK_S_OK
+    }
+
+    fn do_get_id(&mut self, mem: &GuestMemory, chain: &DescChain) -> (u8, u32) {        let writable: Vec<_> = chain.writable().copied().collect();
         let Some((_status, data_segs)) = writable.split_last() else {
             return (VIRTIO_BLK_S_IOERR, 0);
         };
@@ -194,7 +282,7 @@ impl BlockBackend for FileBackend {
         self.file.write_all_at(buf, offset)
     }
     fn flush(&mut self) -> io::Result<()> {
-        self.file.sync_data()
+        flush_to_host(&self.file)
     }
     fn nsectors(&self) -> u64 {
         self.nsectors
@@ -227,7 +315,22 @@ pub struct OverlayBackend {
     /// contents can be reattached after a suspend/resume (see [`Self::resume`]).
     /// `None` disables persistence (the default cold-boot overlay is ephemeral).
     bitmap_path: Option<std::path::PathBuf>,
+    /// Cached handle for `bitmap_path`, opened on first persist. A guest fsync
+    /// is on the synchronous completion path, and re-opening the sidecar each
+    /// time cost milliseconds per flush.
+    bitmap_file: Option<std::fs::File>,
+    /// Which `BITMAP_CHUNK_BYTES` spans of the serialized bitmap have changed
+    /// since the last persist, so a flush rewrites only those. A guest fsync is
+    /// on the synchronous completion path, and the full bitmap is 2 MiB for an
+    /// 8 GiB disk, so rewriting all of it per flush dominated flush latency.
+    bitmap_dirty: Vec<bool>,
 }
+
+/// Granularity at which the bitmap sidecar is rewritten. One page: large enough
+/// that sequential guest writes touch a single chunk, small enough that a chunk
+/// rewrite is cheap.
+const BITMAP_CHUNK_BYTES: usize = 4096;
+const BITMAP_CHUNK_WORDS: usize = BITMAP_CHUNK_BYTES / 8;
 
 impl OverlayBackend {
     /// Open `base_path` read-only and (re)create a fresh, empty sparse overlay.
@@ -250,6 +353,10 @@ impl OverlayBackend {
             nsectors,
             written: vec![0u64; words],
             bitmap_path: Some(Self::bitmap_path_for(overlay_path)),
+            bitmap_file: None,
+            // The sidecar was just removed, so an all-zero bitmap is already
+            // consistent with what a persist would find on disk.
+            bitmap_dirty: vec![false; words.div_ceil(BITMAP_CHUNK_WORDS)],
         })
     }
 
@@ -281,6 +388,9 @@ impl OverlayBackend {
             nsectors,
             written,
             bitmap_path: Some(bitmap_path),
+            bitmap_file: None,
+            // Loaded straight from the sidecar, so nothing needs rewriting yet.
+            bitmap_dirty: vec![false; words.div_ceil(BITMAP_CHUNK_WORDS)],
         })
     }
 
@@ -294,15 +404,51 @@ impl OverlayBackend {
     /// Persist the written-sector bitmap to its sidecar so a later [`Self::resume`]
     /// can reattach this overlay's contents. Best-effort: a failure here only
     /// means a subsequent resume falls back to a cold overlay.
-    fn persist_bitmap(&self) {
-        let Some(path) = &self.bitmap_path else {
+    fn persist_bitmap(&mut self) {
+        let Some(path) = self.bitmap_path.clone() else {
             return;
         };
-        let mut bytes = Vec::with_capacity(self.written.len() * 8);
-        for word in &self.written {
-            bytes.extend_from_slice(&word.to_le_bytes());
+        if !self.bitmap_dirty.iter().any(|d| *d) {
+            return;
         }
-        let _ = std::fs::write(path, &bytes);
+        use std::os::unix::fs::FileExt;
+        let total = self.written.len() * 8;
+        if self.bitmap_file.is_none() {
+            let Ok(f) = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .open(&path)
+            else {
+                return;
+            };
+            // The sidecar is read back wholesale, so it must always be full
+            // length even when only a chunk in the middle has changed.
+            if f.metadata().map(|m| m.len()).unwrap_or(0) != total as u64
+                && f.set_len(total as u64).is_err()
+            {
+                return;
+            }
+            self.bitmap_file = Some(f);
+        }
+        let Some(f) = self.bitmap_file.as_ref() else {
+            return;
+        };
+        for chunk in 0..self.bitmap_dirty.len() {
+            if !self.bitmap_dirty[chunk] {
+                continue;
+            }
+            let lo = chunk * BITMAP_CHUNK_WORDS;
+            let hi = ((chunk + 1) * BITMAP_CHUNK_WORDS).min(self.written.len());
+            let mut bytes = Vec::with_capacity((hi - lo) * 8);
+            for word in &self.written[lo..hi] {
+                bytes.extend_from_slice(&word.to_le_bytes());
+            }
+            if f.write_all_at(&bytes, (lo * 8) as u64).is_err() {
+                return;
+            }
+            self.bitmap_dirty[chunk] = false;
+        }
     }
 
     #[inline]
@@ -315,7 +461,13 @@ impl OverlayBackend {
     fn mark_written(&mut self, sector: u64) {
         let (w, b) = ((sector / 64) as usize, sector % 64);
         if let Some(word) = self.written.get_mut(w) {
+            let before = *word;
             *word |= 1u64 << b;
+            if *word != before
+                && let Some(dirty) = self.bitmap_dirty.get_mut(w / BITMAP_CHUNK_WORDS)
+            {
+                *dirty = true;
+            }
         }
     }
 
@@ -381,7 +533,7 @@ impl BlockBackend for OverlayBackend {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.overlay.sync_data()?;
+        flush_to_host(&self.overlay)?;
         // Keep the resume sidecar current with the durable overlay so a
         // suspend/resume after a guest fsync sees the same disk.
         self.persist_bitmap();
@@ -523,12 +675,122 @@ mod tests {
         assert_eq!(done.status, VIRTIO_BLK_S_UNSUPP);
     }
 
+    /// A guest fsync must leave the bitmap sidecar describing the durable
+    /// overlay, so a later resume sees exactly the sectors that were written.
+    ///
+    /// The sidecar is rewritten incrementally (only changed chunks), so this
+    /// deliberately writes sectors in two widely separated bitmap chunks plus a
+    /// late write in the *first* chunk -- a whole-file rewrite and a correct
+    /// incremental rewrite agree here, but an incremental one that loses track
+    /// of a dirtied chunk does not.
+    #[test]
+    fn overlay_resume_restores_sectors_across_distant_bitmap_chunks() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("chm-cow-resume-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let base_path = dir.join("base.raw");
+        let overlay_path = dir.join("over.raw");
+
+        // Enough sectors that the bitmap spans several chunks.
+        let nsectors = (BITMAP_CHUNK_WORDS as u64) * 64 * 3;
+        let mut f = std::fs::File::create(&base_path).unwrap();
+        f.write_all(&vec![0xAAu8; SECTOR_SIZE as usize]).unwrap();
+        f.set_len(nsectors * SECTOR_SIZE).unwrap();
+        drop(f);
+
+        // Sectors chosen to land in chunk 0, chunk 2, then back to chunk 0.
+        let far = (BITMAP_CHUNK_WORDS as u64) * 64 * 2 + 5;
+        let marks: [(u64, u8); 3] = [(1, 0x11), (far, 0x22), (7, 0x33)];
+
+        let mut ob = OverlayBackend::open(&base_path, &overlay_path, nsectors).unwrap();
+        for (sector, fill) in marks {
+            ob.write_at(sector * SECTOR_SIZE, &[fill; SECTOR_SIZE as usize]).unwrap();
+            // Each guest fsync persists only what changed since the last one.
+            ob.flush().unwrap();
+        }
+        drop(ob);
+
+        let mut resumed = OverlayBackend::resume(&base_path, &overlay_path, nsectors).unwrap();
+        for (sector, fill) in marks {
+            let mut got = [0u8; SECTOR_SIZE as usize];
+            resumed.read_at(sector * SECTOR_SIZE, &mut got).unwrap();
+            assert!(
+                got.iter().all(|&b| b == fill),
+                "sector {sector} should resume as {fill:#x}, got {:#x}",
+                got[0]
+            );
+        }
+        // An untouched sector must still read through to the base.
+        let mut got = [0u8; SECTOR_SIZE as usize];
+        resumed.read_at(0, &mut got).unwrap();
+        assert!(got.iter().all(|&b| b == 0xAA), "untouched sector must read the base");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `WRITE_ZEROES` must actually zero the range, not just be acknowledged.
+    ///
+    /// This is specifically a copy-on-write hazard: an untouched overlay sector
+    /// reads *through to the base image*, so a device that ACKs the request
+    /// without writing hands the guest stale base content while reporting
+    /// success — silent corruption rather than a visible error.
+    #[test]
+    fn write_zeroes_actually_zeroes_over_a_cow_base() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("chm-cow-wz-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let base_path = dir.join("base.raw");
+        let overlay_path = dir.join("over.raw");
+
+        // A base whose every byte is non-zero, so leftover base content is
+        // unmistakable in the read-back.
+        let nsectors = 8u64;
+        let mut f = std::fs::File::create(&base_path).unwrap();
+        f.write_all(&vec![0xEEu8; (nsectors * SECTOR_SIZE) as usize]).unwrap();
+        drop(f);
+
+        let backend = OverlayBackend::open(&base_path, &overlay_path, nsectors).unwrap();
+        let mut dev = BlockDevice::new(Box::new(backend), "t");
+
+        let m = mem();
+        m.write(0x2000, &req(VIRTIO_BLK_T_WRITE_ZEROES, 0, 0)).unwrap();
+        // Payload: zero 2 sectors starting at sector 1.
+        m.write_u64(0x2100, 1).unwrap();
+        m.write_u32(0x2108, 2).unwrap();
+        m.write_u32(0x210c, 0).unwrap();
+        let c = chain(&[
+            Segment { gpa: 0x2000, len: 16, write: false },
+            Segment { gpa: 0x2100, len: 16, write: false },
+            Segment { gpa: 0x2400, len: 1, write: true },
+        ]);
+        assert_eq!(dev.process(&m, &c).status, VIRTIO_BLK_S_OK);
+
+        // Read sectors 0..3 back through the device and check the boundaries:
+        // the zeroed range must be zero, its neighbours must still be base.
+        m.write(0x2000, &req(VIRTIO_BLK_T_IN, 0, 0)).unwrap();
+        let c = chain(&[
+            Segment { gpa: 0x2000, len: 16, write: false },
+            Segment { gpa: 0x3000, len: (SECTOR_SIZE * 4) as u32, write: true },
+            Segment { gpa: 0x2400, len: 1, write: true },
+        ]);
+        assert_eq!(dev.process(&m, &c).status, VIRTIO_BLK_S_OK);
+
+        let mut got = vec![0u8; (SECTOR_SIZE * 4) as usize];
+        m.read(0x3000, &mut got).unwrap();
+        let sec = |i: usize| &got[i * SECTOR_SIZE as usize..(i + 1) * SECTOR_SIZE as usize];
+        assert!(sec(0).iter().all(|&b| b == 0xEE), "sector 0 must be untouched base");
+        assert!(sec(1).iter().all(|&b| b == 0), "sector 1 must read back as zeroes");
+        assert!(sec(2).iter().all(|&b| b == 0), "sector 2 must read back as zeroes");
+        assert!(sec(3).iter().all(|&b| b == 0xEE), "sector 3 must be untouched base");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The copy-on-write overlay must keep the base file pristine while still
     /// reflecting writes back to the guest within the same run.
     #[test]
     fn overlay_writes_do_not_touch_the_base() {
-        use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("chm-cow-test-{}", std::process::id()));
+        use std::io::Write;        let dir = std::env::temp_dir().join(format!("chm-cow-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         let base_path = dir.join("base.raw");
         let overlay_path = dir.join("over.raw");

@@ -728,16 +728,18 @@ fn wedge_session(snapshot: &Path, n: u64, followups: usize, attempt: usize) -> b
     !wedged
 }
 
-/// M32.2 gimbal-side build/CPU benchmark. Boots the snapshot, logs in, and runs
-/// the SAME deterministic `xz` compression workload the Docker baseline runs
-/// (`scripts/bench/workloads/xz.sh`), timing the compression with the guest's own
+/// M32.2/M32.3 gimbal-side benchmark. Boots the snapshot, logs in, and runs the
+/// SAME inner command the Docker baseline runs, timing it with the guest's own
 /// clock and parsing the `BENCH_RESULT` line off the console. Writes a results
 /// JSON compatible with `scripts/bench/report.py`.
 ///
 /// Config (env): `CHM_E2E_SNAPSHOT` (the guest), `BENCH_TRIALS` (default 3),
-/// `BENCH_N` (seq payload size, default 24000000), `BENCH_OUT` (results path).
-/// The workload is inlined over the PTY (no shared FS / network needed), so it
-/// runs against the stock demo guest which has `xz` + coreutils but no toolchain.
+/// `BENCH_N` (seq payload size), `BENCH_OUT` (results path), `BENCH_WORKLOAD`
+/// (label), and `BENCH_CMD` (the timed inner command). With `BENCH_CMD` unset
+/// the workload is the CPU pipeline `seq 1 $BENCH_N | $BENCH_PIPE`, which needs
+/// no shared FS or network and so runs against the stock demo guest. The I/O and
+/// network workloads set `BENCH_CMD` from
+/// `scripts/bench/workloads/commands.sh` -- the same string the container runs.
 #[test]
 #[ignore = "needs a local HVF-compatible snapshot; run via scripts/bench/run-gimbal-e2e.sh"]
 fn microvm_xz_benchmark() {
@@ -751,6 +753,11 @@ fn microvm_xz_benchmark() {
     // drives the xz (default) or gzip workload for cross-runtime comparison.
     let pipe = env::var("BENCH_PIPE").unwrap_or_else(|_| "xz -6 -T1 -c".to_string());
     let workload = env::var("BENCH_WORKLOAD").unwrap_or_else(|_| "xz".to_string());
+    // The timed inner command. Defaults to the CPU pipeline above, so the
+    // published xz/gzip numbers stay byte-for-byte reproducible; the I/O and
+    // network workloads (M32.3) override it with the shared command string from
+    // `scripts/bench/workloads/commands.sh`, which the Docker side also runs.
+    let inner = env::var("BENCH_CMD").unwrap_or_else(|_| format!("seq 1 {n} | {pipe}"));
     let out = env::var("BENCH_OUT")
         .unwrap_or_else(|_| format!("{}/../scripts/bench/results/gimbal-{workload}.json", env!("CARGO_MANIFEST_DIR")));
 
@@ -788,21 +795,20 @@ fn microvm_xz_benchmark() {
             ],
         );
         let boot_deadline = Instant::now() + Duration::from_secs(150);
-        login_to_shell(&mut s, shell, boot_deadline);
+        bench_reach_shell(&mut s, shell, boot_deadline);
         s.drain_for(Duration::from_secs(2));
 
         let uniq = format!("{}_{}", process::id(), nanos());
-        // The same piped workload the Docker/sbx sides run: a deterministic `seq`
-        // stream compressed by a single-threaded compressor ($BENCH_PIPE), output
-        // discarded. No temp file, so no tmpfs RAM pressure and no disk-overlay
-        // dependence -- pure CPU, identical work across runtimes. The completion
-        // tag is emitted via a shell var ($T) so the *echoed* command line never
-        // contains the contiguous `tag=<uniq>` string we wait on -- only the
-        // executed output does (same trick as the other tests).
+        // The same inner command the Docker/sbx sides run ($BENCH_CMD, default a
+        // deterministic `seq` stream through a single-threaded compressor with
+        // the output discarded). The completion tag is emitted via a shell var
+        // ($T) so the *echoed* command line never contains the contiguous
+        // `tag=<uniq>` string we wait on -- only the executed output does (same
+        // trick as the other tests).
         let cmd = format!(
             "T={uniq}; \
              S=$(date +%s.%N); \
-             if seq 1 {n} | {pipe} >/dev/null 2>&1; then OK=1; else OK=0; fi; \
+             if {inner} >/dev/null 2>&1; then OK=1; else OK=0; fi; \
              E=$(date +%s.%N); \
              W=$(awk -v a=$S -v b=$E 'BEGIN{{printf \"%.3f\", b-a}}'); \
              echo \"BENCH_RESULT workload={workload} wall_s=$W ok=$OK tag=${{T}}\"\n"
@@ -901,12 +907,82 @@ fn login_to_shell(session: &mut PtySession, shell: &str, deadline: Instant) {
     }
 }
 
+/// Drive a benchmark session to a usable shell, tolerating either snapshot
+/// style: the demo guest cold-boots to a `login:` getty, while the stock
+/// ITS/LPI captures resume straight into an already-logged-in shell whose
+/// prompt is restored but never reprinted. Nudging with a newline makes the
+/// restored prompt visible; a getty is logged into as usual.
+///
+/// Deliberately separate from `resume_to_shell`, which asserts a resume did
+/// *not* cold-boot -- that assertion is the point of the suspend/resume test and
+/// must not be relaxed here.
+fn bench_reach_shell(session: &mut PtySession, shell: &str, deadline: Instant) {
+    // A cold-booting guest prints its own banner; give it a short window before
+    // assuming the prompt was restored silently. Kept short deliberately: this
+    // wait lands inside the reported `host_envelope_s`, so a generous window
+    // would overstate gimbal's startup cost for resume-style snapshots.
+    if let WaitOutcome::Found(m) = session.wait_for_or_abort(
+        &[shell, "login:"],
+        &DISK_ERRORS,
+        Instant::now() + Duration::from_secs(8),
+    ) {
+        if m != "login:" {
+            return;
+        }
+        return bench_log_in(session, shell, deadline);
+    }
+    // Otherwise assume a restored-but-silent prompt and nudge for it.
+    while Instant::now() < deadline {
+        session.send("\n");
+        match session.wait_for_or_abort(
+            &[shell, "login:"],
+            &DISK_ERRORS,
+            Instant::now() + Duration::from_secs(5),
+        ) {
+            WaitOutcome::Found(m) if m == "login:" => return bench_log_in(session, shell, deadline),
+            WaitOutcome::Found(_) => return,
+            WaitOutcome::Aborted(e) => {
+                session.fail(&format!("guest reported a disk error ({e:?}) before the benchmark"))
+            }
+            WaitOutcome::TimedOut => continue,
+        }
+    }
+    session.fail("guest never produced a shell prompt for the benchmark");
+}
+
+/// Complete a `login:` getty prompt with the standard demo credentials.
+fn bench_log_in(session: &mut PtySession, shell: &str, deadline: Instant) {
+    session.send("ubuntu\n");
+    match session.wait_for(&["Password:", shell], deadline) {
+        Some(p) if p == "Password:" => {
+            session.send("ubuntu\n");
+            if session.wait_for(&[shell], deadline).is_none() {
+                session.fail("did not reach a shell prompt after entering the password");
+            }
+        }
+        Some(_) => {}
+        None => session.fail("no password prompt or shell after the login name"),
+    }
+}
+
 fn snapshot_from_env() -> Option<PathBuf> {
     let raw = env::var_os("CHM_E2E_SNAPSHOT")?;
     if raw.is_empty() {
         return None;
     }
-    Some(PathBuf::from(raw))
+    let path = PathBuf::from(raw);
+    if path.exists() {
+        return Some(path);
+    }
+    // Cargo runs integration tests with the *package* directory as the cwd, so a
+    // relative path written from the workspace root (`snapshots/...`, as the
+    // bench runners pass) would otherwise resolve under `chm/` and be reported
+    // as a missing snapshot. Retry it against the workspace root.
+    let from_workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(&path);
+    if from_workspace.exists() {
+        return Some(from_workspace);
+    }
+    Some(path)
 }
 
 /// Prod a freshly-`chm resume`d session until it lands at a logged-in shell

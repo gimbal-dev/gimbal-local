@@ -23,8 +23,9 @@ mod macos {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     const O_NONBLOCK: i32 = 0x0004;
-    const O_CLOEXEC: i32 = 0x0100_0000;
     const F_SETFL: i32 = 4;
+    const F_SETFD: i32 = 2;
+    const FD_CLOEXEC: i32 = 1;
 
     pub const EFD_NONBLOCK: i32 = O_NONBLOCK;
 
@@ -80,9 +81,18 @@ mod macos {
             }
             let (rd, wr) = (fds[0], fds[1]);
             // SAFETY: configuring fds we own.
+            //
+            // `O_CLOEXEC` is a file-DESCRIPTOR flag and must be set with
+            // `F_SETFD`/`FD_CLOEXEC`; passing it to `F_SETFL` (which only accepts
+            // status flags such as `O_NONBLOCK`) fails with EINVAL on macOS and
+            // silently leaves the descriptor BLOCKING. That made `drain_pipe`'s
+            // trailing read block forever on an empty pipe, so `wait_timeout`
+            // could wedge its caller. Set the two flag classes separately.
             unsafe {
-                fcntl(rd, F_SETFL, O_NONBLOCK | O_CLOEXEC);
-                fcntl(wr, F_SETFL, (flags & O_NONBLOCK) | O_CLOEXEC);
+                fcntl(rd, F_SETFL, O_NONBLOCK);
+                fcntl(rd, F_SETFD, FD_CLOEXEC);
+                fcntl(wr, F_SETFL, flags & O_NONBLOCK);
+                fcntl(wr, F_SETFD, FD_CLOEXEC);
             }
             Ok(EventFd {
                 inner: Arc::new(Inner {
@@ -179,6 +189,67 @@ mod macos {
     impl AsRawFd for EventFd {
         fn as_raw_fd(&self) -> RawFd {
             self.inner.rd
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::{EFD_NONBLOCK, EventFd};
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        /// Run `f` on a helper thread and fail (rather than hang the suite) if it
+        /// does not finish in time. The bug these tests guard against is a
+        /// *blocking* descriptor, whose symptom is an unbounded wait.
+        fn within<T: Send + 'static>(limit: Duration, f: impl FnOnce() -> T + Send + 'static) -> T {
+            let (tx, rx) = mpsc::channel();
+            thread::spawn(move || {
+                let _ = tx.send(f());
+            });
+            rx.recv_timeout(limit)
+                .expect("EventFd operation blocked: the read fd is not O_NONBLOCK")
+        }
+
+        /// `wait_timeout` on an idle EventFd must return at its timeout. It used
+        /// to block forever: `O_CLOEXEC` was passed to `F_SETFL`, which fails on
+        /// macOS and left the read fd blocking, so `drain_pipe`'s trailing read
+        /// never returned.
+        #[test]
+        fn wait_timeout_returns_when_idle() {
+            let fd = EventFd::new(EFD_NONBLOCK).unwrap();
+            let got = within(Duration::from_secs(5), move || fd.wait_timeout(20).unwrap());
+            assert_eq!(got, 0, "an idle wait must time out reporting no wakeups");
+        }
+
+        /// A pending write is taken by the fast path, and the *next* wait (with
+        /// the pipe now drained) must still return rather than block.
+        #[test]
+        fn wait_timeout_drains_then_stays_responsive() {
+            let fd = EventFd::new(EFD_NONBLOCK).unwrap();
+            fd.write(1).unwrap();
+            let got = within(Duration::from_secs(5), move || {
+                let first = fd.wait_timeout(20).unwrap();
+                let second = fd.wait_timeout(20).unwrap();
+                (first, second)
+            });
+            assert_eq!(got.0, 1, "the pending wakeup should be reported");
+            assert_eq!(got.1, 0, "the drained fd should then time out cleanly");
+        }
+
+        /// A write from another thread must wake a parked waiter promptly -- this
+        /// is the property the vCPU WFI park relies on to take virtio completions
+        /// without waiting out its full nap.
+        #[test]
+        fn a_cross_thread_write_wakes_a_parked_waiter() {
+            let fd = EventFd::new(EFD_NONBLOCK).unwrap();
+            let waker = fd.try_clone().unwrap();
+            thread::spawn(move || {
+                thread::sleep(Duration::from_millis(30));
+                let _ = waker.write(1);
+            });
+            let got = within(Duration::from_secs(5), move || fd.wait_timeout(5_000).unwrap());
+            assert_eq!(got, 1, "the parked waiter should observe the cross-thread write");
         }
     }
 }
