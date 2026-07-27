@@ -29,6 +29,7 @@ use std::sync::Mutex;
 pub mod block;
 pub mod devmgr;
 pub mod its;
+pub mod lro;
 pub mod nat;
 pub mod net;
 pub(crate) mod pathsafe;
