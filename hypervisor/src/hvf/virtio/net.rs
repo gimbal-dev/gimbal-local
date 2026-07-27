@@ -30,6 +30,20 @@ use std::collections::VecDeque;
 /// queues is prefixed by this header.
 pub const VIRTIO_NET_HDR_LEN: usize = 12;
 
+/// How many times [`NetDevice::service`] will advance the responder before
+/// handing its backlog to the transport. Bounded so that a responder with an
+/// endless supply of frames still yields to the guest promptly.
+const SERVICE_BURST_PASSES: usize = 32;
+
+/// `VIRTIO_NET_HDR_F_DATA_VALID`: the device has already validated the packet's
+/// transport checksum, so the driver need not. Only meaningful to a driver that
+/// negotiated `VIRTIO_NET_F_GUEST_CSUM`.
+pub const VIRTIO_NET_HDR_F_DATA_VALID: u8 = 2;
+
+/// `VIRTIO_NET_F_GUEST_CSUM`: the driver accepts packets with a checksum it has
+/// been told is already valid.
+pub const VIRTIO_NET_F_GUEST_CSUM: u64 = 1 << 1;
+
 const ETHERTYPE_ARP: u16 = 0x0806;
 const ETHERTYPE_IPV4: u16 = 0x0800;
 const ARP_OP_REQUEST: u16 = 1;
@@ -39,18 +53,25 @@ const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_ECHO_REPLY: u8 = 0;
 
 /// Answers Ethernet frames the guest transmits with the frames a host network
-/// would send back. Returning an empty vector means "no reply" (the frame is
-/// accepted and dropped, as a real NIC would for traffic not destined here).
+/// would send back.
+///
+/// Accepting a frame and producing replies are deliberately separate. A guest
+/// transmit arrives on a vCPU thread inside an MMIO exit, with the guest stopped
+/// for the duration; running the whole stack there makes every packet a stall.
+/// [`accept`](NetResponder::accept) therefore only takes ownership of the frame,
+/// and [`service`](NetResponder::service) — called on the net service thread —
+/// does the work and returns everything to deliver back to the guest. A burst of
+/// transmits then costs one pass over the stack instead of one per frame.
 pub trait NetResponder: Send {
-    /// Given an outbound Ethernet `frame` from the guest, return zero or more
-    /// Ethernet frames to deliver back to the guest.
-    fn handle(&mut self, frame: &[u8]) -> Vec<Vec<u8>>;
+    /// Take an outbound Ethernet `frame` from the guest. Any frames produced in
+    /// response are returned by a subsequent [`service`](Self::service) call.
+    /// Must not block: this runs with the guest stopped.
+    fn accept(&mut self, frame: &[u8]);
 
-    /// Advance any asynchronous work (e.g. a userspace NAT polling its host
-    /// sockets) and return frames to deliver to the guest, independent of guest
-    /// transmit activity. Called periodically by the net service thread. The
-    /// default is a no-op: a purely request/reply responder has nothing to do
-    /// between guest frames.
+    /// Advance the responder (parsing accepted frames, polling host sockets)
+    /// and return frames to deliver to the guest. Called by the net service
+    /// thread, which is woken whenever a frame is accepted and otherwise ticks
+    /// periodically so host-side arrivals are still picked up.
     fn service(&mut self) -> Vec<Vec<u8>> {
         Vec::new()
     }
@@ -63,6 +84,41 @@ pub trait NetResponder: Send {
     }
 }
 
+/// A wake handle shared between the vCPU threads and the net service thread.
+///
+/// The host side of a flow has no readiness signal we can wait on — the NAT
+/// discovers host data by polling its sockets — so the service thread ticks.
+/// The guest side does have one: a transmit notify. Kicking on that turns a
+/// guest ACK into an immediate service pass rather than one that waits out the
+/// remainder of a tick, which is what keeps a request/response round trip fast
+/// once the stack no longer runs on the vCPU thread.
+#[derive(Debug, Default)]
+pub struct NetKick {
+    pending: std::sync::Mutex<bool>,
+    woken: std::sync::Condvar,
+}
+
+impl NetKick {
+    /// Wake the service thread. Cheap and non-blocking; safe to call from a
+    /// vCPU thread inside an MMIO exit.
+    pub fn wake(&self) {
+        if let Ok(mut p) = self.pending.lock() {
+            *p = true;
+        }
+        self.woken.notify_one();
+    }
+
+    /// Block until woken or `timeout` elapses, then consume the wake. A wake
+    /// raised while the caller was working is not lost: it is still pending on
+    /// entry and returns immediately.
+    pub fn wait(&self, timeout: std::time::Duration) {
+        let Ok(guard) = self.pending.lock() else { return };
+        if let Ok((mut guard, _)) = self.woken.wait_timeout_while(guard, timeout, |p| !*p) {
+            *guard = false;
+        }
+    }
+}
+
 /// A minimal host responder that makes a resumed guest's link demonstrably
 /// live: it answers ARP requests for a synthetic gateway and replies to ICMP
 /// echo requests addressed to that gateway. This is enough for `ping <gateway>`
@@ -71,6 +127,7 @@ pub trait NetResponder: Send {
 pub struct EchoResponder {
     gateway_ip: [u8; 4],
     gateway_mac: [u8; 6],
+    replies: VecDeque<Vec<u8>>,
 }
 
 impl EchoResponder {
@@ -80,6 +137,7 @@ impl EchoResponder {
         Self {
             gateway_ip,
             gateway_mac,
+            replies: VecDeque::new(),
         }
     }
 
@@ -168,9 +226,9 @@ impl EchoResponder {
 }
 
 impl NetResponder for EchoResponder {
-    fn handle(&mut self, frame: &[u8]) -> Vec<Vec<u8>> {
+    fn accept(&mut self, frame: &[u8]) {
         if frame.len() < 14 {
-            return Vec::new();
+            return;
         }
         let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
         let reply = match ethertype {
@@ -178,7 +236,11 @@ impl NetResponder for EchoResponder {
             ETHERTYPE_IPV4 => self.handle_ipv4(frame),
             _ => None,
         };
-        reply.into_iter().collect()
+        self.replies.extend(reply);
+    }
+
+    fn service(&mut self) -> Vec<Vec<u8>> {
+        self.replies.drain(..).collect()
     }
 }
 
@@ -205,24 +267,69 @@ fn checksum(data: &[u8]) -> u16 {
 pub struct NetDevice {
     responder: Box<dyn NetResponder>,
     pending_rx: VecDeque<Vec<u8>>,
+    /// The largest frame the guest's receive chains have been observed to hold,
+    /// or `None` until the transport has popped one. Receive coalescing is
+    /// bounded by this rather than by a constant, so a guest posting single-MTU
+    /// buffers keeps getting one segment per frame (see [`super::lro`]).
+    rx_capacity: Option<usize>,
+    /// Whether the driver negotiated `VIRTIO_NET_F_GUEST_CSUM`, and so will
+    /// accept a frame marked `VIRTIO_NET_HDR_F_DATA_VALID` without verifying its
+    /// transport checksum.
+    guest_csum: bool,
 }
 
 impl NetDevice {
-    /// Build a net device answering guest traffic with `responder`.
+    /// Build a net device answering guest traffic with `responder`. The driver
+    /// is assumed not to have negotiated checksum offloads; see
+    /// [`with_features`](Self::with_features).
     pub fn new(responder: Box<dyn NetResponder>) -> Self {
         Self {
             responder,
             pending_rx: VecDeque::new(),
+            rx_capacity: None,
+            guest_csum: false,
         }
     }
 
-    /// Process one transmitted Ethernet `frame` (already stripped of its
-    /// virtio-net header): queue any reply frames the responder produces for
-    /// later injection into the receive queue.
-    pub fn handle_tx_frame(&mut self, frame: &[u8]) {
-        for reply in self.responder.handle(frame) {
-            self.pending_rx.push_back(reply);
+    /// Record the feature set the driver negotiated, so the device can use the
+    /// offloads the guest agreed to. A rehydrated guest bound its features at
+    /// capture time and cannot renegotiate, so this is read from the snapshot.
+    pub fn with_features(mut self, acked: u64) -> Self {
+        self.guest_csum = acked & VIRTIO_NET_F_GUEST_CSUM != 0;
+        self
+    }
+
+    /// The virtio-net header flags to stamp on frames delivered to the guest.
+    ///
+    /// We terminate every flow ourselves, so a frame's payload is by
+    /// construction what we intend the guest to receive; claiming
+    /// `DATA_VALID` is therefore truthful, and it lets both sides skip a
+    /// checksum pass over the whole payload.
+    pub fn rx_header_flags(&self) -> u8 {
+        if self.guest_csum {
+            VIRTIO_NET_HDR_F_DATA_VALID
+        } else {
+            0
         }
+    }
+
+    /// Record the writable capacity of a receive descriptor chain the guest
+    /// posted. Reported by the transport each time it pops one; the smallest
+    /// chain seen is kept, so coalescing never produces a frame that a
+    /// subsequent, smaller chain could not hold.
+    pub fn observe_rx_capacity(&mut self, bytes: usize) {
+        self.rx_capacity = Some(match self.rx_capacity {
+            Some(prev) => prev.min(bytes),
+            None => bytes,
+        });
+    }
+
+    /// Take one transmitted Ethernet `frame` (already stripped of its virtio-net
+    /// header). The frame is handed to the responder but not acted on here: this
+    /// runs on a vCPU thread with the guest stopped, so any reply is produced by
+    /// the next [`service`](Self::service) on the net service thread.
+    pub fn handle_tx_frame(&mut self, frame: &[u8]) {
+        self.responder.accept(frame);
     }
 
     /// Advance the responder's asynchronous work (e.g. a NAT relaying host
@@ -232,9 +339,30 @@ impl NetDevice {
     /// notify.
     pub fn service(&mut self) -> bool {
         let mut produced = false;
-        for reply in self.responder.service() {
-            self.pending_rx.push_back(reply);
-            produced = true;
+        // Build a backlog before returning, rather than handing the transport
+        // whatever a single pass happened to produce. The responder's stack
+        // emits only a segment or two per pass, so draining after each one caps
+        // coalescing at that same segment or two no matter how large a receive
+        // chain the guest posted. Filling one chain's worth first is what lets
+        // [`super::lro`] turn the burst into one large frame.
+        let target = self
+            .rx_capacity
+            .map_or(0, |cap| cap.saturating_sub(VIRTIO_NET_HDR_LEN));
+        let mut pending_bytes: usize = self.pending_rx.iter().map(Vec::len).sum();
+        for _ in 0..SERVICE_BURST_PASSES {
+            let mut any = false;
+            for reply in self.responder.service() {
+                pending_bytes += reply.len();
+                self.pending_rx.push_back(reply);
+                produced = true;
+                any = true;
+            }
+            // Stop as soon as one chain can be filled, and never spin on a
+            // responder with nothing left to give: an idle pass costs a poll of
+            // every host socket, and repeating it just burns a core.
+            if !any || pending_bytes >= target {
+                break;
+            }
         }
         produced
     }
@@ -251,9 +379,17 @@ impl NetDevice {
         !self.pending_rx.is_empty()
     }
 
-    /// Take the next frame to inject into the guest's receive queue, if any.
+    /// Take the next frame to inject into the guest's receive queue, if any,
+    /// merging any immediately following continuations of the same TCP flow into
+    /// it (see [`super::lro`]). Until the transport has reported a chain
+    /// capacity, frames are delivered one at a time.
     pub fn pop_rx(&mut self) -> Option<Vec<u8>> {
-        self.pending_rx.pop_front()
+        let limit = self
+            .rx_capacity
+            .map_or(0, |cap| cap.saturating_sub(VIRTIO_NET_HDR_LEN));
+        // When the frame will carry `DATA_VALID` the guest ignores the transport
+        // checksum, so recomputing it over the merged payload would be pure cost.
+        super::lro::pop_coalesced(&mut self.pending_rx, limit, !self.guest_csum)
     }
 
     /// Return an un-injected frame to the front of the backlog (when no receive
@@ -292,7 +428,8 @@ mod tests {
     #[test]
     fn answers_arp_for_the_gateway() {
         let mut r = EchoResponder::new(GW_IP, GW_MAC);
-        let replies = r.handle(&arp_request());
+        r.accept(&arp_request());
+        let replies = r.service();
         assert_eq!(replies.len(), 1);
         let reply = &replies[0];
         assert_eq!(&reply[0..6], &GUEST_MAC, "dst = guest");
@@ -308,7 +445,8 @@ mod tests {
     #[test]
     fn ignores_arp_for_a_different_ip() {
         let mut r = EchoResponder::new([10, 0, 0, 1], GW_MAC);
-        assert!(r.handle(&arp_request()).is_empty());
+        r.accept(&arp_request());
+        assert!(r.service().is_empty());
     }
 
     fn icmp_echo_request() -> Vec<u8> {
@@ -353,7 +491,8 @@ mod tests {
     fn answers_icmp_echo_to_the_gateway() {
         let mut r = EchoResponder::new(GW_IP, GW_MAC);
         let req = icmp_echo_request();
-        let replies = r.handle(&req);
+        r.accept(&req);
+        let replies = r.service();
         assert_eq!(replies.len(), 1, "echo reply produced");
         let reply = &replies[0];
         assert_eq!(&reply[0..6], &GUEST_MAC, "dst = guest");
@@ -372,6 +511,10 @@ mod tests {
         let mut dev = NetDevice::new(Box::new(EchoResponder::new(GW_IP, GW_MAC)));
         assert!(!dev.has_pending_rx());
         dev.handle_tx_frame(&arp_request());
+        // A transmit only hands the frame to the responder; the reply is
+        // produced by the service thread, never on the vCPU thread.
+        assert!(!dev.has_pending_rx());
+        assert!(dev.service(), "service produced a reply");
         assert!(dev.has_pending_rx());
         let frame = dev.pop_rx().expect("a reply frame");
         assert_eq!(&frame[0..6], &GUEST_MAC);

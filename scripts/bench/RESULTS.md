@@ -183,7 +183,8 @@ disk work.
 **`netget` (12.8x) is untouched.** `NAT_MTU` is 1500 with no offloads
 negotiated, so 64 MiB is roughly 45k packets, each a userspace round trip.
 Raising the MTU and negotiating checksum/GSO offloads is the fix and is not
-attempted here.
+attempted here. (Taken up in #94 below — where the suggested fix turned out to
+be unavailable, and the real cost turned out to be somewhere else entirely.)
 
 ## Caveats
 
@@ -193,3 +194,86 @@ attempted here.
   reserved-address guard (M31.1) otherwise refuses it. Benchmark-only.
 - gimbal's ~10s per-trial host envelope is startup, excluded from the numbers
   above and tracked separately in #79.
+
+## `netget` — receive coalescing (2026-07-28, #94)
+
+Same harness, same host, same snapshot. Baseline re-measured on the day rather
+than quoted from the table above, so the two numbers come from one sitting.
+
+| | median of 5 | range |
+| --- | --- | --- |
+| before | 1.966s | 1.942 – 2.056 |
+| after | **1.213s** | 1.187 – 1.294 |
+
+1.62x. Docker remains 0.155s, so the gap is 7.8x rather than 12.8x.
+
+### The suggested fix was not available
+
+#94 proposed negotiating `MRG_RXBUF` and GSO. A rehydrated snapshot cannot:
+the guest bound its feature set at capture time, and `devmgr` restores
+`acked_features` from `state.json`. This snapshot negotiated `0x120427faf` —
+`GUEST_CSUM`, `GUEST_TSO4/6`, `GUEST_UFO`, but **not** `MRG_RXBUF`. The guest's
+link MTU cannot be raised either: `VIRTIO_NET_F_MTU` with `config.mtu = 1500`
+pins `dev->max_mtu`, and TCP MSS clamping caps the segments regardless.
+
+What that feature set does give us is Linux's "big packets" receive mode:
+without `MRG_RXBUF` but with GSO, `virtio_net` posts multi-page receive chains.
+Measured, the guest was posting 73,708-byte chains and we were putting 1,478
+bytes in each. Coalescing on receive is the only route to larger frames, and it
+is what a hardware LRO NIC does.
+
+### What was actually wrong
+
+**The vCPU was running the network stack.** `NatResponder::handle` ran the whole
+smoltcp pass synchronously inside the MMIO exit for a guest transmit. Measured:
+764ms of every second was spent stopped inside `notify_net`. A transmit now only
+enqueues the frame and wakes the service thread.
+
+**The checksum was 80% of the remaining cost.** Once the vCPU was free, the
+transfer got *slower*. Nested timers narrowed it to `flush_rx` (894ms/s), then
+`pop_rx` (721ms), then `checksum_in_place` (710ms) — a byte-at-a-time RFC-1071
+loop over a merged ~3 KB payload, roughly 75µs per packet in a debug build.
+`GUEST_CSUM` is negotiated, so we stamp `VIRTIO_NET_HDR_F_DATA_VALID` and skip
+the TCP checksum entirely. The claim is truthful: the NAT terminates every flow
+and generates the segment itself. The IP header checksum is still computed —
+Linux verifies that one unconditionally.
+
+**Coalescing needs a backlog to coalesce.** With the above fixed, the merge
+ratio sat at exactly 2.0 with no frame ever hitting the size limit: smoltcp
+emits about 1.5 frames per poll, and draining after every pass meant there was
+never anything to merge. Servicing in a bounded burst — accumulate until one
+receive chain's worth of bytes, at most 32 passes, stop early on an idle pass —
+took the ratio to 29x (45,223 segments into 1,547 frames) and cut interrupts
+from 6,977/s to 1,035/s.
+
+**The service thread slept while the host had data queued.** It waited on the
+kick condvar after *every* pass, including passes that had just delivered
+frames — so a bulk transfer was capped at one chain per 2ms fallback whenever
+guest transmits were sparse. Now a pass that reached the guest goes straight
+round again; only an idle pass waits. This is self-reinforcing with the
+coalescing above: the better the merging, the fewer guest ACKs, the fewer wakes.
+
+### Where I was wrong
+
+1. **LRO on its own was a regression** — 3.22s against a 2.08s baseline. The
+   mechanism was right and the measurement said no. Deferring the stack off the
+   vCPU is what made it pay; neither change is worth anything alone.
+2. **Deferring with a busy service loop was much worse** — 5.567s, because the
+   thread burned a core spinning. The answer to a latency problem was not a
+   tighter loop.
+3. **I assumed the wire was the cost.** It was the checksum, and only nested
+   timers found it. Worth stating that these runs are debug builds, so an
+   unoptimised inner loop is disproportionately expensive — the baseline is
+   debug too, so the comparison is fair, but the absolute figure is not.
+4. **I measured "one poll per pass instead of two"** on the theory the leading
+   `iface.poll` was redundant. It is not: 1.459 / 1.613 / 2.551s, with poll time
+   rising from 553ms to 1,646ms. Reverted.
+5. **Three trials hid a real bug.** A 3-trial run gave 1.49 / 1.33 / 1.41 and I
+   nearly stopped there. Five trials gave 10.09 / 36.22 / 8.42 / 2.09 / 1.19 —
+   the sleeping-service-thread stall above. The fast reading was luck. The fix
+   took the spread to 1.187–1.294 across two independent runs of five.
+
+### What is left
+
+`iface.poll` (smoltcp) is now the largest remaining cost at roughly 550ms of a
+second. How much of that is the debug build is untested.

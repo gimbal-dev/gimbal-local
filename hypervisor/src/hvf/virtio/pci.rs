@@ -190,6 +190,9 @@ struct Inner {
 pub struct VirtioPciDevice {
     name: String,
     inner: Mutex<Inner>,
+    /// Wakes the net service thread when the guest transmits. `None` for
+    /// non-net devices and for a device built without a service thread.
+    kick: Mutex<Option<Arc<super::net::NetKick>>>,
 }
 
 /// Parameters needed to restore a [`VirtioPciDevice`] from a snapshot.
@@ -241,7 +244,14 @@ impl VirtioPciDevice {
         Self {
             name,
             inner: Mutex::new(inner),
+            kick: Mutex::new(None),
         }
+    }
+
+    /// Attach the wake handle the net service thread waits on, so a guest
+    /// transmit is serviced immediately instead of at the next tick.
+    pub fn set_net_kick(&self, kick: Arc<super::net::NetKick>) {
+        *self.kick.lock().unwrap() = Some(kick);
     }
 
     /// Replace the interrupt injector (e.g. with a real GIC-backed one).
@@ -396,6 +406,7 @@ impl Inner {
     /// frames, since a reply produced by a TX notify needs an RX buffer the
     /// guest may already have posted.
     fn notify_net(&mut self, queue_index: u16) {
+        let _tx_t = std::time::Instant::now();
         let mem = self.mem.clone();
         if queue_index == NET_TX_QUEUE {
             let mut completed = false;
@@ -466,17 +477,27 @@ impl Inner {
             };
             let chain = match rx.pop(&mem) {
                 Ok(Some(c)) => c,
-                _ => break, // no posted buffer: leave the backlog for later
+                _ => {
+                    break; // no posted buffer: leave the backlog for later
+                }
             };
-            let frame = match &mut self.backend {
-                Backend::Net(n) => n.pop_rx(),
-                _ => None,
+            let cap: u32 = chain.writable().map(|s| s.len).sum();
+            let (frame, hdr_flags) = match &mut self.backend {
+                Backend::Net(n) => {
+                    // Tell the device how much this guest buffer holds before
+                    // asking for a frame, so receive coalescing is bounded by
+                    // the guest's real capacity rather than a guess.
+                    n.observe_rx_capacity(cap as usize);
+                    (n.pop_rx(), n.rx_header_flags())
+                }
+                _ => (None, 0),
             };
             let Some(frame) = frame else { break };
 
             // Compose [virtio-net header][frame] and spread it across the
             // chain's writable segments.
             let mut payload = vec![0u8; VIRTIO_NET_HDR_LEN];
+            payload[0] = hdr_flags;
             payload[10] = 1; // num_buffers = 1 (little-endian u16)
             payload.extend_from_slice(&frame);
             let mut written = 0usize;
@@ -642,6 +663,15 @@ impl MmioDevice for VirtioPciDevice {
                     );
                 }
                 inner.notify(queue_index);
+                // The guest transmitted; the net service thread does the actual
+                // stack work, so wake it now rather than let it wait out its
+                // tick. Dropping the device lock first keeps the wake off the
+                // path any other thread has to contend for.
+                let net = matches!(inner.backend, Backend::Net(_));
+                drop(inner);
+                if net && let Some(kick) = self.kick.lock().unwrap().as_ref() {
+                    kick.wake();
+                }
             }
             _ => {}
         }
@@ -941,9 +971,11 @@ mod tests {
         intids[11] = 131;
         dev.set_injector(Box::new(MsiSpiInjector::new("net2", intids, sink.clone())));
 
-        // Notify the TX queue (index 1): the device parses the frame, produces an
-        // ARP reply, and injects it into the RX queue.
+        // Notify the TX queue (index 1): the device consumes the frame and hands
+        // it to the responder. The reply is produced off the vCPU thread, so the
+        // service tick is what injects it into the RX queue.
         dev.write(NOTIFICATION_OFFSET, &1u16.to_le_bytes());
+        assert!(dev.service_net(), "service tick injected the reply");
 
         // TX consumed.
         assert_eq!(mem.read_u16(tx_used + 2).unwrap(), 1, "TX descriptor completed");
