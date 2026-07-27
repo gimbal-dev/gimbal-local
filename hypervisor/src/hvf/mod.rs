@@ -1959,7 +1959,8 @@ impl Vcpu for HvfVcpu {
                 0xff
             };
             eprintln!(
-                "[exit] vcpu {} reason={} ec={ec:#x} pc={pc:#x} ipa={:#x}",
+                "[exit] t={} vcpu {} reason={} ec={ec:#x} pc={pc:#x} ipa={:#x}",
+                self.current_cntvct(),
                 self.index,
                 exit.reason,
                 if exit.reason == HV_EXIT_REASON_EXCEPTION {
@@ -2058,7 +2059,17 @@ impl Vcpu for HvfVcpu {
                                 } else {
                                     10
                                 };
-                                std::thread::sleep(std::time::Duration::from_millis(nap_ms));
+                                // Wait on the wake fd rather than sleeping blind.
+                                // Device threads write this fd immediately after
+                                // asserting a completion interrupt, so a guest
+                                // parked in WFI on a virtio completion resumes as
+                                // soon as the device is done instead of after the
+                                // remainder of a 1-10 ms nap. The timeout is the
+                                // same nap, so a wakeup source that never kicks
+                                // (e.g. the virtual timer, self-delivered above)
+                                // behaves exactly as before. `wait_timeout` drains
+                                // the fd itself, so a stale count cannot spin here.
+                                let _ = self.kick.wait_timeout(nap_ms as i32);
                             }
                         } else {
                             // Managed path: one bounded park; the outer loop
