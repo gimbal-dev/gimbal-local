@@ -40,6 +40,7 @@
 //! a real snapshot is exactly the link this module proves.
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::anyhow;
@@ -379,9 +380,13 @@ fn reassemble_rdist_slice(rdist: &[u32], n: usize, id: usize) -> Vec<u32> {
 pub struct GuestRam {
     ptr: *mut u8,
     size: usize,
-    /// Background thread populating the mapping (see `map_file`). Joined in
-    /// `Drop` before `munmap` so it can never touch a torn-down mapping.
-    willneed: Option<std::thread::JoinHandle<()>>,
+    /// Background threads populating the mapping (see `map_file`). Joined in
+    /// `Drop` before `munmap` so they can never touch a torn-down mapping.
+    willneed: Option<Vec<std::thread::JoinHandle<()>>>,
+    /// Set by `Drop` to cut the populate threads short. Without it, tearing down
+    /// a short-lived VM waits out the whole ~650ms populate (#79 measures
+    /// teardown, and a disposable sandbox may not live that long).
+    willneed_stop: Arc<AtomicBool>,
 }
 
 // SAFETY: the mapping is owned exclusively by this struct and only handed to
@@ -390,6 +395,30 @@ unsafe impl Send for GuestRam {}
 // SAFETY: see the `Send` impl above — the raw pointer is never aliased and the
 // mapping is only read/written by the hypervisor as guest memory.
 unsafe impl Sync for GuestRam {}
+
+/// Granularity of the background `MADV_WILLNEED` walk. Small enough that
+/// teardown never waits more than one chunk (~40ms), large enough that the
+/// syscall count stays trivial (16 calls for a 1 GiB guest).
+const WILLNEED_CHUNK: usize = 64 * 1024 * 1024;
+
+/// Number of threads sharing the populate walk.
+///
+/// One thread is not enough: `MADV_WILLNEED` on 1 GiB takes ~700ms, so a
+/// sandbox that starts working immediately (the disposable-sandbox case #79
+/// measures) races the populate and only gets part of the benefit. Splitting
+/// the walk across threads finishes it sooner. Measured interleaved on an
+/// 8-logical-CPU M3 (median of 6, `diskwrite`/`fsyncsmall` in seconds):
+/// 1 thread 1.022/0.320, 4 threads 0.807/0.199, 8 threads 0.732/0.178,
+/// 16 threads 0.667/0.214 — monotonic to the CPU count, then a wash. So: one
+/// thread per logical CPU, capped, because past the core count this is just
+/// more threads contending for the same page-fault path.
+fn willneed_threads(chunks: usize) -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, 8)
+        .min(chunks.max(1))
+}
 
 impl GuestRam {
     /// Map `size` bytes at `file_offset` of `path` copy-on-write.
@@ -413,17 +442,27 @@ impl GuestRam {
     /// mapping is populated up front with `madvise(MADV_WILLNEED)`.
     ///
     /// That call **blocks** on macOS (measured: ~665 ms for 1 GiB) — it is not
-    /// the advisory no-op the Linux semantics suggest — so it runs on a
-    /// dedicated thread and `Drop` joins that thread before `munmap`. The mmap
-    /// step therefore stays ~1.5 ms (the #79 resume win is preserved) while the
-    /// guest still finds most of its pages already resident: diskwrite 1.68 s ->
-    /// 0.54 s, fsyncsmall 0.19 s -> 0.09 s, with the whole-run host envelope
-    /// dropping ~11.9 s -> ~10.8 s. `fcntl(F_RDADVISE)` was measured as an
-    /// alternative and rejected: it warms the *file's* page cache but not the
-    /// mapping, and moved the workload not at all. Because the pages stay clean
-    /// and file-backed this also avoids the private-copy footprint that
-    /// `CHM_EAGER_RAM` forces. Set `CHM_NO_RAM_WILLNEED=1` to skip it (A/B
-    /// comparison / diagnostics).
+    /// the advisory no-op the Linux semantics suggest — so it runs on background
+    /// threads, in chunks so `Drop` can cut it short rather than hold teardown
+    /// for its full duration. The mmap step therefore stays ~1.5 ms (the #79
+    /// resume win is preserved) while the guest still finds most of its pages
+    /// already resident.
+    ///
+    /// **How big the win is depends on how soon the guest starts working.** The
+    /// figure first published for #95 (diskwrite 1.68 s -> 0.54 s, ~3x) was
+    /// measured through a benchmark harness that burned ~10 s before the
+    /// workload ran, so the populate had always finished first. Removing that
+    /// dead time (#79) made the workload race the populate, which is the honest
+    /// disposable-sandbox condition and a smaller win; parallelising the walk
+    /// is what claws it back. Clean interleaved thread-count sweep on an
+    /// 8-logical-CPU M3 (median of 6, diskwrite/fsyncsmall seconds): 1 thread
+    /// 1.022/0.320, 8 threads 0.732/0.178. See `scripts/bench/RESULTS.md`.
+    ///
+    /// `fcntl(F_RDADVISE)` was measured as an alternative and rejected: it warms
+    /// the *file's* page cache but not the mapping, and moved the workload not
+    /// at all. Because the pages stay clean and file-backed this also avoids the
+    /// private-copy footprint that `CHM_EAGER_RAM` forces. Set
+    /// `CHM_NO_RAM_WILLNEED=1` to skip it (A/B comparison / diagnostics).
     fn map_file(path: &Path, file_offset: u64, size: usize) -> Result<Self, RehydrateError> {
         use std::os::unix::fs::FileExt;
         // Open and validate the region is within the file.
@@ -473,23 +512,49 @@ impl GuestRam {
             if ptr != MAP_FAILED {
                 // Populate the mapping off the critical path; see the doc
                 // comment above for why this must not run inline.
+                let willneed_stop = Arc::new(AtomicBool::new(false));
                 let willneed = if std::env::var_os("CHM_NO_RAM_WILLNEED").is_some() {
                     None
                 } else {
                     let addr = ptr as usize;
-                    std::thread::Builder::new()
-                        .name("chm-ram-willneed".into())
-                        .spawn(move || {
-                            // SAFETY: the mapping is live for this thread's whole
-                            // lifetime — `GuestRam::drop` joins it before
-                            // `munmap` — and `MADV_WILLNEED` only populates pages
-                            // the guest may also touch concurrently, which is
-                            // exactly what a first-touch fault would do anyway.
-                            unsafe {
-                                libc::madvise(addr as *mut libc::c_void, size, libc::MADV_WILLNEED);
-                            }
-                        })
-                        .ok()
+                    let chunks = size.div_ceil(WILLNEED_CHUNK);
+                    let nthreads = willneed_threads(chunks);
+                    let mut handles = Vec::with_capacity(nthreads);
+                    for t in 0..nthreads {
+                        let stop = willneed_stop.clone();
+                        let h = std::thread::Builder::new()
+                            .name(format!("chm-ram-willneed-{t}"))
+                            .spawn(move || {
+                                // Chunked so `Drop` can cut this short: a whole-region
+                                // `madvise` is uninterruptible and would hold teardown
+                                // for its full duration. Threads stride through the
+                                // chunk list so each covers a disjoint set and no
+                                // coordination beyond the stop flag is needed.
+                                let mut c = t;
+                                while c < chunks && !stop.load(Ordering::Acquire) {
+                                    let off = c * WILLNEED_CHUNK;
+                                    let len = WILLNEED_CHUNK.min(size - off);
+                                    // SAFETY: `[addr, addr+size)` is a live mapping for
+                                    // this thread's whole lifetime — `GuestRam::drop`
+                                    // joins before `munmap` — and `MADV_WILLNEED` only
+                                    // populates pages the guest may touch concurrently,
+                                    // which is what a first-touch fault would do anyway.
+                                    unsafe {
+                                        libc::madvise(
+                                            (addr + off) as *mut libc::c_void,
+                                            len,
+                                            libc::MADV_WILLNEED,
+                                        );
+                                    }
+                                    c += nthreads;
+                                }
+                            })
+                            .ok();
+                        if let Some(h) = h {
+                            handles.push(h);
+                        }
+                    }
+                    (!handles.is_empty()).then_some(handles)
                 };
                 if timing {
                     eprintln!(
@@ -502,6 +567,7 @@ impl GuestRam {
                     ptr: ptr as *mut u8,
                     size,
                     willneed,
+                    willneed_stop,
                 });
             }
             // Fall through to the eager path if the file-backed mmap was rejected.
@@ -537,6 +603,7 @@ impl GuestRam {
             ptr: ptr as *mut u8,
             size,
             willneed: None,
+            willneed_stop: Arc::new(AtomicBool::new(false)),
         };
 
         // SAFETY: ptr is valid for `size` bytes; we fill it exactly once.
@@ -583,8 +650,11 @@ impl GuestRam {
 
 impl Drop for GuestRam {
     fn drop(&mut self) {
-        if let Some(h) = self.willneed.take() {
-            let _ = h.join();
+        if let Some(handles) = self.willneed.take() {
+            self.willneed_stop.store(true, Ordering::Release);
+            for h in handles {
+                let _ = h.join();
+            }
         }
         // SAFETY: unmapping our own mapping exactly once.
         unsafe {
@@ -1219,6 +1289,27 @@ fn u32_vec(v: &serde_json::Value, key: &str) -> Result<Vec<u32>, RehydrateError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The populate walk strides threads across chunks, so a thread count above
+    /// the chunk count would spawn threads with no work — and a count of zero
+    /// would silently skip the populate entirely, quietly undoing #95.
+    #[test]
+    fn willneed_thread_count_is_bounded_by_chunks_and_never_zero() {
+        assert_eq!(
+            willneed_threads(1),
+            1,
+            "a single chunk needs a single thread"
+        );
+        assert_eq!(
+            willneed_threads(0),
+            1,
+            "an empty region must still be valid"
+        );
+        let many = willneed_threads(1024);
+        assert!((1..=8).contains(&many), "unbounded thread count: {many}");
+        // Monotonic: more chunks can never mean fewer threads.
+        assert!(willneed_threads(16) >= willneed_threads(2));
+    }
 
     // cloud-hypervisor dumps redistributors in two passes: every vCPU's RD_base
     // registers, then every vCPU's SGI-frame registers. `reassemble_rdist_slice`

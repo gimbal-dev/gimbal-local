@@ -61,6 +61,10 @@ mod limits;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod audit;
 
+/// Start-to-ready phase timing (#79).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod startup;
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn main() -> ExitCode {
     imp::main()

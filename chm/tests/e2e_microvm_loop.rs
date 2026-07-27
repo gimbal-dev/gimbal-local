@@ -796,7 +796,11 @@ fn microvm_xz_benchmark() {
         );
         let boot_deadline = Instant::now() + Duration::from_secs(150);
         bench_reach_shell(&mut s, shell, boot_deadline);
-        s.drain_for(Duration::from_secs(2));
+        // Let residual boot chatter settle so the transcript is clean before the
+        // command. Short by design: the tagged completion line is what the trial
+        // matches on, so this only needs to cover the prompt echo, and every
+        // millisecond here lands inside the reported `host_envelope_s` (#79).
+        s.drain_for(Duration::from_millis(300));
 
         let uniq = format!("{}_{}", process::id(), nanos());
         // The same inner command the Docker/sbx sides run ($BENCH_CMD, default a
@@ -853,6 +857,141 @@ fn microvm_xz_benchmark() {
         trial_walls.iter().any(|(_, ok, _)| *ok == 1),
         "no {workload} trial succeeded in the guest"
     );
+}
+
+/// Start-to-ready latency benchmark (#79).
+///
+/// The I/O and CPU benchmarks report `host_envelope_s`, which folds in harness
+/// cost (per-trial codesign, prompt nudging, drain) and so cannot answer "how
+/// fast does a sandbox start". This measures the four phases that matter for a
+/// disposable sandbox, per trial:
+///
+/// * `vmm_ready_s`  — process spawn until the guest is released to run, read
+///   from the `[startup] … guest released (VMM ready)` stamp (`CHM_TRACE_TIMING`).
+/// * `shell_ready_s` — process spawn until a usable shell prompt.
+/// * `teardown_s`   — graceful quit until the process is gone.
+/// * `total_s`      — spawn until gone: the whole disposable-sandbox lifetime.
+///
+/// The signed binary is prepared *before* the clock starts, because codesigning
+/// is a harness artifact (a shipped `chm` is signed once at install), not a
+/// startup cost users pay.
+#[test]
+#[ignore = "needs a local HVF-compatible snapshot; run via scripts/bench/run-gimbal-startup.sh"]
+fn microvm_startup_benchmark() {
+    let Some(snapshot) = snapshot_from_env() else {
+        eprintln!("skipping: set CHM_E2E_SNAPSHOT to a snapshot dir to run the startup benchmark");
+        return;
+    };
+    let trials: usize = env::var("BENCH_TRIALS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5);
+    let out = env::var("BENCH_OUT").unwrap_or_else(|_| {
+        format!(
+            "{}/../scripts/bench/results/gimbal-startup.json",
+            env!("CARGO_MANIFEST_DIR")
+        )
+    });
+    let shell = "@ch-snap:~$";
+
+    let mut rows: Vec<(f64, f64, f64, f64)> = Vec::new();
+    for i in 0..trials {
+        let overlays = snapshot.join(".chm-overlays");
+        if overlays.is_dir() {
+            for entry in fs::read_dir(&overlays).into_iter().flatten().flatten() {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        // Outside the measured window on purpose (see the doc comment).
+        let chm = signed_chm_binary();
+
+        let t0 = Instant::now();
+        let mut s = PtySession::spawn(
+            &chm,
+            &[
+                "connect",
+                snapshot.to_str().unwrap(),
+                "--no-stop-daemon",
+                "--idle-exit",
+                "0",
+                "--max-seconds",
+                "300",
+            ],
+        );
+        bench_reach_shell(&mut s, shell, Instant::now() + Duration::from_secs(150));
+        let shell_ready = t0.elapsed().as_secs_f64();
+        let vmm_ready = parse_vmm_ready(&s.transcript()).unwrap_or(f64::NAN);
+
+        let t_down = Instant::now();
+        s.shutdown();
+        let teardown = t_down.elapsed().as_secs_f64();
+        let total = t0.elapsed().as_secs_f64();
+
+        eprintln!(
+            "gimbal startup trial {}/{}: vmm_ready_s={vmm_ready:.3} shell_ready_s={shell_ready:.3} \
+             teardown_s={teardown:.3} total_s={total:.3}",
+            i + 1,
+            trials
+        );
+        rows.push((vmm_ready, shell_ready, teardown, total));
+    }
+
+    let mut trials_json = String::new();
+    for (idx, (vmm, sh, td, tot)) in rows.iter().enumerate() {
+        if idx > 0 {
+            trials_json.push(',');
+        }
+        // A missing stamp serialises as null rather than NaN, which is not JSON.
+        let vmm = if vmm.is_nan() {
+            "null".to_string()
+        } else {
+            format!("{vmm:.3}")
+        };
+        trials_json.push_str(&format!(
+            "{{\"vmm_ready_s\":{vmm},\"shell_ready_s\":{sh:.3},\"teardown_s\":{td:.3},\"total_s\":{tot:.3}}}"
+        ));
+    }
+    let doc = format!(
+        "{{\n  \"runtime\": \"gimbal\",\n  \"workload\": \"startup\",\n  \
+         \"host\": {{\"ncpu\": 1, \"snapshot\": \"{}\"}},\n  \
+         \"trials\": [{trials_json}]\n}}\n",
+        snapshot
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("snapshot")
+    );
+    if let Some(parent) = Path::new(&out).parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    fs::write(&out, doc).unwrap_or_else(|e| panic!("write {out}: {e}"));
+    eprintln!("gimbal startup benchmark: wrote {out}");
+
+    assert!(
+        rows.iter().any(|(_, sh, _, _)| *sh > 0.0),
+        "no startup trial reached a shell"
+    );
+}
+
+/// Pull the seconds value out of the `[startup] <elapsed> guest released (VMM
+/// ready)` stamp. `chm` formats the elapsed time with `{:?}` on a `Duration`, so
+/// the unit varies with magnitude (`25.412ms`, `1.204s`, `812.4µs`); all three
+/// are normalised to seconds here. Returns `None` when the stamp is absent
+/// (`CHM_TRACE_TIMING` unset, or the guest never got released).
+fn parse_vmm_ready(transcript: &str) -> Option<f64> {
+    let line = transcript
+        .lines()
+        .find(|l| l.contains("[startup]") && l.contains("VMM ready"))?;
+    let field = line.split_whitespace().nth(1)?;
+    let (num, scale) = if let Some(v) = field.strip_suffix("ms") {
+        (v, 1e-3)
+    } else if let Some(v) = field.strip_suffix("µs") {
+        (v, 1e-6)
+    } else if let Some(v) = field.strip_suffix("ns") {
+        (v, 1e-9)
+    } else {
+        (field.strip_suffix('s')?, 1.0)
+    };
+    num.parse::<f64>().ok().map(|v| v * scale)
 }
 
 /// Extract `(wall_s, ok)` from the `BENCH_RESULT ... tag=<uniq>` line in a
@@ -916,28 +1055,20 @@ fn login_to_shell(session: &mut PtySession, shell: &str, deadline: Instant) {
 /// Deliberately separate from `resume_to_shell`, which asserts a resume did
 /// *not* cold-boot -- that assertion is the point of the suspend/resume test and
 /// must not be relaxed here.
+///
+/// The nudge is sent *immediately* and then repeated, rather than after a blind
+/// grace period. A resumed snapshot prints nothing at all, so any pre-nudge wait
+/// is burned in full on every trial and lands inside the reported
+/// `host_envelope_s` -- it measures the harness, not the engine (#79). An early
+/// newline is harmless to a cold-booting guest: it is either consumed before
+/// getty starts or makes getty reprint its prompt.
 fn bench_reach_shell(session: &mut PtySession, shell: &str, deadline: Instant) {
-    // A cold-booting guest prints its own banner; give it a short window before
-    // assuming the prompt was restored silently. Kept short deliberately: this
-    // wait lands inside the reported `host_envelope_s`, so a generous window
-    // would overstate gimbal's startup cost for resume-style snapshots.
-    if let WaitOutcome::Found(m) = session.wait_for_or_abort(
-        &[shell, "login:"],
-        &DISK_ERRORS,
-        Instant::now() + Duration::from_secs(8),
-    ) {
-        if m != "login:" {
-            return;
-        }
-        return bench_log_in(session, shell, deadline);
-    }
-    // Otherwise assume a restored-but-silent prompt and nudge for it.
     while Instant::now() < deadline {
         session.send("\n");
         match session.wait_for_or_abort(
             &[shell, "login:"],
             &DISK_ERRORS,
-            Instant::now() + Duration::from_secs(5),
+            Instant::now() + Duration::from_millis(500),
         ) {
             WaitOutcome::Found(m) if m == "login:" => return bench_log_in(session, shell, deadline),
             WaitOutcome::Found(_) => return,
@@ -1040,6 +1171,13 @@ fn nanos() -> u128 {
 /// Copy the cargo-built `chm` to a temp path and ad-hoc code-sign it with the
 /// hypervisor entitlement. Working on a copy avoids disturbing (or being blocked
 /// by) a `chm` the app/daemon may currently be running from `target/`.
+///
+/// The freshly-signed binary is then executed once, cheaply, to pay macOS's
+/// first-exec code-signature validation here rather than inside a measured
+/// window. That validation costs ~0.3s for a debug `chm` and ~0.01s on every
+/// subsequent exec, so a benchmark that skipped this would attribute an
+/// install-time cost (a shipped `chm` is signed and validated once) to startup
+/// latency on every trial -- which is exactly the error #79's premise came from.
 fn signed_chm_binary() -> PathBuf {
     let src = env!("CARGO_BIN_EXE_chm");
     let dst = env::temp_dir().join(format!("chm-e2e-{}", process::id()));
@@ -1057,6 +1195,9 @@ fn signed_chm_binary() -> PathBuf {
         .expect("run codesign");
     assert!(status.success(), "codesign failed for {}", dst.display());
     let _ = fs::remove_file(&ent);
+    // Warm the signature (see the doc comment). `--version` neither creates a VM
+    // nor touches a snapshot, so this is a pure exec.
+    let _ = Command::new(&dst).arg("--version").output();
     dst
 }
 
@@ -1315,5 +1456,42 @@ fn set_nonblocking(fd: RawFd) {
     unsafe {
         let flags = libc::fcntl(fd, libc::F_GETFL, 0);
         libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
+}
+
+#[cfg(test)]
+mod startup_parse_tests {
+    use super::parse_vmm_ready;
+
+    /// `Duration`'s `{:?}` switches unit with magnitude, so a parser that
+    /// assumes seconds silently reports a 25 ms startup as 25 seconds.
+    #[test]
+    fn parses_every_duration_unit_debug_emits() {
+        let cases = [
+            (
+                "[startup]    25.412ms guest released (VMM ready)",
+                0.025_412,
+            ),
+            ("[startup]     1.204s guest released (VMM ready)", 1.204),
+            (
+                "[startup]    812.4µs guest released (VMM ready)",
+                0.000_812_4,
+            ),
+            (
+                "[startup]      900ns guest released (VMM ready)",
+                0.000_000_9,
+            ),
+        ];
+        for (line, want) in cases {
+            let got = parse_vmm_ready(line).unwrap_or_else(|| panic!("no parse for {line}"));
+            assert!((got - want).abs() < 1e-9, "{line}: got {got}, want {want}");
+        }
+    }
+
+    #[test]
+    fn absent_or_unrelated_stamps_yield_none() {
+        assert!(parse_vmm_ready("ubuntu@ch-snap:~$ ls\n").is_none());
+        // A different phase must not be mistaken for the ready stamp.
+        assert!(parse_vmm_ready("[startup]    3.100ms snapshot parsed\n").is_none());
     }
 }

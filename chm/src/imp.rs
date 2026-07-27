@@ -24,6 +24,7 @@ use crate::firewall;
 use crate::limits;
 use crate::serve;
 use crate::signing;
+use crate::startup;
 use crate::state_cdn;
 
 use hypervisor::arch::aarch64::gic::Vgic;
@@ -673,6 +674,7 @@ struct ConnectArgs {
 }
 
 pub fn main() -> ExitCode {
+    startup::init();
     let raw: Vec<String> = env::args().skip(1).collect();
     match raw.first().map(String::as_str) {
         Some("cloud") => cloud::cloud_main(&raw[1..]),
@@ -1219,6 +1221,7 @@ fn stop_daemon_vm_if_present(socket_path: &Path) -> Result<(), String> {
 fn run(args: &Args) -> Result<ExitCode, String> {
     let dir = &args.snapshot_dir;
     let loaded = load_snapshot(dir)?;
+    startup::stamp("snapshot parsed");
 
     // Userspace-GIC path (experimental, opt-in): rehydrate an ITS/LPI-routed
     // snapshot — the kind Apple's managed GIC cannot deliver completions for, and
@@ -1500,8 +1503,10 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
              see scripts/build-chm.sh)"
         )
     })?;
+    startup::stamp("hypervisor opened");
     let prepared = rehydrate::prepare_usgic_vm(hv.as_ref(), &snap, &mem_ranges)
         .map_err(|e| format!("prepare userspace-GIC VM: {e}"))?;
+    startup::stamp("VM created + guest RAM mapped");
     let guest_mem = prepared.guest_mem.clone();
     let vm = prepared.vm.clone();
     let seed = prepared.seed();
@@ -1692,6 +1697,7 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
         }
     }
     let setups: Vec<CpuSetup> = collected.into_iter().map(|s| s.expect("all ids present")).collect();
+    startup::stamp("vCPUs restored");
 
     // vCPU 0's handles drive the device sinks (SPIs/LPIs are delivered to the
     // boot CPU) and the serial console; collect every vCPU's exit signal so the
@@ -1746,6 +1752,8 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
         }
     };
 
+    startup::stamp("virtio device model wired");
+
     // Interactive console. The serial sink routes a keystroke's line SPI to the
     // vCPU its GICD_IROUTER affinity names (via the shared distributor) and wakes
     // that core — so moving the serial IRQ's affinity (e.g. to CPU1) actually
@@ -1777,6 +1785,7 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
     for go_tx in &go_txs {
         let _ = go_tx.send(sgi_table.clone());
     }
+    startup::stamp("guest released (VMM ready)");
 
     let coordinator = run_console(&uart, &running, args, &limits, &overlay_dir);
 
