@@ -109,9 +109,7 @@ impl Guest {
 fn pump(guest: &mut Guest, nat: &mut NatResponder) {
     guest.poll();
     while let Some(frame) = guest.device.pop_to_guest() {
-        for reply in nat.handle(&frame) {
-            guest.device.push_from_guest(reply);
-        }
+        nat.accept(&frame);
     }
     for reply in NatResponder::service(nat) {
         guest.device.push_from_guest(reply);

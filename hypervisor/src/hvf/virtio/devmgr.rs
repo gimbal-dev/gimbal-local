@@ -468,7 +468,10 @@ pub fn build_device(
                 );
             }
             let responder = NatResponder::new([192, 168, 249, 1], [0x02, 0, 0, 0, 0, 1], policy, net_limits);
-            (Backend::Net(NetDevice::new(Box::new(responder))), Vec::new())
+            (
+                Backend::Net(NetDevice::new(Box::new(responder)).with_features(desc.features)),
+                Vec::new(),
+            )
         }
         BackendKind::Unsupported { virtio_type } => {
             return Err(DevMgrError::Unsupported(format!(

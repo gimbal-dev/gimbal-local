@@ -55,6 +55,11 @@ use super::net::NetResponder;
 /// Per-socket TCP buffering. 64 KiB each direction is enough for the demo's
 /// HTTPS transfers without being wasteful across a handful of flows.
 const TCP_BUF: usize = 64 * 1024;
+/// How much is read from a host socket per attempt. The relay loops until the
+/// host blocks or the guest-facing socket is full, so this bounds one syscall
+/// rather than one service pass.
+const HOST_READ_CHUNK: usize = 16 * 1024;
+
 /// How long a host connect may take before the flow is torn down.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
 /// How much burst the bandwidth token bucket allows: one second of the rate, so
@@ -559,32 +564,48 @@ impl NatResponder {
         }
 
         // Host -> guest: flush any backlog first (already-read bytes, not counted
-        // again), then read more up to the remaining budget.
+        // again), then keep reading while the host has data and the guest-facing
+        // socket has room. One read per pass would cap a flow at 16 KiB per
+        // service call regardless of how much the host had ready.
         if !pending.is_empty() {
             let sent = sock.send_slice(pending).unwrap_or(0);
             pending.drain(..sent);
         }
-        if pending.is_empty() && !*host_eof && sock.can_send() {
+        while pending.is_empty() && !*host_eof && sock.can_send() {
             let cap = match *budget {
                 Some(0) => 0,
-                Some(n) => (n as usize).min(16 * 1024),
-                None => 16 * 1024,
+                Some(n) => (n as usize).min(HOST_READ_CHUNK),
+                None => HOST_READ_CHUNK,
             };
-            if cap > 0 {
-                let mut buf = [0u8; 16 * 1024];
-                match stream.read(&mut buf[..cap]) {
-                    Ok(0) => *host_eof = true,
-                    Ok(n) => {
-                        let sent = sock.send_slice(&buf[..n]).unwrap_or(0);
-                        if sent < n {
-                            pending.extend_from_slice(&buf[sent..n]);
-                        }
-                        if let Some(b) = budget {
-                            *b = b.saturating_sub(n as u64);
-                        }
+            if cap == 0 {
+                break;
+            }
+            let mut buf = [0u8; HOST_READ_CHUNK];
+            match stream.read(&mut buf[..cap]) {
+                Ok(0) => {
+                    *host_eof = true;
+                    break;
+                }
+                Ok(n) => {
+                    let sent = sock.send_slice(&buf[..n]).unwrap_or(0);
+                    if sent < n {
+                        pending.extend_from_slice(&buf[sent..n]);
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-                    Err(_) => *host_eof = true,
+                    if let Some(b) = budget {
+                        *b = b.saturating_sub(n as u64);
+                    }
+                    // A short read means the host had nothing more ready; going
+                    // round again would only earn a `WouldBlock`.
+                    if n < cap {
+                        break;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    break;
+                }
+                Err(_) => {
+                    *host_eof = true;
+                    break;
                 }
             }
         }
@@ -599,7 +620,7 @@ impl NatResponder {
 }
 
 impl NetResponder for NatResponder {
-    fn handle(&mut self, frame: &[u8]) -> Vec<Vec<u8>> {
+    fn accept(&mut self, frame: &[u8]) {
         if std::env::var_os("CHM_TRACE_NAT").is_some() {
             trace_frame("guest->nat", frame);
         }
@@ -608,7 +629,6 @@ impl NetResponder for NatResponder {
             self.admit_syn(dst);
         }
         self.device.push_from_guest(frame.to_vec());
-        self.service()
     }
 
     fn service(&mut self) -> Vec<Vec<u8>> {
