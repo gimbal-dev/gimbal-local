@@ -59,6 +59,14 @@ So on this hardware: gimbal's warm-resume start (~5s) < Docker Sandbox's cold
 microVM create (~12.7s), while both do real per-instance VM isolation that
 Docker Desktop's shared-kernel container does not.
 
+> **Corrected 2026-07-29 (#79).** The "~5s" above was inferred by subtracting
+> the in-guest workload from the host envelope, and was almost entirely
+> *harness* overhead — a blind 8s wait plus a per-trial code-signature
+> validation. Directly instrumented, gimbal is **0.043s to VMM-ready, 0.112s to
+> an interactive shell, 0.247s spawn-to-gone**. The comparison's conclusion
+> holds and gets stronger; the number was wrong. See the #79 section at the end
+> of this file.
+
 ## Prior 2-way result -- xz (2026-07-17)
 
 Earlier run before Docker Sandbox was added, using `seq | xz -6 -T1` (xz is not
@@ -289,6 +297,12 @@ median of 5: **1.601s** against Docker's 0.266s.
 | fsyncsmall | 0.224s | **0.103s** | 2.17x | 0.120s |
 | netget | 1.269s | **1.153s** | 1.10x | 0.155s |
 
+> **Condition note, added 2026-07-29 (#79).** These were measured through a
+> harness that burned ~10s before the workload started, so the background
+> populate had always completed first. Once #79 removed that dead time the
+> workload races the populate and the win is smaller; parallelising the
+> populate recovers most of it. See the #79 section at the end of this file.
+
 Interleaved A/B (alternating trials of the shipped default and
 `CHM_NO_RAM_WILLNEED=1`) because the host was busy; interleaving cancels drift
 that a block-of-5-then-block-of-5 comparison would attribute to the change.
@@ -374,3 +388,100 @@ touch a torn-down mapping. `CHM_NO_RAM_WILLNEED=1` opts out.
    outlier and a 4.08s median looked like a real regression; the host was at
    load average 41 with 65 MB free. Interleaving the variants made both
    agree to within noise.
+
+---
+
+# Startup latency: the engine was never the problem (2026-07-29, #79)
+
+#79 said gimbal's warm resume costs "~5s" and asked for a phase breakdown, a
+repeatable start-to-ready metric, and a target. The breakdown answered the
+issue immediately, and not in the direction the issue expected.
+
+## Result
+
+`scripts/bench/run-gimbal-startup.sh`, 6 trials, `ch-arm-stock-its-net`,
+1 vCPU / 1 GiB, userspace GIC, debug build:
+
+| phase | median | what it covers |
+| --- | ---: | --- |
+| `vmm_ready` | **0.043s** | process start -> guest released and running |
+| `shell_ready` | **0.112s** | process start -> an interactive shell answers |
+| `teardown` | **0.136s** | stop requested -> process gone |
+| `total` | **0.247s** | spawn -> interactive shell -> gone |
+
+Spawn to interactive shell to gone, in under a quarter second. Docker Sandbox
+takes **12.73s** to create its per-sandbox microVM on this same host.
+
+Phase breakdown inside `vmm_ready` (`CHM_TRACE_TIMING=1`, one representative
+run): snapshot parsed 5ms, hypervisor opened 6ms, VM created + guest RAM
+mapped 9ms, vCPUs restored 31ms, virtio wired 39ms, guest released 43ms.
+
+## The "~5s" was harness overhead, not the VMM
+
+The ~5s in #79 was derived by subtracting the in-guest workload from the
+benchmark's host envelope. It was never a measurement of the VMM. Two harness
+artifacts accounted for essentially all of it:
+
+1. **A blind 8s wait.** `bench_reach_shell` waited 8s before its first newline
+   nudge. A silently-resumed snapshot prints nothing on resume, so it *always*
+   burned the full 8s, plus a hard 2s drain. Replaced with an immediate nudge
+   retried every 500ms and a 300ms drain: the envelope collapsed from ~11s to
+   ~1.3-2.3s.
+2. **macOS first-exec code-signature validation, ~0.32s.** The harness
+   codesigns a fresh copy of `chm` per trial and then times the first exec of
+   it. Measured directly: first exec 0.379 / 0.318 / 0.327s, every subsequent
+   exec 0.007 / 0.011 / 0.013s. That is install-time cost, not startup cost,
+   so `signed_chm_binary()` now warms the signature with a `--version` exec
+   before the clock starts.
+
+Artifact 2 was only found because two of my own measurements disagreed — a
+scratch probe said 0.103s to shell, the new harness said 0.324s. Picking the
+flattering one would have shipped a wrong number and hidden a real, if
+irrelevant, macOS behaviour.
+
+## A regression I caused, caught by measuring a second thing
+
+#95 populates guest RAM with `madvise(MADV_WILLNEED)` on a background thread.
+`Drop` joins that thread before `munmap`, and a whole-region `madvise` is
+**uninterruptible** — so teardown held for the populate's full duration.
+Measured: teardown 0.79s with the populate vs 0.08s without. #79 measures
+teardown, so my own #95 fix had regressed the metric #79 exists to track.
+
+Fixed by chunking the walk at 64 MiB with a stop flag set before the join.
+Teardown returned to ~0.09-0.13s, and the #95 win was re-verified as
+undamaged by chunking (interleaved A/B, 5 trials each: diskwrite 1.446s ->
+0.472s, 3.06x, versus 3.23x before chunking).
+
+## Correction to the #95 numbers
+
+With ~10s of harness dead time removed, the workload now races the populate
+instead of starting after it has finished. The published 3.23x was true of the
+old harness; the honest disposable-sandbox figure is smaller. Parallelising
+the populate is what claws it back. Clean interleaved thread-count sweep
+(6 trials each, medians in seconds):
+
+| threads | diskwrite | fsyncsmall |
+| ---: | ---: | ---: |
+| 1 | 1.022 | 0.320 |
+| 4 | 0.807 | 0.199 |
+| 8 | **0.732** | **0.178** |
+| 16 | 0.667 | 0.214 |
+
+Monotonic to the logical-CPU count (8 on this M3), then a wash. Shipped as
+`available_parallelism()` clamped to [1,8] and bounded by the chunk count.
+
+## Not published: the final populate on/off A/B
+
+A final `CHM_NO_RAM_WILLNEED` A/B was run and **discarded**. It showed
+`fsyncsmall` on=0.223 vs off=0.171 (the populate apparently *hurting*) and
+`netget` drifting monotonically 1.85 -> 4.29s across trials. The host was at
+load average 9.8 with Slack at 215% CPU, Teams at 152%+136%, and **59 MB free
+RAM** — on a benchmark whose entire subject is page population. The data was
+not trustworthy and is not reported. Re-measurement on a quiet host is
+outstanding.
+
+## What #79 does not close
+
+Every gimbal start is still a full snapshot rehydrate. There is **no cold
+create-from-image path**, so the 3-way table's "gimbal has no cold boot" caveat
+stands unchanged. #79's startup half is answered; that half is not.
