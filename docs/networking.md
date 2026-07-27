@@ -76,6 +76,29 @@ governed by sha256:147f… · egress default=deny, 1 rule(s) · fs 0 ro / 1 rw �
     allow api.github.com:443
 ```
 
+### Bringing a cloud policy down (`chm policy bind`)
+
+Steps 2–4 above describe a full plane **assignment** — the runner re-execs `chm`
+with the profile in its environment. But you often want the cloud's policy to
+govern a sandbox you are running locally, outside an assignment: you brought the
+snapshot down and you are iterating on it on the Mac. `chm policy bind` is that
+path. It fetches the sandbox's effective policy, verifies the digest through the
+**same** `parse_and_verify` path (and the same fail-closed
+[`CHM_REQUIRE_SIGNED`](security-model.md) posture) the runner uses, then writes
+the workspace's `egress-policy.json` **labelled with the plane's digest**:
+
+```console
+$ chm policy bind --sandbox sbx-11d5f919687f ./my-sandbox
+chm policy bind: governed by sha256:f857c2f0… · egress default=deny, 3 rule(s) · fs 1 ro / 1 rw · digest verified
+  wrote ./my-sandbox/egress-policy.json — the same digest now governs this local sandbox
+```
+
+Because the digest is the policy's **label**, it is what the NAT reports on every
+console `DENY` line and what lands in the durable audit trail — so a refusal on
+this Mac is attributable to the exact policy the control plane issued. Binding is
+an enforcement action, so an unverifiable policy is refused outright rather than
+written in a degraded form.
+
 ### Locally, with no control plane
 
 The same enforcement is available to a self-served (no-`gctl`) user, authored
@@ -174,40 +197,67 @@ addresses the NAT hard-codes today.
 
 ### Running the demo
 
-Once a net-enabled snapshot exists and is registered with the control plane:
+Both halves of the proof are scripted, so they are repeatable rather than a
+one-off screenshot. Each one boots the guest, drives real `curl` probes over the
+serial console, and **asserts** the outcome — including that the allow-listed
+host really does work, without which "nothing gets out" would be trivially
+satisfied by a broken network.
 
-1. **Bind an allow-list to the sandbox** (plane side). Author a default-deny
-   policy that allows exactly one host, then bind it:
+#### 1. Allow-list enforcement (no control plane needed)
 
-   ```console
-   $ curl -s localhost:8080/policies -d '{"version":1,"default_egress":"deny",
-       "egress":[{"action":"allow","host":"api.github.com","ports":[443]}]}'
-   # → returns a policy_digest, e.g. sha256:147f…
-   $ curl -s localhost:8080/sandboxes/$SBX/policy \
-       -d '{"policy_digest":"sha256:147f…","requested_by":"demo"}'
-   ```
+```console
+$ scripts/hvf/egress-allowlist-demo.sh
+egress-demo: PASS
+  - example.com (allow-listed)          -> HTTP 200
+  - neverssl.com (not allow-listed)     -> refused at the DNS gate
+  - 34.223.124.45 (raw IP, DNS bypassed) -> refused at the TCP-connect gate
+  - both denials audited under policy 'm28.4-allowlist-demo'
+```
 
-2. **Bring the sandbox down and run it** (Mac side). The runner verifies the
-   digest teleported intact, hands the profile to `chm run`, and the NAT enforces
-   it. On the guest console you'll see:
+The third probe is the load-bearing one. A guest that **hardcodes an IP address**
+never touches the DNS gate at all — but `chm` is the process that calls
+`connect()`, so default-deny means the host socket is simply never opened. There
+is no path around it from inside the guest. `curl`'s exit codes make the two
+gates distinguishable: `6` = could not resolve (DNS gate), `7` = failed to
+connect (connect gate).
 
-   ```
-   chm runner: governed by sha256:147f… · egress default=deny, 1 rule(s) · digest verified
-   chm: virtio-net _net0 governed by egress policy sha256:147f… (default-deny enforced at the NAT)
-   ```
+#### 2. The policy-digest teleport (needs a plane)
 
-3. **Prove it from inside the guest.** The allowed host works; everything else is
-   refused, and each denial is logged:
+```console
+$ scripts/hvf/policy-teleport-demo.sh
+policy-teleport: binding the plane's policy for sbx-11d5f919687f to snapshots/ch-arm-stock-its-net
+chm policy bind: governed by sha256:f857c2f0… · egress default=deny, 3 rule(s) · digest verified
+policy-teleport: PASS
+  the control plane's policy sha256:f857c2f0…
+  governed a microVM on this Mac:
+    - api.github.com (plane allow-list)  -> HTTP 200
+    - example.com (not allow-listed)     -> refused at the DNS gate
+    - 169.254.169.254 (plane deny rule)  -> refused at the TCP-connect gate
+  every refusal audited under the plane's digest
+```
 
-   ```console
-   guest$ curl https://api.github.com      # ✅ succeeds — allow-listed
-   guest$ curl https://example.com         # ⛔ refused
-   # host console: chm: [egress] DENY dns example.com (default-deny) — sandbox policy sha256:147f…
-   ```
+The script derives its probes from whatever policy the plane actually authored,
+and skips (rather than fails) when no plane or no policy-bound sandbox is
+reachable. Three properties matter here:
 
-4. **Prove the teleport.** The `policy_digest` that governed the cloud run is the
-   same one `chm policy show --sandbox $SBX` reports and that the runner verified
-   on resume — one content-addressed policy, both sides.
+- The **plane's allow rule** let real traffic out — the policy is live, not inert.
+- A host the plane did **not** allow-list was refused, so the allow-list is closed.
+- The plane's **explicit deny of the cloud metadata service** (`169.254.169.254`)
+  fired **by name** — the console line reads `(deny 169.254.169.254)`, not
+  `(default-deny)` — proving that specific cloud-authored rule travelled intact,
+  not merely the default stance. This is the highest-value rule to prove: IMDS is
+  how a compromised agent reaches for cloud credentials.
+
+And the durable record ties it together:
+
+```console
+$ chm audit show snapshots/ch-arm-stock-its-net
+… egress-DENY  dns example.com (default-deny) policy=sha256:f857c2f0…
+… egress-DENY  tcp 169.254.169.254:80 (deny 169.254.169.254) policy=sha256:f857c2f0…
+```
+
+One content-addressed policy, authored in the cloud, enforced on the Mac, and
+named in the audit trail on both sides.
 
 ## Scope & non-goals
 

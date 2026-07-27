@@ -116,7 +116,7 @@ from cache in 0.077 s).
 | **M25 · Live local lifecycle** | ① | **Complete** (one perf ceiling: runtime memfd page-sharing) | #4, #6 |
 | **M30 · Security hardening** | trust/isolation | **P0s + no-FS guard shipped** (#33–#35, #37; CAS digest M30.8 + multi-NIC fail-closed M30.9); signing (#36) + limits (#38) next | #33–#39 |
 | **M27 · Plane-native edge** | ② | **push/pull shipped** (#7 core); postcopy memory + disk plane next (#5) | #5, #7 |
-| **M28 · Consistent controls** | ③ | **M28.1–M28.3 + M28.5 shipped** (policy plumbing + digest teleport; userspace egress NAT; allow-list gate at DNS + TCP-connect; fs mount refusal); enforced on every NIC + fail-closed (M30.9). Live demo (#52) blocked only on a net-enabled snapshot. | #20, #52 |
+| **M28 · Consistent controls** | ③ | **COMPLETE** — policy plumbing + digest teleport, userspace egress NAT, allow-list gate at DNS + TCP-connect, fs mount refusal; enforced on every NIC + fail-closed (M30.9). M28.4 proven on hardware: a plane-authored policy brought down with `chm policy bind` governs a local microVM, and every denial is audited under the plane's digest. | #20 |
 | **M29 · Observability & cost** | ④ | Waits on the gctl telemetry contract | — |
 | **M-USGIC · Userspace GICv3 + ITS** | ① portability | **SHIPPED (experimental) — a stock ITS/LPI snapshot boots to an interactive shell on HVF, does real disk I/O, suspends/resumes, and now runs SMP.** `CHM_USERSPACE_GIC=1 chm run <snapshot>` rehydrates a stock upstream (ITS/LPI-routed) capture — the kind the managed GIC rejects — onto a software GICv3 and drops into a live Ubuntu console (`hvf_rehydrate_stock_its_snapshot_usgic_interactive_shell`). Software distributor/redistributor + trapped CPU interface (SPI/PPI/SGI/**LPI**), live ITS, cross-thread injection, self-managed vtimer, virtio disk/net completion routing, **live suspend/resume checkpoints** (single-vCPU), and **SMP** — a multi-vCPU snapshot resumes with one thread per vCPU and cross-core IPIs routed through the software GIC's SGI delivery (proven live: a 2-vCPU guest resumes, `nproc`=2, and CPU1 services Rescheduling + Function-call IPIs in `/proc/interrupts`). Remaining scope: SMP live-checkpoint and `GITS_*` MMIO. | #81 |
 
@@ -285,13 +285,18 @@ real IPv4 TCP + DNS through a smoltcp NAT, proven by an in-CI relay test) →
 **M28.3** the allow-list gate at DNS + TCP-connect (#51, shipped: the verified
 `chm_profile` teleports through `CHM_EGRESS_POLICY` into the NAT, which refuses
 unlisted DNS names and TCP connects and logs each denial) → **M28.4** the demo +
-teleport proof (#52) → **M28.5** fs scopes (#53, shipped: requested host mounts
+teleport proof (#52, shipped: two scripted hardware proofs — a default-deny
+allow-list refused at BOTH the DNS gate and, for a hardcoded IP, the TCP-connect
+gate; and `chm policy bind` bringing a plane-authored policy down so the cloud's
+digest governs a local sandbox and names every audited denial) → **M28.5** fs scopes (#53, shipped: requested host mounts
 are refused loudly — no host-FS passthrough — and reported to the plane). The
 demo it must land: the plane sets *allow-list only for sandbox N*, it follows the
 sandbox down, and the guest **provably can't get out** except to the allow-list.
-**Remaining before the live demo: a net-enabled snapshot** — every capture in the
-corpus was taken without `--net`, so the capture path needs a virtio-net device
-before guest egress can be exercised end-to-end on real HVF.
+**That demo now runs, on real hardware, from a script.** The net-enabled capture
+that used to block it exists (`GUEST_NET=1` in the capture harness), so
+`scripts/hvf/egress-allowlist-demo.sh` and `scripts/hvf/policy-teleport-demo.sh`
+prove enforcement and the digest teleport end-to-end on a rehydrated stock ITS
+snapshot. See [`networking.md`](networking.md) for the runbook.
 
 ### M29 · Observability & cost — logging, insights, both sides
 
