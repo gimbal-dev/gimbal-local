@@ -592,7 +592,7 @@ fn spawn_net_service(
                         if !ev.allowed {
                             let key = format!("{} {} {}", ev.domain, ev.target, ev.rule);
                             if audited_denials.insert(key) {
-                                audit.egress_deny(ev.domain, &ev.target, &ev.rule, "sandbox-policy");
+                                audit.egress_deny(ev.domain, &ev.target, &ev.rule, &ev.policy);
                             }
                         }
                     }
