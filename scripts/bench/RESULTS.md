@@ -277,3 +277,100 @@ coalescing above: the better the merging, the fewer guest ACKs, the fewer wakes.
 
 `iface.poll` (smoltcp) is now the largest remaining cost at roughly 550ms of a
 second. How much of that is the debug build is untested.
+
+## `diskwrite` — guest-RAM first touch (2026-07-28, #95)
+
+`diskwrite` writes 256 MiB inside the guest and fsyncs. Same-sitting baseline,
+median of 5: **1.601s** against Docker's 0.266s.
+
+| workload | before | after | vs before | Docker |
+| --- | --- | --- | --- | --- |
+| diskwrite | 1.601s | **0.496s** | 3.23x | 0.266s |
+| fsyncsmall | 0.224s | **0.103s** | 2.17x | 0.120s |
+| netget | 1.269s | **1.153s** | 1.10x | 0.155s |
+
+Interleaved A/B (alternating trials of the shipped default and
+`CHM_NO_RAM_WILLNEED=1`) because the host was busy; interleaving cancels drift
+that a block-of-5-then-block-of-5 comparison would attribute to the change.
+
+### The issue's premise was wrong
+
+#95 said the cost was "first-write allocation in the fresh sparse CoW overlay"
+and proposed `F_PREALLOCATE`. I implemented that hypothesis first, as written.
+It bought **1.979s -> 1.696s (~14%)** while costing **8 GiB of real disk per
+sandbox** and **100-772ms of startup**. Rejected — but the more useful result is
+what the small win *proved*: if allocation were the dominant cost, fully
+preallocating the file would have collapsed the number. It did not.
+
+Instrumenting the whole host block path (timers on notify, process, write_at,
+the `pwrite` syscall, the `mark_written` loop, `seed_sector`, `flush`,
+`persist_bitmap`, dumped at 1 Hz) put **the entire host block path at ~230ms of
+a 1.9s wall clock** — 69ms of `pwrite` for ~96 MiB, and 10,065 requests batched
+into just 129 notifies, so the device model was already fine.
+
+The decisive measurement was to delete the disk from the experiment: the same
+256 MiB write to **tmpfs** (`BENCH_DISK_PATH=/dev/shm/gb.dat`) — no block
+device, no overlay, no `pwrite`, no host fsync — still took **1.449s**. So the
+overlay accounted for ~0.5s of the 1.98s and **~1.45s was guest-side RAM first
+touch**. Confirmed independently: four back-to-back 256 MiB tmpfs writes in one
+session cost 1.522s *total* versus 1.449s for one, i.e. iterations 2-4 were
+essentially free. A ~60x first-touch penalty, with no disk involved.
+
+### The cause was #79's own fix
+
+Guest RAM is a file-backed `MAP_PRIVATE` mmap of the snapshot's `memory-ranges`
+— the "160x faster resume" change from #79, which replaced a 622ms eager read
+with a 34µs mmap. Every first touch of a guest page is then a synchronous host
+fault. The A/B switch that shipped with that change proves it: `CHM_EAGER_RAM=1`
+gave **0.588s vs 1.979s (3.4x)**, and the whole-run host envelope *dropped* from
+~12.2s to ~10.9s.
+
+**#79 traded a 622ms eager read for ~1.4s of scattered synchronous faults, and
+its resume-only micro-metric could not see it.** This is a global rehydration
+cost — it is why `fsyncsmall` and `netget` improve too, and neither is a disk
+benchmark.
+
+### Mechanism bake-off
+
+Reverting to eager reads would undo #79. Four alternatives were measured:
+
+| mechanism | diskwrite | fsyncsmall | mmap step |
+| --- | --- | --- | --- |
+| lazy (before) | 1.601s | 0.224s | ~2ms |
+| eager read (`CHM_EAGER_RAM`) | 0.588s | — | 622ms |
+| background thread reading the mapping | 0.482s | **1.254s** | ~2ms |
+| `fcntl(F_RDADVISE)` | 1.643s | — | 318ms |
+| `madvise(MADV_WILLNEED)` inline | 0.534s | 0.094s | **665ms** |
+| `madvise(MADV_WILLNEED)` on a thread | **0.542s** | **0.091s** | **1.5ms** |
+
+Shipped: the last row. `Drop` joins the thread before `munmap`, so it can never
+touch a torn-down mapping. `CHM_NO_RAM_WILLNEED=1` opts out.
+
+### Where I was wrong
+
+1. **I believed the issue.** I spent the first pass implementing its
+   `F_PREALLOCATE` hypothesis. The measurement that mattered was the one that
+   removed the disk entirely, and I should have reached for it first — the
+   issue's own note that "virtio is only ~120ms of the run" was already telling
+   me the device model was not the problem.
+2. **`madvise(MADV_WILLNEED)` is not advisory on macOS.** I shipped it inline
+   with a doc comment stating it was "advisory and non-blocking" — the Linux
+   semantics. `CHM_TRACE_TIMING` showed the mmap step going **2.05ms ->
+   702.9ms**: it re-paid almost exactly the cost #79 removed. The workload
+   numbers were still good, so nothing failed; the claim in the comment was
+   simply false, and only a timing A/B caught it.
+3. **`F_RDADVISE` looked like the obvious fix and does nothing.** It is macOS's
+   genuinely-asynchronous file readahead, so it seemed strictly better. It
+   warms the *file's* page cache, not the *mapping*, and moved the workload by
+   0 (1.643s vs a 1.68s baseline). The cost is not reading bytes off disk, it
+   is the fault itself.
+4. **The background-thread prefault looked like the winner.** Best diskwrite
+   number of the lot (0.482s) — and it regressed `fsyncsmall` from 0.176s to
+   **1.254s**, because a tiny 200 x 4 KiB workload just contends with a thread
+   hammering 1 GiB. Caught only because I checked a second workload, which is
+   the same lesson #94 taught. `madvise` on a thread does not have this problem:
+   it is one kernel call, not a userspace read loop.
+5. **I trusted a block-of-5 A/B on a busy host.** A run that gave a 29.33s
+   outlier and a 4.08s median looked like a real regression; the host was at
+   load average 41 with 65 MB free. Interleaving the variants made both
+   agree to within noise.

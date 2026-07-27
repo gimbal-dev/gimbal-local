@@ -379,6 +379,9 @@ fn reassemble_rdist_slice(rdist: &[u32], n: usize, id: usize) -> Vec<u32> {
 pub struct GuestRam {
     ptr: *mut u8,
     size: usize,
+    /// Background thread populating the mapping (see `map_file`). Joined in
+    /// `Drop` before `munmap` so it can never touch a torn-down mapping.
+    willneed: Option<std::thread::JoinHandle<()>>,
 }
 
 // SAFETY: the mapping is owned exclusively by this struct and only handed to
@@ -401,6 +404,26 @@ impl GuestRam {
     /// page-aligned for a file-backed mmap; when it is not (rare), or if the
     /// mmap is rejected, we fall back to the eager anon+read path. Set
     /// `CHM_EAGER_RAM=1` to force the eager path (A/B comparison / diagnostics).
+    ///
+    /// Lazy fault-in is near-free to set up but is not free to *use*: every page
+    /// the guest touches for the first time costs a synchronous host fault. That
+    /// is the dominant cost of a real workload — a guest writing 256 MiB of
+    /// previously untouched RAM spent ~1.4 s of a 2.0 s run in fault-in alone,
+    /// and the same write repeated in one session was ~60x cheaper (#95). So the
+    /// mapping is populated up front with `madvise(MADV_WILLNEED)`.
+    ///
+    /// That call **blocks** on macOS (measured: ~665 ms for 1 GiB) — it is not
+    /// the advisory no-op the Linux semantics suggest — so it runs on a
+    /// dedicated thread and `Drop` joins that thread before `munmap`. The mmap
+    /// step therefore stays ~1.5 ms (the #79 resume win is preserved) while the
+    /// guest still finds most of its pages already resident: diskwrite 1.68 s ->
+    /// 0.54 s, fsyncsmall 0.19 s -> 0.09 s, with the whole-run host envelope
+    /// dropping ~11.9 s -> ~10.8 s. `fcntl(F_RDADVISE)` was measured as an
+    /// alternative and rejected: it warms the *file's* page cache but not the
+    /// mapping, and moved the workload not at all. Because the pages stay clean
+    /// and file-backed this also avoids the private-copy footprint that
+    /// `CHM_EAGER_RAM` forces. Set `CHM_NO_RAM_WILLNEED=1` to skip it (A/B
+    /// comparison / diagnostics).
     fn map_file(path: &Path, file_offset: u64, size: usize) -> Result<Self, RehydrateError> {
         use std::os::unix::fs::FileExt;
         // Open and validate the region is within the file.
@@ -448,6 +471,26 @@ impl GuestRam {
                 )
             };
             if ptr != MAP_FAILED {
+                // Populate the mapping off the critical path; see the doc
+                // comment above for why this must not run inline.
+                let willneed = if std::env::var_os("CHM_NO_RAM_WILLNEED").is_some() {
+                    None
+                } else {
+                    let addr = ptr as usize;
+                    std::thread::Builder::new()
+                        .name("chm-ram-willneed".into())
+                        .spawn(move || {
+                            // SAFETY: the mapping is live for this thread's whole
+                            // lifetime — `GuestRam::drop` joins it before
+                            // `munmap` — and `MADV_WILLNEED` only populates pages
+                            // the guest may also touch concurrently, which is
+                            // exactly what a first-touch fault would do anyway.
+                            unsafe {
+                                libc::madvise(addr as *mut libc::c_void, size, libc::MADV_WILLNEED);
+                            }
+                        })
+                        .ok()
+                };
                 if timing {
                     eprintln!(
                         "[timing] map_file mmap(COW) {:.1} MiB in {:?} (lazy fault-in)",
@@ -458,6 +501,7 @@ impl GuestRam {
                 return Ok(GuestRam {
                     ptr: ptr as *mut u8,
                     size,
+                    willneed,
                 });
             }
             // Fall through to the eager path if the file-backed mmap was rejected.
@@ -492,6 +536,7 @@ impl GuestRam {
         let ram = GuestRam {
             ptr: ptr as *mut u8,
             size,
+            willneed: None,
         };
 
         // SAFETY: ptr is valid for `size` bytes; we fill it exactly once.
@@ -538,6 +583,9 @@ impl GuestRam {
 
 impl Drop for GuestRam {
     fn drop(&mut self) {
+        if let Some(h) = self.willneed.take() {
+            let _ = h.join();
+        }
         // SAFETY: unmapping our own mapping exactly once.
         unsafe {
             munmap(self.ptr as *mut c_void, self.size);
