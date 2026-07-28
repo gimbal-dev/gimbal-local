@@ -189,12 +189,17 @@ gate locally (only `gicv2m-message-spi` is HVF-restorable), reads the mid-flight
 marker (`gimbal-marker.json` / `GIMBLMK1` frame) to prove continuity, and
 `chm resume`s past the point the cloud session reached.
 
-**Hard rule — the `gic_mode` gate.** If `assign-run` returns HTTP 422
-(its-lpi / unknown snapshot), `chm` surfaces "recapture with `CH_GIC_V2M=1`" and
-stops. It never retries as-is and never self-declares a rejected snapshot
-runnable — this is the same GICv2M/message-SPI capture obligation the local
-`its_lpi_guard` enforces (see *Interrupt controller* above), now enforced at the
-control-plane boundary too.
+**Hard rule — the `gic_mode` gate.** If `assign-run` returns HTTP 422, `chm`
+surfaces the plane's refusal and stops. It never retries as-is and never
+self-declares a rejected snapshot runnable.
+
+The runner re-verifies the mode locally too (defence in depth), and accepts
+**both** proven shapes: `gicv2m-message-spi` (managed GIC) and `its-lpi` — the
+vanilla, stock-upstream shape, which restores on the userspace GICv3. For an
+`its-lpi` assignment the runner sets `CHM_USERSPACE_GIC=1` on the `chm`
+subprocess so the software GIC path is selected. Note the plane's own gate may
+still be stricter than this; that mismatch is tracked as V3.1 in
+[`roadmap.md`](roadmap.md).
 
 The client is a thin `curl` + `serde_json` wrapper (matching `chm cloud`'s
 shell-out-to-`aws`/`ssh` convention) rather than a heavyweight async HTTP stack,
