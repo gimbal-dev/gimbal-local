@@ -26,7 +26,7 @@ use hypervisor::{VmExit, VmOps};
 
 use crate::checkpoint;
 use crate::console_filter::ConsoleFilter;
-use crate::imp::{build_vm_ops, its_lpi_guard, load_snapshot, wire_virtio};
+use crate::imp::{build_vm_ops, cntfrq_guard, its_lpi_guard, load_snapshot, wire_virtio};
 use crate::limits;
 use hypervisor::hvf::virtio::nat::NatLimits;
 
@@ -780,6 +780,7 @@ struct EngineOpts {
 /// Returns a human-readable reason for why it stopped.
 fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Result<String, String> {
     let loaded = load_snapshot(dir)?;
+    cntfrq_guard(&loaded.state_json)?;
     its_lpi_guard(&loaded.state_json)?;
     let (uart, bus) = build_vm_ops(&loaded.state_json);
     let vm_ops: Arc<dyn VmOps> = bus.clone();
