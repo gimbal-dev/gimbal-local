@@ -601,13 +601,27 @@ If `/dev/kvm` is missing, stop and terminate the instance. It is not suitable.
 
 ## Step 11: Snapshot compatibility requirement
 
-For macOS Hypervisor.framework today, do **not** capture a stock ITS/LPI-routed
-arm64 cloud-hypervisor snapshot. Apple's managed GIC cannot deliver LPIs to a
-normal EL1 guest.
+**Capture vanilla.** A stock, unmodified upstream aarch64 `cloud-hypervisor`
+capture — virtio completions routed through the GIC ITS as LPIs, which is what
+upstream does by default — is the shape Gimbal Local wants. No fork, no patched
+binary, no `CH_GIC_V2M`.
 
-The capture must use the project-supported **GICv2M/message-SPI** path so virtio
-completion interrupts are deliverable locally through `hv_gic_send_msi` and the
-proven 1-of-N SPI route.
+Gimbal Local runs these on its userspace GICv3 (`CHM_USERSPACE_GIC=1`), which
+delivers the LPIs Apple's managed GIC cannot. Disk, net, SMP and
+checkpoint/resume are all hardware-proven on that path.
+
+Two caveats worth knowing before you capture:
+
+- **`chm serve` does not support it yet.** `chm run` does. If your integration
+  drives the daemon rather than the CLI, you need the legacy shape below until
+  that is wired.
+- **Legacy fallback:** `CH_GIC_V2M=1` produces a GICv2M/message-SPI capture that
+  runs on the managed GIC and works with `chm serve`. It requires **this
+  repository's patched** Cloud Hypervisor binary — an upstream release binary
+  ignores the flag.
+
+Full contract, including the manifest fields and the disk-shipping rule:
+`docs/hvf-compatible-snapshots.md`.
 
 ## Step 12: First manual proof loop
 
@@ -624,7 +638,7 @@ target/debug/chm cloud capture aws \
   --name <name> \
   --host "ubuntu@$CHM_HOST" \
   --ssh-key ~/.ssh/gimbal-local-capture.pem \
-  --remote-capture-command 'CH_GIC_V2M=1 ./capture.sh' \
+  --remote-capture-command 'CH_GIC_V2M=0 ./capture.sh' \
   --remote-snapshot-dir <snapshot-dir> \
   --to ./snapshots
 ```
@@ -635,7 +649,8 @@ If the remote host has already produced the bundle, omit
 6. Local Mac runs:
 
 ```bash
-target/debug/chm ./snapshots/<name> --max-seconds 30 --idle-exit 0
+CHM_USERSPACE_GIC=1 target/debug/chm run ./snapshots/<name> \
+  --max-seconds 30 --idle-exit 0
 ```
 
 7. Local Mac uploads changed overlay/proof artifacts back to S3:
