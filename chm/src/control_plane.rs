@@ -151,8 +151,10 @@ impl ControlPlane {
         if resp.status == 422 {
             return Err(format!(
                 "control plane refused this snapshot as not runnable (HTTP 422): {}.\n\
-                 This is the gic_mode gate — recapture the snapshot with CH_GIC_V2M=1 \
-                 (gicv2m-message-spi). chm must not override the gate.",
+                 This is the plane's gic_mode gate. Note that a vanilla `its-lpi` \
+                 capture IS restorable here, on the userspace GICv3 — if the plane \
+                 refused one, its gate is stricter than this runner. chm must not \
+                 override the gate; see gimbal-local#102.",
                 http_error_message(&resp.body)
             ));
         }
@@ -939,8 +941,8 @@ fn run_assignment(cp: &ControlPlane, runner_id: &str, opts: &RunOpts) -> Result<
             cp.report_state(&sandbox_id, "error").ok();
             return Err(format!(
                 "checkpoint gic_mode `{gic_mode}` is not HVF-restorable — only \
-                 `gicv2m-message-spi` resumes on apple-hvf; this checkpoint stays \
-                 cloud-only (recapture with CH_GIC_V2M=1 to make it Mac-restorable)"
+                 `gicv2m-message-spi` (managed GIC) and `its-lpi` (userspace GICv3) \
+                 resume on apple-hvf; this checkpoint stays cloud-only"
             ));
         }
     }
@@ -1028,9 +1030,15 @@ fn run_assignment(cp: &ControlPlane, runner_id: &str, opts: &RunOpts) -> Result<
         cp.report_state(&sandbox_id, "resuming")?;
     }
     cp.report_state(&sandbox_id, "running-local")?;
+    let usgic = needs_userspace_gic(gic_mode);
+    if usgic {
+        eprintln!(
+            "chm runner: vanilla ITS/LPI capture — running on the userspace GICv3"
+        );
+    }
     eprintln!("chm runner: running-local — exec chm {}", args.join(" "));
 
-    let exec = run_chm(&args);
+    let exec = run_chm(&args, usgic);
     // A clean exit that left a checkpoint behind is a *suspend*, not a plain
     // stop: report `suspended` and push the checkpoint (the plane opens a
     // resumable child). Otherwise it stopped or errored.
@@ -1069,13 +1077,19 @@ fn run_assignment(cp: &ControlPlane, runner_id: &str, opts: &RunOpts) -> Result<
 
 /// Execute `chm <args>` by re-invoking this signed binary (so it carries the
 /// hypervisor entitlement), streaming its console straight through.
-fn run_chm(args: &[String]) -> Result<i32, String> {
+fn run_chm(args: &[String], usgic: bool) -> Result<i32, String> {
     let exe = env::current_exe().map_err(|e| format!("resolve current exe: {e}"))?;
-    let status = Command::new(exe)
-        .args(args)
-        .status()
-        .map_err(|e| format!("spawn chm: {e}"))?;
-    Ok(status.code().unwrap_or(-1))
+    let mut cmd = Command::new(exe);
+    cmd.args(args);
+    // A vanilla ITS/LPI capture only restores on the software GICv3. The run
+    // path selects it from the environment, so set it for the child rather than
+    // rejecting a snapshot we can actually run.
+    if usgic {
+        cmd.env("CHM_USERSPACE_GIC", "1");
+    }
+    cmd.status()
+        .map_err(|e| format!("spawn chm: {e}"))
+        .map(|st| st.code().unwrap_or(-1))
 }
 
 // ---------------------------------------------------------------------------
@@ -1726,7 +1740,10 @@ fn cmd_pull(opts: &PullOpts) -> Result<(), String> {
 
     if opts.resume {
         eprintln!("chm pull: resuming — exec chm resume {}", opts.to.display());
-        let code = run_chm(&["resume".to_string(), opts.to.display().to_string()])?;
+        let code = run_chm(
+            &["resume".to_string(), opts.to.display().to_string()],
+            needs_userspace_gic(&pull_gic_mode(assign)),
+        )?;
         if code != 0 {
             return Err(format!("chm resume exited {code}"));
         }
@@ -1777,8 +1794,8 @@ fn branch_id_by_name(branches: &[Value], owner: &str, name: &str) -> Option<Stri
 }
 
 /// Materialize a pull's resume assignment into `dest`: re-verify the gic gate
-/// (defense in depth — its-lpi never restores on HVF), then content-address the
-/// bundle through the same CAS path a normal resume uses.
+/// (defense in depth — an unknown mode never restores on HVF), then
+/// content-address the bundle through the same CAS path a normal resume uses.
 fn materialize_assignment_to(assign: &Value, dest: &Path) -> Result<(), String> {
     let download_uri = assign
         .get("download_uri")
@@ -1794,7 +1811,8 @@ fn materialize_assignment_to(assign: &Value, dest: &Path) -> Result<(), String> 
     if !gic_mode.is_empty() && !hvf_restorable(gic_mode) {
         return Err(format!(
             "revision gic_mode `{gic_mode}` is not HVF-restorable — only \
-             `gicv2m-message-spi` resumes on apple-hvf (recapture with CH_GIC_V2M=1)"
+             `gicv2m-message-spi` (managed GIC) and `its-lpi` (userspace GICv3) \
+             resume on apple-hvf"
         ));
     }
 
@@ -1847,7 +1865,27 @@ fn format_commit_result(branch_name: &str, resp: &Value) -> String {
 /// restore checkpoints captured `gicv2m-message-spi`. Everything else (notably
 /// `its-lpi`) stays cloud-only.
 fn hvf_restorable(gic_mode: &str) -> bool {
-    gic_mode == "gicv2m-message-spi"
+    gic_mode == "gicv2m-message-spi" || needs_userspace_gic(gic_mode)
+}
+
+/// The `gic_mode` a pull assignment's manifest declares, or `""` if absent.
+fn pull_gic_mode(assign: &Value) -> String {
+    assign
+        .get("manifest")
+        .and_then(|m| m.get("gic_mode"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
+/// Whether a `gic_mode` needs the userspace GICv3 to be restorable here.
+///
+/// A vanilla (stock upstream) capture routes virtio completions through the GIC
+/// ITS as LPIs, which Apple's *managed* GIC cannot deliver. `chm`'s software
+/// GICv3 can, so such a snapshot IS restorable — it just has to be run with
+/// `CHM_USERSPACE_GIC=1`, which [`run_chm`] sets for these assignments.
+fn needs_userspace_gic(gic_mode: &str) -> bool {
+    gic_mode == "its-lpi"
 }
 
 /// Whether a run left a resumable checkpoint in the workspace (the `chm`
@@ -2457,9 +2495,12 @@ mod tests {
     }
 
     #[test]
-    fn only_message_spi_is_hvf_restorable() {
+    fn both_proven_gic_modes_are_hvf_restorable() {
         assert!(hvf_restorable("gicv2m-message-spi"));
-        assert!(!hvf_restorable("its-lpi"));
+        // Vanilla: restorable on the userspace GICv3, which delivers LPIs.
+        assert!(hvf_restorable("its-lpi"));
+        assert!(needs_userspace_gic("its-lpi"));
+        assert!(!needs_userspace_gic("gicv2m-message-spi"));
         assert!(!hvf_restorable(""));
     }
 

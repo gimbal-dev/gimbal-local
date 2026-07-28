@@ -178,10 +178,13 @@ The macOS product is small and self-contained: `chm` depends only on the
 `virtio-devices`, `vhost_*`, `pci`, …) are compiled into `chm` or the app.
 
 Those upstream crates are kept in the tree for one reason: they build the
-patched Linux `cloud-hypervisor` binary used to **capture** HVF-compatible
+patched Linux `cloud-hypervisor` binary used to capture **legacy** GICv2M
 snapshots (the `CH_GIC_V2M` message-SPI patch; see
-[`scripts/hvf/`](scripts/hvf/)). If you are here for the macOS port, you only
-need `chm/`, `hypervisor/src/hvf/`, and `app/GimbalLocal/`.
+[`scripts/hvf/`](scripts/hvf/)). Note that the recommended capture shape is now
+**vanilla** — stock upstream, no fork — which needs none of them; see
+[`docs/hvf-compatible-snapshots.md`](docs/hvf-compatible-snapshots.md). If you
+are here for the macOS port, you only need `chm/`, `hypervisor/src/hvf/`, and
+`app/GimbalLocal/`.
 
 ## License
 

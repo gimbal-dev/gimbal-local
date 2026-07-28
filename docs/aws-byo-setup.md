@@ -623,6 +623,11 @@ Two caveats worth knowing before you capture:
 Full contract, including the manifest fields and the disk-shipping rule:
 `docs/hvf-compatible-snapshots.md`.
 
+**If you are producing a capture for the Gimbal Local team**, use
+[`graviton-capture-request.md`](graviton-capture-request.md) instead of
+improvising — it specifies the exact instance, binaries, guest shapes, output
+layout and the metadata to report back (`CNTFRQ_EL0` above all).
+
 ## Step 12: First manual proof loop
 
 The first milestone should prove this manually before the app automates it:

@@ -20,9 +20,16 @@
 #   ch-arm-snapshot.tar.zst  the whole snapshot, compressed, ready to copy out
 #
 # Everything is overridable by environment variable; see the CONFIG block.
-# If CH_BIN/CHREMOTE_BIN are set, those binaries are used instead of downloading
-# upstream release binaries. Use that for HVF-compatible GICv2M captures from
-# this fork; upstream binaries do not understand this fork's CH_GIC_V2M patch.
+#
+# The DEFAULT is a *vanilla* capture: stock upstream cloud-hypervisor, ITS/LPI
+# interrupt routing, nothing of this fork. That is the shape gimbal-local now
+# recommends -- its userspace GICv3 delivers the LPIs Apple's managed GIC cannot
+# (run it with CHM_USERSPACE_GIC=1).
+#
+# Set CH_GIC_V2M=1 only for a LEGACY message-SPI capture, which is still what
+# `chm serve` and the macOS app require until gimbal-local#102 lands. That mode
+# is this fork's patch, so it also needs CH_BIN/CHREMOTE_BIN pointing at this
+# fork's built binaries -- upstream releases ignore the flag.
 
 set -euo pipefail
 
@@ -40,7 +47,9 @@ IMG_URL="${IMG_URL:-https://cloud-images.ubuntu.com/noble/current/noble-server-c
 GUEST_CPUS="${GUEST_CPUS:-1}"
 GUEST_MEM_MB="${GUEST_MEM_MB:-1024}"
 BOOT_TIMEOUT="${BOOT_TIMEOUT:-300}"   # seconds to wait for the in-guest marker
-CH_GIC_V2M="${CH_GIC_V2M:-1}"         # 1 = HVF-compatible message-SPI capture
+# 0 = vanilla stock upstream ITS/LPI routing (the default, recommended shape);
+# 1 = legacy GICv2M message-SPI, requires this fork's binaries via CH_BIN.
+CH_GIC_V2M="${CH_GIC_V2M:-0}"
 REUSE_GUEST_RAW="${REUSE_GUEST_RAW:-0}" # 1 = reuse cached guest.raw; default fresh
 # Networking: when GUEST_NET=1 the guest is given a virtio-net NIC and a STATIC
 # address matching the Mac's userspace NAT contract (guest 192.168.249.2, gateway
@@ -394,10 +403,16 @@ except Exception:
 PY
 )"
 if [ "$ITS_ENABLED" = "1" ]; then
-  warn "snapshot has an enabled ITS; this is not HVF-compatible"
-  warn "ensure CH_BIN points to this fork's patched cloud-hypervisor binary"
+  log "GITS_CTLR.Enabled is set ✓ — vanilla (stock upstream) ITS/LPI routing"
+  log "  run this on the Mac with: CHM_USERSPACE_GIC=1 chm run <dir>"
+  log "  the userspace GICv3 delivers the LPIs Apple's managed GIC cannot"
+  if [ "$CH_GIC_V2M" = "1" ]; then
+    warn "but CH_GIC_V2M=1 was requested and the ITS is still enabled"
+    warn "the binary ignored the flag — set CH_BIN to this fork's patched build"
+  fi
 else
-  log "GITS_CTLR.Enabled is clear ✓ — HVF-compatible message-SPI interrupt mode"
+  log "GITS_CTLR.Enabled is clear ✓ — legacy GICv2M message-SPI routing"
+  log "  runnable on the managed GIC (plain 'chm run', 'chm serve', the app)"
 fi
 
 # --- package --------------------------------------------------------------- #

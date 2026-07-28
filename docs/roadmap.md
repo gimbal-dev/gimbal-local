@@ -109,16 +109,100 @@ from cache in 0.077 s).
 
 ---
 
-## Milestones remaining (against the vision)
+## Where we actually are (2026-07-28)
 
-| Milestone | Pillar | Status | Issues |
-| --- | --- | --- | --- |
-| **M25 · Live local lifecycle** | ① | **Complete** (one perf ceiling: runtime memfd page-sharing) | #4, #6 |
-| **M30 · Security hardening** | trust/isolation | **P0s + no-FS guard shipped** (#33–#35, #37; CAS digest M30.8 + multi-NIC fail-closed M30.9); signing (#36) + limits (#38) next | #33–#39 |
-| **M27 · Plane-native edge** | ② | **push/pull shipped** (#7 core); postcopy memory + disk plane next (#5) | #5, #7 |
-| **M28 · Consistent controls** | ③ | **COMPLETE** — policy plumbing + digest teleport, userspace egress NAT, allow-list gate at DNS + TCP-connect, fs mount refusal; enforced on every NIC + fail-closed (M30.9). M28.4 proven on hardware: a plane-authored policy brought down with `chm policy bind` governs a local microVM, and every denial is audited under the plane's digest. | #20 |
-| **M29 · Observability & cost** | ④ | Waits on the gctl telemetry contract | — |
-| **M-USGIC · Userspace GICv3 + ITS** | ① portability | **SHIPPED (experimental) — a stock ITS/LPI snapshot boots to an interactive shell on HVF, does real disk I/O, suspends/resumes, and now runs SMP.** `CHM_USERSPACE_GIC=1 chm run <snapshot>` rehydrates a stock upstream (ITS/LPI-routed) capture — the kind the managed GIC rejects — onto a software GICv3 and drops into a live Ubuntu console (`hvf_rehydrate_stock_its_snapshot_usgic_interactive_shell`). Software distributor/redistributor + trapped CPU interface (SPI/PPI/SGI/**LPI**), live ITS, cross-thread injection, self-managed vtimer, virtio disk/net completion routing, **live suspend/resume checkpoints** (single-vCPU), and **SMP** — a multi-vCPU snapshot resumes with one thread per vCPU and cross-core IPIs routed through the software GIC's SGI delivery (proven live: a 2-vCPU guest resumes, `nproc`=2, and CPU1 services Rescheduling + Function-call IPIs in `/proc/interrupts`). Remaining scope: SMP live-checkpoint and `GITS_*` MMIO. | #81 |
+**The hard part is done.** A **vanilla** — stock upstream, unforked — arm64 Cloud
+Hypervisor KVM snapshot rehydrates on Apple silicon and runs: interactive shell,
+virtio disk, virtio net + NAT egress, SMP, checkpoint/resume. **247 ms**
+start-to-ready against Docker Sandbox's **12.73 s** on the same host.
+
+That works because of the **userspace GICv3** (M-USGIC): a software
+distributor/redistributor/ITS and a trapped CPU interface, delivering the LPIs
+Apple's managed GIC cannot, while HVF still executes the vCPUs. It is a real
+interrupt controller, not a compatibility shim.
+
+**But three things stand between that and the vision.** They are the whole of the
+remaining roadmap:
+
+1. **We have never rehydrated a real cloud snapshot.** Every fixture we own was
+   captured under Lima **on a Mac** — a Mac pretending to be a KVM box, restored
+   on the Mac it came from. The cloud→Mac path is structurally untested.
+2. **The HVF path is blind to the capture host's counter frequency** (#104,
+   found 2026-07-28). Every fixture carries `cntfrq = 24000000` *because they
+   were captured on a Mac*, so the mismatch path has never executed and cannot
+   with the fixtures we have. The KVM path explicitly rejects a mismatch as guest
+   clock corruption; HVF does not check at all.
+3. **`chm serve` rejects vanilla** (#102). The CLI accepts it; the daemon the
+   macOS app drives does not. The UI pillar is not real until it does.
+
+---
+
+## Milestones remaining — the vanilla-first spine
+
+Re-cut 2026-07-28 against the original vision: *snapshots just work → cloud
+integration → UI → security with sane defaults*. Everything is ordered by what
+makes a **vanilla cloud snapshot run everywhere in the product**.
+
+| | Milestone | Pillar | Status | Issues |
+| --- | --- | --- | --- | --- |
+| **V1** | **Make a real cloud snapshot run** | ① | the acid test + its landmines | #104, #105 |
+| **V2** | **Vanilla everywhere in the product** | ①③ | CLI works; daemon + app do not | #102 |
+| **V3** | **Cloud control plane on the vanilla contract** | ②④ | partly blocked cross-repo | #21, #36, #5 |
+| **V4** | **Security with sane defaults** | ③ | substantially shipped; needs the umbrella | #39, #20 |
+
+### V1 · Make a real cloud snapshot run **[the current thrust]**
+
+The milestone that proves the vision. Everything else is preparation.
+
+| | Task | Blocked on |
+| --- | --- | --- |
+| V1.1 | Prove what `CNTFRQ_EL0` an HVF guest actually sees. `hv_vcpu_get_sys_reg(0xdf00)` returns `HV_BAD_ARGUMENT`, so this needs a bare-metal guest payload (cf. `wfi_guest.S`) that reads it and writes to the PL011. Present evidence is indirect. | — |
+| V1.2 | Guard the HVF rehydrate path against a frequency mismatch: parse the clock block, compare, fail loudly like `its_lpi_guard`. Turns silent corruption into a clear diagnosis. (#104) | V1.1 |
+| V1.3 | Decide whether a mismatch is *fixable* or only detectable. Trapping `CNTVCT_EL0` to rescale is likely fatal for perf; rewriting Linux's cached `arch_timer_rate` in restored RAM is fragile and kernel-specific. May be moot if the frequencies match. | V1.1 |
+| V1.4 | Audit the rest of the bug class: MPIDR/affinity layout, `ID_AA64*` feature registers, cache topology, GIC `IIDR` — anywhere a guest probed the *capture* host and cached the answer. | — |
+| V1.5 | **THE ACID TEST** — rehydrate a genuine vanilla Graviton capture (#105). | gimbal cloud |
+
+The capture we need, precisely: [`graviton-capture-request.md`](graviton-capture-request.md).
+
+### V2 · Vanilla everywhere in the product
+
+| | Task | Blocked on |
+| --- | --- | --- |
+| V2.1 | Wire the userspace GIC into `chm serve` (#102). Factor the ~525-line `run_usgic` engine so CLI and daemon share it, checkpoint/resume included. | — |
+| V2.2 | The SwiftUI app opens, runs, stops and resumes a vanilla snapshot end to end. | V2.1 |
+| V2.3 | Make the userspace GIC the **default** and retire `CHM_USERSPACE_GIC=1`; managed GIC becomes the explicit fallback for GICv2M captures. The change that makes the dream the default rather than a flag. | V2.1, V1.5 |
+
+### V3 · Cloud control plane on the vanilla contract
+
+| | Task | Blocked on |
+| --- | --- | --- |
+| V3.1 | `gctl` gates per **entry point** (runnable under `chm run`; refused under `chm serve` until V2.1) rather than per GIC mode. Our side of the confusion is corrected in `d8511789d`. | gctl |
+| V3.2 | One-command `pull → verify → run`, fail-closed. | V3.3 |
+| V3.3 | Signed snapshot manifest + verification, unified trust root (#36). | gctl |
+
+### V4 · Security with sane defaults
+
+| | Task |
+| --- | --- |
+| V4.1 | Threat model + hardening checklist umbrella (#39). A rehydrated snapshot is untrusted code with a device model attached. |
+| V4.2 | Make egress allow-list, reserved-address guard and CoW isolation the **default** posture with a documented opt-out (#20). |
+
+### Deferred, deliberately
+
+- **#101 · cold create-from-image.** Every start is a full snapshot rehydrate.
+  Reframed from a perf problem to a capability/onboarding gap — warm resume is
+  247 ms and a cold path would be slower.
+- **`GITS_*` MMIO.** Not exercised on the resume path; a guest that re-programs
+  its ITS *while running* is untested. No fixture does this.
+- **memfd page-sharing (#4/M25 perf ceiling), postcopy (#5), fork/wake-on-traffic (#6).**
+
+---
+
+## Historical milestone detail (M25–M32)
+
+The sections below are the **previous** milestone structure, kept for the shipped
+detail and rationale they record. The V1–V4 spine above supersedes them as the
+plan; where the two disagree, V1–V4 is current.
 
 ### M25 · Live local lifecycle — suspend · resume · fork
 
@@ -357,15 +441,18 @@ vs. real builds), so they double as end-to-end validation of M30/M31.
 
 ## Standing platform boundaries
 
-- **R1 — ITS/LPI (managed GIC only; no longer a hard wall).** Apple's *managed*
-  GIC (`hv_gic`) delivers message-based SPIs only, with no ITS/LPI path, so the
-  default managed-GIC path still requires a `gicv2m-message-spi` capture
-  (`CH_GIC_V2M=1`) and refuses stock ITS/LPI snapshots at load time and at the
-  `assign-run` 422 gate. **But a stock ITS/LPI snapshot IS now runnable on HVF via
-  the userspace GICv3** (`CHM_USERSPACE_GIC=1`, M-USGIC / #81): it rehydrates onto
-  a software GIC that delivers LPIs the managed GIC cannot, and boots to an
-  interactive shell. R1 is therefore a managed-path default, not a permanent
-  platform limit. See [`hvf-compatible-snapshots.md`](hvf-compatible-snapshots.md).
+- **R1 — ITS/LPI is no longer a wall; it is a solved problem with one gap.**
+  Apple's *managed* GIC (`hv_gic`) delivers message-based SPIs only, with no
+  ITS/LPI path. The **userspace GICv3** (M-USGIC) removes that limit: a stock
+  ITS/LPI capture rehydrates onto a software GIC that delivers LPIs, with disk,
+  net, SMP and checkpoint/resume all hardware-proven. **Vanilla is now the
+  recommended capture shape.** The remaining gap is that `chm serve` has not been
+  wired to it yet (#102), so the daemon still requires a `gicv2m-message-spi`
+  capture. See [`hvf-compatible-snapshots.md`](hvf-compatible-snapshots.md).
+- **Counter frequency is part of the compatibility contract.** A guest caches
+  `CNTFRQ_EL0` at boot; Apple presents HVF guests a fixed frequency we cannot
+  change. A capture from a host with a different frequency risks silent guest
+  clock corruption, and the HVF path does not currently check (#104).
 - **arm64 KVM capacity.** Producing real snapshots needs a genuine arm64 `/dev/kvm`
   host (a Lima nested-KVM guest for $0, or Graviton bare metal); the Mac itself
   can only *run* snapshots, never capture them.
@@ -375,45 +462,30 @@ vs. real builds), so they double as end-to-end validation of M30/M31.
 ## How this is tracked
 
 Progress lives in the
-[GitHub milestones](https://github.com/gimbal-dev/gimbal-local/milestones)
-`M25`–`M31`, one per remaining capability, with the cross-repo handoff issues
-above. **The security track (M30 + M31) is substantially complete** — the local
-host boundary (filesystem, network, resource, daemon) holds; the remaining
-security work is cross-repo (snapshot signing, #36) or distribution notarisation.
-Feature work (M27 plane-native edge) is the next major thrust. The four pillars
-are the V0 capability contract (issue #21); each pillar is only "done" when it is
-enforced identically on both substrates.
+[GitHub issues](https://github.com/gimbal-dev/gimbal-local/issues), mapped to the
+V1–V4 spine:
 
-### What comes next (crisp view, 2026-07-16)
+| Milestone | Issues |
+| --- | --- |
+| V1.2 counter-frequency guard | #104 |
+| V1.5 the acid test | #105 |
+| V2.1 `chm serve` + userspace GIC | #102 |
+| V3 cloud contract / signing / postcopy | #21, #36, #5 |
+| V4 security umbrella / defaults | #39, #20 |
+| Deferred | #101 (cold create), #4, #6 |
 
-- **The pivot — M32 agent workloads + benchmark vs Docker.** Local runtime +
-  host-isolation are complete, so the next thrust is putting real agent/dev
-  workloads to work inside gimbal microVMs (M32.1) and a reproducible benchmark
-  of the same `docker build` / compile job inside a gimbal microVM vs Docker
-  Desktop's Linux VM on the same Mac (M32.2). Local-doable; doubles as end-to-end
-  validation of the M30/M31 security posture.
-- **Security — M31.1, M31.2, M31.3, M31.4 SHIPPED.** The NAT reserved-address
-  guard (M31.1) denies loopback / private LAN / link-local (`169.254.169.254`)
-  regardless of policy, re-checks resolved IPs (closes DNS rebinding), and drops
-  reserved DNS answers. The app now defaults new sandboxes to firewall-on
-  **default-deny** (M31.2), so there is no public egress until allow-listed; the
-  network docs were corrected (M31.3) and the cloud/capture-harness boundary
-  documented (M31.4). Opt out of the host guard with `--allow-local-egress`. The
-  signing fail-closed **posture** (M31.5) now ships: `CHM_REQUIRE_SIGNED` makes
-  verification mandatory on the plane ingest path and enforces the policy-digest
-  recompute; the remaining M31.5 half is gctl producing signed production
-  manifests (#36).
-- **Security (also open):** M30.4 signed manifest + trust root (#36, P1) —
-  `chm` verification + the `CHM_REQUIRE_SIGNED` fail-closed default (M31.5) ship;
-  gctl signing production manifests is the remaining half. Distribution
-  notarisation is still unchecked.
-- **Demo gap:** the live in-guest firewall demo (#52) is blocked only on a
-  net-enabled snapshot; authoring + enforcement already ship. A cloud-side
-  capture-capability request is filed (`gimbal-cloud-control#4`).
-- **Cross-repo (CP) handoffs:** #4/#5/#6 (checkpoint/postcopy/fork phases),
-  #20 (policy plane), #21 (V0 pillar alignment).
-- **Recently shipped + closed:** interactive console freeze (#60), CAS digest
-  hardening (#64) + per-NIC fail-closed egress (#65), disk-overlay rollback (#62)
-  + live engine/revision UI (#61/#69), durable session registry (#71), resource
-  limits + NAT caps (#38), the #66/#67 security follow-ups, and the M29 audit
-  trail.
+The four pillars remain the capability contract (#21); a pillar is only "done"
+when it holds for a **vanilla** snapshot on both substrates.
+
+### What comes next (2026-07-28)
+
+1. **V1.1 + V1.2 — the counter-frequency work.** The highest-value thing we can
+   do without the cloud, and the difference between the first Graviton test being
+   *interpretable* or *mystifying*.
+2. **V2.1 — `chm serve` on the userspace GIC (#102).** The largest single unblock
+   for the product: it is what makes the app able to run what the CLI already
+   runs.
+3. **V1.5 — the acid test (#105).** Blocked on gimbal cloud producing the
+   capture described in
+   [`graviton-capture-request.md`](graviton-capture-request.md). Nothing else is
+   blocked.

@@ -177,6 +177,10 @@ receive prebuilt aarch64 Linux binaries produced from it.
 
 The local `scripts/hvf/capture-on-mac.sh` path (Lima nested KVM on M3+ Macs)
 exports the guest disks into `disks/` automatically, so a bundle captured that
-way is self-contained. Note that it and `capture-arm-snapshot.sh` still default
-to `CH_GIC_V2M=1` (the legacy shape) — pass `CH_GIC_V2M=0` for a vanilla
-capture. The `snapshots/ch-arm-stock-its*` fixtures were produced that way.
+way is self-contained. Both it and `capture-arm-snapshot.sh` now default to
+`CH_GIC_V2M=0` — vanilla. Pass `CH_GIC_V2M=1` (plus `CH_BIN`/`CHREMOTE_BIN`
+pointing at this fork's binaries) only for a legacy capture. The
+`snapshots/ch-arm-stock-its*` fixtures are vanilla.
+
+For a capture on real cloud hardware, the exact spec is
+[`graviton-capture-request.md`](graviton-capture-request.md).
