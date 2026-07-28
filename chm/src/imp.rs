@@ -270,10 +270,10 @@ pub(crate) fn its_lpi_guard(state_json: &str) -> Result<(), String> {
          deliver. The guest would restore but then hang on its first disk/net \
          I/O with no completion interrupt.\n\
          \n\
-         To run it anyway, set CHM_USERSPACE_GIC=1: this rehydrates the snapshot \
-         on an experimental userspace GICv3 that CAN deliver LPIs, and boots a \
-         stock ITS/LPI guest to an interactive shell (single-vCPU; serial works, \
-         virtio-completion routing is in progress). See \
+         Set CHM_USERSPACE_GIC=1 to run it on the userspace GICv3, which CAN \
+         deliver LPIs. That path boots a stock ITS/LPI capture to an interactive \
+         shell with virtio disk and net completions, SMP, and checkpoint/resume, \
+         and is the path the benchmarks run on. See \
          docs/hvf-compatible-snapshots.md.\n\
          \n\
          Alternatively, re-capture with the guest's virtio MSIs routed as GICv3 \

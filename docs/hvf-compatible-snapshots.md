@@ -4,113 +4,124 @@ This note is for the cloud agent/control-plane side of Gimbal. It captures the
 current macOS Hypervisor.framework compatibility boundary and the snapshot shape
 the cloud side should produce for local Mac rehydration.
 
-## Required interrupt mode
+> **Status: 2026-07-28. This document previously recommended `CH_GIC_V2M=1` and a
+> patched fork binary as the production capture path, and described the userspace
+> GIC as "experimental, single-vCPU, serial-only". Both statements are now out of
+> date and the recommendation has flipped.** A **vanilla, unmodified upstream
+> arm64 Cloud Hypervisor capture** is the preferred shape. See "Which capture
+> mode should I produce?" below for the one real caveat (`chm serve`).
 
-Gimbal Local can run arm64 Cloud Hypervisor snapshots on Apple Silicon when
-virtio completion interrupts are routed as normal GIC SPIs:
+## Which capture mode should I produce?
 
-```text
-gic_mode = gicv2m-message-spi
-```
-
-The capture host should set:
-
-```sh
-CH_GIC_V2M=1
-```
-
-when launching the patched Cloud Hypervisor binary from this repository.
-
-## Stock ITS/LPI mode — two paths
-
-Stock arm64 Cloud Hypervisor snapshots usually route virtio MSI/MSI-X
-completions through the GIC ITS as LPIs:
+**Capture vanilla.** No fork, no patched binary, no `CH_GIC_V2M`. A stock
+upstream `cloud-hypervisor` on Graviton, routing virtio completions through the
+GIC ITS as LPIs the way it does by default, is the shape we want:
 
 ```text
-virtio device -> MSI/MSI-X -> GIC ITS -> LPI
-```
-
-Apple's *managed* Hypervisor.framework GIC does not expose a deliverable ITS/LPI
-path. On the **default managed-GIC path**, if a snapshot contains enabled
-`gic-v3-its` state plus MSI-wired virtio devices, `chm` rejects it early rather
-than restoring a guest that would hang on its first disk or network completion
-interrupt.
-
-**There is now a second path.** Setting `CHM_USERSPACE_GIC=1` runs the snapshot
-on a **userspace GICv3** instead of the managed GIC — a software
-distributor/redistributor + a trapped CPU interface that delivers LPIs the
-managed GIC cannot. This rehydrates a *stock* ITS/LPI snapshot and boots it to an
-interactive shell:
-
-```sh
-CHM_USERSPACE_GIC=1 chm run <stock-its-snapshot>
-#   backend:   Apple Hypervisor.framework (userspace GICv3)
-#   ubuntu@ch-snap:~$
-```
-
-This is experimental and currently single-vCPU; serial input works (the shell is
-fully usable), while virtio disk/net *completion* routing through the userspace
-ITS, `GITS_*` MMIO, and SMP are the remaining scope (tracked as M-USGIC / #81).
-For production captures today, the managed-GIC `CH_GIC_V2M=1` contract below is
-still the recommended path.
-
-## Why this is not just a local-runner bug
-
-The limitation matches the prior art:
-
-- QEMU's arm64 `virt` machine explicitly rejects ITS when HVF is using the
-  hardware vGIC: `ITS not supported on HVF when using the hardware vGIC.`
-- QEMU defaults HVF hardware-vGIC MSI routing to GICv2M/message-SPIs, not ITS.
-- VirtualBox's Darwin ARM GIC backend uses SPI injection and does not expose a
-  full MSI/ITS send path.
-- Apple's Hypervisor.framework exports SPI/MSI-doorbell style GIC entry points
-  such as `hv_gic_set_spi` and `hv_gic_send_msi`, but no public full ITS/LPI
-  API has been found.
-
-Gimbal implements a userspace GICv3 (CPU interface + distributor/redistributor +
-ITS) while still using HVF for CPU execution. **This now works end to end on
-hardware** (Apple M3): a stock ITS/LPI snapshot rehydrates onto the software GIC
-and boots to an interactive Ubuntu shell — see
-`hypervisor/tests/hvf_boot.rs::hvf_rehydrate_stock_its_snapshot_usgic_interactive_shell`
-and run it yourself with `CHM_USERSPACE_GIC=1 chm run <snapshot>`. With no managed
-GIC, `ICC_*_EL1` accesses trap to the VMM as `EC=0x18`; the software GIC delivers
-SPIs, PPIs, SGIs, and **LPIs** (INTID >= 8192 — the class the managed GIC cannot
-deliver); the virtual timer is self-managed across WFI so the guest keeps
-ticking. The same architecture ships in libkrun, QEMU (`kernel-irqchip=off`), and
-RexPlayer on Apple Silicon.
-
-What remains to make this the *default* path (rather than the `CHM_USERSPACE_GIC`
-opt-in) is scope, not feasibility: routing virtio disk/net **completions** through
-the userspace ITS (serial already works, so the shell is usable now), `GITS_*`
-MMIO for guests that re-program the ITS live, SMP, and per-access trap
-performance. Until that lands, the capture-side `CH_GIC_V2M=1` contract below
-remains the recommended production path.
-
-## Cloud agent contract
-
-For every snapshot intended to be runnable by Gimbal Local, persist a manifest
-field equivalent to:
-
-```text
-architecture = aarch64
+architecture       = aarch64
 hypervisor_capture = kvm
-gic_mode = gicv2m-message-spi
-compatibility_status = runnable-hvf
-ships_disks = true
-gimbal_local_commit = <commit that built the capture binary>
+gic_mode           = its-lpi          # stock/vanilla — this is the target shape
+ships_disks        = true
 ```
 
-Do not present `its-lpi` snapshots as runnable on the **default managed-GIC**
-path — they are refused there. They ARE runnable on the userspace-GICv3 path
-(`CHM_USERSPACE_GIC=1`, experimental), and remain useful for Linux/KVM restore.
-Label them `its-lpi` and note the managed-GIC mismatch + the userspace-GIC
-opt-in, rather than a flat "incompatible".
+Gimbal Local runs these on a **userspace GICv3** (`CHM_USERSPACE_GIC=1`): a
+software distributor/redistributor/ITS plus a trapped CPU interface, with HVF
+still executing the vCPUs. That delivers the LPIs Apple's managed GIC cannot.
 
-Implementation note: older Cloud Hypervisor code names the serialized GIC
-snapshot node `gic-v3-its` even when the actual ITS is disabled. Do not classify
-compatibility from the snapshot-node name alone. Check the captured routing mode
-or the nested GIC state: `GITS_CTLR.Enabled` clear with MSI-X data values in the
-normal SPI range is the deliverable GICv2M/message-SPI path.
+| capability on a vanilla ITS/LPI capture | state |
+| --- | --- |
+| rehydrate + execute | ✅ hardware-proven |
+| interactive shell over serial | ✅ hardware-proven |
+| virtio **disk** completions | ✅ hardware-proven |
+| virtio **net** completions (+ NAT egress) | ✅ hardware-proven |
+| SMP (multi-vCPU, cross-core IPIs, SPI affinity) | ✅ hardware-proven |
+| checkpoint / suspend / resume | ✅ shipped |
+| `chm run` | ✅ supported |
+| **`chm serve` (daemon / app path)** | ❌ **not yet — see below** |
+
+Reproduce all of the above on an Apple Silicon Mac:
+
+```sh
+CH_SNAPSHOT_DIR=<stock-its-snapshot> \
+  cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot \
+  --test hvf_boot -- --ignored --exact --nocapture \
+  hvf_rehydrate_stock_its_snapshot_usgic_interactive_shell
+```
+
+## The one real gap: `chm serve`
+
+`chm run` honours `CHM_USERSPACE_GIC=1`. **`chm serve` does not.** The daemon
+calls `its_lpi_guard` unconditionally and only has the managed-GIC path wired, so
+a vanilla ITS/LPI bundle is *rejected* there even though the same bundle runs
+fine under `chm run`.
+
+That matters because `chm serve` is what the macOS app drives, and is the likely
+integration point for a control plane. Until it is wired:
+
+- **`chm run` + vanilla capture** — works today, fully.
+- **`chm serve` + vanilla capture** — refused. Needs either the legacy
+  GICv2M capture below, or the userspace-GIC path ported into the daemon.
+
+Tracked as [#102](https://github.com/gimbal-dev/gimbal-local/issues/102). It is wiring, not feasibility — the whole userspace-GIC
+stack it needs is already shipped and proven under `chm run`.
+
+## Do not confuse the two environment variables
+
+| variable | what it does |
+| --- | --- |
+| `CHM_USERSPACE_GIC=1` | **The supported path.** Rehydrates onto the software GICv3, which delivers LPIs. This is what makes vanilla captures work. |
+| `CHM_ALLOW_ITS_LPI=1` | **A debugging bypass. Do not use.** Silences the guard on the *managed* GIC and changes nothing about delivery — the guest restores and then stalls on its first disk or net I/O. |
+
+Anything describing `CHM_ALLOW_ITS_LPI=1` as "the USGIC path" is wrong; it is the
+opposite, and it will look like a hang.
+
+## Legacy path: GICv2M / message-SPI
+
+Before the userspace GIC, the only runnable shape was virtio completions routed
+as normal GIC SPIs:
+
+```text
+gic_mode = gicv2m-message-spi
+```
+
+produced by launching **this repository's patched** Cloud Hypervisor binary with
+`CH_GIC_V2M=1`. It still works and is still regression-tested every change
+(`snapshots/ch-arm-v2m-demo` boots to a login prompt on the managed GIC).
+
+**It is no longer the recommended production shape**, because it requires a
+forked capture engine — the exact coupling the vanilla path removes. Keep it for
+`chm serve` until the daemon is wired, and as a fallback.
+
+## Why the managed GIC cannot do this
+
+The limitation is not a Gimbal bug; it matches the prior art:
+
+- QEMU's arm64 `virt` machine rejects ITS when HVF uses the hardware vGIC:
+  `ITS not supported on HVF when using the hardware vGIC.`
+- QEMU defaults HVF hardware-vGIC MSI routing to GICv2M/message-SPIs, not ITS.
+- VirtualBox's Darwin ARM GIC backend uses SPI injection with no full MSI/ITS
+  send path.
+- Apple exports `hv_gic_set_spi` and `hv_gic_send_msi`, but no public ITS/LPI API
+  has been found.
+
+Running a software GIC alongside hardware CPU virtualisation is the same
+architecture used by libkrun, QEMU (`kernel-irqchip=off`), and RexPlayer on
+Apple Silicon.
+
+## Known caveat: live ITS reprogramming
+
+`GITS_*` MMIO is deliberately not implemented. It is not exercised on the resume
+path — a rehydrated guest inherits an already-programmed ITS — but a guest that
+**re-programs its ITS while running** (hotplug, a driver rebind) is untested.
+None of the fixtures do this. Worth knowing before assuming an arbitrary vanilla
+image is safe.
+
+## Classification note
+
+Older Cloud Hypervisor names the serialized GIC node `gic-v3-its` even when the
+ITS is disabled. **Do not classify compatibility from the node name alone.**
+Check the routing mode or the nested GIC state: `GITS_CTLR.Enabled` clear with
+MSI-X data values in the normal SPI range is the GICv2M/message-SPI path.
 
 ## Disk requirement (ship the guest disks)
 
@@ -155,13 +166,17 @@ image matches the memory image instant-for-instant.
 
 ## Capture requirement
 
-`CH_GIC_V2M=1` only works with this fork's patched Cloud Hypervisor binary. It
-does not change the behavior of an upstream release binary. The capture worker
-must either:
+For the **vanilla path** there is no capture requirement beyond a stock upstream
+aarch64 `cloud-hypervisor` on a KVM host, plus the disk-shipping rule above.
+That is the point of it.
 
-1. build `cloud-hypervisor` and `ch-remote` from this repository, or
-2. receive prebuilt aarch64 Linux binaries produced from this repository.
+For the **legacy GICv2M path**, `CH_GIC_V2M=1` only works with this fork's
+patched binary; it does nothing to an upstream release binary. The capture worker
+must either build `cloud-hypervisor` and `ch-remote` from this repository, or
+receive prebuilt aarch64 Linux binaries produced from it.
 
-The local `scripts/hvf/capture-on-mac.sh` path now follows the same rule for
-M3+ Macs with Lima nested KVM, and exports the guest disks into `disks/`
-automatically so the resulting bundle is self-contained.
+The local `scripts/hvf/capture-on-mac.sh` path (Lima nested KVM on M3+ Macs)
+exports the guest disks into `disks/` automatically, so a bundle captured that
+way is self-contained. Note that it and `capture-arm-snapshot.sh` still default
+to `CH_GIC_V2M=1` (the legacy shape) — pass `CH_GIC_V2M=0` for a vanilla
+capture. The `snapshots/ch-arm-stock-its*` fixtures were produced that way.
