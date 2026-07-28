@@ -20,7 +20,8 @@ Gimbal Local app — these are the docs you want:
 | [`macos-local-runtime.md`](macos-local-runtime.md) | Architecture of the HVF port: how a KVM snapshot is translated and rehydrated onto Apple Hypervisor.framework. |
 | [`gimbal-local-fork-model.md`](gimbal-local-fork-model.md) | How Gimbal Local models images, live checkpoints, and running sandboxes as a fork-based, branchable lineage — the local edge of the control plane's revision graph. |
 | [`hvf-compatible-snapshots.md`](hvf-compatible-snapshots.md) | The snapshot contract: **vanilla (stock upstream, ITS/LPI) is the recommended shape**, the legacy GICv2M fallback and where it is still required, and the disk + copy-on-write requirement. |
-| [`graviton-capture-request.md`](graviton-capture-request.md) | The exact snapshot we need captured on real cloud hardware, and how to produce it — the spec for the V1.5 acid test. |
+| [`graviton-capture-request.md`](graviton-capture-request.md) | The exact snapshot we need captured on real cloud hardware, and how to produce it. Corrected after round 1. |
+| [`graviton-acid-test-results.md`](graviton-acid-test-results.md) | **What happened when we ran it.** A vanilla Graviton2 snapshot boots on Apple silicon — and the guest's clock runs 5.08× slow. The evidence, the numbers, and what can and cannot be fixed. |
 | [`aws-byo-setup.md`](aws-byo-setup.md) | Bring-your-own-AWS setup for the remote→local→remote capture loop (`chm cloud …`). |
 | [`raspberry-pi-offbox-plan.md`](raspberry-pi-offbox-plan.md) | Plan for off-box snapshot capture on a Raspberry Pi / ARM Linux host. |
 

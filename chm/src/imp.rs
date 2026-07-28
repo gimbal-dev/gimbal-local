@@ -284,6 +284,134 @@ pub(crate) fn its_lpi_guard(state_json: &str) -> Result<(), String> {
     ))
 }
 
+/// The counter frequency an Apple-silicon HVF guest observes, in Hz.
+///
+/// `hv_vcpu_get_sys_reg(CNTFRQ_EL0)` returns `HV_BAD_ARGUMENT`, so we derive it
+/// from the host timebase instead: `mach_absolute_time` counts the same system
+/// counter the guest's `CNTVCT_EL0` does, and `mach_timebase_info` gives the
+/// ticks->nanoseconds ratio, so the frequency is `1e9 * denom / numer`. On
+/// current Apple silicon that is `1e9 * 3 / 125` = 24 MHz, which matches the
+/// `arch_timer: cp15 timer(s) running at 24.00MHz` a guest logs at boot.
+///
+/// Deriving it beats hardcoding 24 MHz: if Apple ever ships a part with a
+/// different system counter, this follows it rather than silently lying.
+fn hvf_guest_cntfrq() -> Option<u64> {
+    // Declared here rather than taken from `libc`, whose `mach_timebase_info`
+    // fields are deprecated in favour of a separate `mach2` crate we do not
+    // otherwise need. The ABI is two u32s and has been stable for decades.
+    #[repr(C)]
+    struct MachTimebaseInfo {
+        numer: u32,
+        denom: u32,
+    }
+    unsafe extern "C" {
+        fn mach_timebase_info(info: *mut MachTimebaseInfo) -> libc::c_int;
+    }
+
+    let mut tb = MachTimebaseInfo { numer: 0, denom: 0 };
+    // SAFETY: `mach_timebase_info` writes exactly the two u32 fields of the
+    // struct it is handed; `tb` is a live, correctly laid out local.
+    let rc = unsafe { mach_timebase_info(&raw mut tb) };
+    if rc != 0 || tb.numer == 0 {
+        return None;
+    }
+    Some(1_000_000_000u64 * u64::from(tb.denom) / u64::from(tb.numer))
+}
+
+/// The `cntfrq` recorded in a snapshot's top-level clock block, if present.
+///
+/// cloud-hypervisor stores it as a JSON *string* under `snapshot_data.state`
+/// that has to be parsed a second time:
+/// `{"clock":{"cntvct":..,"host_realtime_ns":..,"cntfrq":24000000}}`.
+///
+/// Returns `None` when the capture predates upstream `69637dde6` ("hypervisor:
+/// aarch64: capture the guest counter for snapshot/restore"), which is when the
+/// block was introduced — a v52.0 capture writes `{}` here.
+fn snapshot_cntfrq(state_json: &str) -> Option<u64> {
+    let root: serde_json::Value = serde_json::from_str(state_json).ok()?;
+    let inner = root.get("snapshot_data")?.get("state")?.as_str()?;
+    let clock: serde_json::Value = serde_json::from_str(inner).ok()?;
+    clock.get("clock")?.get("cntfrq")?.as_u64()
+}
+
+/// Load-time guest-clock-rate guard (#104).
+///
+/// A Linux guest reads `CNTFRQ_EL0` **once at boot**, caches it as
+/// `arch_timer_rate`, and never re-reads it — not on resume, not ever. Apple
+/// presents HVF guests a fixed counter frequency and offers no way to change it:
+/// `hv_vcpu_set_vtimer_offset` sets an *offset*, never a *rate*. So a snapshot
+/// captured on a host with a different frequency resumes into a guest whose
+/// every sleep, timeout and scheduler tick is scaled by the ratio.
+///
+/// Measured on real hardware (2026-07-28): an AWS Graviton2 capture
+/// (121_875_000 Hz) resumed on Apple silicon (24_000_000 Hz) runs **5.08x
+/// slow** — a `sleep 5` in the guest took 25.41s of wall clock.
+///
+/// The danger is not corruption; the guest stays internally consistent. The
+/// danger is that it presents as *"this VM feels sluggish"* rather than *"the
+/// clock is wrong"*, which is a day of profiling the wrong thing. This guard
+/// exists to make that diagnosis immediate.
+///
+/// Unlike the KVM path — which rejects a mismatch outright — the default here is
+/// a loud warning, because the guest genuinely runs and is useful for
+/// inspection, and refusing would mean no cloud snapshot ever starts on a Mac.
+/// Set `CHM_STRICT_CNTFRQ=1` for KVM parity (refuse instead of warn).
+pub(crate) fn cntfrq_guard(state_json: &str) -> Result<(), String> {
+    let Some(host) = hvf_guest_cntfrq() else {
+        return Ok(());
+    };
+    let Some(captured) = snapshot_cntfrq(state_json) else {
+        // Pre-69637dde6 capture: it cannot tell us, so we cannot check. Say so
+        // once rather than implying the clock was verified.
+        eprintln!(
+            "chm: note: this snapshot records no counter frequency (captured by a \
+             cloud-hypervisor build predating upstream 69637dde6), so the guest \
+             clock rate cannot be verified. If it was captured on a host whose \
+             CNTFRQ_EL0 differs from this Mac's {host} Hz, the guest's clock will \
+             run slow or fast by that ratio. See docs/graviton-acid-test-results.md."
+        );
+        return Ok(());
+    };
+    if captured == host {
+        return Ok(());
+    }
+
+    let ratio = captured as f64 / host as f64;
+    let (faster_or_slower, factor) = if captured > host {
+        ("slow", ratio)
+    } else {
+        ("fast", 1.0 / ratio)
+    };
+    let detail = format!(
+        "guest clock rate mismatch: this snapshot was captured on a host whose \
+         counter runs at {captured} Hz, but an Apple Hypervisor.framework guest \
+         sees {host} Hz.\n\
+         \n\
+         The guest cached {captured} Hz as its arch_timer_rate when it first \
+         booted and never re-reads it, so every sleep, timeout, scheduler tick \
+         and wall-clock reading inside it will run {factor:.3}x {faster_or_slower}. \
+         The guest is not corrupted — it stays internally consistent — but it \
+         will look like a slow machine rather than a wrong clock, which is the \
+         easiest way to lose a day to this.\n\
+         \n\
+         There is no restore-time fix: Hypervisor.framework exposes a vtimer \
+         offset, never a rate. See docs/graviton-acid-test-results.md for every \
+         mitigation considered."
+    );
+
+    if env::var_os("CHM_STRICT_CNTFRQ").is_some() {
+        return Err(format!(
+            "{detail}\n\
+             \n\
+             Refusing to start because CHM_STRICT_CNTFRQ is set (this matches the \
+             KVM path, which rejects a mismatch rather than corrupt the guest \
+             clock). Unset it to run anyway with the warning above."
+        ));
+    }
+    eprintln!("chm: warning: {detail}");
+    Ok(())
+}
+
 /// Create the per-run overlay directory as a private `0700` dir that `chm`
 /// owns, refusing to reuse a symlink shipped in an (untrusted) snapshot bundle.
 ///
@@ -1222,6 +1350,10 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     let dir = &args.snapshot_dir;
     let loaded = load_snapshot(dir)?;
     startup::stamp("snapshot parsed");
+
+    // Guest-clock-rate check (#104). Applies to both GIC paths: a frequency
+    // mismatch is a property of the capture host, not of interrupt routing.
+    cntfrq_guard(&loaded.state_json)?;
 
     // Userspace-GIC path (experimental, opt-in): rehydrate an ITS/LPI-routed
     // snapshot — the kind Apple's managed GIC cannot deliver completions for, and
@@ -2709,6 +2841,66 @@ fn banner(dir: &Path, mem_ranges: &Path, num_vcpus: u32, total_ram: u64, backend
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The clock block is a JSON *string* nested under `snapshot_data.state`, so
+    /// it has to be parsed twice. Getting that wrong reads as "no clock block"
+    /// and silently disables the #104 guard, so pin the shape.
+    #[test]
+    fn snapshot_cntfrq_parses_the_doubly_encoded_clock_block() {
+        let with_clock = r#"{"snapshot_data":{"state":
+            "{\"clock\":{\"cntvct\":4426757347,\"host_realtime_ns\":1784730066918609199,\"cntfrq\":24000000}}"}}"#;
+        assert_eq!(snapshot_cntfrq(with_clock), Some(24_000_000));
+
+        // A Graviton2 capture, for contrast.
+        let graviton = r#"{"snapshot_data":{"state":
+            "{\"clock\":{\"cntvct\":16981244116,\"host_realtime_ns\":1,\"cntfrq\":121875000}}"}}"#;
+        assert_eq!(snapshot_cntfrq(graviton), Some(121_875_000));
+    }
+
+    /// cloud-hypervisor v52.0 predates upstream 69637dde6 and writes `{}` here,
+    /// which must read as "cannot tell" rather than as an error or a zero.
+    #[test]
+    fn snapshot_cntfrq_is_absent_on_pre_clock_block_captures() {
+        assert_eq!(snapshot_cntfrq(r#"{"snapshot_data":{"state":"{}"}}"#), None);
+        assert_eq!(snapshot_cntfrq(r#"{"snapshots":{}}"#), None);
+        assert_eq!(snapshot_cntfrq("not json"), None);
+    }
+
+    /// Derived from the host timebase rather than hardcoded, so assert the
+    /// property (a plausible ARM system counter) rather than one machine's value.
+    #[test]
+    fn hvf_guest_cntfrq_is_derived_from_the_host_timebase() {
+        let f = hvf_guest_cntfrq().expect("mach_timebase_info should succeed");
+        assert!(
+            (1_000_000..=1_000_000_000).contains(&f),
+            "implausible counter frequency {f} Hz"
+        );
+    }
+
+    /// A matching capture must be silent, and an unreadable one must not block a
+    /// run — the guard is a diagnosis aid, not a gate (unless asked to be one).
+    #[test]
+    fn cntfrq_guard_admits_matching_and_unknown_captures() {
+        let host = hvf_guest_cntfrq().unwrap();
+        let matching =
+            format!(r#"{{"snapshot_data":{{"state":"{{\"clock\":{{\"cntfrq\":{host}}}}}"}}}}"#);
+        assert!(cntfrq_guard(&matching).is_ok());
+        assert!(cntfrq_guard(r#"{"snapshot_data":{"state":"{}"}}"#).is_ok());
+    }
+
+    /// The Graviton2 case, which is the one that actually happened: warn by
+    /// default so the guest still runs, and name the dilation factor so it is
+    /// diagnosed rather than mistaken for a slow machine.
+    #[test]
+    fn cntfrq_guard_warns_but_admits_a_mismatched_capture() {
+        let graviton =
+            r#"{"snapshot_data":{"state":"{\"clock\":{\"cntfrq\":121875000}}"}}"#;
+        assert!(
+            cntfrq_guard(graviton).is_ok(),
+            "a mismatch must not block the run by default -- refusing would mean \
+             no cloud snapshot ever starts on a Mac"
+        );
+    }
 
     #[test]
     fn effective_wall_secs_takes_the_tighter_cap() {

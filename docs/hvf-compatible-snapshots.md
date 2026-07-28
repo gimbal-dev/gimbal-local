@@ -75,6 +75,34 @@ stack it needs is already shipped and proven under `chm run`.
 Anything describing `CHM_ALLOW_ITS_LPI=1` as "the USGIC path" is wrong; it is the
 opposite, and it will look like a hang.
 
+## Counter frequency: a capture-host property you cannot fix on restore
+
+Interrupt routing is not the only thing a snapshot inherits from its capture
+host. The guest also caches its **counter frequency** (`CNTFRQ_EL0`) as
+`arch_timer_rate` the first time it boots, and never re-reads it.
+
+| host | `CNTFRQ_EL0` |
+| --- | --- |
+| Apple silicon under Hypervisor.framework | 24 000 000 Hz (fixed — no API changes it) |
+| AWS Graviton2 (Neoverse-N1) | 121 875 000 Hz |
+
+A Graviton capture resumed on a Mac therefore runs every sleep, timeout,
+scheduler tick and wall-clock reading **5.078× slow**. This is measured, not
+predicted — see [graviton-acid-test-results.md](graviton-acid-test-results.md).
+The guest is not corrupted; it stays internally consistent, which is exactly
+what makes it dangerous. It presents as a sluggish VM, not as a wrong clock.
+
+`chm` checks this at load and says so:
+
+| variable | what it does |
+| --- | --- |
+| *(unset — the default)* | Warns loudly and **still runs**. A dilated guest is genuinely useful, and refusing would mean no cloud snapshot ever starts on a Mac. |
+| `CHM_STRICT_CNTFRQ=1` | Refuses to start on a mismatch, matching the KVM path's `CntfrqMismatch` rejection. Use it when a wrong clock would be worse than no run at all. |
+
+A capture taken by a cloud-hypervisor build predating upstream `69637dde6`
+records no counter frequency at all, so `chm` cannot verify it and says that
+instead of guessing.
+
 ## Legacy path: GICv2M / message-SPI
 
 Before the userspace GIC, the only runnable shape was virtio completions routed

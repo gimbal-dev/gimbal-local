@@ -109,29 +109,36 @@ from cache in 0.077 s).
 
 ---
 
-## Where we actually are (2026-07-28)
+## Where we actually are (2026-07-28, revised same day)
 
-**The hard part is done.** A **vanilla** — stock upstream, unforked — arm64 Cloud
-Hypervisor KVM snapshot rehydrates on Apple silicon and runs: interactive shell,
-virtio disk, virtio net + NAT egress, SMP, checkpoint/resume. **247 ms**
-start-to-ready against Docker Sandbox's **12.73 s** on the same host.
+**The hard part is done, and the acid test has now passed on real cloud
+hardware.** A **vanilla** — stock upstream, unforked — arm64 Cloud Hypervisor KVM
+snapshot **captured on an AWS Graviton2 host** rehydrates on Apple silicon and
+runs an interactive login shell, with **no code changes required**. Locally
+captured fixtures additionally demonstrate virtio disk, virtio net + NAT egress,
+SMP and checkpoint/resume, at **247 ms** start-to-ready against Docker Sandbox's
+**12.73 s** on the same host.
 
 That works because of the **userspace GICv3** (M-USGIC): a software
 distributor/redistributor/ITS and a trapped CPU interface, delivering the LPIs
 Apple's managed GIC cannot, while HVF still executes the vCPUs. It is a real
 interrupt controller, not a compatibility shim.
 
-**But three things stand between that and the vision.** They are the whole of the
-remaining roadmap:
+**The cloud→Mac boundary is no longer hypothetical — it is crossed.** What
+remains is one hard physical problem and two product gaps:
 
-1. **We have never rehydrated a real cloud snapshot.** Every fixture we own was
-   captured under Lima **on a Mac** — a Mac pretending to be a KVM box, restored
-   on the Mac it came from. The cloud→Mac path is structurally untested.
-2. **The HVF path is blind to the capture host's counter frequency** (#104,
-   found 2026-07-28). Every fixture carries `cntfrq = 24000000` *because they
-   were captured on a Mac*, so the mismatch path has never executed and cannot
-   with the fixtures we have. The KVM path explicitly rejects a mismatch as guest
-   clock corruption; HVF does not check at all.
+1. ~~**We have never rehydrated a real cloud snapshot.**~~ **Done, 2026-07-28.**
+   Three vanilla Graviton2 captures restored and ran an interactive shell. Full
+   evidence in [`graviton-acid-test-results.md`](graviton-acid-test-results.md).
+2. **The guest's clock runs 5.08× slow across the cloud→Mac boundary** (#104).
+   No longer a prediction — **measured**. Graviton2 presents `CNTFRQ_EL0 =
+   121 875 000 Hz`; Apple silicon presents `24 000 000 Hz`. A Linux guest caches
+   the rate at boot and never re-reads it, so every sleep, timeout and scheduler
+   tick stretches by exactly `325/64`. **There is no restore-time fix**: Apple's
+   API exposes a vtimer *offset*, never a *rate*; the DT `clock-frequency`
+   override is unavailable because these guests boot EFI→ACPI; and KVM cannot
+   present a synthetic rate at capture. This is now the single biggest open
+   problem in the project.
 3. **`chm serve` rejects vanilla** (#102). The CLI accepts it; the daemon the
    macOS app drives does not. The UI pillar is not real until it does.
 
@@ -145,22 +152,25 @@ makes a **vanilla cloud snapshot run everywhere in the product**.
 
 | | Milestone | Pillar | Status | Issues |
 | --- | --- | --- | --- | --- |
-| **V1** | **Make a real cloud snapshot run** | ① | the acid test + its landmines | #104, #105 |
+| **V1** | **Make a real cloud snapshot run** | ① | **acid test passed**; clock dilation open | #104, ~~#105~~ |
 | **V2** | **Vanilla everywhere in the product** | ①③ | CLI works; daemon + app do not | #102 |
 | **V3** | **Cloud control plane on the vanilla contract** | ②④ | partly blocked cross-repo | #21, #36, #5 |
 | **V4** | **Security with sane defaults** | ③ | substantially shipped; needs the umbrella | #39, #20 |
 
 ### V1 · Make a real cloud snapshot run **[the current thrust]**
 
-The milestone that proves the vision. Everything else is preparation.
+The milestone that proves the vision. **V1.5 passed on 2026-07-28** — see
+[`graviton-acid-test-results.md`](graviton-acid-test-results.md). V1.1 was
+answered as a side effect, and V1.3 is now the hard, open problem.
 
-| | Task | Blocked on |
+| | Task | Status / blocked on |
 | --- | --- | --- |
-| V1.1 | Prove what `CNTFRQ_EL0` an HVF guest actually sees. `hv_vcpu_get_sys_reg(0xdf00)` returns `HV_BAD_ARGUMENT`, so this needs a bare-metal guest payload (cf. `wfi_guest.S`) that reads it and writes to the PL011. Present evidence is indirect. | — |
-| V1.2 | Guard the HVF rehydrate path against a frequency mismatch: parse the clock block, compare, fail loudly like `its_lpi_guard`. Turns silent corruption into a clear diagnosis. (#104) | V1.1 |
-| V1.3 | Decide whether a mismatch is *fixable* or only detectable. Trapping `CNTVCT_EL0` to rescale is likely fatal for perf; rewriting Linux's cached `arch_timer_rate` in restored RAM is fragile and kernel-specific. May be moot if the frequencies match. | V1.1 |
-| V1.4 | Audit the rest of the bug class: MPIDR/affinity layout, `ID_AA64*` feature registers, cache topology, GIC `IIDR` — anywhere a guest probed the *capture* host and cached the answer. | — |
-| V1.5 | **THE ACID TEST** — rehydrate a genuine vanilla Graviton capture (#105). | gimbal cloud |
+| V1.1 | Establish what `CNTFRQ_EL0` an HVF guest actually sees. | ✅ **Done.** No bare-metal payload needed after all: the guest's own dmesg in the RAM image states it. Mac/HVF = **24 000 000 Hz**; Graviton2 = **121 875 000 Hz**. Confirmed three independent ways (boot log, a measured 5.080× dilation vs 5.078125 predicted, and `CNTVCT`÷rate cross-checked against cloud-init's timestamps). |
+| V1.2 | Guard the HVF rehydrate path against a frequency mismatch: parse the clock block, compare against 24 MHz, fail loudly like `its_lpi_guard`. (#104) | **Next.** Unblocked. Note a v52.0 capture has **no** clock block to parse — the guard must also handle "capture does not say", and the capture request now demands a build containing `69637dde6`. |
+| V1.3 | **Decide whether the 5.08× dilation is fixable or only detectable.** Ruled out by inspection: Apple exposes `hv_vcpu_set_vtimer_offset` (an *offset*, never a *rate*); the DT `clock-frequency` override is unreachable because these guests boot EFI→ACPI; KVM cannot present a synthetic rate at capture; `arch_timer_rate` cannot be re-derived at runtime. The one open avenue is **driving `CNTVOFF` to synthesize the rate** — jittery and exit-bound, but the ratio is exactly `325/64` so a fixed-point correction accumulates no drift. Prototype behind a flag and measure honestly. | **Open — the biggest problem in the project.** |
+| V1.4 | Audit the rest of the bug class: MPIDR/affinity layout, `ID_AA64*` feature registers, cache topology, GIC `IIDR` — anywhere a guest probed the *capture* host and cached the answer. | Partly reassuring: a Graviton2 `MIDR 0x413fd0c1` guest ran fine on Apple silicon, and the ITS/redistributor restore was unaffected. Still worth a systematic pass. |
+| V1.5 | **THE ACID TEST** — rehydrate a genuine vanilla Graviton capture (#105). | ✅ **PASSED 2026-07-28.** Three Graviton2 captures, all restored, all reached an interactive login shell, no code changes. |
+| V1.6 | **Round 2 capture.** Round 1 exposed two bugs in our own request: it pinned `CH_VERSION=v52.0`, which predates the clock block entirely, and the captures fired mid-cloud-init so the guest restarts its getty ~113 s after resume. Both fixed in the request. | gimbal cloud |
 
 The capture we need, precisely: [`graviton-capture-request.md`](graviton-capture-request.md).
 
@@ -449,10 +459,16 @@ vs. real builds), so they double as end-to-end validation of M30/M31.
   recommended capture shape.** The remaining gap is that `chm serve` has not been
   wired to it yet (#102), so the daemon still requires a `gicv2m-message-spi`
   capture. See [`hvf-compatible-snapshots.md`](hvf-compatible-snapshots.md).
-- **Counter frequency is part of the compatibility contract.** A guest caches
-  `CNTFRQ_EL0` at boot; Apple presents HVF guests a fixed frequency we cannot
-  change. A capture from a host with a different frequency risks silent guest
-  clock corruption, and the HVF path does not currently check (#104).
+- **Counter frequency is a hard, unfixable-at-restore part of the compatibility
+  contract.** A guest caches `CNTFRQ_EL0` at boot and never re-reads it. Apple
+  presents HVF guests **24 000 000 Hz** and offers no way to change it —
+  `hv_vcpu_set_vtimer_offset` sets an *offset*, never a *rate*. **Measured
+  2026-07-28:** an AWS Graviton2 guest (`121 875 000 Hz`) resumed on Apple silicon
+  runs **5.08× slow** in wall-clock terms — correct, self-consistent, and living
+  in dilated time. It presents as sluggishness, not as a clock fault, which makes
+  it the most dangerous failure mode we have. The HVF path does not yet check
+  (#104). See [`graviton-acid-test-results.md`](graviton-acid-test-results.md) §4
+  for every mitigation considered and why each one is or is not available.
 - **arm64 KVM capacity.** Producing real snapshots needs a genuine arm64 `/dev/kvm`
   host (a Lima nested-KVM guest for $0, or Graviton bare metal); the Mac itself
   can only *run* snapshots, never capture them.
