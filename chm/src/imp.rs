@@ -237,51 +237,42 @@ impl VmOps for ChmVmOps {
 /// (hardware-proven: ICH List Registers are EL2/nested-only -> HV_UNSUPPORTED,
 /// and there is no PROPBASER/PENDBASER/ITS API). A snapshot whose virtio
 /// completions are routed through the GIC ITS as LPIs would restore and then
-/// hang on its first device wait with no completion interrupt. Detect that here
-/// and fail loudly with an actionable message instead of a silent I/O stall.
+/// hang on its first device wait with no completion interrupt.
 ///
-/// Returns `Ok(())` when the snapshot is deliverable (SPI-routed, ITS disabled,
-/// or no MSI-wired virtio devices), or when `CHM_ALLOW_ITS_LPI` is set to force
-/// a run anyway. Returns `Err` with remediation guidance otherwise.
-pub(crate) fn its_lpi_guard(state_json: &str) -> Result<(), String> {
-    let descs = match devmgr::parse_devices(state_json) {
-        Ok(d) => d,
-        Err(_) => return Ok(()),
+/// Whether this snapshot routes its virtio completion interrupts through the
+/// GIC ITS as LPIs — the routing Apple's managed Hypervisor.framework GIC
+/// physically cannot deliver, and which therefore has to run on the userspace
+/// GICv3 (`run_usgic_engine`).
+///
+/// Both entry points (`chm run` and `chm serve`) use this to route
+/// automatically, so a vanilla upstream capture just works. Only bundles the
+/// managed path would have refused outright are redirected, so nothing that
+/// works on the managed GIC changes path.
+///
+/// `CHM_ALLOW_ITS_LPI=1` forces such a capture onto the managed GIC anyway.
+/// That is a diagnostic for A/B-ing the two backends: the guest restores and
+/// then stalls on its first disk or net I/O, because the completion interrupt
+/// can never arrive.
+pub(crate) fn routes_completions_as_lpis(state_json: &str) -> bool {
+    let Ok(descs) = devmgr::parse_devices(state_json) else {
+        return false;
     };
     let wired_devices = descs
         .iter()
         .filter(|d| !d.vector_events.is_empty() && d.device_id != 0)
         .count();
     if its::classify_routing(state_json, wired_devices) != its::CompletionRouting::ItsLpi {
-        return Ok(());
+        return false;
     }
     if env::var_os("CHM_ALLOW_ITS_LPI").is_some() {
         eprintln!(
-            "chm: warning: CHM_ALLOW_ITS_LPI set -- ignoring ITS/LPI routing \
-             guard; the guest will likely stall on its first I/O wait because \
-             LPI completions cannot be delivered on the managed GIC."
+            "chm: warning: CHM_ALLOW_ITS_LPI set -- running an ITS/LPI capture \
+             on the managed GIC; the guest will likely stall on its first I/O \
+             wait because LPI completions cannot be delivered there."
         );
-        return Ok(());
+        return false;
     }
-    Err(format!(
-        "this snapshot routes its virtio completion interrupts through the GIC \
-         ITS as LPIs ({wired_devices} MSI-wired device(s) + an enabled \
-         gic-v3-its), which Apple's Hypervisor.framework managed GIC cannot \
-         deliver. The guest would restore but then hang on its first disk/net \
-         I/O with no completion interrupt.\n\
-         \n\
-         Set CHM_USERSPACE_GIC=1 to run it on the userspace GICv3, which CAN \
-         deliver LPIs. That path boots a stock ITS/LPI capture to an interactive \
-         shell with virtio disk and net completions, SMP, and checkpoint/resume, \
-         and is the path the benchmarks run on. See \
-         docs/hvf-compatible-snapshots.md.\n\
-         \n\
-         Alternatively, re-capture with the guest's virtio MSIs routed as GICv3 \
-         message-based SPIs (MBI) or legacy INTx line SPIs rather than through a \
-         GIC ITS; the managed GIC delivers those via hv_gic_send_msi / \
-         hv_gic_set_spi. (CHM_ALLOW_ITS_LPI=1 bypasses this guard on the managed \
-         path, but the guest will then stall on first I/O.)"
-    ))
+    true
 }
 
 /// The counter frequency an Apple-silicon HVF guest observes, in Hz.
@@ -1361,15 +1352,19 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     // mismatch is a property of the capture host, not of interrupt routing.
     cntfrq_guard(&loaded.state_json)?;
 
-    // Userspace-GIC path (experimental, opt-in): rehydrate an ITS/LPI-routed
-    // snapshot — the kind Apple's managed GIC cannot deliver completions for, and
-    // which its_lpi_guard otherwise rejects — onto a software GICv3. This is the
-    // path that lifts the "GICv2M capture only" restriction; see issue #81.
-    if env::var_os("CHM_USERSPACE_GIC").is_some() {
+    // Userspace-GIC path: rehydrate an ITS/LPI-routed snapshot — the kind Apple's
+    // managed GIC cannot deliver completions for — onto a software GICv3. This is
+    // the path that lifts the "GICv2M capture only" restriction (#81), so a
+    // vanilla upstream capture runs with no flag.
+    //
+    // Routing is automatic: we only redirect bundles the managed path would have
+    // rejected outright, so nothing that works on the managed GIC changes path.
+    // `CHM_USERSPACE_GIC=1` forces it, for A/B-ing the two backends.
+    if env::var_os("CHM_USERSPACE_GIC").is_some()
+        || routes_completions_as_lpis(&loaded.state_json)
+    {
         return run_usgic(args, loaded);
     }
-
-    its_lpi_guard(&loaded.state_json)?;
 
     // Resume from a live checkpoint when one exists and checkpoints are enabled;
     // a malformed/incompatible checkpoint is discarded so we cold-boot cleanly.

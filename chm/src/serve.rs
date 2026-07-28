@@ -28,8 +28,8 @@ use crate::checkpoint;
 use crate::console::ConsoleInput;
 use crate::console_filter::ConsoleFilter;
 use crate::imp::{
-    Loaded, Outcome, UsgicConfig, UsgicSession, build_vm_ops, cntfrq_guard, its_lpi_guard,
-    load_snapshot, run_usgic_engine, wire_virtio,
+    Loaded, Outcome, UsgicConfig, UsgicSession, build_vm_ops, cntfrq_guard, load_snapshot,
+    routes_completions_as_lpis, run_usgic_engine, wire_virtio,
 };
 use crate::limits;
 use hypervisor::hvf::virtio::nat::NatLimits;
@@ -798,13 +798,23 @@ fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Resu
     let loaded = load_snapshot(dir)?;
     cntfrq_guard(&loaded.state_json)?;
 
-    // The userspace GICv3 delivers the LPI completions Apple's managed GIC
-    // cannot, so a stock ITS/LPI capture runs there. Selected the same way
-    // `chm run` selects it, with `CHM_USERSPACE_GIC=1`.
-    if env::var_os("CHM_USERSPACE_GIC").is_some() {
+    // A stock ITS/LPI capture routes its virtio completions as LPIs, which
+    // Apple's managed GIC cannot deliver. The userspace GICv3 *can* deliver
+    // them, so rather than refusing a bundle we know how to run, route it
+    // there. Forced on with `CHM_USERSPACE_GIC=1` to match `chm run`.
+    //
+    // This only ever redirects snapshots the managed path would have rejected
+    // outright, so a bundle that works today keeps taking the same code path.
+    let forced = env::var_os("CHM_USERSPACE_GIC").is_some();
+    if forced || routes_completions_as_lpis(&loaded.state_json) {
+        if !forced {
+            eprintln!(
+                "chm serve: this snapshot routes virtio completions through the GIC ITS \
+                 as LPIs; running it on the userspace GICv3, which can deliver them."
+            );
+        }
         return run_guest_usgic(dir, opts, inner, loaded);
     }
-    its_lpi_guard(&loaded.state_json)?;
 
     let (uart, bus) = build_vm_ops(&loaded.state_json);
     let vm_ops: Arc<dyn VmOps> = bus.clone();
