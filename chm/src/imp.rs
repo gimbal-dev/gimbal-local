@@ -355,7 +355,10 @@ fn snapshot_cntfrq(state_json: &str) -> Option<u64> {
 /// Unlike the KVM path — which rejects a mismatch outright — the default here is
 /// a loud warning, because the guest genuinely runs and is useful for
 /// inspection, and refusing would mean no cloud snapshot ever starts on a Mac.
-/// Set `CHM_STRICT_CNTFRQ=1` for KVM parity (refuse instead of warn).
+/// Set `CHM_STRICT_CNTFRQ=1` for KVM parity (refuse instead of warn), or
+/// `CHM_GUEST_CNTFRQ=<Hz>` to correct the dilation outright — the offset is
+/// re-programmed on a curve so the guest counter advances at the rate it
+/// believes it has (measured 1.000x).
 pub(crate) fn cntfrq_guard(state_json: &str) -> Result<(), String> {
     let Some(host) = hvf_guest_cntfrq() else {
         return Ok(());
@@ -394,9 +397,10 @@ pub(crate) fn cntfrq_guard(state_json: &str) -> Result<(), String> {
          will look like a slow machine rather than a wrong clock, which is the \
          easiest way to lose a day to this.\n\
          \n\
-         There is no restore-time fix: Hypervisor.framework exposes a vtimer \
-         offset, never a rate. See docs/graviton-acid-test-results.md for every \
-         mitigation considered."
+         Set CHM_GUEST_CNTFRQ={captured} to correct it: chm re-programs the \
+         vtimer offset on a curve so the guest counter advances at the rate the \
+         guest believes it has (measured 1.000x, down from {factor:.3}x). See \
+         docs/hvf-compatible-snapshots.md."
     );
 
     if env::var_os("CHM_STRICT_CNTFRQ").is_some() {
@@ -446,7 +450,7 @@ pub(crate) fn wire_virtio(
     state_json: &str,
     overlay_dir: &Path,
     gic: Option<&Arc<Mutex<dyn Vgic>>>,
-    resume: bool,
+    reattach_overlay: bool,
     cli_egress: Option<&Path>,
     net_limits: &NatLimits,
     allow_local_egress: bool,
@@ -527,7 +531,7 @@ pub(crate) fn wire_virtio(
             desc,
             guest_mem.clone(),
             overlay_dir,
-            resume,
+            reattach_overlay,
             policy,
             dev_limits,
             allow_local_egress,
@@ -1859,7 +1863,13 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
         &loaded.state_json,
         &overlay_dir,
         None, // no managed GIC
-        true, // resume: drain in-flight completions
+        // Reattach the previous run's disk overlay ONLY when we are genuinely
+        // resuming that run's checkpoint. This used to be hardcoded `true`,
+        // which paired a previous session's disk with this rehydrate's pristine
+        // snapshot RAM — the restored page cache described the base image while
+        // the disk carried someone else's writes, so the guest saw
+        // `Input/output error` on reads it believed were cached (#110).
+        resume_state.is_some(),
         args.egress_policy.as_deref(),
         &NatLimits {
             max_connections: limits.max_connections.map(|n| n as usize),

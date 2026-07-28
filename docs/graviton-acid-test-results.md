@@ -165,8 +165,16 @@ real cloud capture.
 
 ## 4. Can it be fixed?
 
-Short version: **not at restore time, and not with any API Apple exposes.**
-Ruled out by inspection, in order of how much we wanted each one to work:
+> **UPDATE — this section's original verdict was wrong, and the fix has now
+> shipped.** The last research row below ("synthesize the rate by driving
+> `CNTVOFF`") turned out to be not just real but practical. Dilation on a
+> vanilla Graviton capture is now a **measured 1.000&times;**, down from
+> 5.081&times;. The analysis of *why the naive approaches fail* is still
+> accurate and is kept below; only the headline conclusion changed.
+
+Short version: **not with any single API Apple exposes — but it is achievable
+by re-programming the one offset Apple does expose, continuously.** Ruled out
+by inspection, in order of how much we wanted each one to work:
 
 | approach | verdict |
 | --- | --- |
@@ -175,7 +183,7 @@ Ruled out by inspection, in order of how much we wanted each one to work:
 | Have KVM present a different `CNTFRQ` at capture | ❌ KVM exposes the host's physical counter rate. This is precisely why upstream KVM *rejects* a mismatch instead of trying to paper over it. |
 | Make the guest re-read the rate on resume | ❌ `arch_timer_rate` is baked into the clocksource `mult`/`shift` and every clockevent at boot. There is no supported runtime path. |
 | Guest agent that steps the clock on resume | ⚠️ Fixes the **wall clock** only. Does nothing about the 5.08&times; dilation of sleeps and timeouts. |
-| Synthesize the rate by driving `CNTVOFF` | 🔬 Real, but research. See below. |
+| Synthesize the rate by driving `CNTVOFF` | ✅ **SHIPPED.** An offset re-programmed on a curve *is* a rate. Measured **1.000&times;**. See below. |
 | Capture on a 24 MHz host | ✅ Works today — that is what our Lima fixtures are. Not the dream. |
 
 ### The one avenue that is actually open
@@ -264,7 +272,7 @@ say explicitly how to verify the guest is quiescent before pausing.
 | Interactive login shell | ✅ |
 | Disk I/O correct (no ext4 checksum errors) | ✅ |
 | Reproducible across three captures | ✅ |
-| **Guest keeps correct time** | ❌ **5.08&times; slow — §3** |
+| **Guest keeps correct time** | ✅ **1.000&times; with `CHM_GUEST_CNTFRQ` — §3** |
 | Snapshot self-describes its counter rate | ❌ needs CH > v52.0 — §5.1 |
 | Guest quiescent at capture | ❌ mid-cloud-init — §5.2 |
 | 2 vCPU + networking capture | ⬜ not produced |

@@ -98,6 +98,25 @@ what makes it dangerous. It presents as a sluggish VM, not as a wrong clock.
 | --- | --- |
 | *(unset — the default)* | Warns loudly and **still runs**. A dilated guest is genuinely useful, and refusing would mean no cloud snapshot ever starts on a Mac. |
 | `CHM_STRICT_CNTFRQ=1` | Refuses to start on a mismatch, matching the KVM path's `CntfrqMismatch` rejection. Use it when a wrong clock would be worse than no run at all. |
+| `CHM_GUEST_CNTFRQ=<Hz>` | **Corrects the dilation.** Tells `chm` the counter frequency the guest believes it has, so it can synthesize that rate. A Graviton2 capture is `CHM_GUEST_CNTFRQ=121875000`. Measured effect: 5.081&times; dilation &rarr; **1.000&times;**. |
+
+### Correcting a dilated guest — `CHM_GUEST_CNTFRQ`
+
+Apple exposes `hv_vcpu_set_vtimer_offset`, which is an *offset*, not a rate — but
+the offset is ours to move. Holding
+`CNTVCT_guest = base + (now - base_host) * guest_hz / host_hz` and re-programming
+the offset onto that curve at every guest entry synthesizes the rate the guest
+already believes it has. The ratio is > 1, so the offset only ever decreases and
+the guest counter never goes backwards.
+
+The value is **explicit rather than inferred**: a capture predating upstream
+`69637dde6` records no frequency at all, and silently guessing a guest's clock
+rate would be worse than a visibly slow guest. Captures that do record it can
+plumb it through automatically.
+
+```console
+$ CHM_USERSPACE_GIC=1 CHM_GUEST_CNTFRQ=121875000 chm run <snapshot>
+```
 
 A capture taken by a cloud-hypervisor build predating upstream `69637dde6`
 records no counter frequency at all, so `chm` cannot verify it and says that
