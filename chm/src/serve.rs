@@ -25,8 +25,12 @@ use hypervisor::hvf::rehydrate::{rehydrate, rehydrate_resume};
 use hypervisor::{VmExit, VmOps};
 
 use crate::checkpoint;
+use crate::console::ConsoleInput;
 use crate::console_filter::ConsoleFilter;
-use crate::imp::{build_vm_ops, cntfrq_guard, its_lpi_guard, load_snapshot, wire_virtio};
+use crate::imp::{
+    Loaded, Outcome, UsgicConfig, UsgicSession, build_vm_ops, cntfrq_guard, its_lpi_guard,
+    load_snapshot, run_usgic_engine, wire_virtio,
+};
 use crate::limits;
 use hypervisor::hvf::virtio::nat::NatLimits;
 
@@ -89,6 +93,10 @@ struct VmInner {
     /// `hv_vcpus_exit`). Published by the worker once the VM is built, so a
     /// `stop` can interrupt even a guest that is spinning without trapping.
     kick: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Delivers bytes to the guest's serial console. Published by the worker
+    /// alongside `kick`; without it the daemon's console is read-only and a
+    /// client could watch a guest but never type into it.
+    input: Option<ConsoleInput>,
 }
 
 enum RunStatus {
@@ -525,6 +533,13 @@ fn handle_conn(stream: UnixStream, daemon: &Daemon) {
             let _ = writer.write_all(resp.as_bytes());
         }
         "console" => stream_console(&mut writer, daemon),
+        "input" => {
+            let resp = match send_input(daemon, arg) {
+                Ok(n) => format!("ok\t{n} byte(s)\n"),
+                Err(e) => format!("error\t{e}\n"),
+            };
+            let _ = writer.write_all(resp.as_bytes());
+        }
         "stop" => {
             let resp = match stop_vm(daemon) {
                 Ok(msg) => format!("ok\t{msg}\n"),
@@ -671,6 +686,7 @@ fn start_vm(daemon: &Daemon, name: &str) -> Result<String, String> {
         status: RunStatus::Running,
         stop_requested: false,
         kick: None,
+        input: None,
     }));
 
     let opts = EngineOpts {
@@ -781,7 +797,15 @@ struct EngineOpts {
 fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Result<String, String> {
     let loaded = load_snapshot(dir)?;
     cntfrq_guard(&loaded.state_json)?;
+
+    // The userspace GICv3 delivers the LPI completions Apple's managed GIC
+    // cannot, so a stock ITS/LPI capture runs there. Selected the same way
+    // `chm run` selects it, with `CHM_USERSPACE_GIC=1`.
+    if env::var_os("CHM_USERSPACE_GIC").is_some() {
+        return run_guest_usgic(dir, opts, inner, loaded);
+    }
     its_lpi_guard(&loaded.state_json)?;
+
     let (uart, bus) = build_vm_ops(&loaded.state_json);
     let vm_ops: Arc<dyn VmOps> = bus.clone();
 
@@ -932,6 +956,182 @@ fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Resu
     reason
 }
 
+/// Deliver bytes from a client into the running guest's serial console.
+///
+/// Escapes are decoded so a line-oriented protocol can carry control characters:
+/// `\n`, `\r`, `\t`, `\0`, `\xNN` and `\\`. A bare command with no argument
+/// sends a newline, which is the common case (waking a login prompt).
+fn send_input(daemon: &Daemon, arg: &str) -> Result<usize, String> {
+    let guard = daemon.current.lock().unwrap();
+    let vm = guard.as_ref().ok_or("no VM running")?;
+    let input = {
+        let inner = vm.inner.lock().unwrap();
+        if let RunStatus::Stopped(ref why) = inner.status {
+            return Err(format!("`{}` is stopped ({why})", vm.name));
+        }
+        inner.input.clone()
+    };
+    let input = input.ok_or("this VM does not expose a console input channel")?;
+    let bytes = decode_input(arg);
+    input(&bytes);
+    Ok(bytes.len())
+}
+
+/// Decode a client's console input, turning backslash escapes into raw bytes.
+fn decode_input(arg: &str) -> Vec<u8> {
+    if arg.is_empty() {
+        return vec![b'\n'];
+    }
+    let mut out = Vec::with_capacity(arg.len());
+    let mut it = arg.bytes().peekable();
+    while let Some(b) = it.next() {
+        if b != b'\\' {
+            out.push(b);
+            continue;
+        }
+        match it.next() {
+            Some(b'n') => out.push(b'\n'),
+            Some(b'r') => out.push(b'\r'),
+            Some(b't') => out.push(b'\t'),
+            Some(b'0') => out.push(0),
+            Some(b'\\') => out.push(b'\\'),
+            Some(b'x') => {
+                // Two hex digits, or a literal `\x` if malformed.
+                let hi = it.peek().copied().and_then(|c| (c as char).to_digit(16));
+                let mut ok = false;
+                if let Some(hi) = hi {
+                    it.next();
+                    if let Some(lo) = it.peek().copied().and_then(|c| (c as char).to_digit(16)) {
+                        it.next();
+                        out.push((hi * 16 + lo) as u8);
+                        ok = true;
+                    } else {
+                        out.push(hi as u8);
+                        ok = true;
+                    }
+                }
+                if !ok {
+                    out.extend_from_slice(b"\\x");
+                }
+            }
+            Some(other) => {
+                out.push(b'\\');
+                out.push(other);
+            }
+            None => out.push(b'\\'),
+        }
+    }
+    out
+}
+
+/// Run a stock ITS/LPI capture on the **userspace GICv3** under the daemon.
+///
+/// Shares `chm run`'s engine (`run_usgic_engine`) so there is exactly one copy
+/// of the multi-threaded vCPU orchestration, cross-vCPU SGI table, ITS/LPI
+/// virtio wiring and checkpoint capture. All this adds is the daemon's own
+/// supervision policy: drain the guest's serial output into the console ring
+/// and stop on the stop flag, the idle timeout, or the wall-clock cap.
+///
+/// Like the CLI, live checkpoints here are single-vCPU only; an SMP capture
+/// cold-boots on the next start (the engine reports that itself).
+fn run_guest_usgic(
+    dir: &Path,
+    opts: &EngineOpts,
+    inner: &Arc<Mutex<VmInner>>,
+    loaded: Loaded,
+) -> Result<String, String> {
+    let allow_local_egress = env::var("CHM_ALLOW_LOCAL_EGRESS")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
+        .unwrap_or(false);
+    let cfg = UsgicConfig {
+        dir,
+        // The daemon's stderr is a log, not a console: no banner, no chatter.
+        quiet: true,
+        // Stop -> Start must round-trip guest state, same as the managed path.
+        checkpoint: true,
+        egress_policy: None,
+        allow_local_egress,
+        limits_file: None,
+        checkpoint_source: "daemon",
+        // The daemon does not own a terminal: no raw mode, no stdin pump.
+        interactive: false,
+    };
+
+    let outcome = run_usgic_engine(&cfg, loaded, &mut |s| supervise_daemon(s, opts, inner))?;
+    Ok(match outcome {
+        Outcome::PoweredOff => "guest powered off".to_string(),
+        Outcome::MaxSeconds => "reached --max-seconds limit".to_string(),
+        Outcome::Idle(secs) => format!(
+            "no console output for {secs}s (likely waiting on an unmodelled device)"
+        ),
+        Outcome::LimitExceeded(reason) => format!("resource limit hit ({reason})"),
+        Outcome::ConsoleClosed | Outcome::Interrupted => "stopped by request".to_string(),
+    })
+}
+
+/// The daemon's supervision loop for a userspace-GIC guest.
+///
+/// The vCPUs run on their own threads, so unlike the managed path this only
+/// pumps the console and watches for a stop; it returns the reason, and the
+/// engine performs the teardown (and the suspend capture) from there.
+fn supervise_daemon(
+    s: &UsgicSession<'_>,
+    opts: &EngineOpts,
+    inner: &Arc<Mutex<VmInner>>,
+) -> Result<Outcome, String> {
+    // Publish a kick that forces *every* vCPU out of `hv_vcpu_run`, so a `stop`
+    // interrupts even a guest spinning without traps. The managed path only has
+    // one vCPU to kick; here the stop must reach all of them.
+    let exits: Vec<Arc<dyn Fn() + Send + Sync>> = s.exits.to_vec();
+    {
+        let mut g = inner.lock().unwrap();
+        g.kick = Some(Arc::new(move || {
+            for e in &exits {
+                e();
+            }
+        }));
+        g.input = Some(s.input.clone());
+    }
+
+    let start = Instant::now();
+    let mut last_output = Instant::now();
+    let max = (opts.max_seconds > 0).then(|| Duration::from_secs(opts.max_seconds));
+    let idle = (opts.idle_exit_secs > 0).then(|| Duration::from_secs(opts.idle_exit_secs));
+    let mut console_filter = ConsoleFilter::new();
+
+    while s.running.load(Ordering::Acquire) {
+        if inner.lock().unwrap().stop_requested {
+            return Ok(Outcome::Interrupted);
+        }
+
+        let raw = s.uart.take_output();
+        if raw.is_empty() {
+            // Nothing to move; yield rather than spin a core against the vCPUs.
+            thread::sleep(Duration::from_millis(5));
+        } else {
+            let bytes = console_filter.feed(&raw);
+            if !bytes.is_empty() {
+                append_console(inner, &bytes);
+                last_output = Instant::now();
+            }
+        }
+
+        if let Some(max) = max
+            && start.elapsed() >= max
+        {
+            return Ok(Outcome::MaxSeconds);
+        }
+        if let Some(idle) = idle
+            && last_output.elapsed() >= idle
+        {
+            return Ok(Outcome::Idle(opts.idle_exit_secs));
+        }
+    }
+    // `running` cleared without the supervisor asking: a vCPU thread powered off
+    // or failed, and the engine reports that outcome in preference to this one.
+    Ok(Outcome::PoweredOff)
+}
+
 /// Push guest serial output into the shared console ring, evicting from the
 /// front (and bumping the dropped counter) when it exceeds the cap.
 fn append_console(inner: &Arc<Mutex<VmInner>>, bytes: &[u8]) {
@@ -962,7 +1162,7 @@ fn ctl(raw: &[String]) -> Result<(), String> {
     let (socket, rest) = take_socket(raw)?;
     if rest.is_empty() {
         return Err(
-            "missing command (list [--json] | status [--json] | start <name> | console | stop | shutdown)"
+            "missing command (list [--json] | status [--json] | start <name> | console | input [text] | stop | shutdown)"
                 .to_string(),
         );
     }
@@ -1029,6 +1229,38 @@ mod tests {
             "status-json"
         );
         assert_eq!(ctl_command(&s(&["start", "vm1"])).unwrap(), "start vm1");
+    }
+
+    #[test]
+    fn bare_input_sends_a_newline() {
+        // The common case: waking a login prompt on a resumed guest, which
+        // emits nothing until it is typed at.
+        assert_eq!(decode_input(""), b"\n");
+    }
+
+    #[test]
+    fn input_decodes_escapes_into_raw_control_bytes() {
+        assert_eq!(decode_input("ubuntu\\n"), b"ubuntu\n");
+        assert_eq!(decode_input("\\r"), b"\r");
+        assert_eq!(decode_input("\\t"), b"\t");
+        assert_eq!(decode_input("\\x03"), &[3u8]);
+        // Ctrl-C then Ctrl-D, the two escapes a console client needs most.
+        assert_eq!(decode_input("\\x03\\x04"), &[3u8, 4u8]);
+        // A literal backslash survives.
+        assert_eq!(decode_input("a\\\\b"), b"a\\b");
+    }
+
+    #[test]
+    fn input_passes_unknown_escapes_through_verbatim() {
+        // Better to deliver what the caller wrote than to silently drop it.
+        assert_eq!(decode_input("\\q"), b"\\q");
+        assert_eq!(decode_input("\\xzz"), b"\\xzz");
+        assert_eq!(decode_input("\\"), b"\\");
+    }
+
+    #[test]
+    fn input_leaves_plain_text_untouched() {
+        assert_eq!(decode_input("ubuntu"), b"ubuntu");
     }
 
     #[test]

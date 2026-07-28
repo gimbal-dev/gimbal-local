@@ -213,14 +213,55 @@ pub(crate) fn install_signal_handlers(restore: RestoreHandle) {
 /// shutdown flag rather than calling `process::exit`, so the run loop returns
 /// and `run()` destroys the HVF VM via `Drop` — the same path a terminating
 /// signal or a guest power-off takes.
+/// Queues host bytes into the guest's PL011 receive FIFO and raises the serial
+/// interrupt for them.
+///
+/// Shared by the CLI's stdin pump and the daemon's `input` command so both
+/// deliver keystrokes identically — the daemon's console would otherwise be
+/// write-only from the guest's side, i.e. an app could watch a VM but never
+/// type into it.
+pub(crate) type ConsoleInput = Arc<dyn Fn(&[u8]) + Send + Sync>;
+
+/// Build a [`ConsoleInput`] over a guest's PL011 and its serial interrupt sink.
+pub(crate) fn console_input(
+    uart: Arc<Pl011>,
+    sink: Arc<dyn MsiSink>,
+    wake: Option<Arc<dyn Fn() + Send + Sync>>,
+) -> ConsoleInput {
+    let spi = serial_spi();
+    let trace = env::var_os("CHM_TRACE_INPUT").is_some();
+    Arc::new(move |bytes: &[u8]| {
+        if bytes.is_empty() {
+            return;
+        }
+        // `push_input` reports whether the guest's receive interrupt should be
+        // raised; the re-assert tick covers the case where it is unmasked later.
+        let assert = uart.push_input(bytes);
+        if trace {
+            eprintln!(
+                "[chm-input] {} byte(s) {:02x?} -> push_input assert={assert} spi={spi}",
+                bytes.len(),
+                bytes
+            );
+        }
+        if assert {
+            sink.deliver_spi(spi);
+            // Wake a WFI-parked vCPU so it takes the serial interrupt now,
+            // rather than at its next idle re-evaluation poll.
+            if let Some(wake) = &wake {
+                wake();
+            }
+        }
+    })
+}
+
 pub(crate) fn spawn_stdin_pump(
     uart: Arc<Pl011>,
     sink: Arc<dyn MsiSink>,
     restore: RestoreHandle,
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
 ) {
-    let spi = serial_spi();
-    let trace = env::var_os("CHM_TRACE_INPUT").is_some();
+    let deliver = console_input(uart, sink, wake);
     thread::spawn(move || {
         let mut stdin = io::stdin();
         let mut buf = [0u8; 64];
@@ -262,24 +303,7 @@ pub(crate) fn spawn_stdin_pump(
                     out.push(b);
                 }
             }
-            if !out.is_empty() {
-                let assert = uart.push_input(&out);
-                if trace {
-                    eprintln!(
-                        "[chm-input] {} byte(s) {:02x?} -> push_input assert={assert} spi={spi}",
-                        out.len(),
-                        out
-                    );
-                }
-                if assert {
-                    sink.deliver_spi(spi);
-                    // Wake a WFI-parked vCPU so it takes the serial interrupt
-                    // now, rather than after its idle re-evaluation poll.
-                    if let Some(wake) = &wake {
-                        wake();
-                    }
-                }
-            }
+            deliver(&out);
         }
     });
 }
