@@ -123,15 +123,17 @@ On the Mac, run the script remotely:
 
 ```bash
 ssh "$PI_HOST" \
-  'CH_GIC_V2M=1 GUEST_CPUS=1 GUEST_MEM_MB=1024 OUT_DIR=$HOME/ch-arm-snapshot bash /tmp/capture-arm-snapshot.sh'
+  'CH_GIC_V2M=0 GUEST_CPUS=1 GUEST_MEM_MB=1024 OUT_DIR=$HOME/ch-arm-snapshot bash /tmp/capture-arm-snapshot.sh'
 ```
 
-`CH_GIC_V2M=1` is important. It makes the guest use a GICv2M/message-SPI path
-instead of stock ITS/LPI routing, because Apple's managed GIC cannot deliver
-LPIs to the restored guest.
+`CH_GIC_V2M=0` is the vanilla shape: stock upstream ITS/LPI routing, no fork.
+Run it on the Mac with `CHM_USERSPACE_GIC=1`, whose software GICv3 delivers the
+LPIs Apple's managed GIC cannot. This is now the script default; the remote
+command keeps it explicit so the capture mode is obvious in logs.
 
-The script now defaults `CH_GIC_V2M` to `1`, but the remote command keeps it
-explicit so the capture mode is obvious in logs.
+`CH_GIC_V2M=1` produces the legacy GICv2M/message-SPI shape that the managed GIC
+path (and, until gimbal-local#102, `chm serve` and the app) requires. It is this
+fork's patch, so it also needs `CH_BIN`/`CHREMOTE_BIN`.
 
 ## Step 5: Copy the snapshot back to the Mac
 
