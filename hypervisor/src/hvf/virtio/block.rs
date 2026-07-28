@@ -345,8 +345,17 @@ impl OverlayBackend {
         let overlay = super::pathsafe::open_rw_create_nofollow(overlay_path, true)?;
         overlay.set_len(nsectors.saturating_mul(SECTOR_SIZE))?;
         let words = nsectors.div_ceil(64) as usize;
-        // A fresh cold-boot overlay leaves no stale bitmap behind.
-        let _ = std::fs::remove_file(Self::bitmap_path_for(overlay_path));
+        // A fresh cold-boot overlay leaves no stale bitmap behind. This must not
+        // be best-effort: the overlay above was just truncated, so a surviving
+        // sidecar would mark sectors as "written" that now read back as zeros
+        // instead of falling through to the base image — silently corrupting the
+        // guest's filesystem rather than failing. A missing sidecar is the normal
+        // case and is not an error.
+        match std::fs::remove_file(Self::bitmap_path_for(overlay_path)) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
         Ok(Self {
             base,
             overlay,
@@ -826,6 +835,82 @@ mod tests {
         drop(ob);
         let base_after = std::fs::read(&base_path).unwrap();
         assert_eq!(base_before, base_after, "base image must remain pristine");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A cold-boot open truncates the overlay, so any surviving bitmap sidecar
+    /// would mark sectors as "written" that now read back as zeros instead of
+    /// falling through to the base image. That is silent filesystem corruption,
+    /// so the sidecar removal must not be best-effort.
+    #[test]
+    fn cold_open_does_not_leave_a_stale_bitmap_shadowing_the_base() {
+        use std::io::Write;
+        let dir =
+            std::env::temp_dir().join(format!("chm-cow-stale-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let base_path = dir.join("base.raw");
+        let overlay_path = dir.join("over.raw");
+
+        // Base: 4 sectors, each filled with its (index+1) byte value.
+        let mut base_bytes = Vec::new();
+        for s in 0..4u8 {
+            base_bytes.extend(std::iter::repeat(s + 1).take(SECTOR_SIZE as usize));
+        }
+        std::fs::File::create(&base_path).unwrap().write_all(&base_bytes).unwrap();
+
+        // A previous session wrote sector 2 and persisted its bitmap.
+        let mut first = OverlayBackend::open(&base_path, &overlay_path, 4).unwrap();
+        first.write_at(2 * SECTOR_SIZE, &[0xEEu8; SECTOR_SIZE as usize]).unwrap();
+        first.flush().unwrap();
+        drop(first);
+        let sidecar = OverlayBackend::bitmap_path_for(&overlay_path);
+        assert!(sidecar.exists(), "the first session should persist a sidecar");
+
+        // Cold boot again. The overlay is truncated, so sector 2 must read the
+        // base value — not the zeros a surviving bitmap would expose.
+        let mut second = OverlayBackend::open(&base_path, &overlay_path, 4).unwrap();
+        assert!(!sidecar.exists(), "a cold open must clear the stale sidecar");
+        let mut got = [0u8; SECTOR_SIZE as usize];
+        second.read_at(2 * SECTOR_SIZE, &mut got).unwrap();
+        assert!(
+            got.iter().all(|&b| b == 3),
+            "sector 2 must fall through to base value 3, got {:#x}",
+            got[0]
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The corruption above is only prevented if the removal is *not* silent.
+    /// With the sidecar path occupied by a directory the removal cannot succeed,
+    /// and a cold open must fail loudly rather than run on with a bitmap it did
+    /// not manage to clear.
+    #[test]
+    fn cold_open_fails_loudly_when_the_stale_bitmap_cannot_be_removed() {
+        use std::io::Write;
+        let dir =
+            std::env::temp_dir().join(format!("chm-cow-stuck-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let base_path = dir.join("base.raw");
+        let overlay_path = dir.join("over.raw");
+        std::fs::File::create(&base_path)
+            .unwrap()
+            .write_all(&vec![7u8; 4 * SECTOR_SIZE as usize])
+            .unwrap();
+
+        // Occupy the sidecar path with something `remove_file` cannot delete.
+        std::fs::create_dir_all(OverlayBackend::bitmap_path_for(&overlay_path)).unwrap();
+
+        let err = match OverlayBackend::open(&base_path, &overlay_path, 4) {
+            Ok(_) => panic!("a cold open that cannot clear the sidecar must fail"),
+            Err(e) => e,
+        };
+        assert_ne!(
+            err.kind(),
+            io::ErrorKind::NotFound,
+            "a missing sidecar is the normal case and must not be reported as an error"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
