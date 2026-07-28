@@ -80,6 +80,28 @@ fn mach_timebase() -> ffi::MachTimebaseInfo {
     })
 }
 
+/// Reduce `a/b` to its lowest terms so a rate scale can be applied as exact
+/// integer arithmetic and accumulate no drift. Graviton2's 121_875_000 Hz over
+/// Apple silicon's 24_000_000 Hz reduces to exactly 325/64.
+fn reduce_ratio(a: u64, b: u64) -> (u64, u64) {
+    let (mut x, mut y) = (a, b);
+    while y != 0 {
+        let t = y;
+        y = x % y;
+        x = t;
+    }
+    let g = x.max(1);
+    (a / g, b / g)
+}
+
+/// The frequency the host virtual counter actually ticks at, derived from the
+/// mach timebase (nanoseconds per tick). Apple silicon reports numer=125,
+/// denom=3, i.e. 24 MHz — the value an HVF guest sees in `CNTFRQ_EL0`.
+pub fn host_counter_hz() -> u64 {
+    let tb = mach_timebase();
+    (u64::from(tb.denom) * 1_000_000_000) / u64::from(tb.numer)
+}
+
 /// Fill `buf` with cryptographically-strong host entropy for the guest's TRNG
 /// firmware calls. Reads `/dev/urandom` (never blocks on modern macOS); on the
 /// rare read failure the buffer is left zeroed, which only weakens one TRNG
@@ -283,6 +305,10 @@ impl Vm for HvfVm {
             vm_ops,
             kick,
             vtimer_offset: AtomicU64::new(0),
+            cnt_scale_num: AtomicU64::new(0),
+            cnt_scale_den: AtomicU64::new(1),
+            cnt_base_host: AtomicU64::new(0),
+            cnt_base_guest: AtomicU64::new(0),
             run_gen: Arc::new(AtomicU64::new(0)),
             usgic: Mutex::new(UserGic {
                 enabled: std::env::var_os("CHM_USERSPACE_GIC").is_some(),
@@ -641,6 +667,62 @@ impl UserGic {
 }
 
 #[cfg(test)]
+mod counter_scale_tests {
+    use super::reduce_ratio;
+
+    /// The ratio that matters in practice: AWS Graviton2's 121.875 MHz counter
+    /// over Apple silicon's 24 MHz. It reduces to exactly 325/64, so the scaled
+    /// curve is computable in integers and accumulates no drift at all.
+    #[test]
+    fn graviton_over_apple_reduces_exactly() {
+        assert_eq!(reduce_ratio(121_875_000, 24_000_000), (325, 64));
+    }
+
+    #[test]
+    fn an_already_reduced_ratio_is_unchanged() {
+        assert_eq!(reduce_ratio(325, 64), (325, 64));
+    }
+
+    #[test]
+    fn a_matching_frequency_reduces_to_unity() {
+        assert_eq!(reduce_ratio(24_000_000, 24_000_000), (1, 1));
+    }
+
+    /// Integer arithmetic on the reduced fraction must not drift: after a full
+    /// simulated hour of host ticks the scaled counter has to land on the exact
+    /// value the guest's own frequency implies, to the tick.
+    #[test]
+    fn the_scaled_curve_accumulates_no_drift_over_an_hour() {
+        let (num, den) = reduce_ratio(121_875_000, 24_000_000);
+        // One hour of host ticks at 24 MHz.
+        let host_ticks: u64 = 24_000_000 * 3600;
+        let scaled = (u128::from(host_ticks) * u128::from(num) / u128::from(den)) as u64;
+        // One hour of guest ticks at the guest's own 121.875 MHz.
+        assert_eq!(scaled, 121_875_000 * 3600);
+    }
+
+    /// The park duration converts the other way (guest ticks back to host
+    /// ticks), so a guest asking to sleep one of its seconds must park for one
+    /// real second rather than 5.08 of them.
+    #[test]
+    fn a_guest_second_converts_back_to_one_host_second() {
+        let (num, den) = reduce_ratio(121_875_000, 24_000_000);
+        let guest_ticks: u64 = 121_875_000;
+        let host_ticks = (u128::from(guest_ticks) * u128::from(den) / u128::from(num)) as u64;
+        assert_eq!(host_ticks, 24_000_000);
+    }
+
+    /// A degenerate frequency must not panic or divide by zero. Callers guard
+    /// against it before ever reaching here, so this only pins that the
+    /// arithmetic itself is total.
+    #[test]
+    fn a_zero_frequency_does_not_panic() {
+        assert_eq!(reduce_ratio(0, 24_000_000), (0, 1));
+        assert_eq!(reduce_ratio(24_000_000, 0), (1, 0));
+    }
+}
+
+#[cfg(test)]
 mod usgic_tests {
     use super::UserGic;
 
@@ -767,6 +849,16 @@ pub struct HvfVcpu {
     /// reliably through `hv_vcpu_get_sys_reg` once the vCPU is forced out of
     /// `run()`. Defaults to 0, matching a freshly created vCPU's counter.
     vtimer_offset: AtomicU64,
+    /// Numerator of the virtual-counter rate scale, or 0 when the counter runs
+    /// at the host rate. See [`Self::set_counter_scale`].
+    cnt_scale_num: AtomicU64,
+    /// Denominator of the virtual-counter rate scale. Only read when
+    /// `cnt_scale_num` is non-zero.
+    cnt_scale_den: AtomicU64,
+    /// Host `mach_absolute_time` at which the scaled-counter curve was anchored.
+    cnt_base_host: AtomicU64,
+    /// Guest `CNTVCT_EL0` at which the scaled-counter curve was anchored.
+    cnt_base_guest: AtomicU64,
     /// Monotonic counter bumped once per `run()` iteration. A host-side watchdog
     /// samples it to tell a vCPU that is making progress (returning from
     /// `hv_vcpu_run` for exits) apart from one wedged inside a single
@@ -918,6 +1010,10 @@ impl HvfVcpu {
     pub fn restore_vtimer_offset(&self, snapshot_cntvct: u64) -> CpuResult<()> {
         // SAFETY: FFI; reads the host monotonic tick.
         let now = unsafe { mach_absolute_time() };
+        // Anchor the scaled-counter curve here too, so a scaled guest's counter
+        // also resumes at its captured value and only then starts running fast.
+        self.cnt_base_host.store(now, Ordering::Relaxed);
+        self.cnt_base_guest.store(snapshot_cntvct, Ordering::Relaxed);
         let offset = now.wrapping_sub(snapshot_cntvct);
         // SAFETY: FFI on the owning thread.
         let ret = unsafe { hv_vcpu_set_vtimer_offset(self.id, offset) };
@@ -932,14 +1028,95 @@ impl HvfVcpu {
         Ok(())
     }
 
+    /// Run the guest's virtual counter at `guest_hz` while the host counter ticks
+    /// at `host_hz`, by continuously re-programming the virtual-timer offset.
+    ///
+    /// A Linux guest reads `CNTFRQ_EL0` once at boot and caches it as
+    /// `arch_timer_rate`; it never re-reads it. A snapshot captured on a host
+    /// with a different counter frequency therefore converts every `CNTVCT_EL0`
+    /// delta with the wrong divisor, and all of its timekeeping is dilated by
+    /// `guest_hz / host_hz` (5.078125x for AWS Graviton2's 121.875 MHz on Apple
+    /// silicon's 24 MHz). Apple exposes no way to change the frequency a guest
+    /// sees, and the guest cannot be made to re-read it.
+    ///
+    /// HVF defines `CNTVCT_EL0 = mach_absolute_time() - offset`, which is an
+    /// offset, not a scale — but the offset is ours to move. Walking it downward
+    /// over time makes the guest's counter advance faster than the host's, which
+    /// is the rate the guest already believes it has. The offset only ever
+    /// decreases (the ratio is > 1), so the guest's counter is still monotonic.
+    ///
+    /// The approximation is piecewise: between re-programs the counter advances
+    /// at the host rate, and each re-program steps it forward onto the intended
+    /// curve. Re-programming happens at every `run()` entry, so the step size is
+    /// bounded by how long the guest runs without exiting.
+    ///
+    /// The ratio is kept as a reduced integer fraction rather than a float, so
+    /// the curve accumulates no drift: 121_875_000/24_000_000 reduces to exactly
+    /// 325/64.
+    pub fn set_counter_scale(&self, guest_hz: u64, host_hz: u64) {
+        if guest_hz == 0 || host_hz == 0 || guest_hz == host_hz {
+            self.cnt_scale_num.store(0, Ordering::Relaxed);
+            return;
+        }
+        let (num, den) = reduce_ratio(guest_hz, host_hz);
+        self.cnt_scale_den.store(den, Ordering::Relaxed);
+        self.cnt_scale_num.store(num, Ordering::Relaxed);
+    }
+
+    /// The scale as a reduced `(numerator, denominator)`, or `None` when the
+    /// guest counter runs at the host rate.
+    fn counter_scale(&self) -> Option<(u64, u64)> {
+        let num = self.cnt_scale_num.load(Ordering::Relaxed);
+        if num == 0 {
+            return None;
+        }
+        Some((num, self.cnt_scale_den.load(Ordering::Relaxed)))
+    }
+
+    /// The guest `CNTVCT_EL0` the scaled curve calls for at host time `now`.
+    fn scaled_cntvct_at(&self, now: u64, num: u64, den: u64) -> u64 {
+        let base_host = self.cnt_base_host.load(Ordering::Relaxed);
+        let base_guest = self.cnt_base_guest.load(Ordering::Relaxed);
+        let elapsed = u128::from(now.wrapping_sub(base_host));
+        let scaled = elapsed * u128::from(num) / u128::from(den);
+        base_guest.wrapping_add(scaled as u64)
+    }
+
+    /// Step the virtual-timer offset onto the scaled curve. Called at every
+    /// `run()` entry; a no-op unless [`Self::set_counter_scale`] is active.
+    ///
+    /// Failures are swallowed deliberately: an un-stepped offset means the guest
+    /// keeps the previous (still monotonic) counter for one more run window,
+    /// which is a degradation, not a correctness break.
+    fn reprogram_scaled_vtimer_offset(&self) {
+        let Some((num, den)) = self.counter_scale() else {
+            return;
+        };
+        // SAFETY: FFI; reads the host monotonic tick.
+        let now = unsafe { mach_absolute_time() };
+        let offset = now.wrapping_sub(self.scaled_cntvct_at(now, num, den));
+        // SAFETY: FFI on the owning thread.
+        let ret = unsafe { hv_vcpu_set_vtimer_offset(self.id, offset) };
+        if ret == HV_SUCCESS {
+            self.vtimer_offset.store(offset, Ordering::Relaxed);
+        }
+    }
+
     /// The guest's current `CNTVCT_EL0`, derived as `mach_absolute_time() -
     /// offset` (HVF's definition) from the offset we last programmed. Used at
     /// checkpoint time because `hv_vcpu_get_sys_reg(CNTVCT_EL0)` is not reliably
     /// readable once the vCPU has been forced out of `run()`.
+    ///
+    /// Under [`Self::set_counter_scale`] this reports the scaled curve rather
+    /// than the last-programmed offset, so the WFI park and the virtual-timer
+    /// poll both reason in the guest's own (faster) time base.
     pub fn current_cntvct(&self) -> u64 {
         // SAFETY: FFI; reads the host monotonic tick.
         let now = unsafe { mach_absolute_time() };
-        now.wrapping_sub(self.vtimer_offset.load(Ordering::Relaxed))
+        match self.counter_scale() {
+            Some((num, den)) => self.scaled_cntvct_at(now, num, den),
+            None => now.wrapping_sub(self.vtimer_offset.load(Ordering::Relaxed)),
+        }
     }
 
     /// How long (in milliseconds) to park a WFI-idle vCPU on its wake fd before
@@ -973,9 +1150,17 @@ impl HvfVcpu {
             return 0;
         }
         let remaining_ticks = cval - now;
+        // The deadline is in guest ticks; under a counter scale those elapse
+        // faster than host ticks, so convert back to the host rate first.
+        let remaining_host_ticks = match self.counter_scale() {
+            Some((num, den)) => {
+                (u128::from(remaining_ticks) * u128::from(den) / u128::from(num)) as u64
+            }
+            None => remaining_ticks,
+        };
         // Convert mach ticks -> ns -> ms via the host timebase.
         let tb = mach_timebase();
-        let remaining_ns = (remaining_ticks as u128) * (tb.numer as u128) / (tb.denom as u128);
+        let remaining_ns = (remaining_host_ticks as u128) * (tb.numer as u128) / (tb.denom as u128);
         let remaining_ms = (remaining_ns / 1_000_000) as i64;
         remaining_ms.clamp(1, WFI_IDLE_POLL_MS as i64) as i32
     }
@@ -1925,6 +2110,11 @@ impl Vcpu for HvfVcpu {
         // Apple's internal WFI wait not honouring its deadline) stops bumping it,
         // which the watchdog detects and breaks by forcing an exit.
         self.run_gen.fetch_add(1, Ordering::Relaxed);
+        // Step the virtual-counter offset onto the scaled curve when the guest
+        // was captured on a host with a different counter frequency. No-op
+        // otherwise. Done first so everything below reasons in the guest's own
+        // time base.
+        self.reprogram_scaled_vtimer_offset();
         // Drain any cross-thread injections (device/net-service completions) into
         // the userspace GIC before we sample the line — they were enqueued off
         // this vCPU's thread and can only be applied here, on the owning thread.

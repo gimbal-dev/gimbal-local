@@ -1022,11 +1022,41 @@ pub fn restore_usgic_vcpu(
             .as_any_concrete_mut()
             .downcast_mut::<HvfVcpu>()
             .expect("HVF vCPU");
+        apply_counter_scale(concrete);
         concrete
             .restore_vtimer_offset(reference)
             .map_err(|e| RehydrateError::Hv(anyhow!("vCPU {id} reseed vtimer: {e}")))?;
     }
     Ok(vcpu)
+}
+
+/// The counter frequency the guest believes it has, from `CHM_GUEST_CNTFRQ`.
+///
+/// A guest caches `CNTFRQ_EL0` once at boot and never re-reads it, and Apple
+/// exposes no way to change the value an HVF guest sees, so a snapshot captured
+/// on a host with a different counter frequency has permanently wrong
+/// timekeeping unless the counter is made to run at the rate the guest expects.
+/// This is the opt-in that turns that synthesis on.
+///
+/// Deliberately an explicit value rather than something inferred: round-1
+/// Graviton captures predate the upstream commit that writes the clock block, so
+/// the frequency is not always in the snapshot, and silently guessing it would
+/// be worse than leaving the guest visibly slow.
+fn requested_guest_cntfrq() -> Option<u64> {
+    std::env::var("CHM_GUEST_CNTFRQ")
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .filter(|hz| *hz > 0)
+}
+
+/// Point this vCPU's virtual counter at the guest's own counter frequency when
+/// one was requested. No-op otherwise.
+fn apply_counter_scale(vcpu: &HvfVcpu) {
+    if let Some(guest_hz) = requested_guest_cntfrq() {
+        vcpu.set_counter_scale(guest_hz, super::host_counter_hz());
+    }
 }
 
 /// This vCPU's SMP cross-delivery handle (its injection queue + wake), for the
@@ -1198,6 +1228,7 @@ pub fn restore_vcpu_state(
     // multi-vCPU resume (and a harmless no-op re-seed for a single vCPU, whose
     // reference IS its own CNTVCT). See [`Snapshot::reference_cntvct`].
     if let Some(reference) = snap.reference_cntvct() {
+        apply_counter_scale(concrete);
         concrete
             .restore_vtimer_offset(reference)
             .map_err(|e| RehydrateError::Hv(anyhow!("vCPU {id} reseed vtimer offset: {e}")))?;

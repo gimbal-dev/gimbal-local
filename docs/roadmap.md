@@ -161,13 +161,13 @@ makes a **vanilla cloud snapshot run everywhere in the product**.
 
 The milestone that proves the vision. **V1.5 passed on 2026-07-28** — see
 [`graviton-acid-test-results.md`](graviton-acid-test-results.md). V1.1 was
-answered as a side effect, and V1.3 is now the hard, open problem.
+answered as a side effect, and V1.3 — the hard problem — is now solved: **V1 is complete.**
 
 | | Task | Status / blocked on |
 | --- | --- | --- |
 | V1.1 | Establish what `CNTFRQ_EL0` an HVF guest actually sees. | ✅ **Done.** No bare-metal payload needed after all: the guest's own dmesg in the RAM image states it. Mac/HVF = **24 000 000 Hz**; Graviton2 = **121 875 000 Hz**. Confirmed three independent ways (boot log, a measured 5.080× dilation vs 5.078125 predicted, and `CNTVCT`÷rate cross-checked against cloud-init's timestamps). |
 | V1.2 | Guard the HVF rehydrate path against a frequency mismatch: parse the clock block, compare against the host, say so loudly. (#104) | ✅ **Done.** Ships on both the CLI and daemon paths. Warns by default and still runs — deliberately diverging from KVM, because a dilated guest is genuinely useful and refusing would mean no cloud snapshot ever starts on a Mac. `CHM_STRICT_CNTFRQ=1` opts in to the KVM rejection. A capture predating `69637dde6` carries no clock block, so the guard reports that it cannot verify rather than guessing. |
-| V1.3 | **Decide whether the 5.08× dilation is fixable or only detectable.** (#108) Ruled out by inspection: Apple exposes `hv_vcpu_set_vtimer_offset` (an *offset*, never a *rate*); the DT `clock-frequency` override is unreachable because these guests boot EFI→ACPI; KVM cannot present a synthetic rate at capture; `arch_timer_rate` cannot be re-derived at runtime. The one open avenue is **driving `CNTVOFF` to synthesize the rate** — jittery and exit-bound, but the ratio is exactly `325/64` so a fixed-point correction accumulates no drift. Prototype behind a flag and measure honestly. | **Open — the biggest problem in the project, and now the only thing standing between us and V1.** |
+| V1.3 | **Fix the 5.08&times; dilation.** (#108) Apple exposes `hv_vcpu_set_vtimer_offset` — an *offset*, never a *rate* — but the offset is ours to move. Holding `CNTVCT_guest = base + (now - base_host) * guest_hz / host_hz` and re-stepping the offset onto that curve at every guest entry synthesizes the rate. `121875000/24000000` reduces to exactly `325/64`, so u128 integer math accumulates **zero drift**. Enabled explicitly with `CHM_GUEST_CNTFRQ=<Hz>`. | ✅ **Done — measured 1.000&times;, down from 5.081&times;.** Guest `sleep 5` takes 5.00 s of host wall clock (was 25.40 s); three consecutive runs at 1.001 / 1.000 / 1.000. Boot-to-shell also halved, 2.19 s &rarr; 1.09 s. Instrument: `scripts/hvf/measure-clock-dilation.py`, validated by first reproducing the known 5.08&times; baseline. |
 | V1.4 | Audit the rest of the bug class: MPIDR/affinity layout, `ID_AA64*` feature registers, cache topology, GIC `IIDR` — anywhere a guest probed the *capture* host and cached the answer. | Partly reassuring: a Graviton2 `MIDR 0x413fd0c1` guest ran fine on Apple silicon, and the ITS/redistributor restore was unaffected. Still worth a systematic pass. |
 | V1.5 | **THE ACID TEST** — rehydrate a genuine vanilla Graviton capture (#105). | ✅ **PASSED 2026-07-28.** Three Graviton2 captures, all restored, all reached an interactive login shell, no code changes. |
 | V1.6 | **Round 2 capture.** Round 1 exposed two bugs in our own request: it pinned `CH_VERSION=v52.0`, which predates the clock block entirely, and the captures fired mid-cloud-init so the guest restarts its getty ~113 s after resume. Both fixed in the request. | gimbal cloud |
@@ -484,7 +484,7 @@ V1–V4 spine:
 | Milestone | Issues |
 | --- | --- |
 | V1.2 counter-frequency guard | ~~#104~~ shipped |
-| V1.3 counter-rate synthesis | **#108** |
+| V1.3 counter-rate synthesis | ~~#108~~ shipped |
 | V1.5 the acid test | ~~#105~~ passed |
 | V2.1 `chm serve` + userspace GIC | #102 |
 | V3 cloud contract / signing / postcopy | #21, #36, #5 |
@@ -496,15 +496,16 @@ when it holds for a **vanilla** snapshot on both substrates.
 
 ### What comes next (2026-07-28)
 
-**V1.1, V1.2 and V1.5 are all done.** The acid test passed, the frequency
+**V1 is complete — V1.1, V1.2, V1.3 and V1.5 are all done.** The acid test passed, the frequency
 question is answered, and the guard that makes the answer legible ships. What
 remains:
 
-1. **V1.3 — can the counter rate be synthesized? (#108).** The last thing between
-   us and V1, and the only honest way to close it is to prototype `CNTVOFF`-driven
-   rate synthesis behind a flag and **measure the jitter**, not predict it. A
-   measured negative result is a perfectly good outcome; the warn-and-run fallback
-   is already shipped and is not embarrassing.
+1. ~~**V1.3 — can the counter rate be synthesized? (#108).**~~ **Done, and the
+   answer was yes.** It was prototyped behind a flag and *measured* rather than
+   predicted: **1.000&times;**, down from 5.081&times;. The jitter never
+   materialised because the userspace-GIC path exits constantly (ICC traps, WFI,
+   MMIO), so the offset is re-stepped far more often than the guest can observe.
+   **V1 is complete.**
 2. **V2.1 — `chm serve` on the userspace GIC (#102).** The largest single unblock
    for the product: it is what makes the app able to run what the CLI already
    runs. Until this lands, the app pillar cannot touch a vanilla snapshot at all.
