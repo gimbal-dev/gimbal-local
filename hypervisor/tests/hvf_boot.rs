@@ -2107,10 +2107,11 @@ fn hvf_rehydrate_real_cloud_snapshot_emits_console() {
 
 /// USGIC END-TO-END: rehydrate a GENUINE stock ITS/LPI-routed cloud-hypervisor
 /// snapshot onto a userspace GICv3 (NO managed GIC) and observe the restored
-/// guest EXECUTE real code. This is the snapshot the shipping managed path
-/// REJECTS (its_lpi_guard: LPI completions the managed GIC cannot deliver); the
-/// userspace-GIC path is the whole point of M-USGIC. Point CH_SNAPSHOT_DIR at a
-/// stock (CH_GIC_V2M=0) capture, e.g. snapshots/ch-arm-stock-its.
+/// guest EXECUTE real code. This is the snapshot the managed GIC cannot run at
+/// all (it delivers LPI completions, which Apple's managed GIC has no mechanism
+/// for), so `routes_completions_as_lpis` sends it down this path automatically.
+/// The userspace-GIC path is the whole point of M-USGIC. Point CH_SNAPSHOT_DIR
+/// at a stock (CH_GIC_V2M=0) capture, e.g. snapshots/ch-arm-stock-its.
 ///
 /// Ignored by default (needs a multi-GB local snapshot + a codesigned bin). Run:
 ///   CH_SNAPSHOT_DIR=snapshots/ch-arm-stock-its <bin> \

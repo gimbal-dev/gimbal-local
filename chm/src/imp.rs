@@ -237,51 +237,42 @@ impl VmOps for ChmVmOps {
 /// (hardware-proven: ICH List Registers are EL2/nested-only -> HV_UNSUPPORTED,
 /// and there is no PROPBASER/PENDBASER/ITS API). A snapshot whose virtio
 /// completions are routed through the GIC ITS as LPIs would restore and then
-/// hang on its first device wait with no completion interrupt. Detect that here
-/// and fail loudly with an actionable message instead of a silent I/O stall.
+/// hang on its first device wait with no completion interrupt.
 ///
-/// Returns `Ok(())` when the snapshot is deliverable (SPI-routed, ITS disabled,
-/// or no MSI-wired virtio devices), or when `CHM_ALLOW_ITS_LPI` is set to force
-/// a run anyway. Returns `Err` with remediation guidance otherwise.
-pub(crate) fn its_lpi_guard(state_json: &str) -> Result<(), String> {
-    let descs = match devmgr::parse_devices(state_json) {
-        Ok(d) => d,
-        Err(_) => return Ok(()),
+/// Whether this snapshot routes its virtio completion interrupts through the
+/// GIC ITS as LPIs — the routing Apple's managed Hypervisor.framework GIC
+/// physically cannot deliver, and which therefore has to run on the userspace
+/// GICv3 (`run_usgic_engine`).
+///
+/// Both entry points (`chm run` and `chm serve`) use this to route
+/// automatically, so a vanilla upstream capture just works. Only bundles the
+/// managed path would have refused outright are redirected, so nothing that
+/// works on the managed GIC changes path.
+///
+/// `CHM_ALLOW_ITS_LPI=1` forces such a capture onto the managed GIC anyway.
+/// That is a diagnostic for A/B-ing the two backends: the guest restores and
+/// then stalls on its first disk or net I/O, because the completion interrupt
+/// can never arrive.
+pub(crate) fn routes_completions_as_lpis(state_json: &str) -> bool {
+    let Ok(descs) = devmgr::parse_devices(state_json) else {
+        return false;
     };
     let wired_devices = descs
         .iter()
         .filter(|d| !d.vector_events.is_empty() && d.device_id != 0)
         .count();
     if its::classify_routing(state_json, wired_devices) != its::CompletionRouting::ItsLpi {
-        return Ok(());
+        return false;
     }
     if env::var_os("CHM_ALLOW_ITS_LPI").is_some() {
         eprintln!(
-            "chm: warning: CHM_ALLOW_ITS_LPI set -- ignoring ITS/LPI routing \
-             guard; the guest will likely stall on its first I/O wait because \
-             LPI completions cannot be delivered on the managed GIC."
+            "chm: warning: CHM_ALLOW_ITS_LPI set -- running an ITS/LPI capture \
+             on the managed GIC; the guest will likely stall on its first I/O \
+             wait because LPI completions cannot be delivered there."
         );
-        return Ok(());
+        return false;
     }
-    Err(format!(
-        "this snapshot routes its virtio completion interrupts through the GIC \
-         ITS as LPIs ({wired_devices} MSI-wired device(s) + an enabled \
-         gic-v3-its), which Apple's Hypervisor.framework managed GIC cannot \
-         deliver. The guest would restore but then hang on its first disk/net \
-         I/O with no completion interrupt.\n\
-         \n\
-         Set CHM_USERSPACE_GIC=1 to run it on the userspace GICv3, which CAN \
-         deliver LPIs. That path boots a stock ITS/LPI capture to an interactive \
-         shell with virtio disk and net completions, SMP, and checkpoint/resume, \
-         and is the path the benchmarks run on. See \
-         docs/hvf-compatible-snapshots.md.\n\
-         \n\
-         Alternatively, re-capture with the guest's virtio MSIs routed as GICv3 \
-         message-based SPIs (MBI) or legacy INTx line SPIs rather than through a \
-         GIC ITS; the managed GIC delivers those via hv_gic_send_msi / \
-         hv_gic_set_spi. (CHM_ALLOW_ITS_LPI=1 bypasses this guard on the managed \
-         path, but the guest will then stall on first I/O.)"
-    ))
+    true
 }
 
 /// The counter frequency an Apple-silicon HVF guest observes, in Hz.
@@ -973,6 +964,10 @@ fn usage() -> String {
          chm ctl status [--json]     Show daemon / running-VM status.\n    \
          chm ctl start <name>        Resume a snapshot by name.\n    \
          chm ctl console             Stream the running guest console.\n    \
+         chm ctl input [TEXT]        Type TEXT at the guest console. TEXT is\n                                \
+         sent as-is, so end it with \\n (or run the\n                                \
+         command bare) to press Enter. A resumed\n                                \
+         guest is idle until it is typed at.\n    \
          chm ctl stop                Stop the running guest.\n    \
          chm ctl shutdown            Stop the guest and exit the daemon.\n\
      \n\
@@ -1359,15 +1354,19 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     // mismatch is a property of the capture host, not of interrupt routing.
     cntfrq_guard(&loaded.state_json)?;
 
-    // Userspace-GIC path (experimental, opt-in): rehydrate an ITS/LPI-routed
-    // snapshot — the kind Apple's managed GIC cannot deliver completions for, and
-    // which its_lpi_guard otherwise rejects — onto a software GICv3. This is the
-    // path that lifts the "GICv2M capture only" restriction; see issue #81.
-    if env::var_os("CHM_USERSPACE_GIC").is_some() {
+    // Userspace-GIC path: rehydrate an ITS/LPI-routed snapshot — the kind Apple's
+    // managed GIC cannot deliver completions for — onto a software GICv3. This is
+    // the path that lifts the "GICv2M capture only" restriction (#81), so a
+    // vanilla upstream capture runs with no flag.
+    //
+    // Routing is automatic: we only redirect bundles the managed path would have
+    // rejected outright, so nothing that works on the managed GIC changes path.
+    // `CHM_USERSPACE_GIC=1` forces it, for A/B-ing the two backends.
+    if env::var_os("CHM_USERSPACE_GIC").is_some()
+        || routes_completions_as_lpis(&loaded.state_json)
+    {
         return run_usgic(args, loaded);
     }
-
-    its_lpi_guard(&loaded.state_json)?;
 
     // Resume from a live checkpoint when one exists and checkpoints are enabled;
     // a malformed/incompatible checkpoint is discarded so we cold-boot cleanly.
@@ -1505,7 +1504,7 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
-enum Outcome {
+pub(crate) enum Outcome {
     PoweredOff,
     MaxSeconds,
     Idle(u64),
@@ -1551,6 +1550,81 @@ impl its::LpiSink for UsgicLpiSink {
     }
 }
 
+/// `chm run --userspace-gic`: drive the shared engine with an interactive
+/// terminal, then report the outcome the way the CLI always has.
+fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
+    let cfg = UsgicConfig {
+        dir: &args.snapshot_dir,
+        quiet: args.quiet,
+        checkpoint: args.checkpoint,
+        egress_policy: args.egress_policy.as_deref(),
+        allow_local_egress: args.allow_local_egress,
+        limits_file: args.limits_file.as_deref(),
+        checkpoint_source: "connect",
+        interactive: true,
+    };
+    let outcome = run_usgic_engine(&cfg, loaded, &mut |s| {
+        run_console(s.uart, s.running, args, s.limits, s.overlay_dir)
+    })?;
+    if !args.quiet {
+        match &outcome {
+            Outcome::PoweredOff => eprintln!("\nchm: guest powered off."),
+            Outcome::Interrupted => eprintln!("chm: session closed; VM shut down."),
+            Outcome::ConsoleClosed => eprintln!("chm: console closed; stopping."),
+            Outcome::MaxSeconds => eprintln!("chm: reached the maximum session time."),
+            Outcome::Idle(secs) => eprintln!("chm: guest idle for {secs}s — stopping."),
+            Outcome::LimitExceeded(reason) => eprintln!("chm: resource limit hit ({reason})."),
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Everything a userspace-GIC session needs that does not come from the snapshot.
+///
+/// The engine below is shared by `chm run` and the `chm serve` daemon, which
+/// differ only in how they supervise a live guest: the CLI owns a terminal and
+/// a keyboard, the daemon owns a console ring and a stop flag. Keeping the
+/// difference in this struct (plus the `supervise` callback) means the hard
+/// part — multi-threaded vCPU orchestration, the cross-vCPU SGI table, ITS/LPI
+/// virtio wiring and checkpoint capture — exists exactly once.
+pub(crate) struct UsgicConfig<'a> {
+    pub dir: &'a Path,
+    /// Suppress the banner and progress chatter (always set for the daemon,
+    /// whose stderr is not a user-facing console).
+    pub quiet: bool,
+    /// Enable live checkpoints (suspend on a clean external stop, resume from a
+    /// saved capture on the next start).
+    pub checkpoint: bool,
+    pub egress_policy: Option<&'a Path>,
+    pub allow_local_egress: bool,
+    pub limits_file: Option<&'a Path>,
+    /// Recorded in the checkpoint so an operator can see which entry point wrote
+    /// it (`connect` for the CLI, `daemon` for `chm serve`).
+    pub checkpoint_source: &'static str,
+    /// Own the terminal: raw mode, signal handlers and a stdin pump into the
+    /// guest's PL011. The daemon's console is read-only and its stdin belongs to
+    /// the service manager, so it opts out.
+    pub interactive: bool,
+}
+
+/// The live handles a supervisor needs while the guest runs.
+///
+/// Handed to the `supervise` callback once every vCPU is released. The callback
+/// returns when the session should end; the engine then performs the ordered
+/// teardown (stop, kick every vCPU out of `run()`, join, capture) regardless of
+/// which supervisor asked for it.
+pub(crate) struct UsgicSession<'a> {
+    pub uart: &'a Arc<Pl011>,
+    pub running: &'a Arc<AtomicBool>,
+    pub limits: &'a limits::LimitsDoc,
+    pub overlay_dir: &'a Path,
+    /// One per vCPU: forces that core out of `hv_vcpu_run` from another thread.
+    pub exits: &'a [ExitSignal],
+    /// Delivers host bytes to the guest's serial console. The CLI drives this
+    /// from stdin; the daemon exposes it as the `input` command.
+    pub input: &'a console::ConsoleInput,
+}
+
 /// Resume a snapshot onto the **userspace GICv3** (no managed GIC) with an
 /// interactive serial console. This is the path for a stock ITS/LPI-routed
 /// snapshot — the capture Apple's managed GIC cannot deliver completions for.
@@ -1564,8 +1638,12 @@ impl its::LpiSink for UsgicLpiSink {
 /// (SMP) snapshots; live checkpoint/suspend is currently single-vCPU only (an
 /// SMP checkpoint is future work), so a multi-vCPU resume is always a cold
 /// rehydrate. The shipping managed-GIC path is untouched.
-fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
-    let dir = &args.snapshot_dir;
+pub(crate) fn run_usgic_engine(
+    cfg: &UsgicConfig<'_>,
+    loaded: Loaded,
+    supervise: &mut dyn FnMut(&UsgicSession<'_>) -> Result<Outcome, String>,
+) -> Result<Outcome, String> {
+    let dir = cfg.dir;
     let n = loaded.num_vcpus as usize;
     if n == 0 {
         return Err("snapshot declares no vCPUs".into());
@@ -1575,7 +1653,7 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
     // Single-vCPU only: the userspace-GIC checkpoint captures one vCPU's software
     // GIC, so an SMP checkpoint is future work; a multi-vCPU run cold-rehydrates.
     let resume_state: Option<Arc<CheckpointState>> =
-        if n == 1 && args.checkpoint && checkpoint::has_checkpoint(dir) {
+        if n == 1 && cfg.checkpoint && checkpoint::has_checkpoint(dir) {
             match checkpoint::read_checkpoint(dir) {
                 Ok(state) if state.usgic.is_some() => Some(Arc::new(state)),
                 Ok(_) => {
@@ -1596,7 +1674,7 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
         };
     let resuming = resume_state.is_some();
 
-    if !args.quiet {
+    if !cfg.quiet {
         let shown_ranges = if resuming {
             checkpoint::memory_ranges_path(dir)
         } else {
@@ -1607,8 +1685,8 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
             eprintln!("chm: resuming a userspace-GIC checkpoint (restored, not cold-booted).\n");
         } else {
             eprintln!(
-                "chm: userspace GIC (experimental) — rehydrating a {n}-vCPU ITS/LPI \
-                 snapshot the managed GIC cannot run.\n"
+                "chm: userspace GICv3 — rehydrating a {n}-vCPU ITS/LPI snapshot, \
+                 the routing Apple's managed GIC cannot deliver.\n"
             );
         }
     }
@@ -1666,6 +1744,11 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
     let (capture_tx, capture_rx) = mpsc::channel::<Option<Result<(), String>>>();
     let mut go_txs: Vec<mpsc::Sender<Arc<Vec<UsgicCpuHandle>>>> = Vec::with_capacity(n);
 
+    // Copied out of `cfg` so the per-vCPU thread closures capture plain values
+    // rather than a borrow of the caller's config, which cannot outlive it.
+    let want_checkpoint = cfg.checkpoint;
+    let checkpoint_source = cfg.checkpoint_source;
+
     let mut threads = Vec::with_capacity(n);
     for id in 0..n {
         let (go_tx, go_rx) = mpsc::channel::<Arc<Vec<UsgicCpuHandle>>>();
@@ -1680,9 +1763,9 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
         let setup_tx = setup_tx.clone();
         let resume = resume_state.clone();
         // Checkpoint capture is single-vCPU: only vCPU 0 on an n==1 run captures.
-        let want_capture = args.checkpoint && n == 1 && id == 0;
+        let want_capture = want_checkpoint && n == 1 && id == 0;
         let capture_tx = capture_tx.clone();
-        let ckpt_dir = dir.clone();
+        let ckpt_dir = dir.to_path_buf();
         let mem_mappings_thread = mem_mappings.clone();
         let guest_mem_capture = guest_mem.clone();
 
@@ -1787,7 +1870,7 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
                                     &state,
                                     &guest_mem_capture,
                                     &mem_mappings_thread,
-                                    "connect",
+                                    checkpoint_source,
                                 ))
                             }
                             Err(e) => Some(Err(format!("capture: {e}"))),
@@ -1845,7 +1928,7 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
     let sgi_table: Arc<Vec<UsgicCpuHandle>> =
         Arc::new(setups.into_iter().map(|s| s.handle).collect());
 
-    let (limits, _src) = limits::resolve_limits(dir, args.limits_file.as_deref());
+    let (limits, _src) = limits::resolve_limits(dir, cfg.limits_file);
     let overlay_dir = dir.join(".chm-overlays");
     let audit = audit::AuditLog::open(dir);
 
@@ -1870,16 +1953,16 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
         // the disk carried someone else's writes, so the guest saw
         // `Input/output error` on reads it believed were cached (#110).
         resume_state.is_some(),
-        args.egress_policy.as_deref(),
+        cfg.egress_policy,
         &NatLimits {
             max_connections: limits.max_connections.map(|n| n as usize),
             max_bytes_per_sec: limits.max_bandwidth_kbps.map(|kbps| kbps * 125),
         },
-        args.allow_local_egress,
+        cfg.allow_local_egress,
         Some(usgic_lpi_sink),
     ) {
         Ok(wired) => {
-            if !wired.summary.is_empty() && !args.quiet {
+            if !wired.summary.is_empty() && !cfg.quiet {
                 eprintln!("chm: virtio device model restored:");
                 for d in &wired.summary {
                     eprintln!("chm:   - {d}");
@@ -1901,21 +1984,37 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
     // that core — so moving the serial IRQ's affinity (e.g. to CPU1) actually
     // delivers there. Single-vCPU routes to vCPU 0, unchanged.
     let spi_router = Arc::new(prepared.spi_router(sgi_table.clone()));
-    let raw_console = RawConsole::enable();
-    console::install_signal_handlers(raw_console.handle());
     let serial_sink: Arc<dyn MsiSink> = Arc::new(UsgicMsiSink {
         router: spi_router,
     });
     let serial_wake: Option<Arc<dyn Fn() + Send + Sync>> = Some(wake0);
-    console::spawn_stdin_pump(
+    // Terminal ownership is the CLI's alone. The daemon must not put the
+    // service manager's stdin into raw mode, install console signal handlers,
+    // or race a stdin pump for bytes it does not own.
+    let raw_console = cfg.interactive.then(|| {
+        let raw = RawConsole::enable();
+        console::install_signal_handlers(raw.handle());
+        console::spawn_stdin_pump(
+            uart.clone(),
+            serial_sink.clone(),
+            raw.handle(),
+            serial_wake.clone(),
+        );
+        raw
+    });
+    // Both paths need this: it re-asserts a level-triggered serial IRQ the guest
+    // left pending, which is what keeps console output flowing after the guest
+    // reopens its tty.
+    let serial_reassert = console::spawn_serial_reassert(
         uart.clone(),
         serial_sink.clone(),
-        raw_console.handle(),
         serial_wake.clone(),
+        running.clone(),
     );
-    let serial_reassert =
-        console::spawn_serial_reassert(uart.clone(), serial_sink, serial_wake, running.clone());
-    if !args.quiet {
+    // Also available to a non-interactive supervisor (the daemon), so a console
+    // consumer can type into the guest without owning this process's stdin.
+    let console_input = console::console_input(uart.clone(), serial_sink, serial_wake);
+    if !cfg.quiet {
         eprintln!(
             "chm: interactive console active — close this window or press Ctrl-A x \
              to end the session.\n"
@@ -1929,7 +2028,14 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
     }
     startup::stamp("guest released (VMM ready)");
 
-    let coordinator = run_console(&uart, &running, args, &limits, &overlay_dir);
+    let coordinator = supervise(&UsgicSession {
+        uart: &uart,
+        running: &running,
+        limits: &limits,
+        overlay_dir: &overlay_dir,
+        exits: &all_exits,
+        input: &console_input,
+    });
 
     // Stop: clear the flag, force every vCPU out of any in-flight run(), join.
     running.store(false, Ordering::Release);
@@ -1942,7 +2048,7 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
     }
     // Receive vCPU 0's suspend outcome (single-vCPU capture only). `None` when
     // nothing was captured (power-off/error, SMP, or checkpoints disabled).
-    let capture_result = if args.checkpoint && n == 1 {
+    let capture_result = if cfg.checkpoint && n == 1 {
         capture_rx.recv().unwrap_or(None)
     } else {
         None
@@ -1962,10 +2068,10 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
     // Suspend/resume bookkeeping (single-vCPU): the vCPU thread already wrote the
     // checkpoint on a clean external stop; report + keep it consistent. Nothing
     // captured means the box is finished, so clear any stale checkpoint.
-    if args.checkpoint && n == 1 {
+    if cfg.checkpoint && n == 1 {
         match capture_result {
             Some(Ok(())) => {
-                if !args.quiet {
+                if !cfg.quiet {
                     eprintln!(
                         "\nchm: suspended — userspace-GIC checkpoint saved (resume to continue)."
                     );
@@ -1979,21 +2085,11 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
         }
     }
 
-    if !args.quiet {
-        match &final_outcome {
-            Outcome::PoweredOff => eprintln!("\nchm: guest powered off."),
-            Outcome::Interrupted => eprintln!("chm: session closed; VM shut down."),
-            Outcome::ConsoleClosed => eprintln!("chm: console closed; stopping."),
-            Outcome::MaxSeconds => eprintln!("chm: reached the maximum session time."),
-            Outcome::Idle(secs) => eprintln!("chm: guest idle for {secs}s — stopping."),
-            Outcome::LimitExceeded(reason) => eprintln!("chm: resource limit hit ({reason})."),
-        }
-    }
     // `prepared` (guest-RAM backings + VM) and `hv` are dropped here, after every
     // vCPU thread has joined (so every vCPU is destroyed before `hv_vm_destroy`).
     drop(prepared);
     drop(hv);
-    Ok(ExitCode::SUCCESS)
+    Ok(final_outcome)
 }
 
 

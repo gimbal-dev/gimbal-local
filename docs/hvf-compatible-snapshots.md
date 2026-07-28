@@ -8,8 +8,8 @@ the cloud side should produce for local Mac rehydration.
 > patched fork binary as the production capture path, and described the userspace
 > GIC as "experimental, single-vCPU, serial-only". Both statements are now out of
 > date and the recommendation has flipped.** A **vanilla, unmodified upstream
-> arm64 Cloud Hypervisor capture** is the preferred shape. See "Which capture
-> mode should I produce?" below for the one real caveat (`chm serve`).
+> arm64 Cloud Hypervisor capture** is the preferred shape, and as of V2.1 it
+> runs through **both** `chm run` and `chm serve` with no flag at all.
 
 ## Which capture mode should I produce?
 
@@ -24,9 +24,10 @@ gic_mode           = its-lpi          # stock/vanilla — this is the target sha
 ships_disks        = true
 ```
 
-Gimbal Local runs these on a **userspace GICv3** (`CHM_USERSPACE_GIC=1`): a
-software distributor/redistributor/ITS plus a trapped CPU interface, with HVF
-still executing the vCPUs. That delivers the LPIs Apple's managed GIC cannot.
+Gimbal Local runs these on a **userspace GICv3**: a software
+distributor/redistributor/ITS plus a trapped CPU interface, with HVF still
+executing the vCPUs. That delivers the LPIs Apple's managed GIC cannot. You do
+not ask for it — `chm` reads the capture and routes there itself.
 
 | capability on a vanilla ITS/LPI capture | state |
 | --- | --- |
@@ -37,7 +38,7 @@ still executing the vCPUs. That delivers the LPIs Apple's managed GIC cannot.
 | SMP (multi-vCPU, cross-core IPIs, SPI affinity) | ✅ hardware-proven |
 | checkpoint / suspend / resume | ✅ shipped |
 | `chm run` | ✅ supported |
-| **`chm serve` (daemon / app path)** | ❌ **not yet — see below** |
+| **`chm serve` (daemon / app path)** | ✅ supported |
 
 Reproduce all of the above on an Apple Silicon Mac:
 
@@ -48,29 +49,42 @@ CH_SNAPSHOT_DIR=<stock-its-snapshot> \
   hvf_rehydrate_stock_its_snapshot_usgic_interactive_shell
 ```
 
-## The one real gap: `chm serve`
+## No flag required
 
-`chm run` honours `CHM_USERSPACE_GIC=1`. **`chm serve` does not.** The daemon
-calls `its_lpi_guard` unconditionally and only has the managed-GIC path wired, so
-a vanilla ITS/LPI bundle is *rejected* there even though the same bundle runs
-fine under `chm run`.
+Both entry points read the capture and pick the backend themselves: if its
+virtio completions route as LPIs, it goes to the userspace GICv3, because that
+is the only path that can deliver them.
 
-That matters because `chm serve` is what the macOS app drives, and is the likely
-integration point for a control plane. Until it is wired:
+```console
+$ chm run <vanilla-graviton-snapshot>      # no environment variables
+$ chm ctl start <name>                     # same decision inside the daemon
+```
 
-- **`chm run` + vanilla capture** — works today, fully.
-- **`chm serve` + vanilla capture** — refused. Needs either the legacy
-  GICv2M capture below, or the userspace-GIC path ported into the daemon.
+This only ever redirects bundles the managed GIC would have refused outright,
+so a capture that runs today keeps taking the same path.
 
-Tracked as [#102](https://github.com/gimbal-dev/gimbal-local/issues/102). It is wiring, not feasibility — the whole userspace-GIC
-stack it needs is already shipped and proven under `chm run`.
+`chm serve` was the last asymmetry ([#102](https://github.com/gimbal-dev/gimbal-local/issues/102)) and is closed: CLI and daemon now
+share one engine, including checkpoint capture and resume, and checkpoints
+written by either are resumable by the other.
+
+Two things worth knowing about the daemon specifically:
+
+- **A resumed guest emits nothing until it is typed at.** Zero console bytes is
+  not evidence of a hang. Send `chm ctl input` (bare = a newline) and read the
+  console again. `chm ctl input <text>` sends the text as-is with no trailing
+  newline, so finish a command with `chm ctl input '\n'` — or a bare
+  `chm ctl input` — to press Enter.
+- **Daemon checkpoints are single-vCPU.** A multi-vCPU capture runs, but Stop
+  will not write a checkpoint for it yet.
 
 ## Do not confuse the two environment variables
 
+Neither is needed on the supported path. Both are diagnostics.
+
 | variable | what it does |
 | --- | --- |
-| `CHM_USERSPACE_GIC=1` | **The supported path.** Rehydrates onto the software GICv3, which delivers LPIs. This is what makes vanilla captures work. |
-| `CHM_ALLOW_ITS_LPI=1` | **A debugging bypass. Do not use.** Silences the guard on the *managed* GIC and changes nothing about delivery — the guest restores and then stalls on its first disk or net I/O. |
+| `CHM_USERSPACE_GIC=1` | **Forces** the software GICv3 even for a capture that would have gone to the managed GIC. Useful for A/B-ing the two backends; not required for vanilla captures, which route there anyway. |
+| `CHM_ALLOW_ITS_LPI=1` | **Forces the opposite, and is almost never what you want.** It pushes an ITS/LPI capture onto the *managed* GIC, which cannot deliver LPIs, so the guest restores and then stalls on its first disk or net I/O. It exists to reproduce that failure deliberately, and it warns. |
 
 Anything describing `CHM_ALLOW_ITS_LPI=1` as "the USGIC path" is wrong; it is the
 opposite, and it will look like a hang.
@@ -115,7 +129,7 @@ rate would be worse than a visibly slow guest. Captures that do record it can
 plumb it through automatically.
 
 ```console
-$ CHM_USERSPACE_GIC=1 CHM_GUEST_CNTFRQ=121875000 chm run <snapshot>
+$ CHM_GUEST_CNTFRQ=121875000 chm run <snapshot>
 ```
 
 A capture taken by a cloud-hypervisor build predating upstream `69637dde6`
@@ -136,8 +150,8 @@ produced by launching **this repository's patched** Cloud Hypervisor binary with
 (`snapshots/ch-arm-v2m-demo` boots to a login prompt on the managed GIC).
 
 **It is no longer the recommended production shape**, because it requires a
-forked capture engine — the exact coupling the vanilla path removes. Keep it for
-`chm serve` until the daemon is wired, and as a fallback.
+forked capture engine — the exact coupling the vanilla path removes. Keep it as
+a fallback and as the managed-GIC regression fixture.
 
 ## Why the managed GIC cannot do this
 

@@ -68,6 +68,10 @@ not our fork: the top-level `snapshot_data.state` is `{}` (see §3), and
 
 ## 2. The acid test
 
+> The `CHM_USERSPACE_GIC=1` below is what the run actually used on the day, and
+> is left here unaltered. It is no longer needed: since V2.1 both `chm run` and
+> `chm serve` route a vanilla capture to the userspace GIC on their own.
+
 ```
 $ CHM_USERSPACE_GIC=1 chm run snapshots/graviton-1
   memory:    1024 MiB

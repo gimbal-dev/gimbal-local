@@ -119,10 +119,10 @@ does it — MSI-X through the GIC ITS as LPIs. That is the *vanilla* shape and i
 is what we now want. Our userspace GICv3 delivers those LPIs on HVF.
 
 > **Do not set `CHM_ALLOW_ITS_LPI=1` anywhere.** That is a debugging bypass on a
-> different (managed-GIC) code path. It silences a guard without changing
-> delivery, so the guest restores and then stalls on its first I/O. It is not
-> the flag for running vanilla — `CHM_USERSPACE_GIC=1` is, and that is a *run*
-> time flag on the Mac, not a capture-time one.
+> different (managed-GIC) code path: it forces a vanilla capture onto the GIC
+> that cannot deliver its completions, so the guest restores and then stalls on
+> its first I/O. Running vanilla needs no flag at all — the Mac side reads the
+> capture and picks the right backend itself.
 
 ---
 
@@ -195,7 +195,7 @@ It should print, near the end:
 
 ```
 GITS_CTLR.Enabled is set ✓ — vanilla (stock upstream) ITS/LPI routing
-  run this on the Mac with: CHM_USERSPACE_GIC=1 chm run <dir>
+  run this on the Mac with: chm run <dir>
 ```
 
 If instead it says `GITS_CTLR.Enabled is clear`, the capture came out in the
@@ -356,8 +356,7 @@ costs us the app demo path, and #102 removes the need entirely.
 ## 7. What we will do with it
 
 1. Check the reported `CNTFRQ_EL0` against what an HVF guest sees.
-2. `CHM_USERSPACE_GIC=1 chm run graviton-vanilla-1cpu` — expect an interactive
-   Ubuntu shell.
+2. `chm run graviton-vanilla-1cpu` — expect an interactive Ubuntu shell.
 3. Same for B, plus `nproc` = 2, a real disk write, and `curl` through the
    userspace NAT.
 4. Checkpoint and resume it, to prove live state survives on a foreign

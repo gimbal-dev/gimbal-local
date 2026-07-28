@@ -606,7 +606,7 @@ capture — virtio completions routed through the GIC ITS as LPIs, which is what
 upstream does by default — is the shape Gimbal Local wants. No fork, no patched
 binary, no `CH_GIC_V2M`.
 
-Gimbal Local runs these on its userspace GICv3 (`CHM_USERSPACE_GIC=1`), which
+Gimbal Local runs these on its userspace GICv3 (routed to automatically), which
 delivers the LPIs Apple's managed GIC cannot. Disk, net, SMP and
 checkpoint/resume are all hardware-proven on that path.
 

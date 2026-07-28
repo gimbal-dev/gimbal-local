@@ -24,7 +24,7 @@
 # The DEFAULT is a *vanilla* capture: stock upstream cloud-hypervisor, ITS/LPI
 # interrupt routing, nothing of this fork. That is the shape gimbal-local now
 # recommends -- its userspace GICv3 delivers the LPIs Apple's managed GIC cannot
-# (run it with CHM_USERSPACE_GIC=1).
+# (it needs no flag on the Mac: `chm` routes it to the userspace GIC).
 #
 # Set CH_GIC_V2M=1 only for a LEGACY message-SPI capture, which is still what
 # `chm serve` and the macOS app require until gimbal-local#102 lands. That mode
@@ -404,7 +404,7 @@ PY
 )"
 if [ "$ITS_ENABLED" = "1" ]; then
   log "GITS_CTLR.Enabled is set ✓ — vanilla (stock upstream) ITS/LPI routing"
-  log "  run this on the Mac with: CHM_USERSPACE_GIC=1 chm run <dir>"
+  log "  run this on the Mac with: chm run <dir>"
   log "  the userspace GICv3 delivers the LPIs Apple's managed GIC cannot"
   if [ "$CH_GIC_V2M" = "1" ]; then
     warn "but CH_GIC_V2M=1 was requested and the ITS is still enabled"
