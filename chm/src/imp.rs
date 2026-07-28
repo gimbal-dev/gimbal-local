@@ -964,8 +964,10 @@ fn usage() -> String {
          chm ctl status [--json]     Show daemon / running-VM status.\n    \
          chm ctl start <name>        Resume a snapshot by name.\n    \
          chm ctl console             Stream the running guest console.\n    \
-         chm ctl input [TEXT]        Type TEXT at the guest console (bare =\n                                \
-         newline). A resumed guest is idle until typed at.\n    \
+         chm ctl input [TEXT]        Type TEXT at the guest console. TEXT is\n                                \
+         sent as-is, so end it with \\n (or run the\n                                \
+         command bare) to press Enter. A resumed\n                                \
+         guest is idle until it is typed at.\n    \
          chm ctl stop                Stop the running guest.\n    \
          chm ctl shutdown            Stop the guest and exit the daemon.\n\
      \n\

@@ -178,15 +178,15 @@ The capture we need, precisely: [`graviton-capture-request.md`](graviton-capture
 
 | | Task | Blocked on |
 | --- | --- | --- |
-| V2.1 | Wire the userspace GIC into `chm serve` (#102). Factor the ~525-line `run_usgic` engine so CLI and daemon share it, checkpoint/resume included. | — |
+| V2.1 | Wire the userspace GIC into `chm serve` (#102). Factor the ~525-line `run_usgic` engine so CLI and daemon share it, checkpoint/resume included. | ✅ **Done.** `run_usgic_engine(cfg, loaded, supervise)` is shared by both entry points. The daemon reaches an interactive shell on a vanilla Graviton capture (`ubuntu@ch-snap:~$`, `uname -a` → `6.8.0-136-generic aarch64`), Stop → Start round-trips live guest RAM (a bash variable set before the stop echoed back after it), and checkpoints interoperate in both directions with the CLI's. Adds a `chm ctl input` command, because the daemon's console was read-only and a resumed guest emits nothing until typed at. |
 | V2.2 | The SwiftUI app opens, runs, stops and resumes a vanilla snapshot end to end. | V2.1 |
-| V2.3 | Make the userspace GIC the **default** and retire `CHM_USERSPACE_GIC=1`; managed GIC becomes the explicit fallback for GICv2M captures. The change that makes the dream the default rather than a flag. | V2.1, V1.5 |
+| V2.3 | ~~Retire `CHM_USERSPACE_GIC=1`~~ **done as auto-routing:** both `chm run` and `chm serve` ask `routes_completions_as_lpis()` and send ITS/LPI captures to the userspace GICv3 with no flag, so `chm run <vanilla-graviton-snapshot>` reaches a shell with zero environment variables. Only bundles the managed GIC would have refused outright change path. **Still open:** whether the userspace GIC should also take *GICv2M* captures, so there is one path rather than a routing decision. | V1.5 |
 
 ### V3 · Cloud control plane on the vanilla contract
 
 | | Task | Blocked on |
 | --- | --- | --- |
-| V3.1 | `gctl` gates per **entry point** (runnable under `chm run`; refused under `chm serve` until V2.1) rather than per GIC mode. Our side of the confusion is corrected in `d8511789d`. | gctl |
+| V3.1 | `gctl` should stop gating on GIC mode entirely: as of V2.1 a vanilla ITS/LPI capture runs under **both** `chm run` and `chm serve`, so an `assign-run` 422 on `gic_mode: its-lpi` now refuses bundles we can run. Our side of the earlier confusion is corrected in `d8511789d`. | gctl |
 | V3.2 | One-command `pull → verify → run`, fail-closed. | V3.3 |
 | V3.3 | Signed snapshot manifest + verification, unified trust root (#36). | gctl |
 
@@ -486,7 +486,7 @@ V1–V4 spine:
 | V1.2 counter-frequency guard | ~~#104~~ shipped |
 | V1.3 counter-rate synthesis | ~~#108~~ shipped |
 | V1.5 the acid test | ~~#105~~ passed |
-| V2.1 `chm serve` + userspace GIC | #102 |
+| V2.1 `chm serve` + userspace GIC | ~~#102~~ shipped |
 | V3 cloud contract / signing / postcopy | #21, #36, #5 |
 | V4 security umbrella / defaults | #39, #20 |
 | Deferred | #101 (cold create), #4, #6 |
@@ -496,9 +496,9 @@ when it holds for a **vanilla** snapshot on both substrates.
 
 ### What comes next (2026-07-28)
 
-**V1 is complete — V1.1, V1.2, V1.3 and V1.5 are all done.** The acid test passed, the frequency
-question is answered, and the guard that makes the answer legible ships. What
-remains:
+**V1 is complete, and V2.1 has shipped.** The acid test passed, the frequency
+question is answered, and a vanilla capture now runs through *both* entry points
+with no flag. What remains:
 
 1. ~~**V1.3 — can the counter rate be synthesized? (#108).**~~ **Done, and the
    answer was yes.** It was prototyped behind a flag and *measured* rather than
@@ -506,9 +506,13 @@ remains:
    materialised because the userspace-GIC path exits constantly (ICC traps, WFI,
    MMIO), so the offset is re-stepped far more often than the guest can observe.
    **V1 is complete.**
-2. **V2.1 — `chm serve` on the userspace GIC (#102).** The largest single unblock
-   for the product: it is what makes the app able to run what the CLI already
-   runs. Until this lands, the app pillar cannot touch a vanilla snapshot at all.
+2. ~~**V2.1 — `chm serve` on the userspace GIC (#102).**~~ **Done.** The engine
+   is shared by CLI and daemon, and routing is automatic in both, so
+   `chm run <vanilla-graviton-snapshot>` and `chm ctl start` each reach an
+   interactive shell with no environment variables. **V2.2 — the SwiftUI app —
+   is now the unblocked pillar**, and it needs no new engine work: it drives the
+   daemon, which speaks `start` / `console` / `input` / `stop` against a vanilla
+   capture.
 3. **V1.6 — round-2 capture.** Blocked on gimbal cloud. Needs the corrected
    version pin, the quiescence check, `CNTFRQ_EL0` reported per instance type
    (Graviton3/4 are unverified), and capture **B** (2 vCPU + net), which round 1
