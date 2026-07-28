@@ -450,7 +450,7 @@ pub(crate) fn wire_virtio(
     state_json: &str,
     overlay_dir: &Path,
     gic: Option<&Arc<Mutex<dyn Vgic>>>,
-    resume: bool,
+    reattach_overlay: bool,
     cli_egress: Option<&Path>,
     net_limits: &NatLimits,
     allow_local_egress: bool,
@@ -531,7 +531,7 @@ pub(crate) fn wire_virtio(
             desc,
             guest_mem.clone(),
             overlay_dir,
-            resume,
+            reattach_overlay,
             policy,
             dev_limits,
             allow_local_egress,
@@ -1863,7 +1863,13 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
         &loaded.state_json,
         &overlay_dir,
         None, // no managed GIC
-        true, // resume: drain in-flight completions
+        // Reattach the previous run's disk overlay ONLY when we are genuinely
+        // resuming that run's checkpoint. This used to be hardcoded `true`,
+        // which paired a previous session's disk with this rehydrate's pristine
+        // snapshot RAM — the restored page cache described the base image while
+        // the disk carried someone else's writes, so the guest saw
+        // `Input/output error` on reads it believed were cached (#110).
+        resume_state.is_some(),
         args.egress_policy.as_deref(),
         &NatLimits {
             max_connections: limits.max_connections.map(|n| n as usize),
