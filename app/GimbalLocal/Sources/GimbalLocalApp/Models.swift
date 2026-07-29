@@ -423,23 +423,39 @@ struct CloudSnapshot: Identifiable, Equatable, Hashable {
     /// mirrors the runner's authoritative `snapshots`-state check.
     var hasDiskImage: Bool = true
 
-    /// HVF (Apple's managed GIC) delivers message-based SPIs only, so only a
-    /// `gicv2m-message-spi` snapshot is restorable here — mirrors the runner's
-    /// local gic gate. Anything else stays cloud-only.
+    /// Whether *this Mac* can rehydrate the snapshot. Mirrors the runner's
+    /// `hvf_restorable`: the managed GIC runs a `gicv2m-message-spi` capture,
+    /// and the userspace GICv3 runs a vanilla `its-lpi` one, so both are
+    /// restorable and `chm` picks the path itself. An unknown mode is not.
     var restorableOnHVF: Bool {
-        compatibility == "runnable" && (gicMode == nil || gicMode == "gicv2m-message-spi")
+        switch gicMode {
+        case nil, "", "gicv2m-message-spi", "its-lpi": return true
+        default: return false
+        }
     }
 
+    /// Whether the *control plane* will hand the bundle over. gctl still gates
+    /// assign-run on gic mode, so a vanilla capture it has classified as
+    /// not-runnable is refused with a 422 before we ever see the bytes. That is
+    /// a different statement from "this Mac cannot run it", and conflating the
+    /// two is what produced the old recapture-with-GICv2M advice.
+    var planeWillRelease: Bool { compatibility == "runnable" }
+
     /// Best pre-flight guess at whether bringing this down will actually boot:
-    /// HVF-restorable **and** it ships a disk image. A snapshot missing its disk
-    /// is a fixture / not bootable, so the UI can steer the user to a real one
-    /// instead of a confusing post-download failure.
-    var likelyBootable: Bool { restorableOnHVF && hasDiskImage }
+    /// restorable here, released by the plane, **and** it ships a disk image. A
+    /// snapshot missing its disk is a fixture / not bootable, so the UI can
+    /// steer the user to a real one instead of a confusing post-download
+    /// failure.
+    var likelyBootable: Bool { restorableOnHVF && planeWillRelease && hasDiskImage }
 
     /// A short reason this snapshot cannot be brought down to run, or nil.
     var notBootableReason: String? {
         if !restorableOnHVF {
-            return "Not HVF-restorable (needs gicv2m-message-spi)"
+            let mode = (gicMode?.isEmpty == false) ? gicMode! : "unknown"
+            return "Interrupt routing `\(mode)` is not one this Mac can rehydrate"
+        }
+        if !planeWillRelease {
+            return "The control plane classifies this as \(compatibility), so it will not release it"
         }
         if !hasDiskImage {
             return "No disk image — a protocol fixture, not a bootable snapshot"
@@ -480,4 +496,47 @@ struct CloudOverview: Equatable {
         sandboxes: nil,
         costSummary: nil
     )
+}
+
+/// A control key the console can send to the guest that a plain text field
+/// cannot express.
+///
+/// Deliberately small: these are the keys that *unstick* a session (interrupt a
+/// runaway command, end input, clear a half-typed line), not an attempt to be a
+/// full terminal. Anything richer belongs in the Terminal.app session.
+enum ConsoleKey: String, CaseIterable, Identifiable {
+    case returnKey
+    case interrupt
+    case endOfFile
+    case clearLine
+
+    var id: String { rawValue }
+
+    /// The wire text for `chm ctl input`, which decodes `\xNN` escapes.
+    var wireText: String {
+        switch self {
+        case .returnKey: return "\\n"
+        case .interrupt: return "\\x03"   // Ctrl-C
+        case .endOfFile: return "\\x04"   // Ctrl-D
+        case .clearLine: return "\\x15"   // Ctrl-U
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .returnKey: return "Return"
+        case .interrupt: return "Ctrl-C"
+        case .endOfFile: return "Ctrl-D"
+        case .clearLine: return "Ctrl-U"
+        }
+    }
+
+    var help: String {
+        switch self {
+        case .returnKey: return "Press Return — wakes a resumed guest that has not printed yet"
+        case .interrupt: return "Interrupt the running command"
+        case .endOfFile: return "End of input (log out of a shell)"
+        case .clearLine: return "Clear the half-typed line"
+        }
+    }
 }

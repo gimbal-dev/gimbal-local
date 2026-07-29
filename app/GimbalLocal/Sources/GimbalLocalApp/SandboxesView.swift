@@ -639,17 +639,21 @@ private struct ConnectivityCard: View {
     }
 }
 
-/// The read-only console, intentionally secondary: collapsed by default so the
-/// detail view stays focused on working *inside* the sandbox rather than just
-/// watching it.
+/// The guest console. Interactive: a resumed snapshot prints nothing until it is
+/// typed at, so an output-only pane would make a perfectly healthy vanilla guest
+/// look hung. Collapsed by default so the detail view stays focused.
 private struct ConsoleExpander: View {
     @EnvironmentObject private var model: AppModel
     @State private var expanded = false
+    @State private var input = ""
+    @FocusState private var inputFocused: Bool
+
+    private var canType: Bool { model.status.state == .running }
 
     var body: some View {
-        GlassCard(title: "Console output", subtitle: "read-only serial stream", systemImage: "text.alignleft") {
+        GlassCard(title: "Console", subtitle: "serial console — type here", systemImage: "text.alignleft") {
             if model.hasInteractiveSession {
-                Label("This sandbox is open in a Terminal session — work in that window. The read-only stream pauses while you're connected.", systemImage: "terminal.fill")
+                Label("This sandbox is open in a Terminal session — work in that window. The in-app console pauses while you're connected.", systemImage: "terminal.fill")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -658,7 +662,7 @@ private struct ConsoleExpander: View {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack(spacing: 10) {
                             StatusPill(
-                                text: model.isConsoleStreaming ? "Streaming live" : "Read-only output",
+                                text: model.isConsoleStreaming ? "Streaming live" : "Not streaming",
                                 systemImage: model.isConsoleStreaming ? "dot.radiowaves.left.and.right" : "eye.fill",
                                 color: model.isConsoleStreaming ? Theme.green : Theme.cyan
                             )
@@ -672,6 +676,18 @@ private struct ConsoleExpander: View {
                             mode: .console(isStreaming: model.isConsoleStreaming)
                         )
                         .frame(minHeight: 260)
+
+                        if model.consoleAwaitsFirstKeystroke {
+                            Label(
+                                "Silence is expected — a restored guest waits at its prompt. Press Return to wake it.",
+                                systemImage: "info.circle"
+                            )
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                        }
+
+                        inputRow
                     }
                     .padding(.top, 10)
                 } label: {
@@ -680,6 +696,40 @@ private struct ConsoleExpander: View {
                 }
             }
         }
+    }
+
+    private var inputRow: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                TextField(canType ? "Type a command, then Return" : "Start the sandbox to type", text: $input)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.body, design: .monospaced))
+                    .focused($inputFocused)
+                    .disabled(!canType)
+                    .onSubmit(send)
+                Button("Send", action: send)
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
+                    .disabled(!canType)
+            }
+            HStack(spacing: 8) {
+                ForEach(ConsoleKey.allCases) { key in
+                    Button(key.label) { model.sendConsoleKey(key) }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(!canType)
+                        .help(key.help)
+                }
+                Spacer()
+            }
+        }
+    }
+
+    private func send() {
+        guard canType else { return }
+        model.sendConsoleLine(input)
+        input = ""
+        inputFocused = true
     }
 }
 
@@ -697,7 +747,7 @@ struct FailureBanner: View {
                 .lineLimit(6)
                 .textSelection(.enabled)
             if reason.contains("ITS") || reason.contains("LPI") {
-                Text("This is a snapshot compatibility issue, not a UI/console issue. Re-capture with GICv2M/message-SPI routing before it can run locally.")
+                Text("A vanilla ITS/LPI capture runs here on the userspace GICv3, so this is not a routing incompatibility. If CHM_ALLOW_ITS_LPI is set, unset it — it forces the capture onto the managed GIC, which cannot deliver LPI completions, so the guest stalls on its first I/O.")
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

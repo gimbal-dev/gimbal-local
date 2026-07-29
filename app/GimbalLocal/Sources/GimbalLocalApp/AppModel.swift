@@ -69,6 +69,11 @@ final class AppModel: ObservableObject {
     @Published var egressPolicyBySandbox: [String: EgressPolicy] = [:]
     @Published var applyingFirewallID: String?
     @Published var consoleText = ""
+    /// Whether anything has been typed at the current guest yet. A resumed guest
+    /// stays completely silent until it is, so this is what lets the UI say
+    /// "silent because nobody has typed" instead of leaving the user staring at
+    /// an empty pane wondering whether it hung.
+    @Published var consoleHasBeenTypedAt = false
     @Published var activityLog = ""
     @Published var selectedSnapshot: SnapshotSummary?
     @Published var isRefreshing = false
@@ -368,6 +373,7 @@ final class AppModel: ObservableObject {
             return
         }
         consoleText = ""
+        consoleHasBeenTypedAt = false
         recordRecentActivity(snapshot.name)
         Task {
             do {
@@ -397,6 +403,41 @@ final class AppModel: ObservableObject {
             process?.terminate()
             consoleProcess = nil
             await refreshLocal()
+        }
+    }
+
+    /// Type a line at the running guest's console.
+    ///
+    /// This is what makes a vanilla capture usable from the app rather than from
+    /// a Terminal window: a resumed guest emits **nothing at all** until it is
+    /// typed at, so without an input path Start looks indistinguishable from a
+    /// hang.
+    func sendConsoleLine(_ line: String) {
+        sendConsole(ChmClient.encodeLine(line), describedAs: line.isEmpty ? "Return" : line)
+    }
+
+    /// Send a control key the text field cannot express (Ctrl-C, Ctrl-D, …).
+    func sendConsoleKey(_ key: ConsoleKey) {
+        sendConsole(key.wireText, describedAs: key.label)
+    }
+
+    private func sendConsole(_ wireText: String, describedAs description: String) {
+        guard status.state == .running else {
+            appendLog("cannot type at the console: no sandbox is running")
+            return
+        }
+        // The stream is what shows the guest's reply, so make sure it is live
+        // before the keystroke lands rather than after.
+        if consoleProcess == nil {
+            attachConsole()
+        }
+        Task {
+            do {
+                _ = try await chm.sendInput(wireText, settings: settings)
+                consoleHasBeenTypedAt = true
+            } catch {
+                appendLog("sending `\(description)` failed: \(error.localizedDescription)")
+            }
         }
     }
 
@@ -1202,7 +1243,25 @@ final class AppModel: ObservableObject {
             \(reason)
             """
         }
-        return "Read-only serial output will stream here after a sandbox is running."
+        if status.state == .running {
+            // Not a hang, and worth saying plainly: a guest restored from a
+            // snapshot resumes at whatever it was doing when it was captured —
+            // usually sitting at an idle prompt — so it prints nothing until it
+            // is typed at.
+            return """
+            The guest is running and silent.
+
+            A resumed snapshot picks up where it was captured, so it prints
+            nothing until you type. Press Return below to wake its prompt.
+            """
+        }
+        return "Serial output will stream here after a sandbox is running."
+    }
+
+    /// True when the guest is up but has produced nothing and has not been typed
+    /// at — the moment the UI should nudge rather than look broken.
+    var consoleAwaitsFirstKeystroke: Bool {
+        status.state == .running && consoleText.isEmpty && !consoleHasBeenTypedAt
     }
 
     var isConsoleStreaming: Bool {
