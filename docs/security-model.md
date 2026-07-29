@@ -104,6 +104,68 @@ takes priority over the remaining feature milestones (it precedes M27).
 
 ---
 
+## 1a. The default posture (V4.2)
+
+An invariant that is only enforced when you remember to switch it on is a
+documentation exercise. This section says what is true of a `chm run` with **no
+flags, no env, no config** — the way almost every sandbox actually starts.
+
+| Control | Default | Opt-out |
+| --- | --- | --- |
+| **Host-network isolation** (I10) | **on** — loopback, RFC1918, link-local and `169.254.169.254` denied before policy is consulted, and DNS answers landing in those ranges dropped | `CHM_ALLOW_LOCAL_EGRESS=1` |
+| **Resource ceilings** | **on** — `chm` baseline: ≤64 vCPU, RAM ≤ host physical, overlay ≤64 GiB, console ≤1 GiB, ≤128 concurrent NAT sockets | `CHM_LIMITS=none` |
+| **No host FS passthrough** (I1) | **on, structural** — not configurable | — |
+| **Bundle + overlay confinement** (I2, I3) | **on, structural** — `O_NOFOLLOW` under the bundle root, private `0700` overlay | — |
+| **Daemon local-and-owner-only** (I4) | **on, structural** | — |
+| **Deliverable-interrupt routing** (I7) | **on** | `CHM_ALLOW_ITS_LPI=1` (diagnostic) |
+| **CAS digest validation** (I8) | **on, structural** | — |
+| **Egress allow-list** (I9) | **off** — see below | `chm firewall set` to turn *on* |
+| **Signature verification** (I6) | **off** — no trust root ships | `CHM_TRUST_STORE` to turn on |
+
+### Two deliberate "off"s, and why
+
+**Egress is not default-deny.** A sandbox that can reach the internet is what a
+sandbox is *for*, and a snapshot rehydrated from the cloud arrives expecting its
+network. Default-deny would mean every user's first experience is a broken
+guest, which trains people to disable the firewall wholesale — a worse outcome
+than the one it prevents.
+
+What matters is that the *dangerous* half of egress is not optional. The threat
+from a hostile guest is not that it reaches the public internet; it is that it
+reaches **your** machine and **your** LAN — `127.0.0.1`, `192.168.0.0/16`, and
+above all the cloud metadata endpoint at `169.254.169.254`. That boundary (I10)
+is on by default, is enforced below policy so no allow-list can widen it by
+accident, and survives DNS answers that resolve into those ranges. Restricting
+public egress on top of that is a policy choice, offered by `chm firewall`.
+
+**Signature verification is not default-fail-closed.** `chm` verifies when a
+trust root is configured, but no trust root ships, because nothing signs yet —
+gctl-side signing is #36. Making it fail-closed today would refuse every bundle
+in existence, so it is `CHM_REQUIRE_SIGNED` for anyone running untrusted
+bundles, and it becomes the default the moment #36 lands.
+
+### Reading the posture of a live workspace
+
+`chm posture` resolves the same sources the run path resolves and prints what is
+actually on:
+
+```console
+$ chm posture snapshots/graviton-1
+  [on ] I10    host-network isolation
+  [n/a] I9     egress allow-list
+  [on ] —      resource ceilings
+                 [baseline] vCPUs<=64 · mem<=24576MiB · disk<=65536MiB · …
+  …
+  No control is weakened from its default.
+```
+
+It exits `0` when nothing is weakened and `1` when something is, so it can gate
+a script. `--json` for the app. This is the executable form of the checklist in
+§4 — a checklist in a document says what we *intended*, and a control you
+believe is on but is not is worse than one you know is off.
+
+---
+
 ## 2. Security invariants
 
 These are the properties we commit to. Each has an enforcement mechanism and a
@@ -504,7 +566,9 @@ name at connect time).
 - [x] **No host FS passthrough** — invariant documented, behavioural test +
       `make security-check` guard (M30.5, shipped).
 - [x] **Resource limits** — per-sandbox vCPU/mem/disk/console/wall ceilings plus
-      NAT connection-count + bandwidth caps (M30.6, shipped).
+      NAT connection-count + bandwidth caps (M30.6, shipped). **Default-on since
+      V4.2**: an unconfigured workspace resolves to the `chm` baseline rather
+      than "unbounded"; `CHM_LIMITS=none` is the documented opt-out.
 - [x] **Network policy** — egress allow/deny enforced on the local datapath: a
       default-deny allow-list applied to every NIC, fail-closed, plus NAT
       connection/bandwidth caps (M28 + M30.9). The live in-guest demo (#52) is
@@ -517,6 +581,9 @@ name at connect time).
       by the 2026-07-16 review.
 - [ ] **Update / signing chain** — the app + `chm` binaries themselves are signed
       and updated over a verified channel (macOS notarisation + release signing).
+- [x] **Posture is inspectable** — `chm posture` reports every control, its
+      state and how it was decided, and exits non-zero if anything is weakened
+      from its default (V4.1/V4.2, §1a).
 - [x] **Escape-response assumptions** — documented (§1 "Out of scope"): a guest
       escape is assumed contained by the HVF VM boundary; the actively-defended
       escape is the bundle-driven host-file path, closed by M30.1 / M30.8 / I1.

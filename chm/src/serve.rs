@@ -28,8 +28,8 @@ use crate::checkpoint;
 use crate::console::ConsoleInput;
 use crate::console_filter::ConsoleFilter;
 use crate::imp::{
-    Loaded, Outcome, UsgicConfig, UsgicSession, build_vm_ops, cntfrq_guard, load_snapshot,
-    routes_completions_as_lpis, run_usgic_engine, wire_virtio,
+    Loaded, Outcome, UsgicConfig, UsgicSession, aarch32_guard, build_vm_ops, cntfrq_guard,
+    load_snapshot, routes_completions_as_lpis, run_usgic_engine, wire_virtio,
 };
 use crate::limits;
 use hypervisor::hvf::virtio::nat::NatLimits;
@@ -797,6 +797,10 @@ struct EngineOpts {
 fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Result<String, String> {
     let loaded = load_snapshot(dir)?;
     cntfrq_guard(&loaded.state_json)?;
+
+    // AArch32-at-EL0 check (V1.4): the capture host advertised 32-bit
+    // userspace and this Mac has none, so a 32-bit exec wedges the vCPU.
+    aarch32_guard(&loaded.snap)?;
 
     // A stock ITS/LPI capture routes its virtio completions as LPIs, which
     // Apple's managed GIC cannot deliver. The userspace GICv3 *can* deliver

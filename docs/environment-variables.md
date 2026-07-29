@@ -1,0 +1,102 @@
+# The `chm` environment variables
+
+`chm` has no debugger. You cannot attach `lldb` to a guest vCPU mid-flight: the
+interesting state lives inside `hv_vcpu_run`, and the interesting failures are
+things that happened forty milliseconds ago in another thread. So the diagnostic
+surface is a set of `CHM_TRACE_*` switches that make the hypervisor narrate
+itself, plus a smaller set of behavioural overrides for A/B-ing a suspected bug
+against a known-good path.
+
+This is not leftover scaffolding. The 5.08× guest clock dilation — the single
+biggest bug in the project's history — was found by turning on `CHM_TRACE_EXIT`
+and `CHM_TRACE_VTIMER` and reading the resulting stream. Each switch costs one
+`env::var_os` at a cold-path boundary.
+
+**None of these are needed to run a snapshot.** `chm run <dir>` needs no
+environment at all. Everything below is for when something is wrong, or when you
+are proving something is right.
+
+---
+
+## Tracing
+
+Set any of these to any value (`=1` by convention) to enable. Output goes to
+stderr, so `2> trace.log` separates it from guest console output.
+
+| Variable | What it prints | Reach for it when |
+| --- | --- | --- |
+| `CHM_TRACE_EXIT` | Every vCPU exit: `[exit] t=<ns> vcpu N reason=R ec=0xEC pc=0x… ipa=0x…`. `reason=1` exception, `reason=2` vtimer; `ec=0x18` is an MSR/MRS trap, `ec=0x1` a WFI/WFE. | The guest is stuck and you need to know *where*. A healthy idle loop is a repeating `0x18, 0x18, 0x1 (WFI), reason=2 (vtimer)`. A tight non-WFI loop is a spin. |
+| `CHM_TRACE_VTIMER` | Virtual timer arming, firing and offset re-stepping. | Time in the guest is wrong — running fast, slow, or jumping. |
+| `CHM_TRACE_ABORT` | Data/instruction aborts with the faulting IPA. | The guest touched an address the device model does not decode. Almost always a missing or misplaced MMIO region. |
+| `CHM_TRACE_HVC` | Hypercalls (PSCI: `CPU_ON`, `CPU_OFF`, `SYSTEM_OFF`, …). | SMP will not come up, or the guest will not shut down. |
+| `CHM_TRACE_MMIO` | Every virtio-PCI MMIO access — register, offset, value. | A device is being configured wrongly, or not at all. Verbose. |
+| `CHM_TRACE_NOTIFY` | Virtqueue kicks from the guest. | The guest submitted work but nothing happened — this tells you whether it kicked. |
+| `CHM_TRACE_DRAIN` | The device-side drain of a virtqueue. | You saw the kick (above) but the request was not serviced. |
+| `CHM_TRACE_MSI` | MSI-X writes and their translation to interrupts. | Completions are not reaching the guest. |
+| `CHM_TRACE_ITS` | GIC ITS command queue processing — `MAPD`, `MAPTI`, `INV`, `INT`. | LPI delivery is broken; a device's interrupt never arrives. |
+| `CHM_TRACE_USGIC` | The userspace GICv3: distributor/redistributor register access, pending-state changes, injection. | The hardest class of bug in this codebase. Pair with `CHM_TRACE_EXIT`. |
+| `CHM_TRACE_NET` | virtio-net frames in and out of the device. | Networking is silent. Confirms whether the guest is even transmitting. |
+| `CHM_TRACE_NAT` | NAT flow decisions: connect/allow/deny, per-flow lifecycle. | Egress is being refused and you need to know by which rule — the reserved-address guard, the allow-list, or a connection cap. |
+| `CHM_TRACE_INPUT` | Bytes written into the guest console. | Keystrokes are not reaching the guest. Distinguishes "not delivered" from "delivered and ignored". |
+| `CHM_TRACE_WATCHDOG` | The run watchdog's liveness sampling. | A run is being killed and you want to see what the watchdog saw. |
+| `CHM_TRACE_TIMING` | `[startup] <elapsed> <label>` for each startup phase. | Start-up is slow and you want the phase, not a guess. |
+
+## Behavioural overrides
+
+These **change what `chm` does**, so they are for bisecting a bug against a
+known-good path, not for normal operation.
+
+| Variable | Effect | Why it exists |
+| --- | --- | --- |
+| `CHM_USERSPACE_GIC=1` | Force the userspace GICv3 even for a capture that would auto-route to Apple's managed GIC. | A/B the two interrupt backends against each other. Auto-routing (I7) picks correctly on its own; this is for proving that. |
+| `CHM_ALLOW_ITS_LPI=1` | Allow an ITS/LPI capture onto the **managed** GIC, which cannot deliver its completions. | Reproducing the failure mode that motivated the userspace GIC. Produces a broken guest by design. |
+| `CHM_DISABLE_SPI_1_OF_N_FALLBACK=1` | Disable 1-of-N SPI target-selection fallback. | Isolating an interrupt-affinity bug. |
+| `CHM_SERIAL_SPI=<n>` | Override the serial console's SPI INTID. | A capture whose device/IRQ ordering differs from what we infer. |
+| `CHM_GUEST_CNTFRQ=<Hz>` | Synthesize a guest counter rate by re-stepping the vtimer offset. | The V1.3 fix for cross-host clock dilation. Normally resolved from the snapshot's clock block. |
+| `CHM_STRICT_CNTFRQ=1` | Refuse to run on a frequency mismatch instead of warning. | KVM's posture. We warn by default because a dilated guest is still useful; this opts into strictness. |
+| `CHM_STRICT_AARCH32=1` | Refuse a snapshot whose guest believes it can run 32-bit binaries. | See [`cpu-feature-deltas.md`](cpu-feature-deltas.md) — such a guest wedges its vCPU if it ever execs one. Warn-only by default. |
+| `CHM_EAGER_RAM=1` | Populate guest RAM eagerly rather than mapping the snapshot file. | Ruling out a lazy-mapping interaction. Slower to start. |
+| `CHM_NO_RAM_WILLNEED=1` | Skip the `madvise(MADV_WILLNEED)` prefault. | Measuring what the prefault is actually buying. |
+| `CHM_FULL_BARRIER=1` | Opt back into the full media barrier on virtio-blk flush. | Comparing durability posture against throughput. |
+| `CHM_RAW_CONSOLE=1` | Disable console filtering; pass guest bytes through untouched. | The filter is suspected of eating something. |
+| `CHM_DISABLE_RUN_WATCHDOG=1` | Disable the run watchdog. | Long single-step debugging sessions the watchdog would otherwise cut short. |
+| `CHM_MAX_RESUMABLE_REVISIONS=<n>` | How many checkpoint revisions stay resumable before older ones are pruned. | Each revision costs a full RAM image; this bounds the store. |
+
+## Policy and control-plane bindings
+
+These are **not** debug switches. They carry configuration, usually set by the
+runner or an operator. See [`security-model.md`](security-model.md) §1a for the
+default posture.
+
+| Variable | Effect |
+| --- | --- |
+| `CHM_LIMITS` | A JSON limits document, or `none` to opt out of the default ceilings entirely. Highest precedence after `--limits`. |
+| `CHM_EGRESS_POLICY` | A JSON egress-policy document handed down by the control plane. Overrides the workspace `egress-policy.json`. |
+| `CHM_ALLOW_LOCAL_EGRESS=1` | **Weakens I10.** Lets the guest reach loopback, your LAN, link-local and `169.254.169.254`. Only for deliberately testing against a local service. |
+| `CHM_TRUST_STORE` | Path to the trusted public keys used to verify a signed snapshot manifest. |
+| `CHM_REQUIRE_SIGNED=1` | Fail closed: refuse any bundle that cannot be signature-verified. |
+| `CHM_RUNNER_CACHE` | Base directory for the runner's content-addressed bundle cache. |
+
+`chm posture <workspace>` prints which of the policy variables are in effect and
+what they have done, so you do not have to reason about precedence by hand.
+
+---
+
+## Worked example: a guest that will not boot
+
+```console
+$ CHM_TRACE_EXIT=1 CHM_TRACE_ABORT=1 chm run snapshots/foo 2> trace.log
+$ tail -20 trace.log
+```
+
+Read the last few exits before it stopped.
+
+- Repeating `ec=0x1` (WFI) with `reason=2` (vtimer) between them — **that is a
+  healthy idle guest**, not a hang. It is waiting for input. Press return.
+- The same `pc=` over and over with no WFI — a spin. Something the guest is
+  polling for is never becoming true; usually an interrupt that was never
+  delivered, so add `CHM_TRACE_USGIC=1` or `CHM_TRACE_ITS=1`.
+- An abort at an `ipa=` outside every device window — the guest is touching an
+  address the device model does not decode.
+- Exits stop entirely — the vCPU is wedged rather than looping. If the guest just
+  ran a 32-bit binary, see [`cpu-feature-deltas.md`](cpu-feature-deltas.md).

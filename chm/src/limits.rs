@@ -30,7 +30,7 @@ use std::env;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 use serde::{Deserialize, Serialize};
 
@@ -72,6 +72,33 @@ pub(crate) struct LimitsDoc {
 }
 
 impl LimitsDoc {
+    /// The ceilings that apply when nothing else is configured (V4.2).
+    ///
+    /// A rehydrated snapshot is untrusted code, so "no configuration" must not
+    /// mean "no bound". These are chosen to sit far above anything a legitimate
+    /// workload does while still stopping a runaway: a guest cannot fill the
+    /// host disk through its overlay, flood the host with console output, or
+    /// exhaust the process file-descriptor table with NAT sockets.
+    ///
+    /// Deliberately **not** bounded here: wall-clock runtime (a sandbox you
+    /// leave running overnight is a normal thing to want) and bandwidth
+    /// (throttling by default would make the network mysteriously slow rather
+    /// than visibly refused). Both remain available to configure.
+    ///
+    /// `CHM_LIMITS=none` opts out entirely.
+    pub fn baseline() -> Self {
+        Self {
+            max_vcpus: Some(64),
+            max_memory_mb: Some(host_ram_mb()),
+            max_disk_mb: Some(64 * 1024),
+            max_wall_seconds: None,
+            max_console_mb: Some(1024),
+            max_connections: Some(128),
+            max_bandwidth_kbps: None,
+            label: Some("chm baseline".to_string()),
+        }
+    }
+
     /// Whether any limit is set (an all-`None` document bounds nothing).
     pub fn is_bounded(&self) -> bool {
         self.max_vcpus.is_some()
@@ -138,6 +165,36 @@ impl LimitsDoc {
     }
 }
 
+/// Interpret a `CHM_LIMITS` value. Split out from [`resolve_limits`] so the
+/// opt-out can be tested without mutating a process-global environment variable
+/// that every other test in this binary reads concurrently.
+fn from_env_value(raw: &str) -> (LimitsDoc, &'static str) {
+    if raw.trim().eq_ignore_ascii_case("none") {
+        return (LimitsDoc::default(), "opt-out");
+    }
+    match serde_json::from_str::<LimitsDoc>(raw) {
+        Ok(doc) => (doc, "env"),
+        Err(_) => (LimitsDoc::default(), "env"),
+    }
+}
+
+/// Physical RAM on this host, in MiB, as the admission ceiling for guest RAM.
+///
+/// A snapshot needing more RAM than the host physically has cannot be mapped
+/// anyway; refusing it up front turns an opaque mid-restore failure into a
+/// sentence. Falls back to a permissive value if `sysctl` is unavailable, since
+/// this is a guard rail, not a security boundary in its own right.
+fn host_ram_mb() -> u64 {
+    let out = match Command::new("/usr/sbin/sysctl").arg("-n").arg("hw.memsize").output() {
+        Ok(o) if o.status.success() => o.stdout,
+        _ => return 1024 * 1024,
+    };
+    match String::from_utf8_lossy(&out).trim().parse::<u64>() {
+        Ok(bytes) if bytes > 0 => bytes / (1024 * 1024),
+        _ => 1024 * 1024,
+    }
+}
+
 /// The per-workspace limits file path.
 fn limits_path(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join(LIMITS_FILE)
@@ -145,8 +202,12 @@ fn limits_path(workspace_dir: &Path) -> PathBuf {
 
 /// Resolve the limits governing a run, in priority order: an explicit
 /// `--limits <file>`, the `CHM_LIMITS` env binding, then the per-workspace
-/// `limits.json`. Returns `(doc, source)`. A missing/unreadable source yields an
-/// empty (unbounded) document, since limits are opt-in.
+/// `limits.json`. Returns `(doc, source)`.
+///
+/// **Configuring nothing yields [`LimitsDoc::baseline`], not "unbounded"** — a
+/// rehydrated snapshot is untrusted code, so the safe posture is the default
+/// (V4.2). `CHM_LIMITS=none` is the documented opt-out and is the only way to
+/// get a genuinely unbounded sandbox.
 pub(crate) fn resolve_limits(workspace_dir: &Path, cli_override: Option<&Path>) -> (LimitsDoc, &'static str) {
     if let Some(path) = cli_override {
         if let Ok(raw) = fs::read_to_string(path)
@@ -157,17 +218,14 @@ pub(crate) fn resolve_limits(workspace_dir: &Path, cli_override: Option<&Path>) 
         return (LimitsDoc::default(), "flag");
     }
     if let Ok(raw) = env::var("CHM_LIMITS") {
-        if let Ok(doc) = serde_json::from_str::<LimitsDoc>(&raw) {
-            return (doc, "env");
-        }
-        return (LimitsDoc::default(), "env");
+        return from_env_value(&raw);
     }
     match fs::read_to_string(limits_path(workspace_dir)) {
         Ok(raw) => match serde_json::from_str::<LimitsDoc>(&raw) {
             Ok(doc) => (doc, "workspace"),
             Err(_) => (LimitsDoc::default(), "workspace"),
         },
-        Err(_) => (LimitsDoc::default(), "none"),
+        Err(_) => (LimitsDoc::baseline(), "baseline"),
     }
 }
 
@@ -370,15 +428,50 @@ mod tests {
         let _ = fs::remove_dir_all(&ws);
     }
 
+    /// V4.2: configuring nothing must not mean bounding nothing. A rehydrated
+    /// snapshot is untrusted code, so the safe posture has to be what you get
+    /// when you type `chm run <dir>` and nothing else.
     #[test]
-    fn resolve_is_unbounded_without_any_source() {
+    fn resolve_falls_back_to_the_baseline_not_to_unbounded() {
         let ws = env::temp_dir().join(format!("chm-limits-none-{}", process::id()));
         let _ = fs::remove_dir_all(&ws);
         fs::create_dir_all(&ws).unwrap();
         let (doc, source) = resolve_limits(&ws, None);
-        assert_eq!(source, "none");
-        assert!(!doc.is_bounded());
+        assert_eq!(source, "baseline");
+        assert!(doc.is_bounded(), "an unconfigured workspace must still be bounded");
         let _ = fs::remove_dir_all(&ws);
+    }
+
+    /// The baseline has to be a ceiling, not a policy: it must not refuse any
+    /// snapshot we actually ship, or it would break the thing it protects.
+    #[test]
+    fn baseline_admits_a_real_capture_and_bounds_a_runaway() {
+        let b = LimitsDoc::baseline();
+        b.validate().expect("baseline must be self-consistent");
+        assert!(b.max_vcpus.unwrap() >= 8, "would refuse an ordinary SMP snapshot");
+        assert!(b.max_memory_mb.unwrap() >= 1024, "would refuse a 1 GiB guest");
+        assert!(b.max_disk_mb.is_some(), "overlay growth must be bounded");
+        assert!(b.max_console_mb.is_some(), "console flooding must be bounded");
+        assert!(b.max_connections.is_some(), "socket exhaustion must be bounded");
+        // Deliberately unset: bounding these by default would degrade rather
+        // than protect. See LimitsDoc::baseline.
+        assert!(b.max_wall_seconds.is_none());
+        assert!(b.max_bandwidth_kbps.is_none());
+    }
+
+    #[test]
+    fn chm_limits_none_is_the_documented_opt_out() {
+        for raw in ["none", "None", "  NONE  "] {
+            let (doc, source) = from_env_value(raw);
+            assert_eq!(source, "opt-out", "{raw:?} should opt out");
+            assert!(!doc.is_bounded());
+        }
+        let (doc, source) = from_env_value(r#"{"max_console_mb":8}"#);
+        assert_eq!(source, "env");
+        assert_eq!(doc.max_console_mb, Some(8));
+        // Malformed must not silently become the opt-out.
+        let (_, source) = from_env_value("{not json");
+        assert_eq!(source, "env");
     }
 
     #[test]

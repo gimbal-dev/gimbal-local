@@ -48,6 +48,10 @@ pub mod rehydrate;
 pub mod translate;
 pub mod checkpoint;
 
+/// Which of a capture's system registers this host can actually reproduce.
+#[cfg(feature = "kvm-snapshot")]
+pub mod sysreg_audit;
+
 pub mod softgic;
 #[cfg(feature = "kvm-snapshot")]
 pub mod virtio;
@@ -879,6 +883,47 @@ pub struct HvfVcpu {
     /// re-asserts the raw IRQ line. This is how a stock ITS/LPI snapshot's virtio
     /// completions (delivered from the device thread) reach the guest.
     inject_queue: Arc<Mutex<Vec<u32>>>,
+}
+
+/// What became of one captured system register when replayed onto this host.
+///
+/// See [`HvfVcpu::probe_sysreg`]. The distinction that matters is between a
+/// register this Mac reproduces faithfully and one where the guest will observe
+/// something other than what its capture host told it at boot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SysregFate {
+    /// HVF took the write and read back exactly the captured value.
+    Restored,
+    /// HVF took the write but reads back something else — the register is
+    /// partly or wholly RES0/RAZ on this core, so only some fields survived.
+    Clamped {
+        /// What the register actually reads after writing the captured value.
+        observed: u64,
+        /// This host's own value before the probe, when readable.
+        host: Option<u64>,
+    },
+    /// HVF rejected the write outright. The guest sees `host` instead of what
+    /// its capture recorded.
+    Refused {
+        /// This host's own value, when readable.
+        host: Option<u64>,
+    },
+    /// The write was accepted but the register cannot be read back, so no claim
+    /// either way is defensible.
+    Unverifiable,
+}
+
+impl SysregFate {
+    /// Whether the guest will observe something other than its captured value.
+    ///
+    /// `Unverifiable` is deliberately *not* a divergence: we cannot demonstrate
+    /// one, and reporting unprovable deltas would make the audit noise.
+    pub fn diverges(&self) -> bool {
+        matches!(
+            self,
+            SysregFate::Clamped { .. } | SysregFate::Refused { .. }
+        )
+    }
 }
 
 // SAFETY: HVF requires a vCPU to be created and run on the same thread; the VMM
@@ -1717,6 +1762,39 @@ impl HvfVcpu {
             )));
         }
         Ok(())
+    }
+
+    /// Replay one captured system register against this host and report what
+    /// actually happens to it, without disturbing the vCPU's usable state.
+    ///
+    /// [`Vcpu::set_state`] restores every non-MPIDR system register
+    /// best-effort — `let _ = self.set_sysreg(id, v)` — because a register that
+    /// is read-only on this core must not abort an otherwise good restore. That
+    /// is the right behaviour, but it is silent: a value the capture host chose
+    /// and the guest may have cached at boot can be dropped with no trace. This
+    /// is the same bug class as the counter-frequency mismatch, which cost a
+    /// 5.08x clock dilation before it was found by accident.
+    ///
+    /// This probe makes that silence measurable. It is deliberately read-mostly:
+    /// the original value is read back and rewritten afterwards, so a probe run
+    /// leaves the vCPU as it found it.
+    pub fn probe_sysreg(&self, reg: u16, captured: u64) -> SysregFate {
+        let host = self.get_sysreg(reg).ok();
+        if self.set_sysreg(reg, captured).is_err() {
+            return SysregFate::Refused { host };
+        }
+        let after = self.get_sysreg(reg).ok();
+        // Put back whatever was there before, so probing cannot perturb a vCPU.
+        if let Some(h) = host {
+            let _ = self.set_sysreg(reg, h);
+        }
+        match after {
+            Some(a) if a == captured => SysregFate::Restored,
+            Some(a) => SysregFate::Clamped { observed: a, host },
+            // Accepted the write but unreadable: treat as restored-but-unverified
+            // rather than claiming a delta we cannot actually demonstrate.
+            None => SysregFate::Unverifiable,
+        }
     }
 
     /// Capture this vCPU's live state for a checkpoint. MUST run on the vCPU's
