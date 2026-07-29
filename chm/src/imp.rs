@@ -25,6 +25,7 @@ use crate::limits;
 use crate::serve;
 use crate::signing;
 use crate::startup;
+use crate::posture;
 use crate::state_cdn;
 use crate::sysregs;
 
@@ -878,6 +879,7 @@ pub fn main() -> ExitCode {
         Some("firewall") => firewall::firewall_main(&raw[1..]),
         Some("limits") => limits::limits_main(&raw[1..]),
         Some("audit") => audit::audit_main(&raw[1..]),
+        Some("posture") => posture::posture_main(&raw[1..]),
         Some("sysregs") => sysregs::sysregs_main(&raw[1..]),
         Some("manifest") => signing::manifest_main(&raw[1..]),
         Some("state-cdn") => state_cdn::state_cdn_main(&raw[1..]),
@@ -988,6 +990,8 @@ fn usage() -> String {
          chm state-cdn reconstruct [OPTIONS]    (pull memory from the state CDN)\n    \
          chm policy show --sandbox ID           (show a sandbox's bound policy)\n    \
          chm firewall set <WORKSPACE_DIR> ...   (author a local egress policy)\n    \
+     chm posture <WORKSPACE_DIR> [--json]   (which security controls are on)\n    \
+     chm sysregs <SNAPSHOT_DIR> [--all]     (CPU registers this Mac reproduces)\n    \
          chm cloud <COMMAND> aws [OPTIONS]      (BYO cloud helpers)\n    \
          chm serve <LIBRARY_DIR> [OPTIONS]      (background daemon)\n    \
          chm ctl <COMMAND> [ARG] [--socket P]   (talk to a daemon)\n\

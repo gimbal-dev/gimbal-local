@@ -63,6 +63,7 @@ mod audit;
 
 /// `chm sysregs` — which captured CPU registers this Mac can reproduce (V1.4).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod posture;
 mod sysregs;
 
 /// Start-to-ready phase timing (#79).

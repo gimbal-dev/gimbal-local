@@ -195,10 +195,10 @@ The capture we need, precisely: [`graviton-capture-request.md`](graviton-capture
 
 ### V4 · Security with sane defaults
 
-| | Task |
-| --- | --- |
-| V4.1 | Threat model + hardening checklist umbrella (#39). A rehydrated snapshot is untrusted code with a device model attached. |
-| V4.2 | Make egress allow-list, reserved-address guard and CoW isolation the **default** posture with a documented opt-out (#20). |
+| | Task | Status |
+| --- | --- | --- |
+| V4.1 | Threat model + hardening checklist umbrella (#39). A rehydrated snapshot is untrusted code with a device model attached. | ✅ **Done.** [`security-model.md`](security-model.md) carries the threat model, invariants I1–I10 and the checklist; §1a now adds **the default posture** — what is true of a run with no flags, no env and no config — including a written argument for the two controls that are deliberately *not* default-on. Made executable as `chm posture`, which resolves the same sources the run path resolves, reports every control with how it was decided, and exits non-zero if anything is weakened. A checklist in a document says what we intended; a control you believe is on but is not is worse than one you know is off. |
+| V4.2 | Make egress allow-list, reserved-address guard and CoW isolation the **default** posture with a documented opt-out (#20). | ✅ **Done.** Audited what was actually on out of the box rather than assuming: the reserved-address guard (I10) and CoW/overlay confinement (I2/I3) were already default-on, but **resource ceilings were not** — an unconfigured workspace resolved to *unbounded*. Now resolves to a `chm` baseline (≤64 vCPU, RAM ≤ host physical, overlay ≤64 GiB, console ≤1 GiB, ≤128 NAT sockets) with `CHM_LIMITS=none` as the documented opt-out. Verified the acid test still passes under the new ceilings. Egress stays open-to-the-internet by design — §1a argues why default-deny would be the worse security outcome. |
 
 ### Deferred, deliberately
 
