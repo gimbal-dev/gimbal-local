@@ -127,12 +127,14 @@ ssh "$PI_HOST" \
 ```
 
 `CH_GIC_V2M=0` is the vanilla shape: stock upstream ITS/LPI routing, no fork.
-Run it on the Mac with `CHM_USERSPACE_GIC=1`, whose software GICv3 delivers the
-LPIs Apple's managed GIC cannot. This is now the script default; the remote
-command keeps it explicit so the capture mode is obvious in logs.
+It is the script default; the remote command keeps it explicit so the capture
+mode is obvious in the logs. Run the result on the Mac with no flags — `chm`
+reads the capture and routes ITS/LPI bundles to its software GICv3, which
+delivers the LPIs Apple's managed GIC cannot.
 
-`CH_GIC_V2M=1` produces the legacy GICv2M/message-SPI shape that the managed GIC
-path (and, until gimbal-local#102, `chm serve` and the app) requires. It is this
+`CH_GIC_V2M=1` produces the legacy GICv2M/message-SPI shape. Nothing requires
+it any more — `chm run`, `chm serve` and the app all take vanilla captures — so
+it is kept only as a regression fixture for the managed-GIC path. It is this
 fork's patch, so it also needs `CH_BIN`/`CHREMOTE_BIN`.
 
 ## Step 5: Copy the snapshot back to the Mac
