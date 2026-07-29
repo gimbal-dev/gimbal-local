@@ -109,38 +109,41 @@ from cache in 0.077 s).
 
 ---
 
-## Where we actually are (2026-07-28, revised same day)
+## Where we actually are (2026-07-29)
 
-**The hard part is done, and the acid test has now passed on real cloud
-hardware.** A **vanilla** — stock upstream, unforked — arm64 Cloud Hypervisor KVM
-snapshot **captured on an AWS Graviton2 host** rehydrates on Apple silicon and
-runs an interactive login shell, with **no code changes required**. Locally
-captured fixtures additionally demonstrate virtio disk, virtio net + NAT egress,
-SMP and checkpoint/resume, at **247 ms** start-to-ready against Docker Sandbox's
-**12.73 s** on the same host.
+**The dream sentence is true.** A **vanilla** — stock upstream, unforked — arm64
+Cloud Hypervisor KVM snapshot **captured on an AWS Graviton2 host** rehydrates on
+Apple silicon and runs an interactive login shell, **with no code changes, no
+flags and no environment variables**, through **all three** entry points: the
+`chm run` CLI, the `chm serve` daemon, and the Gimbal Local SwiftUI app.
 
 That works because of the **userspace GICv3** (M-USGIC): a software
 distributor/redistributor/ITS and a trapped CPU interface, delivering the LPIs
 Apple's managed GIC cannot, while HVF still executes the vCPUs. It is a real
 interrupt controller, not a compatibility shim.
 
-**The cloud→Mac boundary is no longer hypothetical — it is crossed.** What
-remains is one hard physical problem and two product gaps:
+Locally captured fixtures additionally demonstrate virtio disk, virtio net + NAT
+egress, SMP and checkpoint/resume, at **247 ms** start-to-ready against Docker
+Sandbox's **12.73 s** on the same host.
+
+**Every problem that blocked the crossing is now closed:**
 
 1. ~~**We have never rehydrated a real cloud snapshot.**~~ **Done, 2026-07-28.**
    Three vanilla Graviton2 captures restored and ran an interactive shell. Full
    evidence in [`graviton-acid-test-results.md`](graviton-acid-test-results.md).
-2. **The guest's clock runs 5.08× slow across the cloud→Mac boundary** (#104).
-   No longer a prediction — **measured**. Graviton2 presents `CNTFRQ_EL0 =
-   121 875 000 Hz`; Apple silicon presents `24 000 000 Hz`. A Linux guest caches
-   the rate at boot and never re-reads it, so every sleep, timeout and scheduler
-   tick stretches by exactly `325/64`. **There is no restore-time fix**: Apple's
-   API exposes a vtimer *offset*, never a *rate*; the DT `clock-frequency`
-   override is unavailable because these guests boot EFI→ACPI; and KVM cannot
-   present a synthetic rate at capture. This is now the single biggest open
-   problem in the project.
-3. **`chm serve` rejects vanilla** (#102). The CLI accepts it; the daemon the
-   macOS app drives does not. The UI pillar is not real until it does.
+2. ~~**The guest's clock runs 5.08× slow across the cloud→Mac boundary** (#104,
+   #108).~~ **Fixed, and measured at 1.000×.** Graviton2 presents `CNTFRQ_EL0 =
+   121 875 000 Hz` against Apple silicon's `24 000 000 Hz`, and a Linux guest
+   caches the rate at boot. Apple exposes a vtimer *offset*, never a *rate* — but
+   the offset is ours to move, so re-stepping it onto `base + (now - base_host) ×
+   guest_hz / host_hz` at every guest entry synthesizes the rate. `325/64` reduces
+   exactly, so u128 math drifts zero.
+3. ~~**`chm serve` rejects vanilla** (#102).~~ **Fixed in V2.1**, and V2.2 took it
+   the rest of the way into the app.
+
+**What remains is no longer about making it work — it is about making it a
+product.** The open work is the cloud contract (V3), security defaults (V4), and
+a cold create-from-image path (#101). See the spine below.
 
 ---
 
@@ -152,12 +155,12 @@ makes a **vanilla cloud snapshot run everywhere in the product**.
 
 | | Milestone | Pillar | Status | Issues |
 | --- | --- | --- | --- | --- |
-| **V1** | **Make a real cloud snapshot run** | ① | **acid test passed**; clock dilation open | #104, ~~#105~~ |
-| **V2** | **Vanilla everywhere in the product** | ①③ | CLI works; daemon + app do not | #102 |
-| **V3** | **Cloud control plane on the vanilla contract** | ②④ | partly blocked cross-repo | #21, #36, #5 |
+| **V1** | **Make a real cloud snapshot run** | ① | ✅ **complete** — acid test passed, clock fixed | ~~#104~~, ~~#105~~, ~~#108~~ |
+| **V2** | **Vanilla everywhere in the product** | ①③ | ✅ **complete** — CLI, daemon and app all run vanilla flagless | ~~#102~~ |
+| **V3** | **Cloud control plane on the vanilla contract** | ②④ | **the current thrust**; partly blocked cross-repo | #21, #36, #5 |
 | **V4** | **Security with sane defaults** | ③ | substantially shipped; needs the umbrella | #39, #20 |
 
-### V1 · Make a real cloud snapshot run **[the current thrust]**
+### V1 · Make a real cloud snapshot run ✅
 
 The milestone that proves the vision. **V1.5 passed on 2026-07-28** — see
 [`graviton-acid-test-results.md`](graviton-acid-test-results.md). V1.1 was
@@ -174,15 +177,15 @@ answered as a side effect, and V1.3 — the hard problem — is now solved: **V1
 
 The capture we need, precisely: [`graviton-capture-request.md`](graviton-capture-request.md).
 
-### V2 · Vanilla everywhere in the product
+### V2 · Vanilla everywhere in the product ✅
 
 | | Task | Blocked on |
 | --- | --- | --- |
 | V2.1 | Wire the userspace GIC into `chm serve` (#102). Factor the ~525-line `run_usgic` engine so CLI and daemon share it, checkpoint/resume included. | ✅ **Done.** `run_usgic_engine(cfg, loaded, supervise)` is shared by both entry points. The daemon reaches an interactive shell on a vanilla Graviton capture (`ubuntu@ch-snap:~$`, `uname -a` → `6.8.0-136-generic aarch64`), Stop → Start round-trips live guest RAM (a bash variable set before the stop echoed back after it), and checkpoints interoperate in both directions with the CLI's. Adds a `chm ctl input` command, because the daemon's console was read-only and a resumed guest emits nothing until typed at. |
-| V2.2 | The SwiftUI app opens, runs, stops and resumes a vanilla snapshot end to end. | V2.1 |
-| V2.3 | ~~Retire `CHM_USERSPACE_GIC=1`~~ **done as auto-routing:** both `chm run` and `chm serve` ask `routes_completions_as_lpis()` and send ITS/LPI captures to the userspace GICv3 with no flag, so `chm run <vanilla-graviton-snapshot>` reaches a shell with zero environment variables. Only bundles the managed GIC would have refused outright change path. **Still open:** whether the userspace GIC should also take *GICv2M* captures, so there is one path rather than a routing decision. | V1.5 |
+| V2.2 | The SwiftUI app opens, runs, stops and resumes a vanilla snapshot end to end. | ✅ **Done (#114).** Two things were in the way and both are fixed: the app's restorability gate still demanded `gicv2m-message-spi`, so it refused snapshots the runner would happily run (it now mirrors `hvf_restorable`, and separates "this Mac can restore it" from "the plane will release it"); and the console was read-only, which is fatal for a vanilla capture because it resumes at a login prompt and emits nothing until typed at. Input now goes through `chm ctl input`. **Hardware evidence:** from the app, no flags, no environment variables, against a vanilla ITS/LPI Graviton capture — logged in as `ubuntu`, `uname -m` → `aarch64`. Stop wrote a real checkpoint (1 GiB `memory-ranges`); resuming it came back already at `ubuntu@ch-snap:~$` with an in-RAM-only marker intact, so live state genuinely survives Stop → Start. |
+| V2.3 | ~~Retire `CHM_USERSPACE_GIC=1`~~ **done as auto-routing.** Both `chm run` and `chm serve` ask `routes_completions_as_lpis()` and send ITS/LPI captures to the userspace GICv3 with no flag, so a vanilla Graviton snapshot reaches a shell with zero environment variables. Only bundles the managed GIC would have refused outright change path. **The three vestigial forcing mechanisms are now gone (#115):** `HvfVcpu::new` no longer reads the variable to seed `UserGic::enabled` (a library crate letting a process-global change per-vCPU interrupt semantics — a vCPU could have come up trapping ICC registers with no distributor behind them), and the runner no longer sets it on the child (belt-and-braces that would have hidden an auto-routing regression). It survives only as a genuine A/B override on `chm run`/`chm serve`. **Still open:** whether the userspace GIC should also take *GICv2M* captures, so there is one path rather than a routing decision. | V1.5 |
 
-### V3 · Cloud control plane on the vanilla contract
+### V3 · Cloud control plane on the vanilla contract **[the current thrust]**
 
 | | Task | Blocked on |
 | --- | --- | --- |
@@ -405,7 +408,7 @@ so insights and cost accounting are uniform regardless of where a session ran.
 The app already reads the plane's read-only cost/health panel; the rest waits on
 the gctl telemetry/cost event contract.
 
-### M32 · Agent workloads + benchmark vs Docker (#76)  **[the next pivot]**
+### M32 · Agent workloads + benchmark vs Docker (#76)
 
 With the local runtime and host-isolation complete, the next thrust is putting
 **real agents/workloads to work inside gimbal microVMs** and measuring how the
@@ -487,6 +490,8 @@ V1–V4 spine:
 | V1.3 counter-rate synthesis | ~~#108~~ shipped |
 | V1.5 the acid test | ~~#105~~ passed |
 | V2.1 `chm serve` + userspace GIC | ~~#102~~ shipped |
+| V2.2 the app on vanilla | ~~#114~~ shipped |
+| V2.3 retire the forcing env var | ~~#115~~ shipped |
 | V3 cloud contract / signing / postcopy | #21, #36, #5 |
 | V4 security umbrella / defaults | #39, #20 |
 | Deferred | #101 (cold create), #4, #6 |
@@ -494,26 +499,32 @@ V1–V4 spine:
 The four pillars remain the capability contract (#21); a pillar is only "done"
 when it holds for a **vanilla** snapshot on both substrates.
 
-### What comes next (2026-07-28)
+### What comes next (2026-07-29)
 
-**V1 is complete, and V2.1 has shipped.** The acid test passed, the frequency
-question is answered, and a vanilla capture now runs through *both* entry points
-with no flag. What remains:
+**V1 and V2 are both complete.** The acid test passed, the frequency question is
+answered and fixed, and a vanilla capture now runs through the CLI, the daemon
+*and* the app with no flags and no environment variables. The engineering
+problem that defined this project — *can a cloud snapshot cross to a Mac at all*
+— is answered yes, on hardware, three times over.
 
-1. ~~**V1.3 — can the counter rate be synthesized? (#108).**~~ **Done, and the
-   answer was yes.** It was prototyped behind a flag and *measured* rather than
-   predicted: **1.000&times;**, down from 5.081&times;. The jitter never
-   materialised because the userspace-GIC path exits constantly (ICC traps, WFI,
-   MMIO), so the offset is re-stepped far more often than the guest can observe.
-   **V1 is complete.**
-2. ~~**V2.1 — `chm serve` on the userspace GIC (#102).**~~ **Done.** The engine
-   is shared by CLI and daemon, and routing is automatic in both, so
-   `chm run <vanilla-graviton-snapshot>` and `chm ctl start` each reach an
-   interactive shell with no environment variables. **V2.2 — the SwiftUI app —
-   is now the unblocked pillar**, and it needs no new engine work: it drives the
-   daemon, which speaks `start` / `console` / `input` / `stop` against a vanilla
-   capture.
-3. **V1.6 — round-2 capture.** Blocked on gimbal cloud. Needs the corrected
-   version pin, the quiescence check, `CNTFRQ_EL0` reported per instance type
-   (Graviton3/4 are unverified), and capture **B** (2 vCPU + net), which round 1
-   did not produce.
+**The centre of gravity therefore moves from the hypervisor to the product.**
+
+1. **V3 is the thrust, and V3.1 is the gate.** `gctl` still 422s an `assign-run`
+   on `gic_mode: its-lpi`, which now refuses bundles we demonstrably run. Until
+   that changes, the cloud→Mac loop is only closed by hand. This is cross-repo
+   and is the single highest-leverage unblock available.
+2. **#101 — there is no cold create-from-image path.** Every start is a full
+   snapshot rehydrate. That is fine for the rehydrate story and wrong for a
+   product: a user with an image and no snapshot cannot start anything. Needs a
+   shape decision before it needs code.
+3. **V4.1/V4.2 — the security umbrella (#39, #20).** Most of the mechanism is
+   already shipped (egress allow-list, reserved-address guard, CoW isolation,
+   limits, signing). What is missing is the threat model that says which of them
+   are *on by default* and why. A rehydrated snapshot is untrusted code with a
+   device model attached.
+4. **V1.6 — round-2 capture.** Blocked on gimbal cloud. Needs the corrected
+   version pin (`69637dde6` or later, for the clock block), capture *after*
+   cloud-init finishes (round 1 fires mid-cloud-init, so the guest restarts its
+   getty ~113 s after resume and swallows input in that window), `CNTFRQ_EL0`
+   reported per instance type (Graviton3/4 unverified), and capture **B**
+   (2 vCPU + net), which round 1 did not produce.
