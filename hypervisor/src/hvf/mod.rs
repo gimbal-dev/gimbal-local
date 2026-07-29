@@ -310,10 +310,7 @@ impl Vm for HvfVm {
             cnt_base_host: AtomicU64::new(0),
             cnt_base_guest: AtomicU64::new(0),
             run_gen: Arc::new(AtomicU64::new(0)),
-            usgic: Mutex::new(UserGic {
-                enabled: std::env::var_os("CHM_USERSPACE_GIC").is_some(),
-                ..UserGic::default()
-            }),
+            usgic: Mutex::new(UserGic::default()),
             inject_queue: Arc::new(Mutex::new(Vec::new())),
         }))
     }
@@ -486,9 +483,11 @@ impl Vm for HvfVm {
 /// completion to an LPI INTID; this interface hands that INTID to the guest.
 #[derive(Default)]
 struct UserGic {
-    /// Whether the userspace CPU interface is active (no managed GIC; opt-in via
-    /// `CHM_USERSPACE_GIC`). When false the `EC=0x18` arm falls through to the
-    /// normal unhandled-exception error, preserving default behavior.
+    /// Whether the userspace CPU interface is active for this vCPU. Off unless a
+    /// caller turns it on with [`HvfVcpu::set_usgic_enabled`], which
+    /// [`crate::hvf::rehydrate::restore_usgic_vcpu`] does for every vCPU it
+    /// builds. When false the `EC=0x18` arm falls through to the normal
+    /// unhandled-exception error, preserving managed-GIC behaviour.
     enabled: bool,
     /// Pending INTIDs awaiting acknowledgement (FIFO; priority ordering is a
     /// later refinement). Popped by an `ICC_IAR1_EL1` read.
@@ -867,8 +866,8 @@ pub struct HvfVcpu {
     /// stalls the watchdog forces the vCPU out via [`Self::exit_signal`] so it
     /// re-enters and Apple re-evaluates pending interrupts / the timer deadline.
     run_gen: Arc<AtomicU64>,
-    /// Experimental userspace GICv3 CPU interface (see [`UserGic`]). Active only
-    /// when no managed GIC is used and `CHM_USERSPACE_GIC` is set.
+    /// Userspace GICv3 CPU interface (see [`UserGic`]). Active only when no
+    /// managed GIC is used, and only once a caller has switched it on.
     usgic: Mutex<UserGic>,
     /// Cross-thread interrupt-injection queue for the userspace GIC. A device or
     /// net-service thread (which does NOT own this vCPU) cannot call
@@ -1199,15 +1198,21 @@ impl HvfVcpu {
         let _ = gic::rearm_vtimer(self.id);
     }
 
-    // --- Experimental userspace GICv3 CPU interface (Path A / M-USGIC) --------
+    // --- Userspace GICv3 CPU interface ---------------------------------------
 
     /// True when the userspace CPU interface is active for this vCPU.
     fn usgic_enabled(&self) -> bool {
         self.usgic.lock().unwrap().enabled
     }
 
-    /// Enable/disable the experimental userspace CPU interface at runtime (used
-    /// by tests; production enables it at creation via `CHM_USERSPACE_GIC`).
+    /// Switch the userspace CPU interface on for this vCPU.
+    ///
+    /// This is the only way it is ever enabled. On the production path
+    /// [`crate::hvf::rehydrate::restore_usgic_vcpu`] calls it for every vCPU it
+    /// builds, which is what makes a vanilla ITS/LPI capture run; tests call it
+    /// directly. It is deliberately not driven by an environment variable: a
+    /// vCPU with the interface on but no seeded distributor would intercept ICC
+    /// system registers with nothing behind them.
     pub fn set_usgic_enabled(&self, on: bool) {
         self.usgic.lock().unwrap().enabled = on;
     }

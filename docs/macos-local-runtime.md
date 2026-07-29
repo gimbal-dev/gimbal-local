@@ -195,11 +195,9 @@ self-declares a rejected snapshot runnable.
 
 The runner re-verifies the mode locally too (defence in depth), and accepts
 **both** proven shapes: `gicv2m-message-spi` (managed GIC) and `its-lpi` — the
-vanilla, stock-upstream shape, which restores on the userspace GICv3. For an
-`its-lpi` assignment the runner also sets `CHM_USERSPACE_GIC=1` on the `chm`
-subprocess. That is belt-and-braces rather than load-bearing: `chm` reads the
-capture and routes to the software GIC itself, from both entry points. Note the
-plane's own gate may
+vanilla, stock-upstream shape, which restores on the userspace GICv3. It passes
+nothing to the child to make that happen; `chm` reads the capture and picks the
+GIC itself, from both entry points. Note the plane's own gate may
 still be stricter than this; that mismatch is tracked as V3.1 in
 [`roadmap.md`](roadmap.md).
 

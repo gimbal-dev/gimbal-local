@@ -1030,15 +1030,12 @@ fn run_assignment(cp: &ControlPlane, runner_id: &str, opts: &RunOpts) -> Result<
         cp.report_state(&sandbox_id, "resuming")?;
     }
     cp.report_state(&sandbox_id, "running-local")?;
-    let usgic = needs_userspace_gic(gic_mode);
-    if usgic {
-        eprintln!(
-            "chm runner: vanilla ITS/LPI capture — running on the userspace GICv3"
-        );
+    if needs_userspace_gic(gic_mode) {
+        eprintln!("chm runner: vanilla ITS/LPI capture — running on the userspace GICv3");
     }
     eprintln!("chm runner: running-local — exec chm {}", args.join(" "));
 
-    let exec = run_chm(&args, usgic);
+    let exec = run_chm(&args);
     // A clean exit that left a checkpoint behind is a *suspend*, not a plain
     // stop: report `suspended` and push the checkpoint (the plane opens a
     // resumable child). Otherwise it stopped or errored.
@@ -1077,16 +1074,10 @@ fn run_assignment(cp: &ControlPlane, runner_id: &str, opts: &RunOpts) -> Result<
 
 /// Execute `chm <args>` by re-invoking this signed binary (so it carries the
 /// hypervisor entitlement), streaming its console straight through.
-fn run_chm(args: &[String], usgic: bool) -> Result<i32, String> {
+fn run_chm(args: &[String]) -> Result<i32, String> {
     let exe = env::current_exe().map_err(|e| format!("resolve current exe: {e}"))?;
     let mut cmd = Command::new(exe);
     cmd.args(args);
-    // A vanilla ITS/LPI capture only restores on the software GICv3. The run
-    // path selects it from the environment, so set it for the child rather than
-    // rejecting a snapshot we can actually run.
-    if usgic {
-        cmd.env("CHM_USERSPACE_GIC", "1");
-    }
     cmd.status()
         .map_err(|e| format!("spawn chm: {e}"))
         .map(|st| st.code().unwrap_or(-1))
@@ -1740,10 +1731,7 @@ fn cmd_pull(opts: &PullOpts) -> Result<(), String> {
 
     if opts.resume {
         eprintln!("chm pull: resuming — exec chm resume {}", opts.to.display());
-        let code = run_chm(
-            &["resume".to_string(), opts.to.display().to_string()],
-            needs_userspace_gic(&pull_gic_mode(assign)),
-        )?;
+        let code = run_chm(&["resume".to_string(), opts.to.display().to_string()])?;
         if code != 0 {
             return Err(format!("chm resume exited {code}"));
         }
@@ -1861,29 +1849,26 @@ fn format_commit_result(branch_name: &str, resp: &Value) -> String {
     )
 }
 
-/// HVF (Apple's managed GIC) can only deliver message-based SPIs, so it can only
-/// restore checkpoints captured `gicv2m-message-spi`. Everything else (notably
-/// `its-lpi`) stays cloud-only.
+/// Whether this Mac can restore a capture with the given `gic_mode`.
+///
+/// Two shapes qualify, for different reasons. `gicv2m-message-spi` restores on
+/// Apple's *managed* GIC, which delivers message-based SPIs. `its-lpi` — the
+/// vanilla, stock-upstream shape — routes virtio completions through the GIC
+/// ITS as LPIs, which the managed GIC cannot deliver, so it restores on `chm`'s
+/// software GICv3 instead. `chm` picks between them by reading the capture.
+///
+/// An absent or empty `gic_mode` is handled by the caller, not here.
 fn hvf_restorable(gic_mode: &str) -> bool {
     gic_mode == "gicv2m-message-spi" || needs_userspace_gic(gic_mode)
-}
-
-/// The `gic_mode` a pull assignment's manifest declares, or `""` if absent.
-fn pull_gic_mode(assign: &Value) -> String {
-    assign
-        .get("manifest")
-        .and_then(|m| m.get("gic_mode"))
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string()
 }
 
 /// Whether a `gic_mode` needs the userspace GICv3 to be restorable here.
 ///
 /// A vanilla (stock upstream) capture routes virtio completions through the GIC
 /// ITS as LPIs, which Apple's *managed* GIC cannot deliver. `chm`'s software
-/// GICv3 can, so such a snapshot IS restorable — it just has to be run with
-/// `CHM_USERSPACE_GIC=1`, which [`run_chm`] sets for these assignments.
+/// GICv3 can, so such a snapshot IS restorable. Nothing has to be passed to the
+/// child to make that happen: `chm` reads the capture and picks the software
+/// GIC itself. This answers "can this Mac restore it", not "how do we run it".
 fn needs_userspace_gic(gic_mode: &str) -> bool {
     gic_mode == "its-lpi"
 }

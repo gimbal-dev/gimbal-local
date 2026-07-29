@@ -654,7 +654,7 @@ If the remote host has already produced the bundle, omit
 6. Local Mac runs:
 
 ```bash
-CHM_USERSPACE_GIC=1 target/debug/chm run ./snapshots/<name> \
+target/debug/chm run ./snapshots/<name> \
   --max-seconds 30 --idle-exit 0
 ```
 

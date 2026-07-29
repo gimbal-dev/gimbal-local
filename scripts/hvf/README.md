@@ -115,5 +115,8 @@ VM; the loop only runs when invoked this way (or with `CHM_E2E_SNAPSHOT` set and
 
 Both scripts honour environment variables, e.g. `GUEST_CPUS`, `GUEST_MEM_MB`,
 `CH_VERSION`, `IMG_URL`, `OUT_DIR`, `BOOT_TIMEOUT`. `CH_GIC_V2M` defaults to
-`1` so captures are HVF-compatible message-SPI snapshots unless explicitly
-overridden. See the CONFIG block at the top of `capture-arm-snapshot.sh`.
+`0`, the vanilla stock-upstream ITS/LPI shape, which is the supported path and
+runs on the userspace GICv3 with no flags. Set `CH_GIC_V2M=1` only to produce
+the legacy GICv2M/message-SPI shape, which needs this fork's patched binary via
+`CH_BIN`/`CHREMOTE_BIN`. See the CONFIG block at the top of
+`capture-arm-snapshot.sh`.

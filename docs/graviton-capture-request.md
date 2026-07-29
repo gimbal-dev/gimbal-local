@@ -330,26 +330,20 @@ someone losing a day to it.
 
 ---
 
-## 6. The optional third capture — keep the app working
+## 6. The third capture is no longer needed
 
-Until [#102](https://github.com/gimbal-dev/gimbal-local/issues/102) lands,
-`chm serve` (the daemon the macOS app drives) still only accepts a **GICv2M /
-message-SPI** capture. If you want the app path to keep working against
-Graviton artifacts in the meantime, one legacy capture would help:
+This section used to ask for a legacy GICv2M / message-SPI capture, because
+`chm serve` — the daemon the macOS app drives — only accepted that shape.
 
-```bash
-# C — legacy. This one DOES need our fork's patched binary, because
-# CH_GIC_V2M is our patch and upstream will ignore it.
-CH_BIN=/path/to/forked/cloud-hypervisor \
-CHREMOTE_BIN=/path/to/forked/ch-remote \
-  CH_GIC_V2M=1 GUEST_CPUS=1 GUEST_MEM_MB=1024 GUEST_NET=0 \
-  OUT_DIR="$PWD/graviton-gicv2m-1cpu" \
-  bash scripts/hvf/capture-arm-snapshot.sh
-```
+**That is fixed.** [#102](https://github.com/gimbal-dev/gimbal-local/issues/102)
+shipped in V2.1: the daemon routes a vanilla ITS/LPI capture to the userspace
+GICv3 on its own, with no flag. V2.2 then drove a vanilla Graviton capture from
+the app itself to an interactive login shell. Both entry points take vanilla.
 
-This is **strictly a stopgap**, not the direction. Vanilla is the contract.
-If producing our fork on the capture host is inconvenient, skip C — it only
-costs us the app demo path, and #102 removes the need entirely.
+So: **please do not produce a GICv2M capture.** It needs this fork's patched
+binary on the capture host, and nothing depends on it any more. The legacy
+fixtures already in `snapshots/` are enough to keep the managed-GIC path under
+regression test. Vanilla is the contract.
 
 ---
 
