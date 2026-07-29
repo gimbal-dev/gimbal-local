@@ -49,6 +49,29 @@ const GUEST_CODE: [u8; 40] = [
     0x00, 0x00, 0x00, 0x14, // b    .
 ];
 
+/// Reports this Mac's `CTR_EL0`, `DCZID_EL0` and `CLIDR_EL1` — the cache
+/// identity registers — by reading them at EL1 and storing each to MMIO_TX,
+/// then powering off.
+///
+/// This is the only way to see those values. macOS traps `mrs ctr_el0` from EL0
+/// (SIGILL), and `hv_vcpu_get_sys_reg` refuses all three, so a three-instruction
+/// guest is the sole path to the numbers a rehydrated guest will actually
+/// observe. See `hvf_host_cache_identity_registers`.
+#[rustfmt::skip]
+const CACHE_ID_PROBE: [u8; 44] = [
+    0x0a, 0x00, 0xa2, 0xd2, // movz x10, #0x1000, lsl #16 (MMIO_TX)
+    0x29, 0x00, 0x3b, 0xd5, // mrs  x9, ctr_el0
+    0x49, 0x01, 0x00, 0xb9, // str  w9, [x10]
+    0xe9, 0x00, 0x3b, 0xd5, // mrs  x9, dczid_el0
+    0x49, 0x01, 0x00, 0xb9, // str  w9, [x10]
+    0x29, 0x00, 0x39, 0xd5, // mrs  x9, clidr_el1
+    0x49, 0x01, 0x00, 0xb9, // str  w9, [x10]
+    0x00, 0x01, 0x80, 0xd2, // movz x0, #0x8
+    0x00, 0x80, 0xb0, 0xf2, // movk x0, #0x8400, lsl #16 (SYSTEM_OFF)
+    0x02, 0x00, 0x00, 0xd4, // hvc  #0
+    0x00, 0x00, 0x00, 0x14, // b    .
+];
+
 /// vCPU0: PSCI CPU_ON(target MPIDR 1, entry RAM_BASE+0x100, context 0x1234),
 /// then SYSTEM_OFF.
 #[rustfmt::skip]
@@ -262,6 +285,101 @@ fn hvf_cold_boot_mmio_sequence() {
         "expected Shutdown, got {exit:?}"
     );
     assert_eq!(*vm_ops.writes.lock().unwrap(), vec![1, 2, 3, 4, 5, 6]);
+}
+
+/// Pin the cache identity registers this Mac hands a guest.
+///
+/// `CTR_EL0`, `DCZID_EL0` and `CLIDR_EL1` are the registers a rehydrated guest
+/// most obviously cannot be given: `HvfVcpu::set_state` restores them
+/// best-effort and HVF **refuses all three**, so whatever the capture host
+/// recorded is silently dropped and the guest observes Apple's values instead.
+///
+/// They are also unreadable from the host: macOS traps `mrs ctr_el0` at EL0 with
+/// SIGILL, and `hv_vcpu_get_sys_reg` returns `HV_BAD_ARGUMENT` for all three.
+/// A three-instruction guest at EL1 is the only way to obtain them, which is why
+/// this test exists rather than a plain host-side read.
+///
+/// Measured on Apple M3 (2026-07-29). This Mac hands a guest
+/// `CTR_EL0 = 0x9444c004`; an AWS Graviton2 capture records `0xb444c004`. They
+/// differ in **exactly one bit**:
+///
+/// | field | Graviton2 capture | this Mac | consequence |
+/// | --- | --- | --- | --- |
+/// | `DminLine` | 64 B | 64 B | identical — maintenance stride is right |
+/// | `IminLine` | 64 B | 64 B | identical |
+/// | `CWG` / `ERG` | 64 B | 64 B | identical |
+/// | `L1Ip` | PIPT | PIPT | identical |
+/// | `IDC` | 1 | 1 | identical |
+/// | `DIC` (bit 29) | **1** | **0** | guest skips `ic ivau`: **unsound** |
+/// | `DCZID_EL0.BS` | (not captured) | 64 B | matches the guest's cached 64 B |
+///
+/// So the entire cache-geometry surface survives rehydration intact, and the one
+/// real delta is a single bit. See `docs/cpu-feature-deltas.md`.
+///
+/// The assertions below deliberately check *invariants the safety argument rests
+/// on*, not the literal register values, so a future Apple part with different
+/// cache geometry fails here loudly instead of quietly invalidating that
+/// document.
+#[test]
+fn hvf_host_cache_identity_registers() {
+    let ram = HostRam::new(RAM_SIZE);
+    ram.load(0, &CACHE_ID_PROBE);
+    let vm_ops = Arc::new(RecordingVmOps {
+        writes: Mutex::new(Vec::new()),
+    });
+
+    let (_vm, mut vcpu) = build_vm(&ram, vm_ops.clone());
+    vcpu.setup_regs(0, RAM_BASE, 0).expect("setup_regs");
+    let exit = run_to_shutdown(vcpu.as_mut());
+    assert!(
+        matches!(exit, VmExit::Shutdown),
+        "expected Shutdown, got {exit:?}"
+    );
+
+    let regs = vm_ops.writes.lock().unwrap().clone();
+    assert_eq!(regs.len(), 3, "expected CTR_EL0, DCZID_EL0, CLIDR_EL1");
+    let (ctr, dczid, clidr) = (regs[0], regs[1], regs[2]);
+    println!("CTR_EL0={ctr:#010x} DCZID_EL0={dczid:#010x} CLIDR_EL1={clidr:#010x}");
+
+    // Cache maintenance by VA steps by `4 << DminLine` bytes. A guest that
+    // booted elsewhere uses *its* stride; if this host's lines were larger the
+    // guest would skip bytes and leave stale data behind. 64 B is what every
+    // Graviton capture records, so equality here is what makes rehydration
+    // sound — and an inequality is a real bug, not a curiosity.
+    let dmin_line = 4u32 << ((ctr >> 16) & 0xf);
+    assert_eq!(
+        dmin_line, 64,
+        "CTR_EL0.DminLine is {dmin_line} B on this Mac; captures assume 64 B, so \
+         guest cache maintenance would now skip bytes. Re-run the delta audit."
+    );
+
+    // `IminLine` is the instruction-side equivalent. Larger here is *safe*: a
+    // guest stepping 64 B through a bigger line just issues redundant `ic ivau`.
+    let imin_line = 4u32 << (ctr & 0xf);
+    assert!(
+        imin_line >= 64,
+        "CTR_EL0.IminLine is {imin_line} B, smaller than the 64 B a Graviton \
+         capture caches — the guest would now skip instruction-cache lines."
+    );
+
+    // `dc zva` zeroes the *hardware* block regardless of what software believes.
+    // If this host's block were larger than the 64 B a Graviton guest cached,
+    // every `dc zva` in the guest's memset would clobber bytes past the intended
+    // range. This equality is the whole reason that hazard is closed.
+    assert_eq!(dczid & 0x10, 0, "DCZID_EL0.DP set: DC ZVA is trapped here");
+    let zva_block = 4u32 << (dczid & 0xf);
+    assert_eq!(
+        zva_block, 64,
+        "DC ZVA block is {zva_block} B on this Mac but a Graviton guest cached \
+         64 B; a mismatch either corrupts memory past the range or leaves it \
+         non-zero. See docs/cpu-feature-deltas.md."
+    );
+
+    // Recorded rather than asserted: CLIDR_EL1 is refused by HVF too, but no
+    // guest safety property depends on its exact value, and pinning Apple's
+    // cache hierarchy would be a test that breaks on every new part for no
+    // benefit. Printing it keeps it in the record.
+    assert_ne!(clidr, 0, "CLIDR_EL1 read back as zero");
 }
 
 #[test]

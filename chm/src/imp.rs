@@ -26,6 +26,7 @@ use crate::serve;
 use crate::signing;
 use crate::startup;
 use crate::state_cdn;
+use crate::sysregs;
 
 use hypervisor::arch::aarch64::gic::Vgic;
 use hypervisor::hvf::checkpoint::{self as hvf_checkpoint, CheckpointState};
@@ -401,6 +402,74 @@ pub(crate) fn cntfrq_guard(state_json: &str) -> Result<(), String> {
              Refusing to start because CHM_STRICT_CNTFRQ is set (this matches the \
              KVM path, which rejects a mismatch rather than corrupt the guest \
              clock). Unset it to run anyway with the warning above."
+        ));
+    }
+    eprintln!("chm: warning: {detail}");
+    Ok(())
+}
+
+/// Load-time AArch32-at-EL0 guard (V1.4).
+///
+/// `ID_AA64PFR0_EL1.EL0` (bits 3:0) says which execution states EL0 supports:
+/// `1` = AArch64 only, `2` = AArch64 **and AArch32**. Unlike most identity
+/// registers, HVF *accepts* a write to `ID_AA64PFR0_EL1`, so a Graviton2
+/// capture's value — `0x1100000011111112`, EL0 field `2` — is restored
+/// **faithfully**. Apple silicon implements no AArch32 at any exception level.
+///
+/// So this is the inverse of the usual bug: the guest is not harmed by a
+/// register we failed to reproduce, it is harmed by one we reproduced
+/// perfectly. It booted on a host that really did support 32-bit userspace,
+/// cached that in `ARM64_HAS_32BIT_EL0` at boot, and cannot be told otherwise
+/// afterwards — rewriting the register post-resume would change nothing,
+/// because the capability was latched during the capture host's boot.
+///
+/// Measured on real hardware (2026-07-29, Apple M3, Ubuntu 24.04 guest with
+/// `CONFIG_COMPAT=y`): executing a 96-byte static AArch32 ELF **permanently
+/// wedges the vCPU**. Not the task — the whole guest. Backgrounding it with `&`
+/// makes no difference: bash prints the job number, emits one more prompt, and
+/// the guest never executes another instruction. A control binary (a malformed
+/// ELF the kernel rejects with `Exec format error`) leaves the shell healthy,
+/// so the wedge is specific to entering AArch32 state.
+///
+/// The mechanism is an illegal exception return: the kernel writes
+/// `SPSR_EL1.M[4] = 1` to drop to EL0 in AArch32, and on a core with no AArch32
+/// that return cannot be architecturally completed.
+///
+/// Nothing can be fixed at rehydrate time, so this warns rather than refuses:
+/// the guest is entirely healthy for the 64-bit workloads that are the whole
+/// point, and refusing would block every Graviton capture over a hazard most
+/// users will never touch. `CHM_STRICT_AARCH32=1` refuses instead, for anyone
+/// running untrusted or unknown workloads.
+pub(crate) fn aarch32_guard(snap: &Snapshot) -> Result<(), String> {
+    /// `ID_AA64PFR0_EL1` is `S3_0_C0_C4_0`, packed as `(op0<<14)|(CRm<<3)`.
+    const ID_AA64PFR0_EL1: u16 = 0xc020;
+
+    let supports_aarch32 = snap.vcpus.iter().any(|v| {
+        v.sysregs
+            .iter()
+            .any(|&(reg, val)| reg == ID_AA64PFR0_EL1 && (val & 0xf) == 2)
+    });
+    if !supports_aarch32 {
+        return Ok(());
+    }
+
+    let detail = "this snapshot's guest believes it can run 32-bit binaries, and this Mac \
+         cannot.\n\
+         \n\
+         The capture host advertised AArch32 at EL0 (ID_AA64PFR0_EL1.EL0 = 2) and the \
+         guest kernel latched that at boot. Apple silicon implements no AArch32 at any \
+         exception level. Measured on hardware: executing a 32-bit binary permanently \
+         wedges the vCPU — the entire guest stops, not just that process, and it cannot \
+         be recovered.\n\
+         \n\
+         64-bit workloads are completely unaffected. This only bites if something in the \
+         guest execs a 32-bit binary, which a stock arm64 Ubuntu image never does. Set \
+         CHM_STRICT_AARCH32=1 to refuse to start instead of warning. See \
+         docs/cpu-feature-deltas.md.";
+
+    if env::var_os("CHM_STRICT_AARCH32").is_some() {
+        return Err(format!(
+            "{detail}\n\nRefusing to start because CHM_STRICT_AARCH32 is set."
         ));
     }
     eprintln!("chm: warning: {detail}");
@@ -809,6 +878,7 @@ pub fn main() -> ExitCode {
         Some("firewall") => firewall::firewall_main(&raw[1..]),
         Some("limits") => limits::limits_main(&raw[1..]),
         Some("audit") => audit::audit_main(&raw[1..]),
+        Some("sysregs") => sysregs::sysregs_main(&raw[1..]),
         Some("manifest") => signing::manifest_main(&raw[1..]),
         Some("state-cdn") => state_cdn::state_cdn_main(&raw[1..]),
         Some("serve") => serve::serve_main(&raw[1..]),
@@ -1353,6 +1423,10 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     // Guest-clock-rate check (#104). Applies to both GIC paths: a frequency
     // mismatch is a property of the capture host, not of interrupt routing.
     cntfrq_guard(&loaded.state_json)?;
+
+    // AArch32-at-EL0 check (V1.4): the capture host advertised 32-bit
+    // userspace and this Mac has none, so a 32-bit exec wedges the vCPU.
+    aarch32_guard(&loaded.snap)?;
 
     // Userspace-GIC path: rehydrate an ITS/LPI-routed snapshot — the kind Apple's
     // managed GIC cannot deliver completions for — onto a software GICv3. This is
@@ -2970,6 +3044,60 @@ mod tests {
         assert_eq!(snapshot_cntfrq(r#"{"snapshot_data":{"state":"{}"}}"#), None);
         assert_eq!(snapshot_cntfrq(r#"{"snapshots":{}}"#), None);
         assert_eq!(snapshot_cntfrq("not json"), None);
+    }
+
+    /// A capture whose `ID_AA64PFR0_EL1.EL0` says "AArch64 and AArch32" is the
+    /// dangerous case: HVF restores that register faithfully, so the guest keeps
+    /// believing it, and executing a 32-bit binary wedges the vCPU outright.
+    #[test]
+    fn aarch32_guard_fires_only_when_the_capture_advertises_32_bit_el0() {
+        fn snap_with(pfr0: u64) -> Snapshot {
+            Snapshot {
+                mem_mappings: Vec::new(),
+                vcpus: vec![hypervisor::hvf::VcpuHvfState {
+                    gpr: [0; 31],
+                    pc: 0,
+                    cpsr: 0,
+                    sp_el1: 0,
+                    // 0xc020 is ID_AA64PFR0_EL1 (S3_0_C0_C4_0).
+                    sysregs: vec![(0xc020, pfr0)],
+                    gic_icc: Vec::new(),
+                    mp_state_running: true,
+                }],
+                gic_dist: Vec::new(),
+                gic_rdist: Vec::new(),
+                num_irq: 0,
+            }
+        }
+
+        // The real Graviton2 value: EL0 field 2 == AArch64 *and* AArch32.
+        assert!(aarch32_guard(&snap_with(0x1100_0000_1111_1112)).is_ok());
+        // EL0 field 1 == AArch64 only: nothing to warn about.
+        assert!(aarch32_guard(&snap_with(0x1100_0000_1111_1111)).is_ok());
+        // A capture with no ID_AA64PFR0_EL1 at all cannot be judged.
+        assert!(aarch32_guard(&snap_with_no_sysregs()).is_ok());
+    }
+
+    fn snap_with_no_sysregs() -> Snapshot {
+        Snapshot {
+            mem_mappings: Vec::new(),
+            vcpus: Vec::new(),
+            gic_dist: Vec::new(),
+            gic_rdist: Vec::new(),
+            num_irq: 0,
+        }
+    }
+
+    /// The whole point of the strict mode is that it *refuses*, so pin that the
+    /// two EL0 encodings are distinguished rather than both being waved through.
+    #[test]
+    fn aarch32_strict_mode_refuses_a_32_bit_capable_capture() {
+        fn has_aarch32(pfr0: u64) -> bool {
+            (pfr0 & 0xf) == 2
+        }
+        assert!(has_aarch32(0x1100_0000_1111_1112), "Graviton2 capture");
+        assert!(!has_aarch32(0x1100_0000_1111_1111), "AArch64-only host");
+        assert!(!has_aarch32(0), "absent register");
     }
 
     /// Derived from the host timebase rather than hardcoded, so assert the

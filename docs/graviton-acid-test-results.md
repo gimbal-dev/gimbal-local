@@ -283,3 +283,17 @@ say explicitly how to verify the guest is quiescent before pausing.
 | Snapshot self-describes its counter rate | ❌ needs CH > v52.0 — §5.1 |
 | Guest quiescent at capture | ❌ mid-cloud-init — §5.2 |
 | 2 vCPU + networking capture | ⬜ not produced |
+
+---
+
+## 7. Follow-up: the systematic register audit (V1.4)
+
+The clock dilation in §3 was one instance of a class — anywhere the guest probed
+the **capture** host at boot and cached the answer. That class has since been
+audited in full against these same three captures:
+[`cpu-feature-deltas.md`](cpu-feature-deltas.md).
+
+Headline: 105 of 238 registers restore faithfully and 133 are refused, but the
+one real bug is a register HVF restores **perfectly** — `ID_AA64PFR0_EL1` still
+advertises AArch32 at EL0, so the guest believes it can run 32-bit binaries, and
+executing one permanently wedges the vCPU. `chm` now warns at load.
