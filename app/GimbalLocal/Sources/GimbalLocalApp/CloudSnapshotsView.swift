@@ -228,7 +228,14 @@ private struct CloudSnapshotCard: View {
                     color: snapshot.restorableOnHVF ? Theme.green : Theme.orange,
                     systemImage: snapshot.restorableOnHVF ? "checkmark.seal.fill" : "exclamationmark.triangle.fill"
                 )
-                if snapshot.restorableOnHVF && !snapshot.hasDiskImage {
+                if snapshot.restorableOnHVF && !snapshot.planeWillRelease {
+                    CloudTag(
+                        text: "plane says \(snapshot.compatibility)",
+                        color: Theme.orange,
+                        systemImage: "cloud.fill"
+                    )
+                }
+                if snapshot.restorableOnHVF && snapshot.planeWillRelease && !snapshot.hasDiskImage {
                     CloudTag(
                         text: "fixture · no disk",
                         color: Theme.orange,
@@ -280,8 +287,13 @@ private struct CloudSnapshotCard: View {
     /// Fuller guidance for why the bring-down button is disabled.
     private func bootBlockedHelp(_ reason: String) -> String {
         if !snapshot.restorableOnHVF {
-            return "Not restorable on this Mac — HVF delivers message-SPI only. "
-                + "Stays cloud-only; recapture with CH_GIC_V2M=1 to bring it here."
+            return "\(reason). `chm` runs a GICv2M capture on Apple's managed GIC "
+                + "and a vanilla ITS/LPI one on its own userspace GICv3, but this "
+                + "snapshot declares neither."
+        }
+        if !snapshot.planeWillRelease {
+            return "\(reason). This Mac can rehydrate it — the refusal is the "
+                + "plane's, not ours."
         }
         // No disk image: a protocol fixture, not a bootable capture.
         return "\(reason). Pick a snapshot captured from a real host — it ships a "

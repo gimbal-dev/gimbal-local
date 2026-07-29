@@ -421,7 +421,7 @@ final class GimbalLocalAppTests: XCTestCase {
         XCTAssertEqual(s.originLabel, "ran in cloud · linux-kvm")
     }
 
-    func testCloudSnapshotGicGateMarksItsLpiCloudOnly() throws {
+    func testCloudSnapshotVanillaItsLpiIsRestorableHere() throws {
         let json = """
         [
           {
@@ -442,9 +442,39 @@ final class GimbalLocalAppTests: XCTestCase {
 
         let s = try XCTUnwrap(CloudControlClient.parseSnapshots(Data(json.utf8)).first)
         XCTAssertFalse(s.hasLocalCopy)
-        XCTAssertFalse(s.restorableOnHVF, "its-lpi is not HVF-restorable")
+        XCTAssertTrue(s.restorableOnHVF,
+                      "a vanilla its-lpi capture runs on the userspace GICv3")
         XCTAssertEqual(s.originLabel, "captured on Lima KVM")
         XCTAssertEqual(s.ramMib, 2048)
+    }
+
+    /// An interrupt routing we have no path for at all stays cloud-only, and the
+    /// reason names the mode rather than prescribing a GICv2M recapture.
+    func testCloudSnapshotUnknownGicModeIsNotRestorable() {
+        let s = CloudSnapshot(
+            id: "snap-odd", status: "available", kind: "full",
+            sourceKind: nil, gicMode: "gic-v4-vlpi", originSubstrate: nil,
+            vcpus: 1, ramMib: 1024, compatibility: "runnable", hasLocalCopy: false
+        )
+        XCTAssertFalse(s.restorableOnHVF)
+        XCTAssertFalse(s.likelyBootable)
+        XCTAssertEqual(s.notBootableReason,
+                       "Interrupt routing `gic-v4-vlpi` is not one this Mac can rehydrate")
+    }
+
+    /// The plane refusing to release a bundle is a *different* statement from
+    /// this Mac being unable to run it, and the UI must not conflate them.
+    func testPlaneRefusalIsReportedSeparatelyFromLocalCapability() {
+        let s = CloudSnapshot(
+            id: "snap-gated", status: "available", kind: "full",
+            sourceKind: nil, gicMode: "its-lpi", originSubstrate: nil,
+            vcpus: 1, ramMib: 1024, compatibility: "incompatible", hasLocalCopy: false
+        )
+        XCTAssertTrue(s.restorableOnHVF, "we can run it")
+        XCTAssertFalse(s.planeWillRelease, "the plane will not hand it over")
+        XCTAssertFalse(s.likelyBootable)
+        XCTAssertEqual(s.notBootableReason,
+                       "The control plane classifies this as incompatible, so it will not release it")
     }
 
     func testParsesCloudSnapshotsIgnoresMalformedEntries() throws {
@@ -645,5 +675,45 @@ final class GimbalLocalAppTests: XCTestCase {
         let acl = list.branches[1]
         XCTAssertEqual(acl.reviewLabel, "open")
         XCTAssertEqual(acl.aclCount, 1)
+    }
+}
+
+// MARK: - Console input encoding
+
+/// `chm ctl input` decodes `\n`, `\t`, `\xNN` and `\\`, so a line typed by a user
+/// has to be escaped or it arrives at the guest as something else entirely.
+final class ConsoleInputEncodingTests: XCTestCase {
+    func testAPlainLineGetsAnExplicitReturn() {
+        // `chm ctl input TEXT` sends TEXT as-is with no trailing newline, so the
+        // Return has to be part of the payload.
+        XCTAssertEqual(ChmClient.encodeLine("uname -m"), "uname -m\\n")
+    }
+
+    func testAnEmptyLineIsJustAReturn() {
+        XCTAssertEqual(ChmClient.encodeLine(""), "\\n")
+    }
+
+    func testReturnCanBeSuppressed() {
+        XCTAssertEqual(ChmClient.encodeLine("partial", pressReturn: false), "partial")
+    }
+
+    func testABackslashInTheUsersTextSurvivesVerbatim() {
+        // The bug this guards: unescaped, `printf 'a\nb'` would reach the guest
+        // as two lines and the command would be mangled.
+        XCTAssertEqual(
+            ChmClient.encodeLine(#"printf 'a\nb'"#),
+            #"printf 'a\\nb'\n"#
+        )
+    }
+
+    func testAHexEscapeInTheUsersTextIsNotReinterpreted() {
+        XCTAssertEqual(ChmClient.encodeLine(#"echo \x41"#), #"echo \\x41\n"#)
+    }
+
+    func testControlKeysCarryTheirHexEscapes() {
+        XCTAssertEqual(ConsoleKey.interrupt.wireText, "\\x03")
+        XCTAssertEqual(ConsoleKey.endOfFile.wireText, "\\x04")
+        XCTAssertEqual(ConsoleKey.clearLine.wireText, "\\x15")
+        XCTAssertEqual(ConsoleKey.returnKey.wireText, "\\n")
     }
 }

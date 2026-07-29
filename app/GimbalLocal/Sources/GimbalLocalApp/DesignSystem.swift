@@ -288,6 +288,10 @@ struct TerminalPane: View {
     let text: String
     var mode: Mode = .console(isStreaming: false)
 
+    /// The console pane accepts keystrokes (see `ConsoleExpander`), so the badge
+    /// points at the input row rather than claiming the stream is read-only.
+    static let consoleBadgeText = "TYPE BELOW"
+
     var body: some View {
         ScrollViewReader { proxy in
             ScrollView {
@@ -320,7 +324,7 @@ struct TerminalPane: View {
                             .font(.system(size: 10, weight: .black, design: .monospaced))
                             .foregroundStyle(.white.opacity(0.72))
                         if case .console = mode {
-                            Text("READ ONLY")
+                            Text(TerminalPane.consoleBadgeText)
                                 .font(.system(size: 10, weight: .black, design: .monospaced))
                                 .foregroundStyle(Theme.purple)
                                 .padding(.horizontal, 7)

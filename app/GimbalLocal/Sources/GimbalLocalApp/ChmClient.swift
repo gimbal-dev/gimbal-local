@@ -42,6 +42,28 @@ struct ChmClient {
         try await runChecked(settings: settings, args: ["ctl", "stop"])
     }
 
+    /// Type at the running guest's console (`chm ctl input`).
+    ///
+    /// `text` is already-encoded wire text — use ``encodeLine(_:)`` or one of the
+    /// ``ConsoleKey`` values to build it, never a raw user string, because the
+    /// daemon interprets backslash escapes.
+    func sendInput(_ text: String, settings: AppSettings) async throws -> String {
+        try await runChecked(settings: settings, args: ["ctl", "input", text])
+    }
+
+    /// Encode a line the user typed for `chm ctl input`, which reads `\n`, `\t`,
+    /// `\xNN` and `\\` as escapes.
+    ///
+    /// A raw string would be misread: `printf 'a\nb'` typed in the box would
+    /// arrive at the guest as two lines. Doubling every backslash first makes
+    /// the line arrive exactly as typed. `chm ctl input` sends its argument
+    /// as-is with no trailing newline, so Return is an explicit `\n`.
+    static func encodeLine(_ line: String, pressReturn: Bool = true) -> String {
+        var encoded = line.replacingOccurrences(of: "\\", with: "\\\\")
+        if pressReturn { encoded += "\\n" }
+        return encoded
+    }
+
     func shutdown(settings: AppSettings) async throws -> String {
         try await runChecked(settings: settings, args: ["ctl", "shutdown"])
     }
