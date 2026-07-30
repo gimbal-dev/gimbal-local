@@ -52,7 +52,8 @@ known-good path, not for normal operation.
 | `CHM_ALLOW_ITS_LPI=1` | Allow an ITS/LPI capture onto the **managed** GIC, which cannot deliver its completions. | Reproducing the failure mode that motivated the userspace GIC. Produces a broken guest by design. |
 | `CHM_DISABLE_SPI_1_OF_N_FALLBACK=1` | Disable 1-of-N SPI target-selection fallback. | Isolating an interrupt-affinity bug. |
 | `CHM_SERIAL_SPI=<n>` | Override the serial console's SPI INTID. | A capture whose device/IRQ ordering differs from what we infer. |
-| `CHM_GUEST_CNTFRQ=<Hz>` | Synthesize a guest counter rate by re-stepping the vtimer offset. | The V1.3 fix for cross-host clock dilation. Normally resolved from the snapshot's clock block. |
+| `CHM_GUEST_CNTFRQ=<Hz>` | Synthesize a guest counter rate by re-stepping the vtimer offset. | The V1.3 fix for cross-host clock dilation. **Single-vCPU only today** — on SMP the per-vCPU re-step cadence makes the counter incoherent between vCPUs; see [`hvf-compatible-snapshots.md`](hvf-compatible-snapshots.md#-single-vcpu-only-today). |
+| `CHM_DEBUG_VTIMER=1` | Trace every virtual-counter re-step (`cpu`, anchor, ratio, target, offset). | Debugging the SMP counter-coherence bug above. Heavy: this path runs ~10^5 times per vCPU per minute, and the tracing perturbs the timing enough to hide the very divergence it is used to find. |
 | `CHM_STRICT_CNTFRQ=1` | Refuse to run on a frequency mismatch instead of warning. | KVM's posture. We warn by default because a dilated guest is still useful; this opts into strictness. |
 | `CHM_STRICT_AARCH32=1` | Refuse a snapshot whose guest believes it can run 32-bit binaries. | See [`cpu-feature-deltas.md`](cpu-feature-deltas.md) — such a guest wedges its vCPU if it ever execs one. Warn-only by default. |
 | `CHM_EAGER_RAM=1` | Populate guest RAM eagerly rather than mapping the snapshot file. | Ruling out a lazy-mapping interaction. Slower to start. |
