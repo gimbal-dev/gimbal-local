@@ -1,6 +1,6 @@
 # The Graviton capture request
 
-> ### ✅ Round 2 delivered — this request is complete
+> ### ✅ Round 2 delivered — and round 3 is now open
 >
 > gimbal cloud produced `graviton-vanilla-1cpu` and `graviton-vanilla-2cpu-net`
 > on 2026-07-31, against the corrected spec below. Both bugs in round 1 were
@@ -19,6 +19,20 @@
 > show. See `roadmap.md` §V5.5.
 >
 > The rest of this document is kept as the record of what was asked for and why.
+
+> ### 📋 Round 3 is now the live ask — the minimal agent image
+>
+> Round 2 answered *"does a real cloud capture run on a Mac"*. Yes, network and
+> all. Round 3 asks a different question: **is this an image worth running?**
+>
+> The round-2 guest is 74% full with 633 MB of headroom and 663 packages of
+> general-purpose cloud VM. A toolchain does not fit in it. **See [§9–§12](#9-why-the-current-image-is-the-wrong-shape)
+> at the end of this document** for the full spec.
+>
+> The one thing to read if you read nothing else: **do not reuse a Firecracker
+> kernel.** Their aarch64 CI kernel sets `# CONFIG_PCI is not set`; Cloud
+> Hypervisor puts virtio on PCI, so that kernel boots to no disk and no network.
+> Their *rootfs* is a good starting point; their *kernel* is not.
 
 > ### ⚠️ Round 1 is complete — read the results first
 >
@@ -397,3 +411,188 @@ such constraint.
 
 That gap is ours to close, and we are not going to pretend otherwise. It does
 not affect capture **A**, which is the acid test.
+
+---
+
+# Round 3 — the minimal agent image (V5.3)
+
+Round 2 closed the question "does a real cloud capture run on a Mac". It does,
+including the network: from inside the rehydrated guest we get `HTTP 200` from
+`api.github.com` and a working `git clone` over HTTPS.
+
+This round asks for something different. Not "does it run" but **"is this an
+image worth running"** — a purpose-built sandbox for a coding agent, rather than
+a stock Ubuntu cloud image that happens to boot.
+
+## 9. Why the current image is the wrong shape
+
+Measured on `graviton-vanilla-2cpu-net`, from inside the running guest:
+
+```
+$ df -h /
+/dev/vda1       2.4G  1.8G  633M  74% /
+
+$ dpkg -l | grep -c '^ii'
+663
+```
+
+And on the host side, of the artifact itself:
+
+| | |
+| --- | --- |
+| ext4 actually used | **1.82 GiB** |
+| root partition | 2.50 GiB |
+| GPT describes | 3.50 GiB |
+| **`_disk0.raw` on disk** | **8.00 GiB** — 4.5 GiB lies beyond the partition table, pure zeros |
+| `snapshot/memory-ranges` | 2.00 GiB |
+| **materialised per capture** | **10 GiB** (~700 MB compressed) |
+
+Three problems, in order of how much they hurt:
+
+1. **The root filesystem is 74% full.** There is 633 MB of headroom. Installing
+   a compiler, a language runtime and a package cache into that does not fit.
+   The image cannot grow into an agent environment; it has to be built as one.
+2. **663 packages of general-purpose cloud VM** — `cloud-init`, `snapd`,
+   `landscape`, a full `apt` world — almost none of which an agent sandbox uses,
+   all of which is attack surface and restore-time cost.
+3. **10 GiB materialised for 1.82 GiB of payload.** Memory dominates the wire
+   cost for `chm state-cdn reconstruct`, and 4.5 GiB of the disk file is
+   literally zeros past the end of the partition table.
+
+For comparison, the Firecracker CI rootfs for the same architecture
+(`firecracker-ci/v1.12/aarch64/ubuntu-24.04.squashfs`) is **76.5 MB** and
+**192 packages**. That is the right order of magnitude. It is 24× smaller than
+what we are carrying, and it is still a real Ubuntu 24.04 userspace.
+
+## 10. What we want
+
+A capture named **`graviton-agent-min`**, built from a minimal rootfs rather
+than a cloud image.
+
+### 10.1 The kernel — this is the part that will bite
+
+**Cloud Hypervisor puts virtio on PCI.** Our rehydrated guest enumerates
+`00:03.0 Ethernet controller: Red Hat Virtio 1.0 network device [1af4:1041]`
+and the device sits at `BAR 0x200080000`. A kernel without PCI boots fine and
+then sees no disk and no network.
+
+This is not hypothetical. **Do not reuse a Firecracker kernel.** We checked
+`firecracker-ci/v1.12/aarch64/vmlinux-6.1.128.config` directly:
+
+```
+# CONFIG_PCI is not set
+CONFIG_VIRTIO_MMIO=y
+```
+
+Firecracker is virtio-MMIO and compiles the whole PCI subsystem out. Under
+Cloud Hypervisor that kernel is a brick. Their *rootfs* is reusable; their
+*kernel* is not.
+
+The known-good reference is the kernel already in capture B,
+**`6.8.0-136-generic`**, which has exactly what we need:
+
+```
+CONFIG_PCI=y
+CONFIG_PCI_HOST_GENERIC=y
+CONFIG_PCI_MSI=y
+CONFIG_VIRTIO_PCI=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_VIRTIO_NET=y
+CONFIG_VIRTIO_CONSOLE=y
+CONFIG_ARM_GIC_V3=y
+CONFIG_ARM_GIC_V3_ITS=y
+```
+
+**Simplest path: keep the stock Ubuntu kernel and change only the userspace.**
+A custom slim kernel is welcome but is not what we are asking for, and if you
+build one, those nine options are the contract. `ARM_GIC_V3_ITS` matters as much
+as the PCI ones — the ITS is how MSIs reach the guest, and our restore path
+expects it.
+
+### 10.2 The rootfs
+
+Start from a minimal Ubuntu 24.04 base (`debootstrap --variant=minbase`, or the
+Ubuntu base tarball) rather than the cloud image. Target the Firecracker CI
+rootfs's ~192-package shape, then add only what an agent genuinely needs.
+
+**Remove / never install:** `cloud-init`, `snapd`, `landscape-common`,
+`ubuntu-advantage-tools`, `unattended-upgrades`, documentation and locales.
+
+> ⚠️ **`cloud-init` is load-bearing for the network today.** See §8 — capture B's
+> static address is applied by cloud-init at capture time. If you drop
+> `cloud-init`, configure the same addressing statically some other way
+> (`systemd-networkd` unit, or `/etc/network/interfaces`), and keep the contract
+> identical: guest `192.168.249.2/24`, gateway and DNS `192.168.249.1`, gateway
+> MAC `02:00:00:00:00:01`. Dropping cloud-init *and* the static address gives us
+> a guest with no route, which fails the whole point of the round.
+
+**Install:** `git`, `curl`, `ca-certificates`, `openssh-client`,
+`build-essential` (or at minimum `gcc`, `g++`, `make`, `binutils`, `libc6-dev`),
+`python3`, `pkg-config`, `unzip`, `xz-utils`.
+
+One language runtime beyond Python is worth having. Node LTS is the most useful
+single choice for agent workloads; if that is contentious, ship without it and
+we will say so rather than guess.
+
+Also please **`apt clean`** and drop `/var/lib/apt/lists` before the capture, and
+**zero the free space** (`fstrim -av`, or `dd if=/dev/zero of=/zero; sync; rm
+/zero`) so the memory and disk images compress properly.
+
+### 10.3 Sizing
+
+| Knob | Round 2 | **Round 3 ask** | Why |
+| --- | --- | --- | --- |
+| vCPUs | 2 | **2** | Keep it — it is what found the SMP counter bug, and we want that surface. |
+| RAM | 2 GiB | **1 GiB** | Memory dominates the wire cost. Do not go to 512 MiB — a compiler needs room, and we would rather have a working image than a record-breaking one. |
+| root partition | 2.5 GiB | **4 GiB** | *Larger* than today on purpose: the goal is low **used**, with headroom to install into. 74% full is what makes the current image a dead end. |
+| disk file | 8 GiB | **≤ 4 GiB** | Do not hand us 4.5 GiB of zeros past the end of the GPT. Size the file to the partition table. |
+| **target used** | 1.82 GiB | **≤ 1 GiB** | ~76 MB base + toolchain. If it lands at 1.2 GiB that is still a win; tell us the number. |
+
+### 10.4 Everything else stays exactly as round 2
+
+Same host, same CH build (v54.0.0 @ `9ea9019d29af` or newer — it must contain
+`69637dde6`), GICv3 with ITS enabled, one virtio-net NIC, and the same pause
+discipline: **the guest must be quiescent before you pause** (§3). Same metadata
+block, `CNTFRQ_EL0` first.
+
+## 11. Acceptance checks for round 3
+
+Run these **inside the guest, before you pause**, and paste the output. Each one
+is a failure we have actually hit.
+
+```bash
+# 1. PCI is alive and virtio is on it — the Firecracker-kernel trap.
+lspci -nn | grep -i virtio          # expect 1af4:1041 (net) and 1af4:1042 (blk)
+
+# 2. The NIC is up and on OUR contract, not cloud DHCP.
+ip -br addr                          # expect 192.168.249.2/24
+ip route                             # expect default via 192.168.249.1
+
+# 3. The toolchain is real.
+git --version && cc --version && make --version && python3 -V
+
+# 4. It can actually build and fetch.
+git clone --depth 1 https://github.com/octocat/Hello-World.git /tmp/hw
+printf 'int main(void){return 0;}' > /tmp/t.c && cc /tmp/t.c -o /tmp/t && echo BUILD_OK
+
+# 5. The size claim, so we can check it against the artifact.
+df -h / && dpkg -l | grep -c '^ii'
+
+# 6. Quiescent (§3) — no cloud-init or apt still running.
+systemctl is-system-running          # expect running or degraded, NOT starting
+```
+
+Check 1 is the one that decides the round. If `lspci` is empty, the kernel lacks
+PCI and nothing else matters.
+
+## 12. What we will do with it
+
+Rehydrate it on Apple silicon and use it as the default sandbox image for a
+coding agent: `chm workspace` it, run an agent inside, and let that agent clone,
+build and test through the credential-injecting egress proxy — which has been
+built and host-tested but has still never had a real agent workload behind it.
+
+A read-only base is a **feature** for us, not a limitation. We already do
+copy-on-write at the block layer: a live session's overlay on capture B measured
+**4.3 MB**. A small immutable base plus per-sandbox COW is the architecture we
+want, and the smaller the base, the more sandboxes we can hold and ship.

@@ -68,7 +68,7 @@ capture path creates a VGICv3. Three ways to get one:
 | --- | --- | --- | --- |
 | **AWS Graviton bare-metal** | ~an afternoon, costs money per hour | **credentials already work** (`chm-aws` profile authenticates today) | Documented end to end in [`aws-byo-setup.md`](aws-byo-setup.md) — quota, bucket, security group, launch, capture, stop spending. |
 | **Raspberry Pi 5** | one-off hardware, then free | plan written, untried | [`raspberry-pi-offbox-plan.md`](raspberry-pi-offbox-plan.md). **Pi 5 only** — Pi 4 commonly exposes GICv2 and would need a whole new VGICv2 ingest path. Proves "a physically separate Linux/KVM arm64 box", which de-risks the cloud milestone without retiring it. |
-| **gimbal cloud runs it for us** | none of ours | the ask is written | [`graviton-capture-request.md`](graviton-capture-request.md) — round 2, with the two round-1 bugs in our own request already fixed. |
+| **gimbal cloud runs it for us** | none of ours | the ask is written | [`graviton-capture-request.md`](graviton-capture-request.md) — rounds 1 and 2 delivered; **round 3 (the minimal agent image) is the live ask**. |
 
 **Any of the three unblocks V5.1 and V1.6** — gimbal cloud is the one that
 delivered. They were not alternatives in value, only in cost: AWS gives the most faithful artifact, the Pi gives the fastest
@@ -76,9 +76,30 @@ independent one.
 
 ### 🟡 Blocker B — the image is a demo VM, not a build environment
 
-Measured inside a live guest: **1 vCPU, 953 MiB RAM, 2.4 GB disk at 74 % full**,
-and `gcc` `make` `node` `npm` `go` `cargo` all missing. This is an *image*
-problem, not a hypervisor problem — no amount of work on `chm` fixes it. **V5.3.**
+Re-measured on the round-2 capture, inside the live guest: **`/dev/vda1` 2.4 G
+total, 1.8 G used, 633 M free — 74 % full**, **663 packages**, and `gcc` `make`
+`node` `npm` `go` `cargo` all missing. `git`, `curl` and `python3` *are* present.
+
+The headroom is the point. **A toolchain does not fit in 633 MB.** This image
+cannot be grown into an agent environment; it has to be built as one. And the
+artifact around it is the wrong shape too — 1.82 GiB of payload inside a **10
+GiB materialised footprint** (8 GiB disk file of which 4.5 GiB is zeros past the
+end of the GPT, plus 2 GiB of memory).
+
+For scale, the Firecracker CI rootfs for the same architecture is **76.5 MB and
+192 packages** — a real Ubuntu 24.04 userspace, 24× smaller. That is the order
+of magnitude to aim for, and their rootfs is the right starting recipe.
+
+**But not their kernel.** `firecracker-ci/v1.12/aarch64/vmlinux-6.1.128.config`
+has `# CONFIG_PCI is not set` with `CONFIG_VIRTIO_MMIO=y`; Cloud Hypervisor puts
+virtio on PCI (`1af4:1041` at `BAR 0x200080000` in our guest), so that kernel
+boots to no disk and no network. Verified by reading their published config, not
+assumed.
+
+This is an *image* problem, not a hypervisor problem — no amount of work on `chm`
+fixes it. The route is the pipeline we already proved: **specify a minimal rootfs
+for the capture side**, rather than hand-mutating a VM. Spec written, round 3 of
+[`graviton-capture-request.md`](graviton-capture-request.md) §9–§12. **V5.3.**
 
 ### 🟠 Blocker C — cross-repo, not ours to close
 
@@ -106,8 +127,8 @@ nothing from anyone else.
 
 1. ~~**V5.1**~~ — ✅ done. gimbal cloud delivered the capture; the guest reaches
    the real internet and clones from GitHub. Blocker A is closed.
-2. **V5.3** — a real agent image. Now unblocked: there is a NIC to install a
-   toolchain over, and `git`/`curl`/`python3` are already in the image.
+2. **V5.3** — a real agent image. Spec is written (round 3 of the capture
+   request); it is an *image* problem, so the next move is a capture, not code.
 3. **V6.1–V6.3** — the local half of the UI. Needs nobody.
 4. **V6.4 / V3** — the off-box round-trip, once the contract lands.
 
@@ -211,7 +232,7 @@ measured rather than assumed, inside a live rehydrated `graviton-1` guest on
 | --- | --- | --- |
 | V5.1 | **Capture with a NIC and 2+ vCPU**, and prove the NAT, the egress policy *and* the V5.2 credential proxy on a real cloud snapshot. | ✅ **Done — 2026-07-31.** gimbal cloud delivered round 2 (`graviton-vanilla-1cpu`, `graviton-vanilla-2cpu-net`; CH v54.0.0 @ `9ea9019d29af`, post-`69637dde6`, captured after cloud-init, `cntfrq: 121875000` recorded in **both** clock blocks). B rehydrated on Apple silicon with `ens3 UP 192.168.249.2/24`, `nproc`=2, virtio-net at `1af4:1041`. **From inside the guest: `curl https://api.github.com/zen` → `HTTP 200`, and `git clone` of a public repo over HTTPS succeeded.** The userspace NAT's DNS responder answers on the gateway. First cloud capture ever to make a network call here. Two real bugs found — see below. |
 | V5.2 | **How a developer's repo enters the sandbox — answered, and shipped.** The decision was that this is a *credentials* problem, not a filesystem one: a sandbox that can authenticate to GitHub clones the repo itself, so I1 stands untouched. A TLS-terminating egress proxy attaches the credential as the request leaves for a rule-named destination; the guest never holds a secret. Proven live against api.github.com (200 with the rule, 401 without, identical request bytes) and against registry.npmjs.org. New invariant **I12**; `chm proxy show/ca/check`; [`credential-proxy.md`](credential-proxy.md). | ✅ done |
-| V5.3 | **A purpose-built agent image** (toolchain, sensible disk, agent runtime) rather than a stock cloud image. V5.1 unblocked this: the round-2 capture has a NIC, and `git`/`curl`/`python3` are already present, so a toolchain can now be installed from inside the guest. | ⬜ next |
+| V5.3 | **A purpose-built agent image.** Not "install a toolchain over the NIC we just proved" — **specify a minimal rootfs for the capture side**, so the image is reproducible from a manifest rather than a hand-mutated VM. Ask: minimal Ubuntu 24.04 base (Firecracker CI's 192-package / 76.5 MB rootfs is the shape to copy) + `git`, `build-essential`, `python3`, one runtime; **stock Ubuntu kernel kept** (a Firecracker kernel is unusable — `# CONFIG_PCI is not set`); 1 GiB RAM, 4 GiB root partition for *headroom*, ≤ 1 GiB used, disk file sized to the GPT. Spec: [`graviton-capture-request.md`](graviton-capture-request.md) §9–§12. Note a trap: **`cloud-init` currently applies the static NAT address** (§8), so removing it means reproducing that addressing another way. | ☐ **spec written, awaiting capture** |
 | V5.5 | **SMP counter coherence.** Found by V5.1 — the first 2-vCPU capture we have ever held. `CHM_GUEST_CNTFRQ` re-steps the vtimer offset on guest *entry*, so between entries a vCPU runs at the host rate. On one vCPU that is invisible; on two it is not, because each exits at its own cadence (**measured: cpu0 117,950 re-steps vs cpu1 521** — cpu1 sits in `WFI`). The counters drift apart while Linux treats `CNTVCT_EL0` as one system-wide clocksource, so `/proc/uptime` moves **non-monotonically** and occasionally latches an exact multiple of `2^58` ticks (~75 years). Unset, the same capture is a steady `0.197×` = exactly `1/5.078125`. Ruled out: the offset arithmetic (traced healthy over 75 s, zero anomalous values), `wfi_park_ms` (clamped), and a real curve-anchor ordering defect that was fixed anyway. Behaves like a race — tracing it makes it vanish. The fix must make the counter *coherent across vCPUs*, not per-vCPU accurate. | ⬜ **known limitation, documented** |
 | V5.4 | Cold create-from-image (#101) so a fresh sandbox does not require a pre-existing capture. | ⬜ nothing blocking |
 
