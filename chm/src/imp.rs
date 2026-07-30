@@ -3071,6 +3071,7 @@ fn collect_checkpoint(
         num_irq,
         usgic: None,
         usgic_cpus: Vec::new(),
+        host_realtime_ns: hvf_checkpoint::now_realtime_ns(),
     })
 }
 
@@ -3127,6 +3128,7 @@ fn collect_usgic_checkpoint(
         // which is a price worth paying for a format with no cross-references.
         usgic: usgic_cpus.first().cloned(),
         usgic_cpus,
+        host_realtime_ns: hvf_checkpoint::now_realtime_ns(),
     })
 }
 
@@ -3327,6 +3329,7 @@ mod tests {
                 gic_rdist: Vec::new(),
                 num_irq: 0,
                 captured_cntfrq: None,
+                captured_realtime_ns: None,
             }
         }
 
@@ -3346,6 +3349,7 @@ mod tests {
             gic_rdist: Vec::new(),
             num_irq: 0,
             captured_cntfrq: None,
+            captured_realtime_ns: None,
         }
     }
 

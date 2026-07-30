@@ -74,6 +74,12 @@ pub struct CheckpointState {
     /// Interrupt-line width the GIC was built with (carried from the parent
     /// snapshot so the distributor offset walk matches on resume).
     pub num_irq: u32,
+    /// Host wall-clock time when this checkpoint was taken, in nanoseconds since
+    /// the Unix epoch, so resume can advance the guest's counter over the pause
+    /// instead of waking it in the past. `None` on a checkpoint written before
+    /// this field existed, which simply does not get the advance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_realtime_ns: Option<u64>,
     /// Userspace-GIC live state for vCPU 0, when this checkpoint was taken on
     /// the software GICv3 path (M-USGIC). `None` on the managed-GIC path, where
     /// `gic_dist` + the per-vCPU `rdist` carry the interrupt state instead. Kept
@@ -229,7 +235,17 @@ pub fn capture_all(
         num_irq,
         usgic: None,
         usgic_cpus: Vec::new(),
+        host_realtime_ns: now_realtime_ns(),
     })
+}
+
+/// Host wall clock now, in nanoseconds since the Unix epoch. `None` if the host
+/// clock is before the epoch, which is not a case worth propagating.
+pub fn now_realtime_ns() -> Option<u64> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_nanos() as u64)
 }
 
 /// Apply a captured distributor onto a fresh VM's GIC, skipping the active
@@ -433,6 +449,7 @@ mod tests {
             num_irq: 64,
             usgic: None,
             usgic_cpus: Vec::new(),
+            host_realtime_ns: None,
         };
         let json = serde_json::to_string(&cp).unwrap();
         let back: CheckpointState = serde_json::from_str(&json).unwrap();
@@ -475,6 +492,7 @@ mod tests {
             num_irq: 64,
             usgic: Some(usgic),
             usgic_cpus: Vec::new(),
+            host_realtime_ns: None,
         };
         let json = serde_json::to_string(&cp).unwrap();
         let back: CheckpointState = serde_json::from_str(&json).unwrap();

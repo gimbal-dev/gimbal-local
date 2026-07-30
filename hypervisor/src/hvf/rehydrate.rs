@@ -154,6 +154,10 @@ pub struct Snapshot {
     /// `CNTFRQ_EL0` of the host this snapshot was captured on, when the capture
     /// records it. `None` for a capture predating upstream `69637dde6`.
     pub captured_cntfrq: Option<u64>,
+    /// Host wall-clock time at the instant of capture, in nanoseconds since the
+    /// Unix epoch. Recorded in the same clock block as [`Self::captured_cntfrq`],
+    /// so it is `None` for exactly the same captures.
+    pub captured_realtime_ns: Option<u64>,
 }
 
 impl Snapshot {
@@ -259,6 +263,7 @@ impl Snapshot {
             gic_rdist,
             num_irq,
             captured_cntfrq: snapshot_cntfrq(state_json),
+            captured_realtime_ns: snapshot_clock_field(state_json, "host_realtime_ns"),
         })
     }
 
@@ -1056,9 +1061,11 @@ pub fn counter_clock(
     snap: &Snapshot,
     resume: Option<&crate::hvf::checkpoint::CheckpointState>,
 ) -> Option<Arc<VtimerClock>> {
-    let reference = match resume {
-        Some(cp) => cp.reference_cntvct()?,
-        None => snap.reference_cntvct()?,
+    // Take the counter and the wall-clock time from the SAME source, or the
+    // elapsed span is measured between two unrelated instants.
+    let (captured, captured_realtime_ns) = match resume {
+        Some(cp) => (cp.reference_cntvct()?, cp.host_realtime_ns),
+        None => (snap.reference_cntvct()?, snap.captured_realtime_ns),
     };
     // The capture's own recorded frequency is the default: correcting the rate
     // costs a measured 2.8% of wall time in stop-the-world barriers, and leaving
@@ -1066,6 +1073,15 @@ pub fn counter_clock(
     // every timeout, sleep and scheduler tick in it wrong. An explicit
     // `CHM_GUEST_CNTFRQ` overrides either way, including `0` to opt out.
     let guest_hz = effective_guest_hz(requested_guest_cntfrq(), snap.captured_cntfrq);
+    // The guest reads ticks at the frequency it believes it has, whether or not
+    // the rate is being corrected, so the elapsed span converts with that.
+    let believed_hz = snap.captured_cntfrq.unwrap_or(guest_hz);
+    let reference = advance_to_wall_clock(
+        captured,
+        captured_realtime_ns,
+        now_realtime_ns(),
+        believed_hz,
+    );
     Some(VtimerClock::new(
         reference,
         guest_hz,
@@ -1092,6 +1108,54 @@ fn snapshot_clock_field(state_json: &str, field: &str) -> Option<u64> {
     let inner = root.get("snapshot_data")?.get("state")?.as_str()?;
     let clock: serde_json::Value = serde_json::from_str(inner).ok()?;
     clock.get("clock")?.get(field)?.as_u64()
+}
+
+/// Nanoseconds since the Unix epoch at 2020-01-01, used only as a floor for
+/// deciding whether a recorded capture time is a real timestamp.
+const PLAUSIBLE_EPOCH_FLOOR_NS: u64 = 1_577_836_800_000_000_000;
+
+/// Advance a captured `CNTVCT_EL0` by the wall-clock time that has passed since
+/// the capture, so a resumed guest wakes up believing the current date.
+///
+/// Without this a snapshot resumes frozen at the instant it was taken, and the
+/// staleness is not cosmetic: measured on a capture 5 hours old, `apt-get
+/// update` **refused** `noble-updates` and `noble-security` with *"Release file
+/// is not valid yet (invalid for another 4h 2min 0s)"*, because repository
+/// metadata published after the capture is dated in the guest's future. TLS
+/// certificate validity, token expiry and `make` all have the same exposure,
+/// and it grows the longer a snapshot sits in a registry.
+///
+/// This is what the KVM path already does on restore (`restore_clock`), so it is
+/// parity rather than novelty. `elapsed` is converted with the **guest's**
+/// counter frequency, since that is the rate at which the guest interprets the
+/// ticks it reads, whether or not the rate is being corrected.
+///
+/// Returns `captured` unchanged when the capture recorded no time, when the
+/// recorded time is not plausibly a Unix timestamp (a zero or garbage field
+/// would otherwise throw the guest ~57 years forward), or when the host clock is
+/// behind the capture.
+fn advance_to_wall_clock(
+    captured: u64,
+    captured_realtime_ns: Option<u64>,
+    now_realtime_ns: u64,
+    guest_hz: u64,
+) -> u64 {
+    let Some(then) = captured_realtime_ns.filter(|ns| *ns >= PLAUSIBLE_EPOCH_FLOOR_NS) else {
+        return captured;
+    };
+    if guest_hz == 0 {
+        return captured;
+    }
+    let elapsed_ns = u128::from(now_realtime_ns.saturating_sub(then));
+    let ticks = elapsed_ns * u128::from(guest_hz) / 1_000_000_000;
+    captured.wrapping_add(u64::try_from(ticks).unwrap_or(0))
+}
+
+/// Host wall clock now, in nanoseconds since the Unix epoch.
+fn now_realtime_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
 }
 
 /// The frequency the counter should be made to run at: an explicit override
@@ -1409,6 +1473,50 @@ mod tests {
         );
         // `CHM_GUEST_CNTFRQ=0` opts out even though the capture states a rate.
         assert_eq!(effective_guest_hz(Some(0), Some(121_875_000)), 0);
+    }
+
+    /// A snapshot resumes frozen at the instant it was captured unless the
+    /// elapsed wall time is added back, and a stale guest clock is not cosmetic:
+    /// a 5-hour-old capture had `apt-get update` refuse two repositories as
+    /// "not valid yet". Converted with the frequency the GUEST believes it has,
+    /// since that is the rate it reads its own counter at.
+    #[test]
+    fn the_counter_is_advanced_over_the_time_a_snapshot_sat_still() {
+        const HZ: u64 = 121_875_000;
+        let then = PLAUSIBLE_EPOCH_FLOOR_NS + 86_400_000_000_000;
+
+        // Five hours later: 5 * 3600 * 121_875_000 ticks further on.
+        let five_hours = 5 * 3_600 * 1_000_000_000u64;
+        assert_eq!(
+            advance_to_wall_clock(1_000, Some(then), then + five_hours, HZ),
+            1_000 + 5 * 3_600 * HZ
+        );
+
+        // Same instant: nothing to add.
+        assert_eq!(advance_to_wall_clock(1_000, Some(then), then, HZ), 1_000);
+
+        // Host clock BEHIND the capture: never rewind the guest.
+        assert_eq!(
+            advance_to_wall_clock(1_000, Some(then), then - 60_000_000_000, HZ),
+            1_000
+        );
+
+        // A capture that recorded no time is left exactly as captured.
+        assert_eq!(advance_to_wall_clock(1_000, None, then, HZ), 1_000);
+
+        // A zero or otherwise implausible field would throw the guest ~57 years
+        // forward, so it is rejected rather than believed.
+        assert_eq!(advance_to_wall_clock(1_000, Some(0), then, HZ), 1_000);
+        assert_eq!(
+            advance_to_wall_clock(1_000, Some(PLAUSIBLE_EPOCH_FLOOR_NS - 1), then, HZ),
+            1_000
+        );
+
+        // Unknown guest frequency: the tick conversion is undefined, so skip it.
+        assert_eq!(
+            advance_to_wall_clock(1_000, Some(then), then + five_hours, 0),
+            1_000
+        );
     }
 
     /// The clock block is doubly encoded — a JSON string inside JSON — and a
