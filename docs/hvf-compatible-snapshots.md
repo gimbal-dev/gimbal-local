@@ -115,64 +115,68 @@ predicted — see [graviton-acid-test-results.md](graviton-acid-test-results.md)
 The guest is not corrupted; it stays internally consistent, which is exactly
 what makes it dangerous. It presents as a sluggish VM, not as a wrong clock.
 
-`chm` checks this at load and says so:
+**`chm` corrects this automatically.** A capture taken by a cloud-hypervisor
+build including upstream `69637dde6` records the frequency of the host it was
+taken on, so nothing has to be guessed or configured: the counter is
+rate-corrected on load and the guest keeps correct time.
 
 | variable | what it does |
 | --- | --- |
-| *(unset — the default)* | Warns loudly and **still runs**. A dilated guest is genuinely useful, and refusing would mean no cloud snapshot ever starts on a Mac. |
-| `CHM_STRICT_CNTFRQ=1` | Refuses to start on a mismatch, matching the KVM path's `CntfrqMismatch` rejection. Use it when a wrong clock would be worse than no run at all. |
-| `CHM_GUEST_CNTFRQ=<Hz>` | **Corrects the dilation.** Tells `chm` the counter frequency the guest believes it has, so it can synthesize that rate. A Graviton2 capture is `CHM_GUEST_CNTFRQ=121875000`. Measured effect: 5.081&times; dilation &rarr; **1.000&times;**. |
+| *(unset — the default)* | The capture's own recorded frequency is used and the dilation is corrected. `chm` prints a note saying so. A capture that records no frequency cannot be corrected, and `chm` says that instead of guessing. |
+| `CHM_GUEST_CNTFRQ=<Hz>` | Overrides the recorded value, or supplies one for a capture predating `69637dde6`. A Graviton2 capture is `121875000`. |
+| `CHM_GUEST_CNTFRQ=0` | **Declines the correction** and accepts the dilated clock, trading a wrong clock for ~2.8% of wall time. |
+| `CHM_STRICT_CNTFRQ=1` | Refuses to start on an *uncorrectable* mismatch, matching the KVM path's `CntfrqMismatch` rejection. |
 
-### Correcting a dilated guest — `CHM_GUEST_CNTFRQ`
+### How the correction works
 
 Apple exposes `hv_vcpu_set_vtimer_offset`, which is an *offset*, not a rate — but
-the offset is ours to move. Holding
-`CNTVCT_guest = base + (now - base_host) * guest_hz / host_hz` and re-programming
-the offset onto that curve at every guest entry synthesizes the rate the guest
-already believes it has. The ratio is > 1, so the offset only ever decreases and
-the guest counter never goes backwards.
+the offset is ours to move. A VM-global clock holds one offset shared by every
+vCPU and steps it forward periodically, so the guest's counter advances at the
+rate the guest already believes it has. Measured effect: **5.081× dilation →
+1.000×** — `sleep 20` inside a 2-vCPU Graviton2 guest takes 20.01 s of host wall
+clock, and `/proc/uptime` advances 20.02 guest-seconds over it.
 
-The value is **explicit rather than inferred**: a capture predating upstream
-`69637dde6` records no frequency at all, and silently guessing a guest's clock
-rate would be worse than a visibly slow guest. Captures that do record it can
-plumb it through automatically.
+#### One offset, shared, moved by a stop-the-world barrier
 
-```console
-$ CHM_GUEST_CNTFRQ=121875000 chm run <snapshot>
-```
+The offset is shared rather than per-vCPU, and that is the whole design. Linux
+treats `CNTVCT_EL0` as a single system-wide clocksource and reads it on whichever
+core it happens to be running, so two vCPUs must return the same value — not
+merely close values. `arch_sys_counter` is a **56-bit** clocksource and
+`clocksource_delta()` computes `(now - last) & mask`, so a read even *one tick*
+behind its predecessor is latched as `2^56` ticks ≈ **18.7 guest-years** forward.
+Bounded skew is therefore not an acceptable target; exact equality is.
 
-A capture taken by a cloud-hypervisor build predating upstream `69637dde6`
-records no counter frequency at all, so `chm` cannot verify it and says that
-instead of guessing.
+Since two vCPUs hold equal offsets only if the offset never changes while either
+is running, the stepper forces every vCPU out of `hv_vcpu_run`, publishes the new
+offset, and lets them back in. If it cannot get them all out in time it
+**abandons the step** — the guest stays coherent and merely runs slow for another
+window. Slow-but-correct beats fast-but-corrupt.
 
-#### ⚠️ Single-vCPU only, today
+#### The cost, measured
 
-The rate synthesis is **correct on a 1-vCPU guest and not yet correct on SMP.**
+The period trades barrier overhead against how far the guest's clock is allowed
+to lag before being caught up. Measured on a 2-vCPU Graviton2 capture:
 
-The offset is only re-stepped onto the curve when a vCPU *enters* the guest, so
-between two entries that vCPU's counter advances at the host rate rather than
-the scaled one. On one vCPU that is invisible: every read the guest makes is
-taken after an entry, so it lands on the curve. On several vCPUs it is not,
-because each vCPU exits at its own cadence — measured on a 2-vCPU Graviton2
-capture, **cpu0 re-stepped 117,950 times while cpu1 re-stepped 521**, since cpu1
-spent most of the run parked in `WFI`. The two counters therefore drift apart,
-and Linux treats `CNTVCT_EL0` as one coherent system-wide clocksource.
+| `CHM_VTIMER_STEP_MS` | wall time stopped | worst-case guest clock error |
+| --- | --- | --- |
+| 5 | 26.9% | 4 ms |
+| 10 | 10.1% | 8 ms |
+| **20 (default)** | **2.8%** | **16 ms** |
+| 50 | 0.8% | 40 ms |
 
-The symptom is not subtle. On a 2-vCPU capture with `CHM_GUEST_CNTFRQ` set,
-`/proc/uptime` moves **non-monotonically** — observed stepping forward ~1,241 s,
-back again, and occasionally latching onto an exact multiple of `2^58` ticks
-(~75 years). Without the variable the same capture is rock-steady at a uniform
-`0.197×` (exactly `1/5.078125`), i.e. simply slow.
+20 ms is the knee: below it the barrier cost climbs steeply as vCPUs spend their
+time bouncing in and out of the guest; above it the saving is small and the clock
+gets lumpy. `CHM_TRACE_VTIMER=1` reports the live duty cycle.
 
-So on a multi-vCPU capture the current choice is an honest one between a guest
-whose clock is *slow but sane* (leave `CHM_GUEST_CNTFRQ` unset) and one whose
-clock is *right on average but incoherent* (set it). **Leave it unset**, unless
-you are working on this bug. Tracked in `docs/roadmap.md` §5 under V5.1; the fix
-has to make the counter coherent across vCPUs rather than per-vCPU accurate.
+#### This also fixed the *uncorrected* path
 
-`CHM_DEBUG_VTIMER=1` traces every re-step — but note it is heavy enough to
-change the timing it observes, and has been seen to mask the divergence
-entirely.
+The per-vCPU offsets were seeded independently, on each vCPU's own thread at its
+own `mach_absolute_time()`, so they differed permanently even with no rate
+correction at all. Measured inside a 2-vCPU guest with a pinned two-thread
+ping-pong test that establishes a strict happens-before chain between reads:
+**19,992 of 40,000 strictly-ordered samples went backwards**, and the guest's
+`date` read **July 2101**. It is now 0 of 40,000, on both the corrected and
+uncorrected paths.
 
 ## Legacy path: GICv2M / message-SPI
 
