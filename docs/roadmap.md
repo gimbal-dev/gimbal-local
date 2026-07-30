@@ -3,16 +3,110 @@
 Gimbal Local rehydrates Cloud Hypervisor arm64 / KVM snapshots onto Apple
 Hypervisor.framework (HVF), so a workload captured in the cloud can be brought
 down and run — or resumed *past where it left off* — on an Apple-silicon Mac.
-This doc is the tidy map: the vision it serves, what is shipped and proven, and
-what remains.
 
-It is a companion to [`macos-local-runtime.md`](macos-local-runtime.md) (the
-architecture) — read that for *how* the port works; read this for *where the
-product is going*.
+Companion to [`macos-local-runtime.md`](macos-local-runtime.md) (the
+architecture): read that for *how* the port works, this for *where it is going*.
 
 ---
 
-## The vision: four capability pillars (V0)
+## 1. The dream, and how much of it is true
+
+> **A Cloud Hypervisor snapshot from the cloud is brought down and rehydrated on
+> a Mac, where it runs as a secure local sandbox — and a coding agent works
+> inside it.**
+
+Four sentences, in dependency order. This is the honest score:
+
+| | | |
+| --- | --- | --- |
+| **1. A vanilla cloud snapshot runs on a Mac.** | ✅ **true, hardware-proven** | Stock upstream, unforked, Graviton2-captured, **no flags and no environment variables**, through all three entry points (`chm run`, `chm serve`, the app). |
+| **2. It is a *secure* sandbox.** | ✅ **true, and it is enforced rather than asserted** | 12 invariants, default-on posture, `chm posture` reports what is actually in force and exits non-zero if anything is weakened. |
+| **3. It round-trips with the cloud.** | 🟡 **half true** | Cross-substrate mobility is proven (a cloud session resumed on HVF *past its marker*). The signed-manifest contract (V3) is not finished, and it is cross-repo. |
+| **4. A coding agent works inside it.** | 🔴 **not yet** | Measured, not guessed. Two blockers left: the capture has **no NIC**, and the image has **no toolchain**. |
+
+**What changed the shape of the plan:** V1–V4 were about making it *work*. That
+part is done. What remains is making it a *product* — evidence for the parts we
+built but never proved end-to-end (V5.1), an image worth running (V5.3), and a
+UI that shows any of it (V6).
+
+---
+
+## 2. What is actually blocking us — one place
+
+Everything below is ordered by *what kind* of blocker it is, because they need
+very different things from us.
+
+### 🔴 Blocker A — we have no capture with a NIC
+
+**This is the single highest-value gap in the whole plan**, because it is the
+only one where **the code already exists and only the evidence is missing.**
+
+The userspace NAT, the egress allow-list and the V5.2 credential proxy are all
+built and all tested against the real internet *from the host side*. **None of
+them has ever met a real cloud capture**, because every capture we hold was
+taken with `net = None` — `ip -br link` inside a live rehydrated guest shows
+loopback and nothing else. No `git clone`, no `npm install`, no API call.
+
+**Why we cannot just make one on the Mac.** Cloud Hypervisor snapshots are
+produced by Cloud Hypervisor running on Linux/KVM. The Mac is the *consumer* in
+this architecture — deliberately, that is the entire product. Apple silicon
+cannot run arm64 KVM, so it cannot manufacture the artifact it is designed to
+receive. Something else has to produce it.
+
+**What we actually need is not AWS.** It is *an arm64 Linux box with KVM that
+can create a **VGICv3** device* — `/dev/kvm` alone is not enough, because the
+capture path creates a VGICv3. Three ways to get one:
+
+| Route | Effort | Status | Notes |
+| --- | --- | --- | --- |
+| **AWS Graviton bare-metal** | ~an afternoon, costs money per hour | **credentials already work** (`chm-aws` profile authenticates today) | Documented end to end in [`aws-byo-setup.md`](aws-byo-setup.md) — quota, bucket, security group, launch, capture, stop spending. |
+| **Raspberry Pi 5** | one-off hardware, then free | plan written, untried | [`raspberry-pi-offbox-plan.md`](raspberry-pi-offbox-plan.md). **Pi 5 only** — Pi 4 commonly exposes GICv2 and would need a whole new VGICv2 ingest path. Proves "a physically separate Linux/KVM arm64 box", which de-risks the cloud milestone without retiring it. |
+| **gimbal cloud runs it for us** | none of ours | the ask is written | [`graviton-capture-request.md`](graviton-capture-request.md) — round 2, with the two round-1 bugs in our own request already fixed. |
+
+**Any of the three unblocks V5.1 and V1.6.** They are not alternatives in value,
+only in cost: AWS gives the most faithful artifact, the Pi gives the fastest
+independent one.
+
+### 🟡 Blocker B — the image is a demo VM, not a build environment
+
+Measured inside a live guest: **1 vCPU, 953 MiB RAM, 2.4 GB disk at 74 % full**,
+and `gcc` `make` `node` `npm` `go` `cargo` all missing. This is an *image*
+problem, not a hypervisor problem — no amount of work on `chm` fixes it. **V5.3.**
+
+### 🟠 Blocker C — cross-repo, not ours to close
+
+V3.1 and V3.3 need `gctl` changes. Our side of V3.1 is already corrected.
+
+### ✅ Not blocked — we can start today
+
+**V6 (the app tells the whole truth)** and **V5.4 (cold create-from-image)** need
+nothing from anyone else.
+
+---
+
+## 3. The spine
+
+| | Milestone | Pillar | Status |
+| --- | --- | --- | --- |
+| **V1** | Make a real cloud snapshot run | ① | ✅ **complete** — acid test passed, clock fixed, CPU deltas audited |
+| **V2** | Vanilla everywhere in the product | ①③ | ✅ **complete** — CLI, daemon and app all run vanilla, flagless |
+| **V3** | Cloud control plane on the vanilla contract | ②④ | 🟠 partly blocked cross-repo (#21, #36) |
+| **V4** | Security with sane defaults | ③ | ✅ **complete** — threat model, default posture, `chm posture` |
+| **V5** | The coding-agent sandbox | ①③ | 🔴 **the current thrust** — V5.2 shipped; V5.1 needs a capture, V5.3 needs an image |
+| **V6** | The app tells the whole truth | ③④ | ⬜ **ready to start, nothing blocking it** |
+
+**Recommended order of attack:**
+
+1. **V5.1** — clear Blocker A by whichever of the three routes is cheapest today.
+   Highest value per unit of work in the entire plan.
+2. **V6.1–V6.3** — the local half of the UI. Needs nobody. Can proceed in
+   parallel with, or during, the wait for a capture.
+3. **V5.3** — a real agent image, once there is a NIC to install a toolchain over.
+4. **V6.4 / V3** — the off-box round-trip, once the contract lands.
+
+---
+
+## 4. The vision it serves (V0)
 
 The end state, shared with the control plane
 ([Gimbal Cloud](https://github.com/gimbal-dev/gimbal-cloud-control)), is four
@@ -36,9 +130,7 @@ source of truth; `chm`-on-HVF (Mac) and cloud-hypervisor-on-KVM (cloud) are
 [runner contract](https://github.com/gimbal-dev/gimbal-cloud-control/blob/main/docs/runner-contract.md).
 A capability that only works on one substrate is not done.
 
----
-
-## The line: what Gimbal Local owns
+### The line: what Gimbal Local owns
 
 Gimbal Local owns everything on the Mac — the **app** (`app/GimbalLocal`), the
 **engine + daemon** (`chm`, `hypervisor/src/hvf/`), and the thin **runner client**
@@ -49,7 +141,121 @@ source of truth.
 
 ---
 
-## Milestones to date (shipped & proven)
+## 5. Milestone detail
+
+### V1 · Make a real cloud snapshot run ✅
+
+The milestone that proves the vision. **V1.5 passed on 2026-07-28** — see
+[`graviton-acid-test-results.md`](graviton-acid-test-results.md). V1.1 was
+answered as a side effect, and V1.3 — the hard problem — is now solved: **V1 is complete.**
+
+| | Task | Status / blocked on |
+| --- | --- | --- |
+| V1.1 | Establish what `CNTFRQ_EL0` an HVF guest actually sees. | ✅ **Done.** No bare-metal payload needed after all: the guest's own dmesg in the RAM image states it. Mac/HVF = **24 000 000 Hz**; Graviton2 = **121 875 000 Hz**. Confirmed three independent ways (boot log, a measured 5.080× dilation vs 5.078125 predicted, and `CNTVCT`÷rate cross-checked against cloud-init's timestamps). |
+| V1.2 | Guard the HVF rehydrate path against a frequency mismatch: parse the clock block, compare against the host, say so loudly. (#104) | ✅ **Done.** Ships on both the CLI and daemon paths. Warns by default and still runs — deliberately diverging from KVM, because a dilated guest is genuinely useful and refusing would mean no cloud snapshot ever starts on a Mac. `CHM_STRICT_CNTFRQ=1` opts in to the KVM rejection. A capture predating `69637dde6` carries no clock block, so the guard reports that it cannot verify rather than guessing. |
+| V1.3 | **Fix the 5.08&times; dilation.** (#108) Apple exposes `hv_vcpu_set_vtimer_offset` — an *offset*, never a *rate* — but the offset is ours to move. Holding `CNTVCT_guest = base + (now - base_host) * guest_hz / host_hz` and re-stepping the offset onto that curve at every guest entry synthesizes the rate. `121875000/24000000` reduces to exactly `325/64`, so u128 integer math accumulates **zero drift**. Enabled explicitly with `CHM_GUEST_CNTFRQ=<Hz>`. | ✅ **Done — measured 1.000&times;, down from 5.081&times;.** Guest `sleep 5` takes 5.00 s of host wall clock (was 25.40 s); three consecutive runs at 1.001 / 1.000 / 1.000. Boot-to-shell also halved, 2.19 s &rarr; 1.09 s. Instrument: `scripts/hvf/measure-clock-dilation.py`, validated by first reproducing the known 5.08&times; baseline. |
+| V1.4 | Audit the rest of the bug class: MPIDR/affinity layout, `ID_AA64*` feature registers, cache topology, GIC `IIDR` — anywhere a guest probed the *capture* host and cached the answer. | ✅ **Done 2026-07-29 — and it found a new bug.** 238 captured registers replayed against a real HVF vCPU: 105 restored, 133 refused, 0 clamped. Every `ID_AA64*`/`MIDR`/`MPIDR` restores exactly, which is *why* a Graviton guest runs here at all. The bug is the inverse of the one we went looking for: `ID_AA64PFR0_EL1.EL0 = 2` (AArch32 at EL0) is restored **faithfully**, so the guest still believes it can run 32-bit binaries — and executing one **permanently wedges the vCPU**, verified against a control that the shell survives. Warned at load; `CHM_STRICT_AARCH32=1` refuses. Also: `CTR_EL0.DIC` differs in exactly one bit (latent, stressed without fault) and the `DC ZVA` block size is identical (hazard closed). Instrument: `chm sysregs`. Full report: [`cpu-feature-deltas.md`](cpu-feature-deltas.md). |
+| V1.5 | **THE ACID TEST** — rehydrate a genuine vanilla Graviton capture (#105). | ✅ **PASSED 2026-07-28.** Three Graviton2 captures, all restored, all reached an interactive login shell, no code changes. |
+| V1.6 | **Round 2 capture.** Round 1 exposed two bugs in our own request: it pinned `CH_VERSION=v52.0`, which predates the clock block entirely, and the captures fired mid-cloud-init so the guest restarts its getty ~113 s after resume. Both fixed in the request. | gimbal cloud |
+
+The capture we need, precisely: [`graviton-capture-request.md`](graviton-capture-request.md).
+
+### V2 · Vanilla everywhere in the product ✅
+
+| | Task | Blocked on |
+| --- | --- | --- |
+| V2.1 | Wire the userspace GIC into `chm serve` (#102). Factor the ~525-line `run_usgic` engine so CLI and daemon share it, checkpoint/resume included. | ✅ **Done.** `run_usgic_engine(cfg, loaded, supervise)` is shared by both entry points. The daemon reaches an interactive shell on a vanilla Graviton capture (`ubuntu@ch-snap:~$`, `uname -a` → `6.8.0-136-generic aarch64`), Stop → Start round-trips live guest RAM (a bash variable set before the stop echoed back after it), and checkpoints interoperate in both directions with the CLI's. Adds a `chm ctl input` command, because the daemon's console was read-only and a resumed guest emits nothing until typed at. |
+| V2.2 | The SwiftUI app opens, runs, stops and resumes a vanilla snapshot end to end. | ✅ **Done (#114).** Two things were in the way and both are fixed: the app's restorability gate still demanded `gicv2m-message-spi`, so it refused snapshots the runner would happily run (it now mirrors `hvf_restorable`, and separates "this Mac can restore it" from "the plane will release it"); and the console was read-only, which is fatal for a vanilla capture because it resumes at a login prompt and emits nothing until typed at. Input now goes through `chm ctl input`. **Hardware evidence:** from the app, no flags, no environment variables, against a vanilla ITS/LPI Graviton capture — logged in as `ubuntu`, `uname -m` → `aarch64`. Stop wrote a real checkpoint (1 GiB `memory-ranges`); resuming it came back already at `ubuntu@ch-snap:~$` with an in-RAM-only marker intact, so live state genuinely survives Stop → Start. |
+| V2.3 | ~~Retire `CHM_USERSPACE_GIC=1`~~ **done as auto-routing.** Both `chm run` and `chm serve` ask `routes_completions_as_lpis()` and send ITS/LPI captures to the userspace GICv3 with no flag, so a vanilla Graviton snapshot reaches a shell with zero environment variables. Only bundles the managed GIC would have refused outright change path. **The three vestigial forcing mechanisms are now gone (#115):** `HvfVcpu::new` no longer reads the variable to seed `UserGic::enabled` (a library crate letting a process-global change per-vCPU interrupt semantics — a vCPU could have come up trapping ICC registers with no distributor behind them), and the runner no longer sets it on the child (belt-and-braces that would have hidden an auto-routing regression). It survives only as a genuine A/B override on `chm run`/`chm serve`. **Still open:** whether the userspace GIC should also take *GICv2M* captures, so there is one path rather than a routing decision. | V1.5 |
+
+### V3 · Cloud control plane on the vanilla contract 🟠
+
+| | Task | Blocked on |
+| --- | --- | --- |
+| V3.1 | `gctl` should stop gating on GIC mode entirely: as of V2.1 a vanilla ITS/LPI capture runs under **both** `chm run` and `chm serve`, so an `assign-run` 422 on `gic_mode: its-lpi` now refuses bundles we can run. Our side of the earlier confusion is corrected in `d8511789d`. | gctl |
+| V3.2 | One-command `pull → verify → run`, fail-closed. | V3.3 |
+| V3.3 | Signed snapshot manifest + verification, unified trust root (#36). | gctl |
+
+### V4 · Security with sane defaults ✅
+
+| | Task | Status |
+| --- | --- | --- |
+| V4.1 | Threat model + hardening checklist umbrella (#39). A rehydrated snapshot is untrusted code with a device model attached. | ✅ **Done.** [`security-model.md`](security-model.md) carries the threat model, invariants I1–I10 and the checklist; §1a now adds **the default posture** — what is true of a run with no flags, no env and no config — including a written argument for the two controls that are deliberately *not* default-on. Made executable as `chm posture`, which resolves the same sources the run path resolves, reports every control with how it was decided, and exits non-zero if anything is weakened. A checklist in a document says what we intended; a control you believe is on but is not is worse than one you know is off. |
+| V4.2 | Make egress allow-list, reserved-address guard and CoW isolation the **default** posture with a documented opt-out (#20). | ✅ **Done.** Audited what was actually on out of the box rather than assuming: the reserved-address guard (I10) and CoW/overlay confinement (I2/I3) were already default-on, but **resource ceilings were not** — an unconfigured workspace resolved to *unbounded*. Now resolves to a `chm` baseline (≤64 vCPU, RAM ≤ host physical, overlay ≤64 GiB, console ≤1 GiB, ≤128 NAT sockets) with `CHM_LIMITS=none` as the documented opt-out. Verified the acid test still passes under the new ceilings. Egress stays open-to-the-internet by design — §1a argues why default-deny would be the worse security outcome. |
+
+### V5 · The coding-agent sandbox — measured gap list **[the current thrust]**
+
+V1–V4 deliver the sentence *"a vanilla Cloud Hypervisor snapshot from the cloud
+just works on my Mac, safely."* That sentence is true. It is **not** the same as
+*"a developer's coding agent runs in this sandbox"*, and the difference was
+measured rather than assumed, inside a live rehydrated `graviton-1` guest on
+2026-07-30:
+
+| what a coding agent needs | measured | gap |
+| --- | --- | --- |
+| 64-bit userspace | `aarch64`, **2382 ELF binaries, 0 of them 32-bit**, no `armhf` multiarch | ✅ none — the V1.4 AArch32 wedge is effectively unreachable |
+| **network** | `ip -br link` → **loopback only**, no routes; the capture config says `net = None` | 🔴 **blocker.** No `git clone`, no `npm install`, no API call. We *built* the userspace NAT and egress policy but have never run them against a real cloud capture |
+| **CPU / RAM / disk** | 1 vCPU · 953 MiB · 2.4 GB disk, **74 % full, 634 MB free** | 🔴 **blocker.** A demo VM, not a build environment |
+| **toolchain** | `git` ✅ `python3` ✅ `curl` ✅ — `gcc` `make` `node` `npm` `go` `cargo` **all missing** | 🟡 an *image* problem, not a hypervisor problem: needs a purpose-built agent image, not stock Ubuntu cloud |
+| **developer's code in / out** | credential-injecting egress proxy (V5.2) | ✅ **answered without touching I1.** The repo does not need to be *passed in*: the sandbox authenticates and clones it. The credential is attached at the network edge and is never present in the guest, so a compromised job cannot carry one out. Remaining caveat: this covers *remote-call* secrets; a secret a local tool must actually read still has to live in the guest |
+| **fresh sandbox from an image** | every start is a rehydrate | 🟡 #101 |
+
+| | Task | Status |
+| --- | --- | --- |
+| V5.1 | **Capture with a NIC and 2+ vCPU**, and prove the NAT, the egress policy *and* the V5.2 credential proxy on a real cloud snapshot. Highest value in the plan: the only blocker where the code already exists and only the evidence is missing. **Not blocked on gimbal cloud** — see §2 *Blocker A*: there are three routes, AWS BYO is self-serve, and those credentials already authenticate. | ⬜ a capture (3 routes) |
+| V5.2 | **How a developer's repo enters the sandbox — answered, and shipped.** The decision was that this is a *credentials* problem, not a filesystem one: a sandbox that can authenticate to GitHub clones the repo itself, so I1 stands untouched. A TLS-terminating egress proxy attaches the credential as the request leaves for a rule-named destination; the guest never holds a secret. Proven live against api.github.com (200 with the rule, 401 without, identical request bytes) and against registry.npmjs.org. New invariant **I12**; `chm proxy show/ca/check`; [`credential-proxy.md`](credential-proxy.md). | ✅ done |
+| V5.3 | **A purpose-built agent image** (toolchain, sensible disk, agent runtime) rather than a stock cloud image. Needs V5.1 first: installing a toolchain requires a NIC. | ⬜ after V5.1 |
+| V5.4 | Cold create-from-image (#101) so a fresh sandbox does not require a pre-existing capture. | ⬜ nothing blocking |
+
+### V6 · The app tells the whole truth
+
+**The problem, stated plainly: `chm` has 22 subcommands and the app drives 8.**
+Everything we have built to make a local sandbox *trustworthy* — the security
+posture, the egress audit trail, the credential proxy shipped in V5.2 — is
+reachable only by someone who knows to type it. A person evaluating whether to
+run untrusted code on their Mac cannot see any of it.
+
+That is not a cosmetic gap. The pitch is "cloud snapshots run locally **in a
+secure way**", and right now the app can only demonstrate the first half. A
+control that nobody can see is, for most users, a control that does not exist.
+
+The same is true of the **off-box** half. The dream — *bring a cloud snapshot
+down and rehydrate it here* — is `chm pull`, and it is CLI-only. The app's Cloud
+tab today counts what the control plane has (`runners`, `snapshots`,
+`sandboxes`, running cost); it cannot *move* anything.
+
+#### The audit
+
+| `chm` capability | In the app? | Why it matters that it isn't |
+| --- | --- | --- |
+| `run` / `ctl` / `fork` / `revisions` / `rollback` / `branches` / `workspace` / `limits` / `firewall` / `runner` | ✅ yes | The local lifecycle is well covered. |
+| **`posture`** | ❌ **no** | 12 security invariants, including I12 shipped today. The single most important thing to surface, and the only place a user learns what is *weakened*. |
+| **`proxy`** (`show` / `ca` / `check`) | ❌ **no** | Shipped in V5.2 and completely invisible. The CA install step in particular is a *guest-side* action the app should hand to you, not something to find in a doc. |
+| **`audit`** | ❌ **no** | What did this sandbox actually reach? Answering that in a UI is most of the value of having recorded it. |
+| **`policy`** | ❌ **no** | `firewall` is wired but the control-plane egress policy behind it is not shown, so a governed session looks identical to an ungoverned one. |
+| **`pull` / `push`** | ❌ **no** | *This is the dream, and it is CLI-only.* |
+| **`cloud`** | 🟡 read-only | Counts and cost, no actions. |
+| **`state-cdn`** | ❌ **no** | The off-box memory plane is invisible; there is no way to see whether a rehydrate streamed pages or read them locally. |
+| `manifest` / `sysregs` / `serve` / `connect` | — | Diagnostics. CLI is the right home; a "copy diagnostics" affordance is enough. |
+
+| | Task | Size |
+| --- | --- | --- |
+| V6.1 | **Security panel.** Render `chm posture --json` as first-class UI: each invariant with its state (on / n/a / **weakened**), what weakened it, and the exact env var or flag responsible. Weakened must be visually loud — that is the whole point of computing it. | M |
+| V6.2 | **Credential proxy UI.** Show the rule set, which destinations are intercepted vs relayed, and where each credential comes from (never its value). A one-click **"install CA in guest"** that runs the `chm proxy ca --for-guest` script through the existing interactive console, and a **"test this rule"** button wrapping `chm proxy check` — including the control run, because a green tick that cannot fail is not evidence. | M |
+| V6.3 | **Egress + audit view.** The policy in force (with its content hash), and a live decision log — allowed, denied, relayed, injected — per sandbox. Feeds off `chm audit` and `CHM_PROXY_LOG`. | M |
+| V6.4 | **Off-box round-trip.** `pull` a cloud snapshot and `push` a local one, with progress, from the Cloud tab. This is the dream expressed as a button. Includes surfacing `state-cdn` so a streamed rehydrate is legible as such. | L |
+| V6.5 | **Capability honesty.** One place that states what this build can and cannot do — HVF backend, vanilla-snapshot support, the V5 gap list — so nobody has to infer it from whether a thing crashed. | S |
+
+**Ordering note.** V6.1–V6.3 are all local and can ship without a cloud
+dependency. V6.4 needs the control plane and shares the V5.1 blocker, so it goes
+last.
+
+---
+
+
+---
+
+## 6. Shipped & proven — how we got here
 
 The port was built as a long series of hardware-proven milestones (`M1`–`M24`),
 then the cloud-integration work that followed. Grouped by theme:
@@ -109,24 +315,19 @@ from cache in 0.077 s).
 
 ---
 
-## Where we actually are (2026-07-29)
+### Why a vanilla capture runs here at all
 
-**The dream sentence is true.** A **vanilla** — stock upstream, unforked — arm64
-Cloud Hypervisor KVM snapshot **captured on an AWS Graviton2 host** rehydrates on
-Apple silicon and runs an interactive login shell, **with no code changes, no
-flags and no environment variables**, through **all three** entry points: the
-`chm run` CLI, the `chm serve` daemon, and the Gimbal Local SwiftUI app.
-
-That works because of the **userspace GICv3** (M-USGIC): a software
-distributor/redistributor/ITS and a trapped CPU interface, delivering the LPIs
-Apple's managed GIC cannot, while HVF still executes the vCPUs. It is a real
-interrupt controller, not a compatibility shim.
+The **userspace GICv3** (M-USGIC): a software distributor / redistributor / ITS
+and a trapped CPU interface, delivering the LPIs Apple's managed GIC cannot,
+while HVF still executes the vCPUs. It is a real interrupt controller, not a
+compatibility shim. Both `chm run` and `chm serve` ask
+`routes_completions_as_lpis()` and route ITS/LPI captures to it **with no flag**.
 
 Locally captured fixtures additionally demonstrate virtio disk, virtio net + NAT
 egress, SMP and checkpoint/resume, at **247 ms** start-to-ready against Docker
 Sandbox's **12.73 s** on the same host.
 
-**Every problem that blocked the crossing is now closed:**
+### The three problems that blocked the crossing — all closed
 
 1. ~~**We have never rehydrated a real cloud snapshot.**~~ **Done, 2026-07-28.**
    Three vanilla Graviton2 captures restored and ran an interactive shell. Full
@@ -136,95 +337,15 @@ Sandbox's **12.73 s** on the same host.
    121 875 000 Hz` against Apple silicon's `24 000 000 Hz`, and a Linux guest
    caches the rate at boot. Apple exposes a vtimer *offset*, never a *rate* — but
    the offset is ours to move, so re-stepping it onto `base + (now - base_host) ×
-   guest_hz / host_hz` at every guest entry synthesizes the rate. `325/64` reduces
-   exactly, so u128 math drifts zero.
-3. ~~**`chm serve` rejects vanilla** (#102).~~ **Fixed in V2.1**, and V2.2 took it
-   the rest of the way into the app.
-
-**What remains is no longer about making it work — it is about making it a
-product.** The open work is the cloud contract (V3), security defaults (V4), and
-a cold create-from-image path (#101). See the spine below.
+   guest_hz / host_hz` at every guest entry synthesizes the rate. `325/64`
+   reduces exactly, so u128 math drifts zero.
+3. ~~**`chm serve` rejects vanilla** (#102).~~ **Fixed in V2.1**, and V2.2 took
+   it the rest of the way into the app.
 
 ---
 
-## Milestones remaining — the vanilla-first spine
+## 7. Deferred, deliberately
 
-Re-cut 2026-07-28 against the original vision: *snapshots just work → cloud
-integration → UI → security with sane defaults*. Everything is ordered by what
-makes a **vanilla cloud snapshot run everywhere in the product**.
-
-| | Milestone | Pillar | Status | Issues |
-| --- | --- | --- | --- | --- |
-| **V1** | **Make a real cloud snapshot run** | ① | ✅ **complete** — acid test passed, clock fixed | ~~#104~~, ~~#105~~, ~~#108~~ |
-| **V2** | **Vanilla everywhere in the product** | ①③ | ✅ **complete** — CLI, daemon and app all run vanilla flagless | ~~#102~~ |
-| **V3** | **Cloud control plane on the vanilla contract** | ②④ | **the current thrust**; partly blocked cross-repo | #21, #36, #5 |
-| **V4** | **Security with sane defaults** | ③ | substantially shipped; needs the umbrella | #39, #20 |
-
-### V1 · Make a real cloud snapshot run ✅
-
-The milestone that proves the vision. **V1.5 passed on 2026-07-28** — see
-[`graviton-acid-test-results.md`](graviton-acid-test-results.md). V1.1 was
-answered as a side effect, and V1.3 — the hard problem — is now solved: **V1 is complete.**
-
-| | Task | Status / blocked on |
-| --- | --- | --- |
-| V1.1 | Establish what `CNTFRQ_EL0` an HVF guest actually sees. | ✅ **Done.** No bare-metal payload needed after all: the guest's own dmesg in the RAM image states it. Mac/HVF = **24 000 000 Hz**; Graviton2 = **121 875 000 Hz**. Confirmed three independent ways (boot log, a measured 5.080× dilation vs 5.078125 predicted, and `CNTVCT`÷rate cross-checked against cloud-init's timestamps). |
-| V1.2 | Guard the HVF rehydrate path against a frequency mismatch: parse the clock block, compare against the host, say so loudly. (#104) | ✅ **Done.** Ships on both the CLI and daemon paths. Warns by default and still runs — deliberately diverging from KVM, because a dilated guest is genuinely useful and refusing would mean no cloud snapshot ever starts on a Mac. `CHM_STRICT_CNTFRQ=1` opts in to the KVM rejection. A capture predating `69637dde6` carries no clock block, so the guard reports that it cannot verify rather than guessing. |
-| V1.3 | **Fix the 5.08&times; dilation.** (#108) Apple exposes `hv_vcpu_set_vtimer_offset` — an *offset*, never a *rate* — but the offset is ours to move. Holding `CNTVCT_guest = base + (now - base_host) * guest_hz / host_hz` and re-stepping the offset onto that curve at every guest entry synthesizes the rate. `121875000/24000000` reduces to exactly `325/64`, so u128 integer math accumulates **zero drift**. Enabled explicitly with `CHM_GUEST_CNTFRQ=<Hz>`. | ✅ **Done — measured 1.000&times;, down from 5.081&times;.** Guest `sleep 5` takes 5.00 s of host wall clock (was 25.40 s); three consecutive runs at 1.001 / 1.000 / 1.000. Boot-to-shell also halved, 2.19 s &rarr; 1.09 s. Instrument: `scripts/hvf/measure-clock-dilation.py`, validated by first reproducing the known 5.08&times; baseline. |
-| V1.4 | Audit the rest of the bug class: MPIDR/affinity layout, `ID_AA64*` feature registers, cache topology, GIC `IIDR` — anywhere a guest probed the *capture* host and cached the answer. | ✅ **Done 2026-07-29 — and it found a new bug.** 238 captured registers replayed against a real HVF vCPU: 105 restored, 133 refused, 0 clamped. Every `ID_AA64*`/`MIDR`/`MPIDR` restores exactly, which is *why* a Graviton guest runs here at all. The bug is the inverse of the one we went looking for: `ID_AA64PFR0_EL1.EL0 = 2` (AArch32 at EL0) is restored **faithfully**, so the guest still believes it can run 32-bit binaries — and executing one **permanently wedges the vCPU**, verified against a control that the shell survives. Warned at load; `CHM_STRICT_AARCH32=1` refuses. Also: `CTR_EL0.DIC` differs in exactly one bit (latent, stressed without fault) and the `DC ZVA` block size is identical (hazard closed). Instrument: `chm sysregs`. Full report: [`cpu-feature-deltas.md`](cpu-feature-deltas.md). |
-| V1.5 | **THE ACID TEST** — rehydrate a genuine vanilla Graviton capture (#105). | ✅ **PASSED 2026-07-28.** Three Graviton2 captures, all restored, all reached an interactive login shell, no code changes. |
-| V1.6 | **Round 2 capture.** Round 1 exposed two bugs in our own request: it pinned `CH_VERSION=v52.0`, which predates the clock block entirely, and the captures fired mid-cloud-init so the guest restarts its getty ~113 s after resume. Both fixed in the request. | gimbal cloud |
-
-The capture we need, precisely: [`graviton-capture-request.md`](graviton-capture-request.md).
-
-### V2 · Vanilla everywhere in the product ✅
-
-| | Task | Blocked on |
-| --- | --- | --- |
-| V2.1 | Wire the userspace GIC into `chm serve` (#102). Factor the ~525-line `run_usgic` engine so CLI and daemon share it, checkpoint/resume included. | ✅ **Done.** `run_usgic_engine(cfg, loaded, supervise)` is shared by both entry points. The daemon reaches an interactive shell on a vanilla Graviton capture (`ubuntu@ch-snap:~$`, `uname -a` → `6.8.0-136-generic aarch64`), Stop → Start round-trips live guest RAM (a bash variable set before the stop echoed back after it), and checkpoints interoperate in both directions with the CLI's. Adds a `chm ctl input` command, because the daemon's console was read-only and a resumed guest emits nothing until typed at. |
-| V2.2 | The SwiftUI app opens, runs, stops and resumes a vanilla snapshot end to end. | ✅ **Done (#114).** Two things were in the way and both are fixed: the app's restorability gate still demanded `gicv2m-message-spi`, so it refused snapshots the runner would happily run (it now mirrors `hvf_restorable`, and separates "this Mac can restore it" from "the plane will release it"); and the console was read-only, which is fatal for a vanilla capture because it resumes at a login prompt and emits nothing until typed at. Input now goes through `chm ctl input`. **Hardware evidence:** from the app, no flags, no environment variables, against a vanilla ITS/LPI Graviton capture — logged in as `ubuntu`, `uname -m` → `aarch64`. Stop wrote a real checkpoint (1 GiB `memory-ranges`); resuming it came back already at `ubuntu@ch-snap:~$` with an in-RAM-only marker intact, so live state genuinely survives Stop → Start. |
-| V2.3 | ~~Retire `CHM_USERSPACE_GIC=1`~~ **done as auto-routing.** Both `chm run` and `chm serve` ask `routes_completions_as_lpis()` and send ITS/LPI captures to the userspace GICv3 with no flag, so a vanilla Graviton snapshot reaches a shell with zero environment variables. Only bundles the managed GIC would have refused outright change path. **The three vestigial forcing mechanisms are now gone (#115):** `HvfVcpu::new` no longer reads the variable to seed `UserGic::enabled` (a library crate letting a process-global change per-vCPU interrupt semantics — a vCPU could have come up trapping ICC registers with no distributor behind them), and the runner no longer sets it on the child (belt-and-braces that would have hidden an auto-routing regression). It survives only as a genuine A/B override on `chm run`/`chm serve`. **Still open:** whether the userspace GIC should also take *GICv2M* captures, so there is one path rather than a routing decision. | V1.5 |
-
-### V3 · Cloud control plane on the vanilla contract **[the current thrust]**
-
-| | Task | Blocked on |
-| --- | --- | --- |
-| V3.1 | `gctl` should stop gating on GIC mode entirely: as of V2.1 a vanilla ITS/LPI capture runs under **both** `chm run` and `chm serve`, so an `assign-run` 422 on `gic_mode: its-lpi` now refuses bundles we can run. Our side of the earlier confusion is corrected in `d8511789d`. | gctl |
-| V3.2 | One-command `pull → verify → run`, fail-closed. | V3.3 |
-| V3.3 | Signed snapshot manifest + verification, unified trust root (#36). | gctl |
-
-### V4 · Security with sane defaults
-
-| | Task | Status |
-| --- | --- | --- |
-| V4.1 | Threat model + hardening checklist umbrella (#39). A rehydrated snapshot is untrusted code with a device model attached. | ✅ **Done.** [`security-model.md`](security-model.md) carries the threat model, invariants I1–I10 and the checklist; §1a now adds **the default posture** — what is true of a run with no flags, no env and no config — including a written argument for the two controls that are deliberately *not* default-on. Made executable as `chm posture`, which resolves the same sources the run path resolves, reports every control with how it was decided, and exits non-zero if anything is weakened. A checklist in a document says what we intended; a control you believe is on but is not is worse than one you know is off. |
-| V4.2 | Make egress allow-list, reserved-address guard and CoW isolation the **default** posture with a documented opt-out (#20). | ✅ **Done.** Audited what was actually on out of the box rather than assuming: the reserved-address guard (I10) and CoW/overlay confinement (I2/I3) were already default-on, but **resource ceilings were not** — an unconfigured workspace resolved to *unbounded*. Now resolves to a `chm` baseline (≤64 vCPU, RAM ≤ host physical, overlay ≤64 GiB, console ≤1 GiB, ≤128 NAT sockets) with `CHM_LIMITS=none` as the documented opt-out. Verified the acid test still passes under the new ceilings. Egress stays open-to-the-internet by design — §1a argues why default-deny would be the worse security outcome. |
-
-### V5 · The coding-agent sandbox — measured gap list
-
-V1–V4 deliver the sentence *"a vanilla Cloud Hypervisor snapshot from the cloud
-just works on my Mac, safely."* That sentence is true. It is **not** the same as
-*"a developer's coding agent runs in this sandbox"*, and the difference was
-measured rather than assumed, inside a live rehydrated `graviton-1` guest on
-2026-07-30:
-
-| what a coding agent needs | measured | gap |
-| --- | --- | --- |
-| 64-bit userspace | `aarch64`, **2382 ELF binaries, 0 of them 32-bit**, no `armhf` multiarch | ✅ none — the V1.4 AArch32 wedge is effectively unreachable |
-| **network** | `ip -br link` → **loopback only**, no routes; the capture config says `net = None` | 🔴 **blocker.** No `git clone`, no `npm install`, no API call. We *built* the userspace NAT and egress policy but have never run them against a real cloud capture |
-| **CPU / RAM / disk** | 1 vCPU · 953 MiB · 2.4 GB disk, **74 % full, 634 MB free** | 🔴 **blocker.** A demo VM, not a build environment |
-| **toolchain** | `git` ✅ `python3` ✅ `curl` ✅ — `gcc` `make` `node` `npm` `go` `cargo` **all missing** | 🟡 an *image* problem, not a hypervisor problem: needs a purpose-built agent image, not stock Ubuntu cloud |
-| **developer's code in / out** | credential-injecting egress proxy (V5.2) | ✅ **answered without touching I1.** The repo does not need to be *passed in*: the sandbox authenticates and clones it. The credential is attached at the network edge and is never present in the guest, so a compromised job cannot carry one out. Remaining caveat: this covers *remote-call* secrets; a secret a local tool must actually read still has to live in the guest |
-| **fresh sandbox from an image** | every start is a rehydrate | 🟡 #101 |
-
-| | Task | Status |
-| --- | --- | --- |
-| V5.1 | **Capture with a NIC and 2+ vCPU** and prove the NAT + egress policy on a real cloud snapshot. Highest value: it is the only blocker where the code already exists and only the evidence is missing. | gimbal cloud (folds into V1.6) |
-| V5.2 | **How a developer's repo enters the sandbox — answered, and shipped.** The decision was that this is a *credentials* problem, not a filesystem one: a sandbox that can authenticate to GitHub clones the repo itself, so I1 stands untouched. A TLS-terminating egress proxy attaches the credential as the request leaves for a rule-named destination; the guest never holds a secret. Proven live against api.github.com (200 with the rule, 401 without, identical request bytes) and against registry.npmjs.org. New invariant **I12**; `chm proxy show/ca/check`; [`credential-proxy.md`](credential-proxy.md). | ✅ done |
-| V5.3 | **A purpose-built agent image** (toolchain, sensible disk, agent runtime) rather than a stock cloud image. | image |
-| V5.4 | Cold create-from-image (#101) so a fresh sandbox does not require a pre-existing capture. | M |
-
-### Deferred, deliberately
 
 - **#101 · cold create-from-image.** Every start is a full snapshot rehydrate.
   Reframed from a perf problem to a capability/onboarding gap — warm resume is
@@ -235,7 +356,7 @@ measured rather than assumed, inside a live rehydrated `graviton-1` guest on
 
 ---
 
-## Historical milestone detail (M25–M32)
+## 8. Historical milestone detail (M25–M32)
 
 The sections below are the **previous** milestone structure, kept for the shipped
 detail and rationale they record. The V1–V4 spine above supersedes them as the
@@ -476,7 +597,7 @@ vs. real builds), so they double as end-to-end validation of M30/M31.
 
 ---
 
-## Standing platform boundaries
+## 9. Standing platform boundaries
 
 - **R1 — ITS/LPI is no longer a wall; it is a solved problem with one gap.**
   Apple's *managed* GIC (`hv_gic`) delivers message-based SPIs only, with no
@@ -502,7 +623,7 @@ vs. real builds), so they double as end-to-end validation of M30/M31.
 
 ---
 
-## How this is tracked
+## 10. How this is tracked
 
 Progress lives in the
 [GitHub issues](https://github.com/gimbal-dev/gimbal-local/issues), mapped to the
@@ -522,33 +643,3 @@ V1–V4 spine:
 
 The four pillars remain the capability contract (#21); a pillar is only "done"
 when it holds for a **vanilla** snapshot on both substrates.
-
-### What comes next (2026-07-29)
-
-**V1 and V2 are both complete.** The acid test passed, the frequency question is
-answered and fixed, and a vanilla capture now runs through the CLI, the daemon
-*and* the app with no flags and no environment variables. The engineering
-problem that defined this project — *can a cloud snapshot cross to a Mac at all*
-— is answered yes, on hardware, three times over.
-
-**The centre of gravity therefore moves from the hypervisor to the product.**
-
-1. **V3 is the thrust, and V3.1 is the gate.** `gctl` still 422s an `assign-run`
-   on `gic_mode: its-lpi`, which now refuses bundles we demonstrably run. Until
-   that changes, the cloud→Mac loop is only closed by hand. This is cross-repo
-   and is the single highest-leverage unblock available.
-2. **#101 — there is no cold create-from-image path.** Every start is a full
-   snapshot rehydrate. That is fine for the rehydrate story and wrong for a
-   product: a user with an image and no snapshot cannot start anything. Needs a
-   shape decision before it needs code.
-3. **V4.1/V4.2 — the security umbrella (#39, #20).** Most of the mechanism is
-   already shipped (egress allow-list, reserved-address guard, CoW isolation,
-   limits, signing). What is missing is the threat model that says which of them
-   are *on by default* and why. A rehydrated snapshot is untrusted code with a
-   device model attached.
-4. **V1.6 — round-2 capture.** Blocked on gimbal cloud. Needs the corrected
-   version pin (`69637dde6` or later, for the clock block), capture *after*
-   cloud-init finishes (round 1 fires mid-cloud-init, so the guest restarts its
-   getty ~113 s after resume and swallows input in that window), `CNTFRQ_EL0`
-   reported per instance type (Graviton3/4 unverified), and capture **B**
-   (2 vCPU + net), which round 1 did not produce.
