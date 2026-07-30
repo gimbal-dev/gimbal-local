@@ -200,6 +200,30 @@ The capture we need, precisely: [`graviton-capture-request.md`](graviton-capture
 | V4.1 | Threat model + hardening checklist umbrella (#39). A rehydrated snapshot is untrusted code with a device model attached. | ✅ **Done.** [`security-model.md`](security-model.md) carries the threat model, invariants I1–I10 and the checklist; §1a now adds **the default posture** — what is true of a run with no flags, no env and no config — including a written argument for the two controls that are deliberately *not* default-on. Made executable as `chm posture`, which resolves the same sources the run path resolves, reports every control with how it was decided, and exits non-zero if anything is weakened. A checklist in a document says what we intended; a control you believe is on but is not is worse than one you know is off. |
 | V4.2 | Make egress allow-list, reserved-address guard and CoW isolation the **default** posture with a documented opt-out (#20). | ✅ **Done.** Audited what was actually on out of the box rather than assuming: the reserved-address guard (I10) and CoW/overlay confinement (I2/I3) were already default-on, but **resource ceilings were not** — an unconfigured workspace resolved to *unbounded*. Now resolves to a `chm` baseline (≤64 vCPU, RAM ≤ host physical, overlay ≤64 GiB, console ≤1 GiB, ≤128 NAT sockets) with `CHM_LIMITS=none` as the documented opt-out. Verified the acid test still passes under the new ceilings. Egress stays open-to-the-internet by design — §1a argues why default-deny would be the worse security outcome. |
 
+### V5 · The coding-agent sandbox — measured gap list
+
+V1–V4 deliver the sentence *"a vanilla Cloud Hypervisor snapshot from the cloud
+just works on my Mac, safely."* That sentence is true. It is **not** the same as
+*"a developer's coding agent runs in this sandbox"*, and the difference was
+measured rather than assumed, inside a live rehydrated `graviton-1` guest on
+2026-07-30:
+
+| what a coding agent needs | measured | gap |
+| --- | --- | --- |
+| 64-bit userspace | `aarch64`, **2382 ELF binaries, 0 of them 32-bit**, no `armhf` multiarch | ✅ none — the V1.4 AArch32 wedge is effectively unreachable |
+| **network** | `ip -br link` → **loopback only**, no routes; the capture config says `net = None` | 🔴 **blocker.** No `git clone`, no `npm install`, no API call. We *built* the userspace NAT and egress policy but have never run them against a real cloud capture |
+| **CPU / RAM / disk** | 1 vCPU · 953 MiB · 2.4 GB disk, **74 % full, 634 MB free** | 🔴 **blocker.** A demo VM, not a build environment |
+| **toolchain** | `git` ✅ `python3` ✅ `curl` ✅ — `gcc` `make` `node` `npm` `go` `cargo` **all missing** | 🟡 an *image* problem, not a hypervisor problem: needs a purpose-built agent image, not stock Ubuntu cloud |
+| **developer's code in / out** | no mechanism at all | 🔴 **blocker, and an unmade design decision.** I1 ("no host FS passthrough") is a security invariant we deliberately hold; a local coding sandbox has to get the repo in somehow. Scoped virtio-fs, a git remote loop, or a syncing volume — each trades against I1 differently |
+| **fresh sandbox from an image** | every start is a rehydrate | 🟡 #101 |
+
+| | Task | Status |
+| --- | --- | --- |
+| V5.1 | **Capture with a NIC and 2+ vCPU** and prove the NAT + egress policy on a real cloud snapshot. Highest value: it is the only blocker where the code already exists and only the evidence is missing. | gimbal cloud (folds into V1.6) |
+| V5.2 | **Decide how a developer's repo enters the sandbox**, and write the trade against I1 before building. | decision |
+| V5.3 | **A purpose-built agent image** (toolchain, sensible disk, agent runtime) rather than a stock cloud image. | image |
+| V5.4 | Cold create-from-image (#101) so a fresh sandbox does not require a pre-existing capture. | M |
+
 ### Deferred, deliberately
 
 - **#101 · cold create-from-image.** Every start is a full snapshot rehydrate.

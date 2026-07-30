@@ -159,10 +159,37 @@ be recovered.
 `CHM_STRICT_AARCH32=1` refuses to start instead, for anyone running unknown or
 untrusted workloads.
 
-**In practice the exposure is narrow.** A stock arm64 Ubuntu image ships no
-32-bit userspace and never execs one. 64-bit workloads are wholly unaffected.
-But it is a real, reproducible, unrecoverable hang reachable from ordinary
-unprivileged userspace, and it was invisible before this audit.
+### How reachable is it, really?
+
+Asserting "a stock image never does this" is not evidence, so it was counted.
+In a rehydrated `graviton-1` guest:
+
+| measurement | result |
+| --- | --- |
+| ELF binaries under `/usr/bin /usr/sbin /bin /sbin /usr/lib` | **2382, all 64-bit** |
+| …of which AArch32 (`ELF 32-bit`) | **0** |
+| `dpkg --print-foreign-architectures` | **empty** — no `armhf` multiarch |
+
+So there is not one 32-bit binary in the image, and `apt` **cannot** install one
+without a deliberate `dpkg --add-architecture armhf` first. Every runtime a
+coding-agent or CI workload would use on arm64 — Python, Node, Go, Rust, Java,
+gcc — is 64-bit. Reaching this bug takes three deliberate steps that nothing
+does by accident.
+
+It is also **specific to Graviton2**. Neoverse-N1 implements AArch32 at EL0 and
+Graviton2 enables it; later Neoverse cores (Graviton3/4) drop AArch32 entirely,
+so a capture from those hosts would set `ID_AA64PFR0_EL1.EL0 = 1` and the
+divergence would not exist. This is a legacy-silicon artifact, not a permanent
+property of cloud captures.
+
+**Verdict: real, unrecoverable, and effectively unreachable.** It stays warned
+rather than refused because refusing would block every Graviton2 capture over a
+hazard nothing triggers. `CHM_STRICT_AARCH32=1` is there for anyone running
+genuinely untrusted guests who would rather not carry the risk at all.
+
+It was worth finding regardless: it is a reproducible unrecoverable hang
+reachable from ordinary unprivileged userspace, and it was invisible before this
+audit.
 
 ---
 
