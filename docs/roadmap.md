@@ -183,7 +183,7 @@ nothing from anyone else.
 | **V2** | Vanilla everywhere in the product | ①③ | ✅ **complete** — CLI, daemon and app all run vanilla, flagless |
 | **V3** | Cloud control plane on the vanilla contract | ②④ | 🟠 partly blocked cross-repo (#21, #36) |
 | **V4** | Security with sane defaults | ③ | ✅ **complete** — threat model, default posture, `chm posture` |
-| **V5** | The coding-agent sandbox | ①③ | 🔴 **the current thrust** — V5.1 and V5.2 shipped; V5.5 is the open bug |
+| **V5** | The coding-agent sandbox | ①③ | 🟢 **V5.1, V5.2, V5.3, V5.5 and V5.6 shipped** — no known correctness bug left; V5.4 (cold create-from-image) is the remainder |
 | **V6** | The app tells the whole truth | ③④ | ⬜ **ready to start, nothing blocking it** |
 
 **Recommended order of attack:**
