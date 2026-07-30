@@ -259,6 +259,24 @@ $ chm audit show snapshots/ch-arm-stock-its-net
 One content-addressed policy, authored in the cloud, enforced on the Mac, and
 named in the audit trail on both sides.
 
+## Getting credentials in without putting them in the guest
+
+Because `chm` *is* the guest's whole network, it is also the one place every
+outbound call must pass through — which makes it the natural place to attach a
+credential. A rule names a destination; the proxy terminates TLS for that
+destination only, adds the `Authorization` header as the request leaves, and
+opens its own fully-verified connection upstream. The guest sends no secret and
+never holds one.
+
+This is the answer to "how does the developer's repo get into the sandbox": it
+is a credentials problem, not a filesystem problem, and a sandbox that can
+authenticate to GitHub can clone the repo itself. See
+[`credential-proxy.md`](credential-proxy.md).
+
+Nothing is intercepted unless a rule names it. A flow with no rule is relayed as
+opaque bytes exactly as before, and a rules file with only `passthrough` entries
+installs no hook in the data path at all.
+
 ## Scope & non-goals
 
 - **No host filesystem passthrough.** There is deliberately no virtiofs/9p/shared

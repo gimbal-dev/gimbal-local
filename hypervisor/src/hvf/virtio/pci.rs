@@ -326,6 +326,17 @@ impl VirtioPciDevice {
             _ => Vec::new(),
         }
     }
+
+    /// Install the interception hook on this device's NAT, if it is a NIC.
+    ///
+    /// Set after construction because the proxy must bind its port first, and
+    /// because a run with no proxy configured leaves this untouched.
+    pub fn set_net_intercept(&self, decider: Option<Arc<dyn super::nat::InterceptDecider>>) {
+        let mut inner = self.inner.lock().unwrap();
+        if let Backend::Net(n) = &mut inner.backend {
+            n.set_intercept(decider);
+        }
+    }
 }
 
 impl Inner {

@@ -120,6 +120,7 @@ flags, no env, no config** — the way almost every sandbox actually starts.
 | **Deliverable-interrupt routing** (I7) | **on** | `CHM_ALLOW_ITS_LPI=1` (diagnostic) |
 | **CAS digest validation** (I8) | **on, structural** | — |
 | **Egress allow-list** (I9) | **off** — see below | `chm firewall set` to turn *on* |
+| **Credential custody** (I12) | **n/a by default** — no rules means no credentials, which is strictly safer than holding them | a rules file turns it *on*; `allow_cleartext` weakens it |
 | **Signature verification** (I6) | **off** — no trust root ships | `CHM_TRUST_STORE` to turn on |
 
 ### Two deliberate "off"s, and why
@@ -182,6 +183,7 @@ test/guard so a regression is caught, not discovered.
 | I7 | **Undeliverable snapshots are never mis-run.** A capture whose virtio completions route through the GIC ITS as LPIs is rehydrated onto the userspace GICv3, which can deliver them; it is never run on the managed GIC, which cannot. | `routes_completions_as_lpis` routes both `chm run` and `chm serve`; `CHM_ALLOW_ITS_LPI=1` is a diagnostic-only override. | **Holds today** (V2.1 — was "refused", now "routed and run") |
 | I8 | **The content store cannot select a host file.** A manifest checksum is only ever used as a CAS path after it is validated as a canonical sha256 hex digest, and every CAS object (including cache hits) is re-hashed before it is linked into a guest. | Digest-shape gate + re-hash on hit in `materialize_bundle`. | **Holds today** (M30.8) |
 | I9 | **A governed session's egress is enforced on every NIC and fails closed.** The resolved policy applies to all virtio-net NICs, and a session whose policy source is present but unresolvable denies all egress rather than running open. | Per-NIC policy clone + `EgressResolution::FailClosed` deny-all. | **Holds today** (M30.9) |
+| I12 | **A credential that authenticates an outbound call is never present in the guest.** For any destination named by a credential-proxy rule, the secret is resolved on the host and attached as the request leaves; the guest holds no copy and full control of the guest yields nothing reusable. The credential is chosen from the destination the NAT admitted — never from the guest's `Host` header or SNI — and a rule that permits injection over cleartext reports as weakened. | TLS terminated only for rule-named hosts, header rewritten in `credproxy::http`, credential selected in `credproxy::rules::decide`. `hypervisor` receives an address and opaque bytes, never a secret. | **Holds today** (V5.2) |
 | I10 | **A guest cannot reach the host's own networks.** No sandbox flow reaches loopback, RFC1918 LAN, link-local (incl. `169.254.169.254`), or other special-use ranges, regardless of policy or DNS answers, unless local egress is explicitly opted in or the trusted policy names the exact IP. | Reserved-address guard in the NAT: `decide_connect` denies reserved IPs before the allow rules (IP-literal allow or `--allow-local-egress` excepted); DNS answers resolving into reserved ranges are dropped. | **Holds today** (M31.1) |
 
 ---

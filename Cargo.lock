@@ -1051,6 +1051,7 @@ dependencies = [
  "hypervisor",
  "libc",
  "ring",
+ "rustls",
  "serde",
  "serde_json",
 ]

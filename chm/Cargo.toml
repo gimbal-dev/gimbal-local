@@ -32,6 +32,10 @@ libc = { workspace = true }
 # it, not a new crate, and there is no adequate std/CLI alternative for
 # authenticated GCM decryption.
 ring = "0.17.14"
+# TLS for the credential proxy. Already vendored in the workspace (the migration
+# transport uses it); this is a direct use of the same pinned version, not a new
+# crate in the tree.
+rustls = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 

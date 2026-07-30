@@ -214,13 +214,13 @@ measured rather than assumed, inside a live rehydrated `graviton-1` guest on
 | **network** | `ip -br link` → **loopback only**, no routes; the capture config says `net = None` | 🔴 **blocker.** No `git clone`, no `npm install`, no API call. We *built* the userspace NAT and egress policy but have never run them against a real cloud capture |
 | **CPU / RAM / disk** | 1 vCPU · 953 MiB · 2.4 GB disk, **74 % full, 634 MB free** | 🔴 **blocker.** A demo VM, not a build environment |
 | **toolchain** | `git` ✅ `python3` ✅ `curl` ✅ — `gcc` `make` `node` `npm` `go` `cargo` **all missing** | 🟡 an *image* problem, not a hypervisor problem: needs a purpose-built agent image, not stock Ubuntu cloud |
-| **developer's code in / out** | no mechanism at all | 🔴 **blocker, and an unmade design decision.** I1 ("no host FS passthrough") is a security invariant we deliberately hold; a local coding sandbox has to get the repo in somehow. Scoped virtio-fs, a git remote loop, or a syncing volume — each trades against I1 differently |
+| **developer's code in / out** | credential-injecting egress proxy (V5.2) | ✅ **answered without touching I1.** The repo does not need to be *passed in*: the sandbox authenticates and clones it. The credential is attached at the network edge and is never present in the guest, so a compromised job cannot carry one out. Remaining caveat: this covers *remote-call* secrets; a secret a local tool must actually read still has to live in the guest |
 | **fresh sandbox from an image** | every start is a rehydrate | 🟡 #101 |
 
 | | Task | Status |
 | --- | --- | --- |
 | V5.1 | **Capture with a NIC and 2+ vCPU** and prove the NAT + egress policy on a real cloud snapshot. Highest value: it is the only blocker where the code already exists and only the evidence is missing. | gimbal cloud (folds into V1.6) |
-| V5.2 | **Decide how a developer's repo enters the sandbox**, and write the trade against I1 before building. | decision |
+| V5.2 | **How a developer's repo enters the sandbox — answered, and shipped.** The decision was that this is a *credentials* problem, not a filesystem one: a sandbox that can authenticate to GitHub clones the repo itself, so I1 stands untouched. A TLS-terminating egress proxy attaches the credential as the request leaves for a rule-named destination; the guest never holds a secret. Proven live against api.github.com (200 with the rule, 401 without, identical request bytes) and against registry.npmjs.org. New invariant **I12**; `chm proxy show/ca/check`; [`credential-proxy.md`](credential-proxy.md). | ✅ done |
 | V5.3 | **A purpose-built agent image** (toolchain, sensible disk, agent runtime) rather than a stock cloud image. | image |
 | V5.4 | Cold create-from-image (#101) so a fresh sandbox does not require a pre-existing capture. | M |
 

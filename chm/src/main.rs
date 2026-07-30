@@ -66,6 +66,9 @@ mod audit;
 mod posture;
 mod sysregs;
 
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod credproxy;
+
 /// Start-to-ready phase timing (#79).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod startup;

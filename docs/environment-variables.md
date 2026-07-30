@@ -76,6 +76,9 @@ default posture.
 | `CHM_TRUST_STORE` | Path to the trusted public keys used to verify a signed snapshot manifest. |
 | `CHM_REQUIRE_SIGNED=1` | Fail closed: refuse any bundle that cannot be signature-verified. |
 | `CHM_RUNNER_CACHE` | Base directory for the runner's content-addressed bundle cache. |
+| `CHM_PROXY_RULES` | Credential-proxy rules: either a path to a JSON document or the document itself, so a launcher holding rules in memory need not write them to disk. Overrides `<workspace>/proxy-rules.json`. See [`credential-proxy.md`](credential-proxy.md). |
+| `CHM_PROXY_CA_BUNDLE` | Path to the PEM trust anchors the proxy verifies *origins* against. Defaults to `/etc/ssl/cert.pem` (128 roots). This never affects what the guest trusts. |
+| `CHM_PROXY_LOG=1` | Print every proxy decision — injected, relayed, or failed — to stderr as it happens. Not a debug-only switch in spirit: it is how you see what a job actually reached. |
 
 `chm posture <workspace>` prints which of the policy variables are in effect and
 what they have done, so you do not have to reason about precedence by hand.

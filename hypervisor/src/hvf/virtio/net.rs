@@ -79,6 +79,9 @@ pub trait NetResponder: Send {
     /// Take the egress-decision events (allow/deny) accumulated since the last
     /// drain, for the audit trail. The default responder makes no policy
     /// decisions, so it has none.
+    fn set_intercept(&mut self, _decider: Option<std::sync::Arc<dyn super::nat::InterceptDecider>>) {}
+
+    /// Take the responder's egress decisions accumulated since the last
     fn drain_egress_events(&mut self) -> Vec<super::nat::EgressEvent> {
         Vec::new()
     }
@@ -371,6 +374,14 @@ impl NetDevice {
     /// trail (see [`NetResponder::drain_egress_events`]).
     pub fn drain_egress_events(&mut self) -> Vec<super::nat::EgressEvent> {
         self.responder.drain_egress_events()
+    }
+
+    /// Install the responder's interception hook, if it has one.
+    pub fn set_intercept(
+        &mut self,
+        decider: Option<std::sync::Arc<dyn super::nat::InterceptDecider>>,
+    ) {
+        self.responder.set_intercept(decider);
     }
 
     /// Whether a frame is waiting to be delivered into the guest's receive

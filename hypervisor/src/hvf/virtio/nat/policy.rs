@@ -243,6 +243,16 @@ impl EgressPolicy {
         self.default_decision()
     }
 
+    /// The hostname `ip` was most recently resolved from, if the guest asked us
+    /// for it and the answer has not aged out.
+    ///
+    /// Exposed because a decision made *after* the connect is admitted — such as
+    /// whether to divert the flow through a local proxy — needs the same name the
+    /// policy itself matched on, and re-resolving could get a different answer.
+    pub fn resolved_host(&self, ip: Ipv4Addr) -> Option<String> {
+        self.resolve_cache.lookup(ip, Instant::now()).map(str::to_string)
+    }
+
     /// Decide a TCP connect to `ip:port`. If the IP was resolved from a name in
     /// the cache, hostname rules are matched too; otherwise only IP-literal
     /// rules (and the default) apply — so a guest that skips DNS and dials a raw
