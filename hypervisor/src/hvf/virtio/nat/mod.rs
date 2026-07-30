@@ -46,8 +46,8 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
-use std::sync::mpsc;
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use super::net::NetResponder;
@@ -123,6 +123,33 @@ struct Flow {
     host: HostSide,
 }
 
+/// Where an admitted flow should be sent, instead of straight to its origin.
+///
+/// Carries the destination *and* the bytes to send first, because the NAT has
+/// no opinion about — and deliberately no knowledge of — the handover format.
+#[derive(Debug, Clone)]
+pub struct Divert {
+    /// The local address to dial instead of the origin.
+    pub addr: SocketAddr,
+    /// Written before any guest bytes, so the far end learns the true origin.
+    pub preamble: Vec<u8>,
+}
+
+/// Consulted once per admitted flow to ask whether it should be diverted.
+///
+/// This is the whole of the NAT's involvement in interception. It is expressed
+/// as a callback rather than a rule list on purpose: matching rules to hosts,
+/// and above all *why* a flow is worth diverting, belongs to the layer that
+/// holds the credentials. Keeping that out of the hypervisor crate means this
+/// code cannot leak a secret it never receives.
+pub trait InterceptDecider: Send + Sync + std::fmt::Debug {
+    /// Return `Some` to divert, `None` to dial the origin directly.
+    ///
+    /// `host` is the name the guest resolved to reach `ip`, when it used our
+    /// DNS; a guest that dialled a raw IP supplies `None`.
+    fn divert(&self, ip: Ipv4Addr, port: u16, host: Option<&str>) -> Option<Divert>;
+}
+
 /// The userspace NAT responder.
 pub struct NatResponder {
     iface: Interface,
@@ -145,6 +172,8 @@ pub struct NatResponder {
     /// Bandwidth token bucket: available bytes, refilled at `max_bytes_per_sec`.
     bw_tokens: f64,
     bw_last_refill: Instant,
+    /// Optional interception hook; `None` means every flow is dialled directly.
+    intercept: Option<Arc<dyn InterceptDecider>>,
 }
 
 impl NatResponder {
@@ -195,7 +224,17 @@ impl NatResponder {
             limits,
             bw_tokens,
             bw_last_refill: boot,
+            intercept: None,
         }
+    }
+
+    /// Install (or clear) the interception hook.
+    ///
+    /// Separate from the constructor because the proxy binds a port and so is
+    /// built after the NAT, and because a caller with no proxy must be able to
+    /// leave this untouched.
+    pub fn set_intercept(&mut self, decider: Option<Arc<dyn InterceptDecider>>) {
+        self.intercept = decider;
     }
 
     /// Take the egress-decision events accumulated since the last drain.
@@ -415,17 +454,38 @@ impl NatResponder {
 
         for (dst, handle) in accepted {
             self.listeners.remove(&dst);
+            // Ask before dialling. The hostname comes from the same cache the
+            // connect policy matched on, so the decision cannot be moved by DNS
+            // changing underneath us between admit and connect.
+            let divert = self.intercept.as_ref().and_then(|d| {
+                let host = self.policy.resolved_host(*dst.ip());
+                d.divert(*dst.ip(), dst.port(), host.as_deref())
+            });
+            if let Some(d) = &divert {
+                self.events.push(EgressEvent {
+                    domain: "tcp",
+                    target: dst.to_string(),
+                    allowed: true,
+                    rule: format!("divert {}", d.addr),
+                    policy: self.policy.label().to_string(),
+                });
+            }
             let (tx, rx) = mpsc::channel();
             std::thread::Builder::new()
                 .name("chm-nat-connect".into())
                 .spawn(move || {
-                    let res = TcpStream::connect_timeout(&dst.into(), CONNECT_TIMEOUT).and_then(
-                        |s| {
-                            s.set_nonblocking(true)?;
-                            s.set_nodelay(true).ok();
-                            Ok(s)
-                        },
-                    );
+                    let target = divert.as_ref().map_or(SocketAddr::from(dst), |d| d.addr);
+                    let res = TcpStream::connect_timeout(&target, CONNECT_TIMEOUT).and_then(|mut s| {
+                        // The preamble goes out on the still-blocking socket:
+                        // it is a few dozen bytes to a local listener, and a
+                        // partial write here would desynchronise the far end.
+                        if let Some(d) = &divert {
+                            s.write_all(&d.preamble)?;
+                        }
+                        s.set_nonblocking(true)?;
+                        s.set_nodelay(true).ok();
+                        Ok(s)
+                    });
                     let _ = tx.send(res);
                 })
                 .ok();
@@ -633,6 +693,10 @@ impl NetResponder for NatResponder {
 
     fn service(&mut self) -> Vec<Vec<u8>> {
         NatResponder::service(self)
+    }
+
+    fn set_intercept(&mut self, decider: Option<Arc<dyn InterceptDecider>>) {
+        NatResponder::set_intercept(self, decider);
     }
 
     fn drain_egress_events(&mut self) -> Vec<EgressEvent> {

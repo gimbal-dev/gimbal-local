@@ -871,7 +871,9 @@ fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Resu
     let allow_local_egress = env::var("CHM_ALLOW_LOCAL_EGRESS")
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes"))
         .unwrap_or(false);
-    if let Err(e) = wire_virtio(
+    // Held for the life of the served VM: dropping it would not stop the proxy,
+    // but keeping it makes the ownership honest and leaves room to stop it.
+    let _proxy = match wire_virtio(
         &bus,
         &rvm.guest_mem,
         &loaded.state_json,
@@ -882,9 +884,14 @@ fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Resu
         &net_limits,
         allow_local_egress,
         None,
+        None,
     ) {
-        eprintln!("chm serve: warning: virtio device model not wired: {e}");
-    }
+        Ok(wired) => wired.proxy,
+        Err(e) => {
+            eprintln!("chm serve: warning: virtio device model not wired: {e}");
+            None
+        }
+    };
 
     let start = Instant::now();
     let mut last_output = Instant::now();
@@ -1064,6 +1071,7 @@ fn run_guest_usgic(
         // Stop -> Start must round-trip guest state, same as the managed path.
         checkpoint: true,
         egress_policy: None,
+        proxy_rules: None,
         allow_local_egress,
         limits_file: None,
         checkpoint_source: "daemon",

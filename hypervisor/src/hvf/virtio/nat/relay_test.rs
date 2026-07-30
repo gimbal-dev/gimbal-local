@@ -352,3 +352,129 @@ fn bandwidth_cap_throttles_relay_throughput() {
 }
 
 
+
+/// A decider that sends everything on one port to a fixed address.
+#[derive(Debug)]
+struct DivertPort {
+    port: u16,
+    to: SocketAddr,
+}
+
+impl InterceptDecider for DivertPort {
+    fn divert(&self, ip: Ipv4Addr, port: u16, host: Option<&str>) -> Option<Divert> {
+        (port == self.port).then(|| Divert {
+            addr: self.to,
+            preamble: format!("ORIGIN {ip} {port} {}\n", host.unwrap_or("-")).into_bytes(),
+        })
+    }
+}
+
+/// A server that reads one line of preamble, then echoes — standing in for the
+/// credential proxy. Returns its port and a channel carrying the preamble it saw.
+fn spawn_preamble_echo() -> (u16, mpsc::Receiver<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        if let Ok((mut stream, _)) = listener.accept() {
+            let mut line = Vec::new();
+            let mut byte = [0u8; 1];
+            while let Ok(1) = stream.read(&mut byte) {
+                if byte[0] == b'\n' {
+                    break;
+                }
+                line.push(byte[0]);
+            }
+            let _ = tx.send(String::from_utf8_lossy(&line).to_string());
+            let mut buf = [0u8; 2048];
+            loop {
+                match stream.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        if stream.write_all(&buf[..n]).is_err() {
+                            break;
+                        }
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+    (port, rx)
+}
+
+#[test]
+fn an_intercepted_flow_reaches_the_proxy_with_the_true_destination() {
+    // The guest dials one address; the flow must arrive somewhere else entirely,
+    // carrying the destination it *meant* — otherwise the far end cannot pick
+    // the right credential, and cannot present the right certificate.
+    let (proxy_port, saw) = spawn_preamble_echo();
+    let origin_port = spawn_echo_server();
+    let mut nat = NatResponder::new(
+        [192, 168, 249, 1],
+        [0x02, 0, 0, 0, 0, 1],
+        local_allow_all(),
+        NatLimits::default(),
+    );
+    nat.set_intercept(Some(Arc::new(DivertPort {
+        port: origin_port,
+        to: SocketAddr::from(([127, 0, 0, 1], proxy_port)),
+    })));
+
+    let dst = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), origin_port);
+    let payload = b"through the proxy";
+    assert_eq!(
+        drive_echo(&mut nat, dst, payload),
+        payload,
+        "bytes must still flow after the divert"
+    );
+
+    let preamble = saw
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the proxy must receive the handover preamble");
+    assert_eq!(
+        preamble,
+        format!("ORIGIN 127.0.0.1 {origin_port} -"),
+        "the preamble must name the origin the guest dialled, not the proxy"
+    );
+    assert!(
+        nat.drain_events()
+            .iter()
+            .any(|e| e.rule.starts_with("divert ")),
+        "the divert must be visible in the egress event stream"
+    );
+}
+
+#[test]
+fn a_flow_the_decider_declines_still_goes_straight_to_its_origin() {
+    // Interception is per-destination, never global: a decider that says no must
+    // leave the flow untouched, so an un-listed host is never routed through a
+    // component that holds credentials.
+    let (proxy_port, saw) = spawn_preamble_echo();
+    let origin_port = spawn_echo_server();
+    let mut nat = NatResponder::new(
+        [192, 168, 249, 1],
+        [0x02, 0, 0, 0, 0, 1],
+        local_allow_all(),
+        NatLimits::default(),
+    );
+    // Matches a port nothing will dial.
+    nat.set_intercept(Some(Arc::new(DivertPort {
+        port: origin_port.wrapping_add(1),
+        to: SocketAddr::from(([127, 0, 0, 1], proxy_port)),
+    })));
+
+    let dst = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 1), origin_port);
+    let payload = b"direct";
+    assert_eq!(drive_echo(&mut nat, dst, payload), payload);
+    assert!(
+        saw.recv_timeout(Duration::from_millis(300)).is_err(),
+        "the proxy must not have seen this flow at all"
+    );
+    assert!(
+        !nat.drain_events()
+            .iter()
+            .any(|e| e.rule.starts_with("divert ")),
+        "no divert should be recorded"
+    );
+}

@@ -32,6 +32,7 @@ use rustls::pki_types::{CertificateDer, InvalidDnsNameError, PrivateKeyDer, Serv
 use rustls::server::{VerifierBuilderError, WebPkiClientVerifier};
 use rustls::{
     ClientConfig, ClientConnection, RootCertStore, ServerConfig, ServerConnection, StreamOwned,
+    version,
 };
 use thiserror::Error;
 use vm_memory::bitmap::BitmapSlice;
@@ -231,7 +232,9 @@ impl TlsStream {
         let client_certs = load_cert_chain(&cert_dir.join(CLIENT_CERT_FILE))?;
         let client_key = load_private_key(&cert_dir.join(CLIENT_KEY_FILE))?;
 
-        let config = ClientConfig::builder()
+        // TLS 1.3 only. Both ends of a migration are our own binaries, so there
+        // is no legacy peer to accommodate and nothing to gain from offering 1.2.
+        let config = ClientConfig::builder_with_protocol_versions(&[&version::TLS13])
             .with_root_certificates(root_store)
             .with_client_auth_cert(client_certs, client_key)
             .map_err(TlsError::RustlsError)
@@ -422,7 +425,8 @@ impl TlsServerConfig {
             .map_err(TlsError::RustlsVerifierBuilderError)
             .map_err(MigratableError::Tls)?;
 
-        let config = ServerConfig::builder()
+        // TLS 1.3 only; see the client above.
+        let config = ServerConfig::builder_with_protocol_versions(&[&version::TLS13])
             .with_client_cert_verifier(client_verifier)
             .with_single_cert(server_certs, server_key)
             .map_err(TlsError::RustlsError)

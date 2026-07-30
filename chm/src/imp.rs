@@ -20,6 +20,7 @@ use crate::console::{self, RawConsole};
 use crate::console_filter::ConsoleFilter;
 use crate::audit;
 use crate::control_plane;
+use crate::credproxy;
 use crate::firewall;
 use crate::limits;
 use crate::serve;
@@ -516,6 +517,7 @@ pub(crate) fn wire_virtio(
     net_limits: &NatLimits,
     allow_local_egress: bool,
     lpi_sink_override: Option<Arc<dyn its::LpiSink>>,
+    cli_proxy_rules: Option<&Path>,
 ) -> Result<WiredVirtio, String> {
     let descs =
         devmgr::parse_devices(state_json).map_err(|e| format!("parse virtio devices: {e}"))?;
@@ -641,9 +643,28 @@ pub(crate) fn wire_virtio(
     for dev in &drainable {
         dev.drain_on_resume();
     }
+
+    // The credential proxy, if this workspace configures one. Installed after
+    // the NICs exist because the hook is per-device, and only when a rule would
+    // actually inject: a run with nothing to inject keeps the plain data path.
+    let workspace = overlay_dir.parent().unwrap_or(overlay_dir);
+    let proxy = match credproxy::cli::start_for_workspace(workspace, cli_proxy_rules) {
+        Ok(Some((proxy, decider))) => {
+            for dev in &net_devices {
+                dev.set_net_intercept(Some(Arc::clone(&decider)));
+            }
+            Some(proxy)
+        }
+        Ok(None) => None,
+        // Fail closed: a rules file that cannot be honoured must stop the run
+        // rather than quietly boot a guest whose calls will go out unsigned.
+        Err(e) => return Err(format!("credential proxy: {e}")),
+    };
+
     Ok(WiredVirtio {
         summary,
         net_devices,
+        proxy,
     })
 }
 
@@ -748,6 +769,9 @@ fn parse_egress_policy(raw: &str) -> Option<EgressPolicy> {
 pub(crate) struct WiredVirtio {
     pub summary: Vec<String>,
     pub net_devices: Vec<Arc<VirtioPciDevice>>,
+    /// The credential proxy, when this run has one. Held only to keep it alive
+    /// and stoppable for the life of the VM — nothing else reads it.
+    pub proxy: Option<credproxy::server::RunningProxy>,
 }
 
 /// How long the net service thread waits for a guest transmit before servicing
@@ -849,6 +873,9 @@ struct Args {
     /// `CHM_EGRESS_POLICY` env binding and any per-workspace `egress-policy.json`.
     /// `None` falls back to that resolution order. See [`resolve_egress_policy`].
     egress_policy: Option<PathBuf>,
+    /// Credential-proxy rules for this run, overriding `CHM_PROXY_RULES` and any
+    /// per-workspace `proxy-rules.json`. See [`credproxy::cli::resolve_rules`].
+    proxy_rules: Option<PathBuf>,
     /// Optional path to a local resource-limits file (`--limits`). When set, it
     /// bounds this run's resources, overriding the `CHM_LIMITS` env binding and
     /// any per-workspace `limits.json`. See [`limits::resolve_limits`].
@@ -880,6 +907,7 @@ pub fn main() -> ExitCode {
         Some("limits") => limits::limits_main(&raw[1..]),
         Some("audit") => audit::audit_main(&raw[1..]),
         Some("posture") => posture::posture_main(&raw[1..]),
+        Some("proxy") => credproxy::cli::proxy_main(&raw[1..]),
         Some("sysregs") => sysregs::sysregs_main(&raw[1..]),
         Some("manifest") => signing::manifest_main(&raw[1..]),
         Some("state-cdn") => state_cdn::state_cdn_main(&raw[1..]),
@@ -991,6 +1019,7 @@ fn usage() -> String {
          chm policy show --sandbox ID           (show a sandbox's bound policy)\n    \
          chm firewall set <WORKSPACE_DIR> ...   (author a local egress policy)\n    \
      chm posture <WORKSPACE_DIR> [--json]   (which security controls are on)\n    \
+     chm proxy show [WORKSPACE_DIR]         (credential injection for egress)\n    \
      chm sysregs <SNAPSHOT_DIR> [--all]     (CPU registers this Mac reproduces)\n    \
          chm cloud <COMMAND> aws [OPTIONS]      (BYO cloud helpers)\n    \
          chm serve <LIBRARY_DIR> [OPTIONS]      (background daemon)\n    \
@@ -1009,6 +1038,10 @@ fn usage() -> String {
          --egress-policy <FILE>  Govern this run's outbound network with a local\n                        \
          egress policy (see `chm firewall`); overrides any per-workspace\n                        \
          `egress-policy.json` and the control-plane binding.\n    \
+         --proxy-rules <FILE>  Inject credentials into this run's outbound calls\n                        \
+         for the listed destinations, so the guest never holds them (see\n                        \
+         `chm proxy`); overrides `CHM_PROXY_RULES` and any per-workspace\n                        \
+         `proxy-rules.json`.\n    \
          --allow-local-egress  Let the guest reach reserved / host-internal\n                        \
          address ranges (loopback, private LAN, link-local metadata). OFF by\n                        \
          default: the NAT blocks them regardless of policy (M31.1). Also via\n                        \
@@ -1065,6 +1098,7 @@ fn parse(raw: &[String]) -> Parsed {
     let mut quiet = false;
     let mut checkpoint = false;
     let mut egress_policy: Option<PathBuf> = None;
+    let mut proxy_rules: Option<PathBuf> = None;
     let mut limits_file: Option<PathBuf> = None;
     let mut allow_local_egress = env_flag("CHM_ALLOW_LOCAL_EGRESS");
 
@@ -1092,6 +1126,13 @@ fn parse(raw: &[String]) -> Parsed {
                     return Parsed::Error(format!("{a} requires a value"));
                 };
                 egress_policy = Some(PathBuf::from(v));
+            }
+            "--proxy-rules" => {
+                i += 1;
+                let Some(v) = raw.get(i) else {
+                    return Parsed::Error(format!("{a} requires a value"));
+                };
+                proxy_rules = Some(PathBuf::from(v));
             }
             "--limits" => {
                 i += 1;
@@ -1136,6 +1177,7 @@ fn parse(raw: &[String]) -> Parsed {
             session_lock: None,
             checkpoint,
             egress_policy,
+            proxy_rules,
             limits_file,
             allow_local_egress,
         }),
@@ -1153,6 +1195,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
     let mut session_lock: Option<PathBuf> = None;
     let mut checkpoint = false;
     let mut egress_policy: Option<PathBuf> = None;
+    let mut proxy_rules: Option<PathBuf> = None;
     let mut limits_file: Option<PathBuf> = None;
     let mut allow_local_egress = env_flag("CHM_ALLOW_LOCAL_EGRESS");
 
@@ -1176,6 +1219,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
                     "--socket" => socket_path = PathBuf::from(v),
                     "--session-lock" => session_lock = Some(PathBuf::from(v)),
                     "--egress-policy" => egress_policy = Some(PathBuf::from(v)),
+                    "--proxy-rules" => proxy_rules = Some(PathBuf::from(v)),
                     "--limits" => limits_file = Some(PathBuf::from(v)),
                     "--max-seconds" | "--idle-exit" => {
                         let Ok(n) = v.parse::<u64>() else {
@@ -1213,6 +1257,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
                 session_lock,
                 checkpoint,
                 egress_policy,
+                proxy_rules,
                 limits_file,
                 allow_local_egress,
             },
@@ -1636,6 +1681,7 @@ fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
         quiet: args.quiet,
         checkpoint: args.checkpoint,
         egress_policy: args.egress_policy.as_deref(),
+        proxy_rules: args.proxy_rules.as_deref(),
         allow_local_egress: args.allow_local_egress,
         limits_file: args.limits_file.as_deref(),
         checkpoint_source: "connect",
@@ -1674,6 +1720,7 @@ pub(crate) struct UsgicConfig<'a> {
     /// saved capture on the next start).
     pub checkpoint: bool,
     pub egress_policy: Option<&'a Path>,
+    pub proxy_rules: Option<&'a Path>,
     pub allow_local_egress: bool,
     pub limits_file: Option<&'a Path>,
     /// Recorded in the checkpoint so an operator can see which entry point wrote
@@ -2038,6 +2085,7 @@ pub(crate) fn run_usgic_engine(
         },
         cfg.allow_local_egress,
         Some(usgic_lpi_sink),
+        cfg.proxy_rules,
     ) {
         Ok(wired) => {
             if !wired.summary.is_empty() && !cfg.quiet {
@@ -2658,6 +2706,7 @@ fn resume_smp(
         },
         args.allow_local_egress,
         None,
+        args.proxy_rules.as_deref(),
     ) {
         Ok(wired) => {
             if !wired.summary.is_empty() && !args.quiet {

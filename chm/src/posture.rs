@@ -28,6 +28,7 @@ use std::mem;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use crate::credproxy;
 use crate::limits;
 use crate::signing;
 
@@ -93,6 +94,58 @@ fn assess(dir: &Path) -> Vec<Control> {
              before policy is consulted"
                 .to_string()
         },
+    });
+
+    // I12 — credential custody. Absent configuration is the documented posture,
+    // not a weakening: a sandbox with no injected credentials is strictly safer
+    // than one with them. What *would* be a weakening is a rule attaching a
+    // credential over cleartext, so that is the case singled out.
+    let (proxy_state, proxy_detail) = match credproxy::cli::resolve_rules(Some(dir), None) {
+        Ok(Some(r)) => {
+            let patterns = r.rules.intercept_patterns();
+            let cleartext: Vec<&str> = r
+                .rules
+                .rules
+                .iter()
+                .filter(|rule| rule.allow_cleartext)
+                .map(|rule| rule.name.as_str())
+                .collect();
+            if patterns.is_empty() {
+                (
+                    State::NotApplicable,
+                    format!("{} defines no injecting rules", r.origin),
+                )
+            } else if cleartext.is_empty() {
+                (
+                    State::Active,
+                    format!(
+                        "credentials injected at the proxy for {} — never present in the guest",
+                        patterns.join(", ")
+                    ),
+                )
+            } else {
+                (
+                    State::Weakened,
+                    format!(
+                        "rule(s) {} allow_cleartext — a credential may go out unencrypted",
+                        cleartext.join(", ")
+                    ),
+                )
+            }
+        }
+        Ok(None) => (
+            State::NotApplicable,
+            "no proxy rules; the guest holds whatever credentials it was given".to_string(),
+        ),
+        // A rules file that cannot be parsed would fail the run, so report it as
+        // a weakening rather than letting `posture` look clean.
+        Err(e) => (State::Weakened, format!("proxy rules unusable: {e}")),
+    };
+    out.push(Control {
+        invariant: "I12",
+        name: "credential custody",
+        state: proxy_state,
+        detail: proxy_detail,
     });
 
     // I9 — egress policy. Absent policy is *not* a weakening: a sandbox that
