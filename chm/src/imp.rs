@@ -36,9 +36,11 @@ use hypervisor::hvf::devices::{MmioBus, Pl011};
 use hypervisor::hvf::gic::GicMsiSink;
 use hypervisor::hvf::rehydrate::{
     self, PreparedVm, Snapshot, enable_group1_spi_forwarding, prepare_vm, restore_distributor,
-    restore_vcpu_state,
+    restore_vcpu_state, snapshot_cntfrq,
 };
 use hypervisor::hvf::UsgicCpuHandle;
+use hypervisor::hvf::VtimerClock;
+use hypervisor::hvf::host_counter_hz;
 use hypervisor::hvf::UsgicSpiRouter;
 use hypervisor::hvf::virtio::GuestMemory;
 use hypervisor::hvf::virtio::nat::{EgressPolicy, NatLimits};
@@ -312,22 +314,6 @@ fn hvf_guest_cntfrq() -> Option<u64> {
     Some(1_000_000_000u64 * u64::from(tb.denom) / u64::from(tb.numer))
 }
 
-/// The `cntfrq` recorded in a snapshot's top-level clock block, if present.
-///
-/// cloud-hypervisor stores it as a JSON *string* under `snapshot_data.state`
-/// that has to be parsed a second time:
-/// `{"clock":{"cntvct":..,"host_realtime_ns":..,"cntfrq":24000000}}`.
-///
-/// Returns `None` when the capture predates upstream `69637dde6` ("hypervisor:
-/// aarch64: capture the guest counter for snapshot/restore"), which is when the
-/// block was introduced — a v52.0 capture writes `{}` here.
-fn snapshot_cntfrq(state_json: &str) -> Option<u64> {
-    let root: serde_json::Value = serde_json::from_str(state_json).ok()?;
-    let inner = root.get("snapshot_data")?.get("state")?.as_str()?;
-    let clock: serde_json::Value = serde_json::from_str(inner).ok()?;
-    clock.get("clock")?.get("cntfrq")?.as_u64()
-}
-
 /// Load-time guest-clock-rate guard (#104).
 ///
 /// A Linux guest reads `CNTFRQ_EL0` **once at boot**, caches it as
@@ -346,13 +332,18 @@ fn snapshot_cntfrq(state_json: &str) -> Option<u64> {
 /// clock is wrong"*, which is a day of profiling the wrong thing. This guard
 /// exists to make that diagnosis immediate.
 ///
-/// Unlike the KVM path — which rejects a mismatch outright — the default here is
-/// a loud warning, because the guest genuinely runs and is useful for
-/// inspection, and refusing would mean no cloud snapshot ever starts on a Mac.
-/// Set `CHM_STRICT_CNTFRQ=1` for KVM parity (refuse instead of warn), or
-/// `CHM_GUEST_CNTFRQ=<Hz>` to correct the dilation outright — the offset is
-/// re-programmed on a curve so the guest counter advances at the rate it
-/// believes it has (measured 1.000x).
+/// **A capture that records its frequency is now corrected automatically**, so
+/// on those this guard only reports what was done. It still matters for a
+/// capture that predates upstream `69637dde6` and therefore cannot state its own
+/// frequency: nothing can be inferred, and the dilation has to be named.
+/// Whether the operator has explicitly switched rate correction off.
+fn cntfrq_correction_disabled() -> bool {
+    env::var("CHM_GUEST_CNTFRQ")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        == Some(0)
+}
+
 pub(crate) fn cntfrq_guard(state_json: &str) -> Result<(), String> {
     let Some(host) = hvf_guest_cntfrq() else {
         return Ok(());
@@ -379,10 +370,25 @@ pub(crate) fn cntfrq_guard(state_json: &str) -> Result<(), String> {
     } else {
         ("fast", 1.0 / ratio)
     };
+
+    // The snapshot stated its own frequency, so the counter is being corrected;
+    // say what is happening rather than warning about a problem already solved.
+    if !cntfrq_correction_disabled() {
+        eprintln!(
+            "chm: note: this snapshot was captured at {captured} Hz and an Apple \
+             Hypervisor.framework guest sees {host} Hz, so the guest counter is \
+             rate-corrected to keep its clock right (it would otherwise run \
+             {factor:.3}x {faster_or_slower}). This costs a measured 2.8% of wall \
+             time in stop-the-world barriers; set CHM_GUEST_CNTFRQ=0 to turn it \
+             off and accept the dilation. See docs/hvf-compatible-snapshots.md."
+        );
+        return Ok(());
+    }
+
     let detail = format!(
         "guest clock rate mismatch: this snapshot was captured on a host whose \
          counter runs at {captured} Hz, but an Apple Hypervisor.framework guest \
-         sees {host} Hz.\n\
+         sees {host} Hz, and rate correction is disabled by CHM_GUEST_CNTFRQ=0.\n\
          \n\
          The guest cached {captured} Hz as its arch_timer_rate when it first \
          booted and never re-reads it, so every sleep, timeout, scheduler tick \
@@ -391,9 +397,7 @@ pub(crate) fn cntfrq_guard(state_json: &str) -> Result<(), String> {
          will look like a slow machine rather than a wrong clock, which is the \
          easiest way to lose a day to this.\n\
          \n\
-         Set CHM_GUEST_CNTFRQ={captured} to correct it: chm re-programs the \
-         vtimer offset on a curve so the guest counter advances at the rate the \
-         guest believes it has (measured 1.000x, down from {factor:.3}x). See \
+         Unset CHM_GUEST_CNTFRQ to restore the correction. See \
          docs/hvf-compatible-snapshots.md."
     );
 
@@ -1859,6 +1863,12 @@ pub(crate) fn run_usgic_engine(
     let guest_mem = prepared.guest_mem.clone();
     let vm = prepared.vm.clone();
     let seed = prepared.seed();
+    // ONE virtual-counter clock for the whole VM. Every vCPU programs the offset
+    // it publishes, which is what keeps the guest's `CNTVCT_EL0` coherent across
+    // cores; when the counter is rate-scaled, `spawn_vtimer_stepper` below is
+    // what moves it. See `hypervisor::hvf::VtimerClock`.
+    let clock = rehydrate::counter_clock(&snap, resume_state.as_deref())
+        .unwrap_or_else(|| VtimerClock::new(0, 0, host_counter_hz()));
 
     let running = Arc::new(AtomicBool::new(true));
     let outcome: Arc<Mutex<Option<Result<Outcome, String>>>> = Arc::new(Mutex::new(None));
@@ -1897,6 +1907,7 @@ pub(crate) fn run_usgic_engine(
         let outcome = outcome.clone();
         let setup_tx = setup_tx.clone();
         let resume = resume_state.clone();
+        let clock = clock.clone();
         let capture_tx = capture_tx.clone();
 
         let t = thread::Builder::new()
@@ -1910,6 +1921,7 @@ pub(crate) fn run_usgic_engine(
                     resume.as_deref(),
                     id,
                     &vm_ops,
+                    &clock,
                 ) {
                     Ok(v) => v,
                     Err(e) => {
@@ -2144,6 +2156,11 @@ pub(crate) fn run_usgic_engine(
         let _ = go_tx.send(sgi_table.clone());
     }
     startup::stamp("guest released (VMM ready)");
+    // Virtual-counter stepper: advances a rate-scaled guest's shared counter
+    // offset with every vCPU stopped, so no core ever runs on a stale one. No
+    // thread and no barrier when the counter runs at the host rate.
+    let vtimer_stepper =
+        spawn_vtimer_stepper(clock.clone(), all_exits.clone(), running.clone());
 
     let coordinator = supervise(&UsgicSession {
         uart: &uart,
@@ -2156,8 +2173,14 @@ pub(crate) fn run_usgic_engine(
 
     // Stop: clear the flag, force every vCPU out of any in-flight run(), join.
     running.store(false, Ordering::Release);
+    // Release any vCPU waiting on an in-flight counter step first, so teardown
+    // cannot block behind the stepper.
+    clock.release();
     for exit in &all_exits {
         exit();
+    }
+    if let Some(h) = vtimer_stepper {
+        let _ = h.join();
     }
     let _ = serial_reassert.join();
     if let Some(h) = net_service {
@@ -2297,6 +2320,129 @@ impl PhaseGate {
         }
         *s
     }
+}
+
+/// How often the virtual-counter stepper advances a rate-scaled clock, and how
+/// long it will wait for every vCPU to leave the guest before giving up.
+///
+/// The period is the whole trade-off, and both sides of it were measured on a
+/// 2-vCPU Graviton2 capture rather than reasoned about. Between steps the
+/// guest's counter runs at the host rate, so it falls behind and each step jumps
+/// it forward; the guest's worst-case error against real time is
+/// `period * (1 - host_hz/guest_hz)`, and the barriers cost a share of wall
+/// time that rises sharply as the period shrinks:
+///
+/// | period | stopped | worst-case guest clock error |
+/// | ------ | ------- | ---------------------------- |
+/// |   5 ms |  26.9%  |    4 ms |
+/// |  10 ms |  10.1%  |    8 ms |
+/// |  20 ms |   2.8%  |   16 ms |
+/// |  50 ms |   0.8%  |   40 ms |
+///
+/// 20 ms is the knee: below it the barrier cost climbs steeply (vCPUs spend
+/// their time bouncing in and out of the guest), above it the gain is small and
+/// the clock gets lumpy. Overridable via `CHM_VTIMER_STEP_MS`.
+const VTIMER_STEP_INTERVAL: Duration = Duration::from_millis(20);
+const VTIMER_STEP_TIMEOUT: Duration = Duration::from_millis(20);
+
+/// Spawn the virtual-counter stepper for a rate-scaled guest.
+///
+/// A guest captured on a host with a different counter frequency has its cached
+/// `arch_timer_rate` baked in, so the only way to give it correct timekeeping is
+/// to run its counter at the rate it already believes (see
+/// [`hypervisor::hvf::VtimerClock`]). HVF offers an offset, not a rate, so the
+/// offset has to keep moving — and moving it per-vCPU at run entry is what made
+/// `CNTVCT_EL0` disagree across cores. This thread moves it once, for the whole
+/// VM, with every vCPU stopped.
+///
+/// Returns `None` for an unscaled clock, which never moves and so needs no
+/// thread and pays no barrier.
+fn spawn_vtimer_stepper(
+    clock: Arc<VtimerClock>,
+    exits: Vec<ExitSignal>,
+    running: Arc<AtomicBool>,
+) -> Option<thread::JoinHandle<()>> {
+    if !clock.scaled() {
+        return None;
+    }
+    let interval = env::var("CHM_VTIMER_STEP_MS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|ms| *ms > 0)
+        .map_or(VTIMER_STEP_INTERVAL, Duration::from_millis);
+    let handle = thread::Builder::new()
+        .name("chm-vtimer-step".into())
+        .spawn(move || {
+            let trace = env::var("CHM_TRACE_VTIMER").is_ok();
+            let force_exit = move || {
+                for sig in &exits {
+                    sig();
+                }
+            };
+            let (mut stepped, mut skipped) = (0u64, 0u64);
+            // Stop-the-world accounting: the whole cost of this design is the
+            // time every vCPU spends outside the guest waiting for the barrier,
+            // so measure it directly rather than inferring it from guest
+            // throughput (which is hostage to whatever else the Mac is doing).
+            let (mut barrier_total, mut barrier_max) = (Duration::ZERO, Duration::ZERO);
+            let started = Instant::now();
+            const REPORT_EVERY: Duration = Duration::from_secs(5);
+            let mut last_report = Instant::now();
+            let (mut reported, mut reported_total) = (0u64, Duration::ZERO);
+            while running.load(Ordering::Relaxed) {
+                thread::sleep(interval);
+                let t = Instant::now();
+                let ok = clock.step(&force_exit, VTIMER_STEP_TIMEOUT);
+                let took = t.elapsed();
+                barrier_total += took;
+                barrier_max = barrier_max.max(took);
+                if ok {
+                    stepped += 1;
+                } else {
+                    skipped += 1;
+                }
+                // Report while the VM is still alive: teardown is not always
+                // reached (a harness may kill the process outright).
+                if trace && last_report.elapsed() >= REPORT_EVERY {
+                    let wall = last_report.elapsed();
+                    let n = (stepped + skipped - reported).max(1);
+                    eprintln!(
+                        "[vtimer] {stepped} stepped {skipped} skipped | barrier \
+                         {:.2}% of wall, mean {:.3}ms, max {:.3}ms",
+                        (barrier_total - reported_total).as_secs_f64() / wall.as_secs_f64()
+                            * 100.0,
+                        (barrier_total - reported_total).as_secs_f64() * 1e3 / n as f64,
+                        barrier_max.as_secs_f64() * 1e3,
+                    );
+                    last_report = Instant::now();
+                    reported = stepped + skipped;
+                    reported_total = barrier_total;
+                    barrier_max = Duration::ZERO;
+                }
+            }
+            // Never leave a vCPU blocked waiting on a stepper that has stopped.
+            clock.release();
+            if trace {
+                let wall = started.elapsed();
+                let duty = if wall.is_zero() {
+                    0.0
+                } else {
+                    barrier_total.as_secs_f64() / wall.as_secs_f64() * 100.0
+                };
+                eprintln!(
+                    "[vtimer] stepper stopped: {stepped} stepped, {skipped} skipped, \
+                     barrier total {:.3}s of {:.3}s wall ({duty:.2}% stopped), \
+                     max {:.3}ms, mean {:.3}ms",
+                    barrier_total.as_secs_f64(),
+                    wall.as_secs_f64(),
+                    barrier_max.as_secs_f64() * 1e3,
+                    barrier_total.as_secs_f64() * 1e3
+                        / (stepped + skipped).max(1) as f64,
+                );
+            }
+        })
+        .expect("spawn vtimer stepper");
+    Some(handle)
 }
 
 /// A boxed closure that forces one vCPU out of `hv_vcpu_run` (its `exit_signal`).
@@ -2925,6 +3071,7 @@ fn collect_checkpoint(
         num_irq,
         usgic: None,
         usgic_cpus: Vec::new(),
+        host_realtime_ns: hvf_checkpoint::now_realtime_ns(),
     })
 }
 
@@ -2981,6 +3128,7 @@ fn collect_usgic_checkpoint(
         // which is a price worth paying for a format with no cross-references.
         usgic: usgic_cpus.first().cloned(),
         usgic_cpus,
+        host_realtime_ns: hvf_checkpoint::now_realtime_ns(),
     })
 }
 
@@ -3180,6 +3328,8 @@ mod tests {
                 gic_dist: Vec::new(),
                 gic_rdist: Vec::new(),
                 num_irq: 0,
+                captured_cntfrq: None,
+                captured_realtime_ns: None,
             }
         }
 
@@ -3198,6 +3348,8 @@ mod tests {
             gic_dist: Vec::new(),
             gic_rdist: Vec::new(),
             num_irq: 0,
+            captured_cntfrq: None,
+            captured_realtime_ns: None,
         }
     }
 

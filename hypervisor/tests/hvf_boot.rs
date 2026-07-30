@@ -20,7 +20,7 @@ use std::{env, fs};
 
 use hypervisor::arch::aarch64::gic::{GicState, Vgic, VgicConfig};
 use hypervisor::hvf::gic::{inject_lpi_via_lr, GICD_TYPER, HvfGicV3};
-use hypervisor::hvf::HvfVcpu;
+use hypervisor::hvf::{HvfVcpu, VtimerClock};
 use hypervisor::{CpuState, HypervisorVmConfig, HypervisorVmError, Vcpu, Vm, VmExit, VmOps};
 
 type VmOpsResult<T> = Result<T, HypervisorVmError>;
@@ -2514,7 +2514,8 @@ fn hvf_rehydrate_stock_its_snapshot_usgic_smp() {
     use hypervisor::hvf::UsgicCpuHandle;
     use hypervisor::hvf::devices::{MmioBus, Pl011};
     use hypervisor::hvf::rehydrate::{
-        Snapshot, prepare_usgic_vm, restore_usgic_vcpu, usgic_cpu_handle, usgic_set_cpu_table,
+        Snapshot, counter_clock, prepare_usgic_vm, restore_usgic_vcpu, usgic_cpu_handle,
+        usgic_set_cpu_table,
     };
 
     const PL011_BASE: u64 = 0x0900_0000;
@@ -2540,6 +2541,9 @@ fn hvf_rehydrate_stock_its_snapshot_usgic_smp() {
     let vm_ops: Arc<dyn VmOps> = Arc::new(bus);
     let hv = hypervisor::new().expect("hypervisor::new() — codesigned?");
     let prepared = prepare_usgic_vm(hv.as_ref(), &snap, &mem_ranges).expect("prepare_usgic_vm");
+    // One shared counter clock for the VM, as the production engine builds.
+    let clock = counter_clock(&snap, None)
+        .unwrap_or_else(|| VtimerClock::new(0, 0, hypervisor::hvf::host_counter_hz()));
     let vm = prepared.vm.clone();
     let seed = prepared.seed();
 
@@ -2558,12 +2562,13 @@ fn hvf_rehydrate_stock_its_snapshot_usgic_smp() {
         let seed = seed.clone();
         let snap = snap.clone();
         let vm_ops = vm_ops.clone();
+        let clock = clock.clone();
         let setup_tx = setup_tx.clone();
         let exits_c = exits[id].clone();
         let fault_c = faulted.clone();
         let running_c = running.clone();
         threads.push(thread::spawn(move || {
-            let mut vcpu = restore_usgic_vcpu(&vm, &seed, &snap, None, id, &vm_ops)
+            let mut vcpu = restore_usgic_vcpu(&vm, &seed, &snap, None, id, &vm_ops, &clock)
                 .unwrap_or_else(|e| panic!("restore_usgic_vcpu {id}: {e}"));
             let handle = usgic_cpu_handle(&mut vcpu).expect("usgic cpu handle");
             setup_tx.send((id, handle)).expect("send setup");

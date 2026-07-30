@@ -52,16 +52,13 @@ use crate::arch::aarch64::gic::{Vgic, VgicConfig};
 use crate::cpu::Vcpu;
 use crate::hvf::ffi::SYSREG_CNTVCT_EL0;
 use crate::hvf::gic::HvfGicV3;
+use crate::hvf::softgic::Distributor;
 use crate::hvf::translate::gic_ingest::{
     dist_to_hvf, num_irq_from_dist_len, redist_rd_base_words, redist_to_hvf, redist_words_per_vcpu,
 };
 use crate::hvf::translate::kvm_ingest::snapshot_json_to_hvf;
 use crate::hvf::virtio::GuestMemory;
-use crate::hvf::HvfVcpu;
-use crate::hvf::UsgicCpuHandle;
-use crate::hvf::UsgicSpiRouter;
-use crate::hvf::softgic::Distributor;
-use crate::hvf::VcpuHvfState;
+use crate::hvf::{HvfVcpu, UsgicCpuHandle, UsgicSpiRouter, VcpuHvfState, VtimerClock};
 use crate::hypervisor::Hypervisor;
 use crate::vm::{Vm, VmOps};
 use crate::{CpuState, HypervisorVmConfig};
@@ -154,6 +151,13 @@ pub struct Snapshot {
     pub gic_rdist: Vec<u32>,
     /// Number of interrupt lines the captured GICv3 was built with.
     pub num_irq: u32,
+    /// `CNTFRQ_EL0` of the host this snapshot was captured on, when the capture
+    /// records it. `None` for a capture predating upstream `69637dde6`.
+    pub captured_cntfrq: Option<u64>,
+    /// Host wall-clock time at the instant of capture, in nanoseconds since the
+    /// Unix epoch. Recorded in the same clock block as [`Self::captured_cntfrq`],
+    /// so it is `None` for exactly the same captures.
+    pub captured_realtime_ns: Option<u64>,
 }
 
 impl Snapshot {
@@ -258,6 +262,8 @@ impl Snapshot {
             gic_dist,
             gic_rdist,
             num_irq,
+            captured_cntfrq: snapshot_cntfrq(state_json),
+            captured_realtime_ns: snapshot_clock_field(state_json, "host_realtime_ns"),
         })
     }
 
@@ -818,6 +824,9 @@ pub fn rehydrate_usgic(
     // uses `prepare_usgic_vm` + `restore_usgic_vcpu` directly, one per thread,
     // because HVF binds a vCPU to its creating thread.
     let seed = prepared.seed();
+    // One clock for the whole VM: see `counter_clock`.
+    let clock = counter_clock(snap, resume)
+        .unwrap_or_else(|| VtimerClock::new(0, 0, super::host_counter_hz()));
     let mut vcpus = Vec::with_capacity(snap.vcpus.len());
     for id in 0..snap.vcpus.len() {
         vcpus.push(restore_usgic_vcpu(
@@ -827,6 +836,7 @@ pub fn rehydrate_usgic(
             resume,
             id,
             vm_ops,
+            &clock,
         )?);
     }
     if timing {
@@ -968,6 +978,7 @@ pub fn restore_usgic_vcpu(
     resume: Option<&crate::hvf::checkpoint::CheckpointState>,
     id: usize,
     vm_ops: &Arc<dyn VmOps>,
+    clock: &Arc<VtimerClock>,
 ) -> Result<Box<dyn Vcpu>, RehydrateError> {
     let mut vcpu = vm
         .create_vcpu(id as u32, Some(vm_ops.clone()))
@@ -1023,56 +1034,156 @@ pub fn restore_usgic_vcpu(
     vcpu.set_state(&CpuState::Hvf(vcpu_state.clone()))
         .map_err(|e| RehydrateError::Hv(anyhow!("restore vCPU {id} state: {e}")))?;
 
-    // One shared virtual-counter reference across cores (no-op for 1 vCPU).
-    // On resume the reference is the checkpoint's captured CNTVCT so the guest's
-    // virtual clock stays continuous across the suspend.
-    let reference_cntvct = match resume {
-        Some(cp) => cp.reference_cntvct(),
-        None => snap.reference_cntvct(),
-    };
-    if let Some(reference) = reference_cntvct {
+    // Bind this vCPU to the VM's ONE counter clock. Every vCPU programming the
+    // same virtual-timer offset is what makes `CNTVCT_EL0` coherent across
+    // cores; seeding an offset per vCPU (as this used to) leaves them
+    // permanently skewed and wraps the guest's 56-bit clocksource. See
+    // [`VtimerClock`].
+    {
         let concrete = vcpu
             .as_any_concrete_mut()
             .downcast_mut::<HvfVcpu>()
             .expect("HVF vCPU");
-        // Seed the anchor before activating the scale: `apply_counter_scale`
-        // makes the curve live, and a curve without an origin evaluates from host
-        // time zero. On SMP a secondary vCPU can be in `run()` while this runs.
         concrete
-            .restore_vtimer_offset(reference)
-            .map_err(|e| RehydrateError::Hv(anyhow!("vCPU {id} reseed vtimer: {e}")))?;
-        apply_counter_scale(concrete);
+            .attach_clock(clock.clone())
+            .map_err(|e| RehydrateError::Hv(anyhow!("vCPU {id} attach counter clock: {e}")))?;
     }
     Ok(vcpu)
 }
 
-/// The counter frequency the guest believes it has, from `CHM_GUEST_CNTFRQ`.
+/// Build the one [`VtimerClock`] a rehydrated VM's vCPUs all share, anchored on
+/// the snapshot's (or checkpoint's) reference `CNTVCT_EL0` so the guest's
+/// virtual counter resumes where it was captured.
+///
+/// `None` when the snapshot carried no counter at all, in which case the guest
+/// keeps HVF's fresh counter and there is nothing to keep coherent.
+pub fn counter_clock(
+    snap: &Snapshot,
+    resume: Option<&crate::hvf::checkpoint::CheckpointState>,
+) -> Option<Arc<VtimerClock>> {
+    // Take the counter and the wall-clock time from the SAME source, or the
+    // elapsed span is measured between two unrelated instants.
+    let (captured, captured_realtime_ns) = match resume {
+        Some(cp) => (cp.reference_cntvct()?, cp.host_realtime_ns),
+        None => (snap.reference_cntvct()?, snap.captured_realtime_ns),
+    };
+    // The capture's own recorded frequency is the default: correcting the rate
+    // costs a measured 2.8% of wall time in stop-the-world barriers, and leaving
+    // it uncorrected costs a Graviton guest a 5.078x time dilation, which makes
+    // every timeout, sleep and scheduler tick in it wrong. An explicit
+    // `CHM_GUEST_CNTFRQ` overrides either way, including `0` to opt out.
+    let guest_hz = effective_guest_hz(requested_guest_cntfrq(), snap.captured_cntfrq);
+    // The guest reads ticks at the frequency it believes it has, whether or not
+    // the rate is being corrected, so the elapsed span converts with that.
+    let believed_hz = snap.captured_cntfrq.unwrap_or(guest_hz);
+    let reference = advance_to_wall_clock(
+        captured,
+        captured_realtime_ns,
+        now_realtime_ns(),
+        believed_hz,
+    );
+    Some(VtimerClock::new(
+        reference,
+        guest_hz,
+        super::host_counter_hz(),
+    ))
+}
+
+/// The `cntfrq` recorded in a snapshot's top-level clock block, if present.
+///
+/// cloud-hypervisor stores it as a JSON *string* under `snapshot_data.state`
+/// that has to be parsed a second time:
+/// `{"clock":{"cntvct":..,"host_realtime_ns":..,"cntfrq":24000000}}`.
+///
+/// `None` when the capture predates upstream `69637dde6` ("hypervisor: aarch64:
+/// capture the guest counter for snapshot/restore"), which introduced the block
+/// — a v52.0 capture writes `{}` here.
+pub fn snapshot_cntfrq(state_json: &str) -> Option<u64> {
+    snapshot_clock_field(state_json, "cntfrq")
+}
+
+/// One `u64` out of a snapshot's doubly encoded top-level clock block.
+fn snapshot_clock_field(state_json: &str, field: &str) -> Option<u64> {
+    let root: serde_json::Value = serde_json::from_str(state_json).ok()?;
+    let inner = root.get("snapshot_data")?.get("state")?.as_str()?;
+    let clock: serde_json::Value = serde_json::from_str(inner).ok()?;
+    clock.get("clock")?.get(field)?.as_u64()
+}
+
+/// Nanoseconds since the Unix epoch at 2020-01-01, used only as a floor for
+/// deciding whether a recorded capture time is a real timestamp.
+const PLAUSIBLE_EPOCH_FLOOR_NS: u64 = 1_577_836_800_000_000_000;
+
+/// Advance a captured `CNTVCT_EL0` by the wall-clock time that has passed since
+/// the capture, so a resumed guest wakes up believing the current date.
+///
+/// Without this a snapshot resumes frozen at the instant it was taken, and the
+/// staleness is not cosmetic: measured on a capture 5 hours old, `apt-get
+/// update` **refused** `noble-updates` and `noble-security` with *"Release file
+/// is not valid yet (invalid for another 4h 2min 0s)"*, because repository
+/// metadata published after the capture is dated in the guest's future. TLS
+/// certificate validity, token expiry and `make` all have the same exposure,
+/// and it grows the longer a snapshot sits in a registry.
+///
+/// This is what the KVM path already does on restore (`restore_clock`), so it is
+/// parity rather than novelty. `elapsed` is converted with the **guest's**
+/// counter frequency, since that is the rate at which the guest interprets the
+/// ticks it reads, whether or not the rate is being corrected.
+///
+/// Returns `captured` unchanged when the capture recorded no time, when the
+/// recorded time is not plausibly a Unix timestamp (a zero or garbage field
+/// would otherwise throw the guest ~57 years forward), or when the host clock is
+/// behind the capture.
+fn advance_to_wall_clock(
+    captured: u64,
+    captured_realtime_ns: Option<u64>,
+    now_realtime_ns: u64,
+    guest_hz: u64,
+) -> u64 {
+    let Some(then) = captured_realtime_ns.filter(|ns| *ns >= PLAUSIBLE_EPOCH_FLOOR_NS) else {
+        return captured;
+    };
+    if guest_hz == 0 {
+        return captured;
+    }
+    let elapsed_ns = u128::from(now_realtime_ns.saturating_sub(then));
+    let ticks = elapsed_ns * u128::from(guest_hz) / 1_000_000_000;
+    captured.wrapping_add(u64::try_from(ticks).unwrap_or(0))
+}
+
+/// Host wall clock now, in nanoseconds since the Unix epoch.
+fn now_realtime_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64)
+}
+
+/// The frequency the counter should be made to run at: an explicit override
+/// first, else whatever the capture recorded, else 0 (leave it at the host
+/// rate). `Some(0)` from the override is the opt-out and deliberately wins over
+/// a recorded frequency.
+fn effective_guest_hz(override_hz: Option<u64>, captured: Option<u64>) -> u64 {
+    override_hz.or(captured).unwrap_or(0)
+}
+
+/// An explicit `CHM_GUEST_CNTFRQ` override. `Some(0)` means "do not scale".
 ///
 /// A guest caches `CNTFRQ_EL0` once at boot and never re-reads it, and Apple
 /// exposes no way to change the value an HVF guest sees, so a snapshot captured
 /// on a host with a different counter frequency has permanently wrong
 /// timekeeping unless the counter is made to run at the rate the guest expects.
-/// This is the opt-in that turns that synthesis on.
 ///
-/// Deliberately an explicit value rather than something inferred: round-1
-/// Graviton captures predate the upstream commit that writes the clock block, so
-/// the frequency is not always in the snapshot, and silently guessing it would
-/// be worse than leaving the guest visibly slow.
+/// This used to be the *only* way to turn that synthesis on, because a
+/// pre-`69637dde6` capture does not record the frequency and guessing it would
+/// have been worse than a visibly slow guest. It is now an override: a capture
+/// that states its own frequency is believed (see [`snapshot_cntfrq`]), and this
+/// exists to correct a capture that cannot, or to switch the correction off.
 fn requested_guest_cntfrq() -> Option<u64> {
     std::env::var("CHM_GUEST_CNTFRQ")
         .ok()?
         .trim()
         .parse::<u64>()
         .ok()
-        .filter(|hz| *hz > 0)
-}
-
-/// Point this vCPU's virtual counter at the guest's own counter frequency when
-/// one was requested. No-op otherwise.
-fn apply_counter_scale(vcpu: &HvfVcpu) {
-    if let Some(guest_hz) = requested_guest_cntfrq() {
-        vcpu.set_counter_scale(guest_hz, super::host_counter_hz());
-    }
 }
 
 /// This vCPU's SMP cross-delivery handle (its injection queue + wake), for the
@@ -1243,12 +1354,17 @@ pub fn restore_vcpu_state(
     // and the secondary's timer never fires, so this override is load-bearing for
     // multi-vCPU resume (and a harmless no-op re-seed for a single vCPU, whose
     // reference IS its own CNTVCT). See [`Snapshot::reference_cntvct`].
+    //
+    // NOTE: this is the managed-GIC (GICv2M) path, which seeds each vCPU on its
+    // own thread and so still leaves cores skewed by however far apart those
+    // calls land — the defect [`VtimerClock`] closes on the userspace-GIC path.
+    // Vanilla GICv3 snapshots (the supported contract since #102) never come
+    // through here; rate scaling is deliberately not offered on this path
+    // because without the clock it cannot be made coherent.
     if let Some(reference) = snap.reference_cntvct() {
-        // Anchor first, then scale — see the note in `rehydrate_vcpu`.
         concrete
             .restore_vtimer_offset(reference)
             .map_err(|e| RehydrateError::Hv(anyhow!("vCPU {id} reseed vtimer offset: {e}")))?;
-        apply_counter_scale(concrete);
     }
     Ok(())
 }
@@ -1337,6 +1453,84 @@ fn u32_vec(v: &serde_json::Value, key: &str) -> Result<Vec<u32>, RehydrateError>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The capture states its own counter frequency, so believing it is what
+    /// makes a vanilla cloud snapshot keep correct time with no flags at all.
+    /// An explicit override still wins — including `0`, which is the documented
+    /// way to decline the correction and accept the dilation instead.
+    #[test]
+    fn a_captures_own_frequency_drives_correction_unless_overridden() {
+        // Nothing known, nothing to do.
+        assert_eq!(effective_guest_hz(None, None), 0);
+        // The Graviton2 case: the capture says 121.875 MHz, so use it.
+        assert_eq!(effective_guest_hz(None, Some(121_875_000)), 121_875_000);
+        // A pre-69637dde6 capture records nothing; the override supplies it.
+        assert_eq!(effective_guest_hz(Some(121_875_000), None), 121_875_000);
+        // The override beats the recorded value when they disagree.
+        assert_eq!(
+            effective_guest_hz(Some(100_000_000), Some(121_875_000)),
+            100_000_000
+        );
+        // `CHM_GUEST_CNTFRQ=0` opts out even though the capture states a rate.
+        assert_eq!(effective_guest_hz(Some(0), Some(121_875_000)), 0);
+    }
+
+    /// A snapshot resumes frozen at the instant it was captured unless the
+    /// elapsed wall time is added back, and a stale guest clock is not cosmetic:
+    /// a 5-hour-old capture had `apt-get update` refuse two repositories as
+    /// "not valid yet". Converted with the frequency the GUEST believes it has,
+    /// since that is the rate it reads its own counter at.
+    #[test]
+    fn the_counter_is_advanced_over_the_time_a_snapshot_sat_still() {
+        const HZ: u64 = 121_875_000;
+        let then = PLAUSIBLE_EPOCH_FLOOR_NS + 86_400_000_000_000;
+
+        // Five hours later: 5 * 3600 * 121_875_000 ticks further on.
+        let five_hours = 5 * 3_600 * 1_000_000_000u64;
+        assert_eq!(
+            advance_to_wall_clock(1_000, Some(then), then + five_hours, HZ),
+            1_000 + 5 * 3_600 * HZ
+        );
+
+        // Same instant: nothing to add.
+        assert_eq!(advance_to_wall_clock(1_000, Some(then), then, HZ), 1_000);
+
+        // Host clock BEHIND the capture: never rewind the guest.
+        assert_eq!(
+            advance_to_wall_clock(1_000, Some(then), then - 60_000_000_000, HZ),
+            1_000
+        );
+
+        // A capture that recorded no time is left exactly as captured.
+        assert_eq!(advance_to_wall_clock(1_000, None, then, HZ), 1_000);
+
+        // A zero or otherwise implausible field would throw the guest ~57 years
+        // forward, so it is rejected rather than believed.
+        assert_eq!(advance_to_wall_clock(1_000, Some(0), then, HZ), 1_000);
+        assert_eq!(
+            advance_to_wall_clock(1_000, Some(PLAUSIBLE_EPOCH_FLOOR_NS - 1), then, HZ),
+            1_000
+        );
+
+        // Unknown guest frequency: the tick conversion is undefined, so skip it.
+        assert_eq!(
+            advance_to_wall_clock(1_000, Some(then), then + five_hours, 0),
+            1_000
+        );
+    }
+
+    /// The clock block is doubly encoded — a JSON string inside JSON — and a
+    /// capture predating upstream `69637dde6` writes `{}` there rather than
+    /// omitting it, so "absent" has to be distinguished from "malformed".
+    #[test]
+    fn snapshot_cntfrq_reads_the_doubly_encoded_clock_block() {
+        let with_clock =
+            r#"{"snapshot_data":{"state":"{\"clock\":{\"cntvct\":1,\"cntfrq\":121875000}}"}}"#;
+        assert_eq!(snapshot_cntfrq(with_clock), Some(121_875_000));
+        assert_eq!(snapshot_cntfrq(r#"{"snapshot_data":{"state":"{}"}}"#), None);
+        assert_eq!(snapshot_cntfrq(r#"{"snapshots":{}}"#), None);
+        assert_eq!(snapshot_cntfrq("not json"), None);
+    }
 
     /// The populate walk strides threads across chunks, so a thread count above
     /// the chunk count would spawn threads with no work — and a count of zero

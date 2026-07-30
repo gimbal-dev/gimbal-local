@@ -26,7 +26,8 @@ stderr, so `2> trace.log` separates it from guest console output.
 | Variable | What it prints | Reach for it when |
 | --- | --- | --- |
 | `CHM_TRACE_EXIT` | Every vCPU exit: `[exit] t=<ns> vcpu N reason=R ec=0xEC pc=0x… ipa=0x…`. `reason=1` exception, `reason=2` vtimer; `ec=0x18` is an MSR/MRS trap, `ec=0x1` a WFI/WFE. | The guest is stuck and you need to know *where*. A healthy idle loop is a repeating `0x18, 0x18, 0x1 (WFI), reason=2 (vtimer)`. A tight non-WFI loop is a spin. |
-| `CHM_TRACE_VTIMER` | Virtual timer arming, firing and offset re-stepping. | Time in the guest is wrong — running fast, slow, or jumping. |
+| `CHM_TRACE_VTIMER` | Virtual timer arming and firing, plus the shared counter clock's stepper: steps taken/abandoned and the share of wall time spent stopped, every 5s. | Time in the guest is wrong — running fast, slow, or jumping — or the clock correction is costing more than it should. |
+| `CHM_TRACE_VTIMER_WFI` | Every WFI park, with the guest counter and the timer deadline it parked against. | A guest that idles and never wakes. Very heavy: it perturbs the timing it observes. |
 | `CHM_TRACE_ABORT` | Data/instruction aborts with the faulting IPA. | The guest touched an address the device model does not decode. Almost always a missing or misplaced MMIO region. |
 | `CHM_TRACE_HVC` | Hypercalls (PSCI: `CPU_ON`, `CPU_OFF`, `SYSTEM_OFF`, …). | SMP will not come up, or the guest will not shut down. |
 | `CHM_TRACE_MMIO` | Every virtio-PCI MMIO access — register, offset, value. | A device is being configured wrongly, or not at all. Verbose. |
@@ -52,8 +53,9 @@ known-good path, not for normal operation.
 | `CHM_ALLOW_ITS_LPI=1` | Allow an ITS/LPI capture onto the **managed** GIC, which cannot deliver its completions. | Reproducing the failure mode that motivated the userspace GIC. Produces a broken guest by design. |
 | `CHM_DISABLE_SPI_1_OF_N_FALLBACK=1` | Disable 1-of-N SPI target-selection fallback. | Isolating an interrupt-affinity bug. |
 | `CHM_SERIAL_SPI=<n>` | Override the serial console's SPI INTID. | A capture whose device/IRQ ordering differs from what we infer. |
-| `CHM_GUEST_CNTFRQ=<Hz>` | Synthesize a guest counter rate by re-stepping the vtimer offset. | The V1.3 fix for cross-host clock dilation. **Single-vCPU only today** — on SMP the per-vCPU re-step cadence makes the counter incoherent between vCPUs; see [`hvf-compatible-snapshots.md`](hvf-compatible-snapshots.md#-single-vcpu-only-today). |
-| `CHM_DEBUG_VTIMER=1` | Trace every virtual-counter re-step (`cpu`, anchor, ratio, target, offset). | Debugging the SMP counter-coherence bug above. Heavy: this path runs ~10^5 times per vCPU per minute, and the tracing perturbs the timing enough to hide the very divergence it is used to find. |
+| `CHM_GUEST_CNTFRQ=<Hz>` | Override the guest counter rate the VM-global clock synthesizes. | Not normally needed: a capture including upstream `69637dde6` records its own frequency and is corrected automatically. Set it for an older capture that records none, or `0` to decline the correction and accept the dilation. See [`hvf-compatible-snapshots.md`](hvf-compatible-snapshots.md#how-the-correction-works). |
+| `CHM_VTIMER_STEP_MS=<ms>` | How often the shared counter clock steps forward (default 20). | Trades stop-the-world barrier overhead against the guest's worst-case clock error: 5 ms is 26.9% of wall time for 4 ms error, 20 ms is 2.8% for 16 ms, 50 ms is 0.8% for 40 ms. |
+| `CHM_DEBUG_VTIMER=1` | One line per accepted offset step: host tick, curve target, old and new offset, and how far the guest's counter jumped. | Checking that the correction is stepping as expected. 50 lines/s at the default period — far lighter than it once was, when it sat on the guest-entry path. |
 | `CHM_STRICT_CNTFRQ=1` | Refuse to run on a frequency mismatch instead of warning. | KVM's posture. We warn by default because a dilated guest is still useful; this opts into strictness. |
 | `CHM_STRICT_AARCH32=1` | Refuse a snapshot whose guest believes it can run 32-bit binaries. | See [`cpu-feature-deltas.md`](cpu-feature-deltas.md) — such a guest wedges its vCPU if it ever execs one. Warn-only by default. |
 | `CHM_EAGER_RAM=1` | Populate guest RAM eagerly rather than mapping the snapshot file. | Ruling out a lazy-mapping interaction. Slower to start. |
