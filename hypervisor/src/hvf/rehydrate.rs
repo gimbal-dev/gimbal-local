@@ -1022,10 +1022,13 @@ pub fn restore_usgic_vcpu(
             .as_any_concrete_mut()
             .downcast_mut::<HvfVcpu>()
             .expect("HVF vCPU");
-        apply_counter_scale(concrete);
+        // Seed the anchor before activating the scale: `apply_counter_scale`
+        // makes the curve live, and a curve without an origin evaluates from host
+        // time zero. On SMP a secondary vCPU can be in `run()` while this runs.
         concrete
             .restore_vtimer_offset(reference)
             .map_err(|e| RehydrateError::Hv(anyhow!("vCPU {id} reseed vtimer: {e}")))?;
+        apply_counter_scale(concrete);
     }
     Ok(vcpu)
 }
@@ -1228,10 +1231,11 @@ pub fn restore_vcpu_state(
     // multi-vCPU resume (and a harmless no-op re-seed for a single vCPU, whose
     // reference IS its own CNTVCT). See [`Snapshot::reference_cntvct`].
     if let Some(reference) = snap.reference_cntvct() {
-        apply_counter_scale(concrete);
+        // Anchor first, then scale — see the note in `rehydrate_vcpu`.
         concrete
             .restore_vtimer_offset(reference)
             .map_err(|e| RehydrateError::Hv(anyhow!("vCPU {id} reseed vtimer offset: {e}")))?;
+        apply_counter_scale(concrete);
     }
     Ok(())
 }

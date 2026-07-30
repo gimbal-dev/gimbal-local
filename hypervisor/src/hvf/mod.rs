@@ -23,7 +23,7 @@ use std::any::Any;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
@@ -96,6 +96,31 @@ fn reduce_ratio(a: u64, b: u64) -> (u64, u64) {
     }
     let g = x.max(1);
     (a / g, b / g)
+}
+
+/// Whether `CHM_DEBUG_VTIMER` asked for per-entry virtual-counter tracing.
+///
+/// Cached, because the only caller sits on the guest-entry path — measured at
+/// ~118,000 calls per vCPU per minute on a busy guest — and `env::var_os`
+/// allocates. Tracing here is heavy enough to change the timing it is
+/// observing, so it stays opt-in.
+fn debug_vtimer() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("CHM_DEBUG_VTIMER").is_some())
+}
+
+/// The guest `CNTVCT_EL0` the scaled curve calls for at host time `now`, given
+/// the anchor (`base_host`, `base_guest`) and the reduced rate `num/den`.
+///
+/// `now.saturating_sub(base_host)` is load-bearing. A `now` behind the anchor
+/// means the curve has not started yet, not that ~2^64 ticks have elapsed —
+/// wrapping there converts a sub-microsecond thread race into a counter about
+/// `2^64 * num/den` ticks ahead, which a guest's monotonic clocksource then
+/// latches permanently.
+fn scaled_cntvct(base_guest: u64, base_host: u64, now: u64, num: u64, den: u64) -> u64 {
+    let elapsed = u128::from(now.saturating_sub(base_host));
+    let scaled = elapsed * u128::from(num) / u128::from(den);
+    base_guest.wrapping_add(scaled as u64)
 }
 
 /// The frequency the host virtual counter actually ticks at, derived from the
@@ -313,6 +338,7 @@ impl Vm for HvfVm {
             cnt_scale_den: AtomicU64::new(1),
             cnt_base_host: AtomicU64::new(0),
             cnt_base_guest: AtomicU64::new(0),
+            vtimer_reprogram_failed: AtomicBool::new(false),
             run_gen: Arc::new(AtomicU64::new(0)),
             usgic: Mutex::new(UserGic::default()),
             inject_queue: Arc::new(Mutex::new(Vec::new())),
@@ -671,7 +697,7 @@ impl UserGic {
 
 #[cfg(test)]
 mod counter_scale_tests {
-    use super::reduce_ratio;
+    use super::{reduce_ratio, scaled_cntvct};
 
     /// The ratio that matters in practice: AWS Graviton2's 121.875 MHz counter
     /// over Apple silicon's 24 MHz. It reduces to exactly 325/64, so the scaled
@@ -722,6 +748,59 @@ mod counter_scale_tests {
     fn a_zero_frequency_does_not_panic() {
         assert_eq!(reduce_ratio(0, 24_000_000), (0, 1));
         assert_eq!(reduce_ratio(24_000_000, 0), (1, 0));
+    }
+
+    /// The curve must never be evaluated behind its own anchor. Measured on a
+    /// 2-vCPU Graviton2 capture: a secondary vCPU reaching `run()` while
+    /// rehydrate was still seeding evaluated the curve from an anchor ahead of
+    /// `now`, the subtraction wrapped, and the guest's counter landed on exactly
+    /// 2^58 ticks — 2_364_967_189 guest seconds, or ~75 years. Linux's
+    /// clocksource is monotonic, so it kept the jump and RCU then reported its
+    /// kthreads starved for 2.36e12 jiffies.
+    #[test]
+    fn a_now_behind_the_anchor_does_not_run_the_counter_75_years_forward() {
+        let (num, den) = reduce_ratio(121_875_000, 24_000_000);
+        let base_guest: u64 = 7_694_581_610; // capture B's recorded CNTVCT
+        let anchor: u64 = 1_000_000;
+
+        // `now` one tick behind the anchor: the curve has not started.
+        assert_eq!(
+            scaled_cntvct(base_guest, anchor, anchor - 1, num, den),
+            base_guest,
+            "a now behind the anchor must pin the counter at the guest base"
+        );
+        // The wrapping form this replaced produced a value ~2^58 ticks out.
+        let wrapped = {
+            let elapsed = u128::from((anchor - 1u64).wrapping_sub(anchor));
+            base_guest.wrapping_add((elapsed * u128::from(num) / u128::from(den)) as u64)
+        };
+        assert!(
+            wrapped / 121_875_000 > 1_000_000_000,
+            "the bug this pins should be worth >1e9 guest seconds, was {}",
+            wrapped / 121_875_000
+        );
+
+        // And an unanchored curve (base_host still zero) must not measure
+        // elapsed from host time zero.
+        let unanchored = scaled_cntvct(base_guest, 0, 5_000_000_000_000, num, den);
+        assert!(
+            unanchored > base_guest,
+            "sanity: with no anchor the curve does run from zero, which is why \
+             counter_scale() reports the scale inactive until it is seeded"
+        );
+    }
+
+    /// Forward progress still works: one host second past the anchor must
+    /// advance the guest counter by exactly one guest second.
+    #[test]
+    fn one_host_second_past_the_anchor_is_one_guest_second() {
+        let (num, den) = reduce_ratio(121_875_000, 24_000_000);
+        let base_guest: u64 = 7_694_581_610;
+        let anchor: u64 = 42_000_000;
+        assert_eq!(
+            scaled_cntvct(base_guest, anchor, anchor + 24_000_000, num, den),
+            base_guest + 121_875_000
+        );
     }
 }
 
@@ -862,6 +941,9 @@ pub struct HvfVcpu {
     cnt_base_host: AtomicU64,
     /// Guest `CNTVCT_EL0` at which the scaled-counter curve was anchored.
     cnt_base_guest: AtomicU64,
+    /// Set the first time `hv_vcpu_set_vtimer_offset` refuses a reprogram, so the
+    /// warning is emitted once per vCPU rather than on every guest entry.
+    vtimer_reprogram_failed: AtomicBool,
     /// Monotonic counter bumped once per `run()` iteration. A host-side watchdog
     /// samples it to tell a vCPU that is making progress (returning from
     /// `hv_vcpu_run` for exits) apart from one wedged inside a single
@@ -1056,8 +1138,13 @@ impl HvfVcpu {
         let now = unsafe { mach_absolute_time() };
         // Anchor the scaled-counter curve here too, so a scaled guest's counter
         // also resumes at its captured value and only then starts running fast.
-        self.cnt_base_host.store(now, Ordering::Relaxed);
+        //
+        // Order matters: the guest base is published first, then the host base
+        // with Release. `counter_scale()` reads `cnt_base_host` with Acquire and
+        // treats zero as "not yet anchored", so a vCPU thread can never observe
+        // an anchored host base without the matching guest base.
         self.cnt_base_guest.store(snapshot_cntvct, Ordering::Relaxed);
+        self.cnt_base_host.store(now, Ordering::Release);
         let offset = now.wrapping_sub(snapshot_cntvct);
         // SAFETY: FFI on the owning thread.
         let ret = unsafe { hv_vcpu_set_vtimer_offset(self.id, offset) };
@@ -1108,10 +1195,27 @@ impl HvfVcpu {
     }
 
     /// The scale as a reduced `(numerator, denominator)`, or `None` when the
-    /// guest counter runs at the host rate.
+    /// guest counter runs at the host rate — or when the curve has no anchor yet.
+    ///
+    /// The anchor is seeded by [`Self::restore_vtimer_offset`]. Until then
+    /// `cnt_base_host` is zero, and evaluating the curve would measure `elapsed`
+    /// from host time zero instead of from resume, producing a counter value
+    /// wildly ahead of the guest's. On an SMP guest that is not hypothetical: a
+    /// secondary vCPU can enter `run()` while rehydrate is still seeding, and one
+    /// such evaluation permanently drags the guest's monotonic clocksource
+    /// forward (measured: a 2-vCPU Graviton capture jumping to 2^58 ticks, ~75
+    /// years, after which RCU reports its kthreads starved for 2.36e12 jiffies).
+    /// Reporting the scale as inactive makes every consumer fall back to the
+    /// plain offset, which is always safe.
     fn counter_scale(&self) -> Option<(u64, u64)> {
         let num = self.cnt_scale_num.load(Ordering::Relaxed);
         if num == 0 {
+            return None;
+        }
+        // Acquire pairs with the Release store of the anchor in
+        // `restore_vtimer_offset`: a non-zero host base here guarantees the
+        // matching guest base is visible to this thread.
+        if self.cnt_base_host.load(Ordering::Acquire) == 0 {
             return None;
         }
         Some((num, self.cnt_scale_den.load(Ordering::Relaxed)))
@@ -1119,11 +1223,9 @@ impl HvfVcpu {
 
     /// The guest `CNTVCT_EL0` the scaled curve calls for at host time `now`.
     fn scaled_cntvct_at(&self, now: u64, num: u64, den: u64) -> u64 {
-        let base_host = self.cnt_base_host.load(Ordering::Relaxed);
+        let base_host = self.cnt_base_host.load(Ordering::Acquire);
         let base_guest = self.cnt_base_guest.load(Ordering::Relaxed);
-        let elapsed = u128::from(now.wrapping_sub(base_host));
-        let scaled = elapsed * u128::from(num) / u128::from(den);
-        base_guest.wrapping_add(scaled as u64)
+        scaled_cntvct(base_guest, base_host, now, num, den)
     }
 
     /// Step the virtual-timer offset onto the scaled curve. Called at every
@@ -1138,11 +1240,33 @@ impl HvfVcpu {
         };
         // SAFETY: FFI; reads the host monotonic tick.
         let now = unsafe { mach_absolute_time() };
-        let offset = now.wrapping_sub(self.scaled_cntvct_at(now, num, den));
+        let target = self.scaled_cntvct_at(now, num, den);
+        let offset = now.wrapping_sub(target);
+        if debug_vtimer() {
+            eprintln!(
+                "[vtimer] cpu={} now={now} base_host={} base_guest={} num={num} den={den} \
+                 target={target} offset={offset}",
+                self.id,
+                self.cnt_base_host.load(Ordering::Acquire),
+                self.cnt_base_guest.load(Ordering::Relaxed),
+            );
+        }
         // SAFETY: FFI on the owning thread.
         let ret = unsafe { hv_vcpu_set_vtimer_offset(self.id, offset) };
         if ret == HV_SUCCESS {
             self.vtimer_offset.store(offset, Ordering::Relaxed);
+        } else if !self.vtimer_reprogram_failed.swap(true, Ordering::Relaxed) {
+            // Do not swallow this. A vCPU whose offset stops tracking the scaled
+            // curve keeps running on the *previous* offset, so under SMP its
+            // CNTVCT diverges from its siblings' while the guest still assumes a
+            // single coherent counter. Warn once per vCPU: this sits in a path
+            // that runs ~10^5 times per minute, so per-call logging would itself
+            // perturb what it is measuring.
+            eprintln!(
+                "chm: warning: hv_vcpu_set_vtimer_offset failed on vcpu {} (ret={ret:#x}); \
+                 guest counter on this vcpu will drift from the scaled curve",
+                self.id,
+            );
         }
     }
 

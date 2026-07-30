@@ -136,6 +136,35 @@ A capture taken by a cloud-hypervisor build predating upstream `69637dde6`
 records no counter frequency at all, so `chm` cannot verify it and says that
 instead of guessing.
 
+#### ⚠️ Single-vCPU only, today
+
+The rate synthesis is **correct on a 1-vCPU guest and not yet correct on SMP.**
+
+The offset is only re-stepped onto the curve when a vCPU *enters* the guest, so
+between two entries that vCPU's counter advances at the host rate rather than
+the scaled one. On one vCPU that is invisible: every read the guest makes is
+taken after an entry, so it lands on the curve. On several vCPUs it is not,
+because each vCPU exits at its own cadence — measured on a 2-vCPU Graviton2
+capture, **cpu0 re-stepped 117,950 times while cpu1 re-stepped 521**, since cpu1
+spent most of the run parked in `WFI`. The two counters therefore drift apart,
+and Linux treats `CNTVCT_EL0` as one coherent system-wide clocksource.
+
+The symptom is not subtle. On a 2-vCPU capture with `CHM_GUEST_CNTFRQ` set,
+`/proc/uptime` moves **non-monotonically** — observed stepping forward ~1,241 s,
+back again, and occasionally latching onto an exact multiple of `2^58` ticks
+(~75 years). Without the variable the same capture is rock-steady at a uniform
+`0.197×` (exactly `1/5.078125`), i.e. simply slow.
+
+So on a multi-vCPU capture the current choice is an honest one between a guest
+whose clock is *slow but sane* (leave `CHM_GUEST_CNTFRQ` unset) and one whose
+clock is *right on average but incoherent* (set it). **Leave it unset**, unless
+you are working on this bug. Tracked in `docs/roadmap.md` §5 under V5.1; the fix
+has to make the counter coherent across vCPUs rather than per-vCPU accurate.
+
+`CHM_DEBUG_VTIMER=1` traces every re-step — but note it is heavy enough to
+change the timing it observes, and has been seen to mask the divergence
+entirely.
+
 ## Legacy path: GICv2M / message-SPI
 
 Before the userspace GIC, the only runnable shape was virtio completions routed

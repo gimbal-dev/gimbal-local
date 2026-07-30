@@ -1,5 +1,25 @@
 # The Graviton capture request
 
+> ### ✅ Round 2 delivered — this request is complete
+>
+> gimbal cloud produced `graviton-vanilla-1cpu` and `graviton-vanilla-2cpu-net`
+> on 2026-07-31, against the corrected spec below. Both bugs in round 1 were
+> fixed: the build was **cloud-hypervisor v54.0.0 @ `9ea9019d29af`** (post
+> `69637dde6`, so the clock block is real — `cntfrq: 121875000` is recorded in
+> *both* captures), and the pause happened **after cloud-init finished**.
+>
+> **Capture B is the one that mattered.** It is the first capture we have ever
+> held with a NIC, and the first with 2 vCPU. On Apple Hypervisor.framework it
+> rehydrates with `ens3 UP 192.168.249.2/24`, and from inside the guest
+> `curl https://api.github.com/zen` returns `HTTP 200` and `git clone` over
+> HTTPS succeeds. That closes V5.1.
+>
+> It also earned its keep by breaking something: 2 vCPU + `CHM_GUEST_CNTFRQ`
+> exposed a counter-coherence bug that a 1-vCPU capture structurally cannot
+> show. See `roadmap.md` §V5.5.
+>
+> The rest of this document is kept as the record of what was asked for and why.
+
 > ### ⚠️ Round 1 is complete — read the results first
 >
 > Three round-1 captures were produced against this document and **the acid test

@@ -26,7 +26,7 @@ Four sentences, in dependency order. This is the honest score:
 
 **What changed the shape of the plan:** V1–V4 were about making it *work*. That
 part is done. What remains is making it a *product* — evidence for the parts we
-built but never proved end-to-end (V5.1), an image worth running (V5.3), and a
+built and now proved end-to-end (V5.1 ✅), an image worth running (V5.3), and a
 UI that shows any of it (V6).
 
 ---
@@ -36,15 +36,22 @@ UI that shows any of it (V6).
 Everything below is ordered by *what kind* of blocker it is, because they need
 very different things from us.
 
-### 🔴 Blocker A — we have no capture with a NIC
+### ✅ Blocker A (CLOSED 2026-07-31) — we had no capture with a NIC
 
-**This is the single highest-value gap in the whole plan**, because it is the
-only one where **the code already exists and only the evidence is missing.**
+It was the single highest-value gap in the plan, because it was the only one
+where the code already existed and only the evidence was missing.
 
-The userspace NAT, the egress allow-list and the V5.2 credential proxy are all
-built and all tested against the real internet *from the host side*. **None of
-them has ever met a real cloud capture**, because every capture we hold was
-taken with `net = None` — `ip -br link` inside a live rehydrated guest shows
+**Closed by the gimbal cloud round-2 capture.** `graviton-vanilla-2cpu-net`
+rehydrates on Apple silicon with a working virtio-net NIC, and from inside that
+guest `curl https://api.github.com/zen` returns `HTTP 200` and `git clone` over
+HTTPS succeeds. The record of *why* this was hard is kept below, because the
+constraint it describes is structural and still true — we consume captures, we
+cannot make them.
+
+The userspace NAT, the egress allow-list and the V5.2 credential proxy were all
+built and all tested against the real internet *from the host side*, but **none
+of them had ever met a real cloud capture**, because every capture we held was
+taken with `net = None` — `ip -br link` inside a live rehydrated guest showed
 loopback and nothing else. No `git clone`, no `npm install`, no API call.
 
 **Why we cannot just make one on the Mac.** Cloud Hypervisor snapshots are
@@ -63,8 +70,8 @@ capture path creates a VGICv3. Three ways to get one:
 | **Raspberry Pi 5** | one-off hardware, then free | plan written, untried | [`raspberry-pi-offbox-plan.md`](raspberry-pi-offbox-plan.md). **Pi 5 only** — Pi 4 commonly exposes GICv2 and would need a whole new VGICv2 ingest path. Proves "a physically separate Linux/KVM arm64 box", which de-risks the cloud milestone without retiring it. |
 | **gimbal cloud runs it for us** | none of ours | the ask is written | [`graviton-capture-request.md`](graviton-capture-request.md) — round 2, with the two round-1 bugs in our own request already fixed. |
 
-**Any of the three unblocks V5.1 and V1.6.** They are not alternatives in value,
-only in cost: AWS gives the most faithful artifact, the Pi gives the fastest
+**Any of the three unblocks V5.1 and V1.6** — gimbal cloud is the one that
+delivered. They were not alternatives in value, only in cost: AWS gives the most faithful artifact, the Pi gives the fastest
 independent one.
 
 ### 🟡 Blocker B — the image is a demo VM, not a build environment
@@ -92,16 +99,16 @@ nothing from anyone else.
 | **V2** | Vanilla everywhere in the product | ①③ | ✅ **complete** — CLI, daemon and app all run vanilla, flagless |
 | **V3** | Cloud control plane on the vanilla contract | ②④ | 🟠 partly blocked cross-repo (#21, #36) |
 | **V4** | Security with sane defaults | ③ | ✅ **complete** — threat model, default posture, `chm posture` |
-| **V5** | The coding-agent sandbox | ①③ | 🔴 **the current thrust** — V5.2 shipped; V5.1 needs a capture, V5.3 needs an image |
+| **V5** | The coding-agent sandbox | ①③ | 🔴 **the current thrust** — V5.1 and V5.2 shipped; V5.3 needs an image, V5.5 is an open bug |
 | **V6** | The app tells the whole truth | ③④ | ⬜ **ready to start, nothing blocking it** |
 
 **Recommended order of attack:**
 
-1. **V5.1** — clear Blocker A by whichever of the three routes is cheapest today.
-   Highest value per unit of work in the entire plan.
-2. **V6.1–V6.3** — the local half of the UI. Needs nobody. Can proceed in
-   parallel with, or during, the wait for a capture.
-3. **V5.3** — a real agent image, once there is a NIC to install a toolchain over.
+1. ~~**V5.1**~~ — ✅ done. gimbal cloud delivered the capture; the guest reaches
+   the real internet and clones from GitHub. Blocker A is closed.
+2. **V5.3** — a real agent image. Now unblocked: there is a NIC to install a
+   toolchain over, and `git`/`curl`/`python3` are already in the image.
+3. **V6.1–V6.3** — the local half of the UI. Needs nobody.
 4. **V6.4 / V3** — the off-box round-trip, once the contract lands.
 
 ---
@@ -202,9 +209,10 @@ measured rather than assumed, inside a live rehydrated `graviton-1` guest on
 
 | | Task | Status |
 | --- | --- | --- |
-| V5.1 | **Capture with a NIC and 2+ vCPU**, and prove the NAT, the egress policy *and* the V5.2 credential proxy on a real cloud snapshot. Highest value in the plan: the only blocker where the code already exists and only the evidence is missing. **Not blocked on gimbal cloud** — see §2 *Blocker A*: there are three routes, AWS BYO is self-serve, and those credentials already authenticate. | ⬜ a capture (3 routes) |
+| V5.1 | **Capture with a NIC and 2+ vCPU**, and prove the NAT, the egress policy *and* the V5.2 credential proxy on a real cloud snapshot. | ✅ **Done — 2026-07-31.** gimbal cloud delivered round 2 (`graviton-vanilla-1cpu`, `graviton-vanilla-2cpu-net`; CH v54.0.0 @ `9ea9019d29af`, post-`69637dde6`, captured after cloud-init, `cntfrq: 121875000` recorded in **both** clock blocks). B rehydrated on Apple silicon with `ens3 UP 192.168.249.2/24`, `nproc`=2, virtio-net at `1af4:1041`. **From inside the guest: `curl https://api.github.com/zen` → `HTTP 200`, and `git clone` of a public repo over HTTPS succeeded.** The userspace NAT's DNS responder answers on the gateway. First cloud capture ever to make a network call here. Two real bugs found — see below. |
 | V5.2 | **How a developer's repo enters the sandbox — answered, and shipped.** The decision was that this is a *credentials* problem, not a filesystem one: a sandbox that can authenticate to GitHub clones the repo itself, so I1 stands untouched. A TLS-terminating egress proxy attaches the credential as the request leaves for a rule-named destination; the guest never holds a secret. Proven live against api.github.com (200 with the rule, 401 without, identical request bytes) and against registry.npmjs.org. New invariant **I12**; `chm proxy show/ca/check`; [`credential-proxy.md`](credential-proxy.md). | ✅ done |
-| V5.3 | **A purpose-built agent image** (toolchain, sensible disk, agent runtime) rather than a stock cloud image. Needs V5.1 first: installing a toolchain requires a NIC. | ⬜ after V5.1 |
+| V5.3 | **A purpose-built agent image** (toolchain, sensible disk, agent runtime) rather than a stock cloud image. V5.1 unblocked this: the round-2 capture has a NIC, and `git`/`curl`/`python3` are already present, so a toolchain can now be installed from inside the guest. | ⬜ next |
+| V5.5 | **SMP counter coherence.** Found by V5.1 — the first 2-vCPU capture we have ever held. `CHM_GUEST_CNTFRQ` re-steps the vtimer offset on guest *entry*, so between entries a vCPU runs at the host rate. On one vCPU that is invisible; on two it is not, because each exits at its own cadence (**measured: cpu0 117,950 re-steps vs cpu1 521** — cpu1 sits in `WFI`). The counters drift apart while Linux treats `CNTVCT_EL0` as one system-wide clocksource, so `/proc/uptime` moves **non-monotonically** and occasionally latches an exact multiple of `2^58` ticks (~75 years). Unset, the same capture is a steady `0.197×` = exactly `1/5.078125`. Ruled out: the offset arithmetic (traced healthy over 75 s, zero anomalous values), `wfi_park_ms` (clamped), and a real curve-anchor ordering defect that was fixed anyway. Behaves like a race — tracing it makes it vanish. The fix must make the counter *coherent across vCPUs*, not per-vCPU accurate. | ⬜ **known limitation, documented** |
 | V5.4 | Cold create-from-image (#101) so a fresh sandbox does not require a pre-existing capture. | ⬜ nothing blocking |
 
 ### V6 · The app tells the whole truth
@@ -247,8 +255,7 @@ tab today counts what the control plane has (`runners`, `snapshots`,
 | V6.5 | **Capability honesty.** One place that states what this build can and cannot do — HVF backend, vanilla-snapshot support, the V5 gap list — so nobody has to infer it from whether a thing crashed. | S |
 
 **Ordering note.** V6.1–V6.3 are all local and can ship without a cloud
-dependency. V6.4 needs the control plane and shares the V5.1 blocker, so it goes
-last.
+dependency. V6.4 needs the control plane, so it goes last.
 
 ---
 
