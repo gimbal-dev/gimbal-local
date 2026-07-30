@@ -23,7 +23,7 @@ use std::any::Any;
 use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
@@ -41,12 +41,12 @@ mod ffi;
 use ffi::*;
 pub mod gic;
 use gic::HvfGicV3;
+pub mod checkpoint;
 #[cfg(feature = "kvm-snapshot")]
 pub mod devices;
 #[cfg(feature = "kvm-snapshot")]
 pub mod rehydrate;
 pub mod translate;
-pub mod checkpoint;
 
 /// Which of a capture's system registers this host can actually reproduce.
 #[cfg(feature = "kvm-snapshot")]
@@ -78,7 +78,10 @@ fn mach_timebase() -> ffi::MachTimebaseInfo {
         let ret = unsafe { ffi::mach_timebase_info(&mut info) };
         if ret != 0 || info.numer == 0 || info.denom == 0 {
             // Fall back to the Apple-Silicon 24 MHz timebase (125/3 ns per tick).
-            info = ffi::MachTimebaseInfo { numer: 125, denom: 3 };
+            info = ffi::MachTimebaseInfo {
+                numer: 125,
+                denom: 3,
+            };
         }
         info
     })
@@ -98,12 +101,12 @@ fn reduce_ratio(a: u64, b: u64) -> (u64, u64) {
     (a / g, b / g)
 }
 
-/// Whether `CHM_DEBUG_VTIMER` asked for per-entry virtual-counter tracing.
+/// Whether `CHM_DEBUG_VTIMER` asked for per-step virtual-counter tracing.
 ///
-/// Cached, because the only caller sits on the guest-entry path — measured at
-/// ~118,000 calls per vCPU per minute on a busy guest — and `env::var_os`
-/// allocates. Tracing here is heavy enough to change the timing it is
-/// observing, so it stays opt-in.
+/// One line per accepted offset step — 50/s at the default 20 ms period — naming
+/// the host tick, the curve target, and how far the guest's counter jumped.
+/// Still cached: this used to sit on the guest-entry path at ~118,000 calls per
+/// vCPU per minute, and `env::var_os` allocates.
 fn debug_vtimer() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("CHM_DEBUG_VTIMER").is_some())
@@ -334,10 +337,10 @@ impl Vm for HvfVm {
             vm_ops,
             kick,
             vtimer_offset: AtomicU64::new(0),
+            clock: OnceLock::new(),
+            programmed_epoch: AtomicU64::new(0),
             cnt_scale_num: AtomicU64::new(0),
             cnt_scale_den: AtomicU64::new(1),
-            cnt_base_host: AtomicU64::new(0),
-            cnt_base_guest: AtomicU64::new(0),
             vtimer_reprogram_failed: AtomicBool::new(false),
             run_gen: Arc::new(AtomicU64::new(0)),
             usgic: Mutex::new(UserGic::default()),
@@ -786,7 +789,7 @@ mod counter_scale_tests {
         assert!(
             unanchored > base_guest,
             "sanity: with no anchor the curve does run from zero, which is why \
-             counter_scale() reports the scale inactive until it is seeded"
+             VtimerClock captures `base_host` at construction rather than lazily"
         );
     }
 
@@ -800,6 +803,141 @@ mod counter_scale_tests {
         assert_eq!(
             scaled_cntvct(base_guest, anchor, anchor + 24_000_000, num, den),
             base_guest + 121_875_000
+        );
+    }
+}
+
+#[cfg(test)]
+mod vtimer_clock_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    use super::VtimerClock;
+
+    const GRAVITON_HZ: u64 = 121_875_000;
+    const APPLE_HZ: u64 = 24_000_000;
+
+    /// The defect this type exists to close: every vCPU must read the SAME
+    /// offset, because HVF derives `CNTVCT_EL0` from it and the guest treats the
+    /// counter as one system-wide clocksource. Seeding per vCPU (the old
+    /// behaviour) left a permanent skew — measured at 2,909 ticks on a 2-vCPU
+    /// Graviton capture, enough to wrap the guest's 56-bit clocksource.
+    #[test]
+    fn one_clock_hands_every_vcpu_the_same_offset() {
+        let clock = VtimerClock::new(7_694_581_610, 0, APPLE_HZ);
+        let first = clock.offset();
+        // Anchoring is a one-off at construction; later readers see that value,
+        // not one derived from whenever they happened to ask.
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(clock.offset(), first);
+        assert_eq!(clock.epoch(), 1);
+    }
+
+    /// An unscaled clock never moves, so it needs no stepper and pays no
+    /// stop-the-world barrier.
+    #[test]
+    fn an_unscaled_clock_never_steps() {
+        let clock = VtimerClock::new(1_000_000, 0, APPLE_HZ);
+        assert!(!clock.scaled());
+        let before = clock.offset();
+        assert!(!clock.step(&|| {}, Duration::from_millis(1)));
+        assert_eq!(
+            clock.offset(),
+            before,
+            "an unscaled offset must be constant"
+        );
+    }
+
+    /// A scaled clock steps the offset DOWN (HVF: `CNTVCT = now - offset`), so
+    /// the guest's counter only ever jumps forward.
+    #[test]
+    fn a_scaled_clock_steps_the_offset_down() {
+        let clock = VtimerClock::new(7_694_581_610, GRAVITON_HZ, APPLE_HZ);
+        assert!(clock.scaled());
+        assert_eq!(
+            clock.scale(),
+            (325, 64),
+            "121.875/24 MHz must reduce exactly"
+        );
+        let before = clock.offset();
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(clock.step(&|| {}, Duration::from_millis(50)));
+        assert!(
+            clock.offset() < before,
+            "offset must decrease so the guest counter advances faster, was {before} now {}",
+            clock.offset()
+        );
+        assert_eq!(clock.epoch(), 2, "a step must publish a new epoch");
+    }
+
+    /// The safety property: while ANY vCPU is executing guest code the offset
+    /// must not move, because a half-applied change is exactly the cross-core
+    /// skew that corrupts the guest's clock. Failing to step is the correct
+    /// outcome — the guest simply runs at the host rate for another window.
+    #[test]
+    fn a_step_is_abandoned_while_a_vcpu_is_in_the_guest() {
+        let clock = VtimerClock::new(7_694_581_610, GRAVITON_HZ, APPLE_HZ);
+        let before = clock.offset();
+        clock.enter();
+        std::thread::sleep(Duration::from_millis(5));
+        let forced = Arc::new(AtomicBool::new(false));
+        let f = forced.clone();
+        assert!(
+            !clock.step(
+                &move || f.store(true, Ordering::SeqCst),
+                Duration::from_millis(20)
+            ),
+            "a step must not publish while a vCPU is in the guest"
+        );
+        assert!(
+            forced.load(Ordering::SeqCst),
+            "the step must try to force an exit"
+        );
+        assert_eq!(clock.offset(), before, "the offset must be untouched");
+        // Once the vCPU is out, the same step succeeds.
+        clock.leave();
+        assert!(clock.step(&|| {}, Duration::from_millis(50)));
+        assert!(clock.offset() < before);
+    }
+
+    /// A vCPU leaving the guest must let a waiting step complete promptly rather
+    /// than making it burn its whole timeout.
+    #[test]
+    fn leaving_the_guest_wakes_a_waiting_step() {
+        let clock = VtimerClock::new(7_694_581_610, GRAVITON_HZ, APPLE_HZ);
+        clock.enter();
+        let c = clock.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(10));
+            c.leave();
+        });
+        let t = std::time::Instant::now();
+        assert!(clock.step(&|| {}, Duration::from_secs(5)));
+        assert!(
+            t.elapsed() < Duration::from_secs(1),
+            "step waited {:?}; it should wake on leave(), not time out",
+            t.elapsed()
+        );
+    }
+
+    /// Entering must never block indefinitely on a stepper: proceeding early is
+    /// safe (it raises `in_guest`, so the step fails rather than publishing
+    /// under a running vCPU), and blocking forever would wedge teardown.
+    #[test]
+    fn release_unblocks_a_vcpu_waiting_on_a_step() {
+        let clock = VtimerClock::new(7_694_581_610, GRAVITON_HZ, APPLE_HZ);
+        clock.enter(); // hold one vCPU in, so the step below cannot finish
+        let c = clock.clone();
+        let stepper = std::thread::spawn(move || {
+            c.step(&|| {}, Duration::from_secs(30));
+        });
+        std::thread::sleep(Duration::from_millis(20));
+        clock.release();
+        clock.leave();
+        assert!(
+            stepper.join().is_ok(),
+            "release() must let an in-flight step unwind"
         );
     }
 }
@@ -828,7 +966,10 @@ mod usgic_tests {
         assert_eq!(g.read_iar(), 8192);
         assert_eq!(g.active, Some(8192));
         // While active, the line must not re-assert for the next pending one.
-        assert!(!g.should_assert(), "an active interrupt suppresses re-assert");
+        assert!(
+            !g.should_assert(),
+            "an active interrupt suppresses re-assert"
+        );
     }
 
     #[test]
@@ -909,8 +1050,232 @@ mod usgic_tests {
         );
         g.write_dir(); // now deactivate
         assert_eq!(g.active, None);
-        assert!(g.should_assert(), "after DIR the next pending is deliverable");
+        assert!(
+            g.should_assert(),
+            "after DIR the next pending is deliverable"
+        );
         assert_eq!(g.read_iar(), 8193);
+    }
+}
+
+/// The single virtual-counter offset that every vCPU in a VM must have
+/// programmed, plus the rendezvous that lets it change safely.
+///
+/// # Why one shared offset is mandatory
+///
+/// HVF defines `CNTVCT_EL0 = mach_absolute_time() - offset`, and
+/// `mach_absolute_time()` is one counter shared by every host core. So two
+/// vCPUs read the same `CNTVCT_EL0` **iff** they have the same offset
+/// programmed. Linux treats `CNTVCT_EL0` as a single system-wide clocksource
+/// and reads it from whichever CPU it happens to be running on, so a
+/// per-vCPU offset makes the guest's clock non-monotonic.
+///
+/// That is not a cosmetic problem. `arch_sys_counter` is a 56-bit clocksource,
+/// and `clocksource_delta()` computes `(now - last) & mask`: a read that is
+/// even one tick behind the previous one wraps to ~2^56 ticks and is latched
+/// into the guest's timekeeping as a ~18.7-year forward jump. Measured on a
+/// 2-vCPU Graviton capture before this type existed: 19,992 backwards reads out
+/// of 40,000 strictly-ordered cross-vCPU samples, a constant 2,909-tick skew,
+/// and a guest that believed the date was 2101.
+///
+/// # Two sources of skew, both closed here
+///
+/// 1. **Anchoring.** Each vCPU used to seed its own offset as
+///    `mach_absolute_time() - reference` on its own thread, so the offsets
+///    differed by however far apart the restore calls landed (~2,909 ticks in
+///    practice) — forever. The offset is now computed once, here, and every
+///    vCPU programs *this* value.
+/// 2. **Rate scaling.** When [`HvfVcpu::set_counter_scale`] is active the
+///    offset must keep moving (see that method for why). Moving it while any
+///    vCPU is executing guest code re-creates per-vCPU skew, so [`Self::step`]
+///    changes it only while every vCPU is out of `hv_vcpu_run`. Guest code
+///    therefore never observes a half-applied change.
+pub struct VtimerClock {
+    /// Reduced rate-scale numerator, or 0 when the guest counter runs at the
+    /// host rate — in which case the offset is constant and [`Self::step`] is
+    /// never needed.
+    num: u64,
+    /// Reduced rate-scale denominator. Only meaningful when `num` is non-zero.
+    den: u64,
+    /// Host tick at which the curve was anchored.
+    base_host: u64,
+    /// Guest `CNTVCT_EL0` at which the curve was anchored (the snapshot's
+    /// shared reference counter).
+    base_guest: u64,
+    /// The offset every vCPU must program before entering the guest.
+    offset: AtomicU64,
+    /// Bumped whenever `offset` changes, so a vCPU can skip a redundant
+    /// `hv_vcpu_set_vtimer_offset` on the overwhelmingly common path where
+    /// nothing moved.
+    epoch: AtomicU64,
+    gate: Mutex<ClockGate>,
+    cv: Condvar,
+}
+
+/// Rendezvous state for [`VtimerClock`].
+#[derive(Default)]
+struct ClockGate {
+    /// How many vCPUs are currently inside `hv_vcpu_run`.
+    in_guest: usize,
+    /// A stepper wants the offset to itself; new entries wait.
+    stepping: bool,
+}
+
+/// How long a vCPU will wait for an in-progress step before entering the guest
+/// anyway. Entering early is *safe* — it raises `in_guest`, which makes the
+/// step fail rather than publish under a running vCPU — so this is a liveness
+/// valve, not a correctness one.
+const CLOCK_ENTER_WAIT: std::time::Duration = std::time::Duration::from_millis(100);
+
+impl VtimerClock {
+    /// Anchor the counter at `reference` (the snapshot's shared `CNTVCT_EL0`).
+    /// `guest_hz`/`host_hz` enable rate scaling; equal values, or a zero,
+    /// leave the counter at the host rate.
+    pub fn new(reference: u64, guest_hz: u64, host_hz: u64) -> Arc<Self> {
+        // SAFETY: FFI; reads the host monotonic tick.
+        let base_host = unsafe { mach_absolute_time() };
+        let (num, den) = if guest_hz == 0 || host_hz == 0 || guest_hz == host_hz {
+            (0, 1)
+        } else {
+            reduce_ratio(guest_hz, host_hz)
+        };
+        Arc::new(Self {
+            num,
+            den,
+            base_host,
+            base_guest: reference,
+            offset: AtomicU64::new(base_host.wrapping_sub(reference)),
+            epoch: AtomicU64::new(1),
+            gate: Mutex::new(ClockGate::default()),
+            cv: Condvar::new(),
+        })
+    }
+
+    /// Whether the counter is rate-scaled, and so needs [`Self::step`] to be
+    /// driven. An unscaled clock has a constant offset and needs nothing.
+    pub fn scaled(&self) -> bool {
+        self.num != 0
+    }
+
+    /// The rate scale as a reduced `(numerator, denominator)`; `(0, 1)` when the
+    /// counter runs at the host rate.
+    fn scale(&self) -> (u64, u64) {
+        (self.num, self.den)
+    }
+
+    /// The offset every vCPU must currently have programmed.
+    fn offset(&self) -> u64 {
+        self.offset.load(Ordering::Acquire)
+    }
+
+    /// The current offset generation.
+    fn epoch(&self) -> u64 {
+        self.epoch.load(Ordering::Acquire)
+    }
+
+    /// Mark this vCPU as entering guest execution. Blocks (briefly) while a
+    /// step is in flight so the entry cannot race a publish.
+    fn enter(&self) {
+        let mut g = self.gate.lock().unwrap();
+        if g.stepping {
+            let (ng, _) = self.cv.wait_timeout(g, CLOCK_ENTER_WAIT).unwrap();
+            g = ng;
+        }
+        g.in_guest += 1;
+    }
+
+    /// Mark this vCPU as having left guest execution.
+    fn leave(&self) {
+        let mut g = self.gate.lock().unwrap();
+        g.in_guest -= 1;
+        if g.stepping && g.in_guest == 0 {
+            drop(g);
+            self.cv.notify_all();
+        }
+    }
+
+    /// Advance the offset onto the scaled curve, but only while no vCPU is
+    /// executing guest code.
+    ///
+    /// `force_exit` is invoked to push every vCPU out of `hv_vcpu_run`. If they
+    /// are not all out within `timeout` the step is **abandoned**: the offset
+    /// keeps its previous value, so the guest's counter stays coherent and
+    /// merely runs at the host rate for another window. Degrading to "slow but
+    /// correct" is the whole point — a partially applied offset would corrupt
+    /// the guest's clock permanently.
+    ///
+    /// Returns whether the offset was advanced.
+    pub fn step(&self, force_exit: &dyn Fn(), timeout: std::time::Duration) -> bool {
+        if !self.scaled() {
+            return false;
+        }
+        {
+            let mut g = self.gate.lock().unwrap();
+            if g.stepping {
+                return false;
+            }
+            g.stepping = true;
+        }
+        force_exit();
+        let mut g = self.gate.lock().unwrap();
+        let deadline = std::time::Instant::now() + timeout;
+        while g.in_guest > 0 {
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let (ng, _) = self.cv.wait_timeout(g, deadline - now).unwrap();
+            g = ng;
+        }
+        let advanced = if g.in_guest == 0 {
+            // SAFETY: FFI; reads the host monotonic tick.
+            let now = unsafe { mach_absolute_time() };
+            let target = scaled_cntvct(self.base_guest, self.base_host, now, self.num, self.den);
+            let next = now.wrapping_sub(target);
+            // The scale ratio is > 1, so the offset only ever decreases and the
+            // guest's counter only ever jumps forward. Guard it anyway: a
+            // backwards offset move would rewind the guest's clock, which is the
+            // exact failure this type exists to prevent.
+            let prev = self.offset.load(Ordering::Relaxed);
+            if next < prev {
+                self.offset.store(next, Ordering::Release);
+                self.epoch.fetch_add(1, Ordering::Release);
+                if debug_vtimer() {
+                    eprintln!(
+                        "[vtimer] step now={now} target={target} offset {prev} -> {next} \
+                         (guest jumped {} ticks)",
+                        prev - next
+                    );
+                }
+                true
+            } else {
+                false
+            }
+        } else {
+            false
+        };
+        g.stepping = false;
+        drop(g);
+        self.cv.notify_all();
+        advanced
+    }
+
+    /// Release any vCPU blocked in [`Self::enter`], for teardown.
+    pub fn release(&self) {
+        self.gate.lock().unwrap().stepping = false;
+        self.cv.notify_all();
+    }
+}
+
+/// Marks a vCPU as executing guest code for the guard's lifetime, so
+/// [`VtimerClock::step`] can tell when it is safe to move the shared offset.
+struct ClockGuard<'a>(Option<&'a VtimerClock>);
+
+impl Drop for ClockGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(clock) = self.0 {
+            clock.leave();
+        }
     }
 }
 
@@ -931,16 +1296,22 @@ pub struct HvfVcpu {
     /// reliably through `hv_vcpu_get_sys_reg` once the vCPU is forced out of
     /// `run()`. Defaults to 0, matching a freshly created vCPU's counter.
     vtimer_offset: AtomicU64,
+    /// The VM-global counter clock. Every vCPU programs the offset this
+    /// publishes, which is what makes `CNTVCT_EL0` coherent across cores — see
+    /// [`VtimerClock`]. Attached during rehydrate; absent only for a vCPU that
+    /// was never restored from a snapshot.
+    clock: OnceLock<Arc<VtimerClock>>,
+    /// The [`VtimerClock`] epoch this vCPU has actually programmed, so a run
+    /// entry can skip a redundant `hv_vcpu_set_vtimer_offset` — the common case,
+    /// since an unscaled clock never moves at all.
+    programmed_epoch: AtomicU64,
     /// Numerator of the virtual-counter rate scale, or 0 when the counter runs
-    /// at the host rate. See [`Self::set_counter_scale`].
+    /// at the host rate. Mirrored from the clock purely so the WFI idle nap can
+    /// convert a guest-tick deadline into a host-tick wait.
     cnt_scale_num: AtomicU64,
     /// Denominator of the virtual-counter rate scale. Only read when
     /// `cnt_scale_num` is non-zero.
     cnt_scale_den: AtomicU64,
-    /// Host `mach_absolute_time` at which the scaled-counter curve was anchored.
-    cnt_base_host: AtomicU64,
-    /// Guest `CNTVCT_EL0` at which the scaled-counter curve was anchored.
-    cnt_base_guest: AtomicU64,
     /// Set the first time `hv_vcpu_set_vtimer_offset` refuses a reprogram, so the
     /// warning is emitted once per vCPU rather than on every guest entry.
     vtimer_reprogram_failed: AtomicBool,
@@ -1134,18 +1505,21 @@ impl HvfVcpu {
     /// tick never fires and a resumed guest idles in WFI for minutes (and its
     /// soft-lockup watchdog trips on the apparent stall).
     pub fn restore_vtimer_offset(&self, snapshot_cntvct: u64) -> CpuResult<()> {
+        // A vCPU bound to a `VtimerClock` takes its offset from the clock and
+        // from nowhere else; letting a per-vCPU seed land here would re-open the
+        // cross-core skew the clock exists to close.
+        if self.clock.get().is_some() {
+            return Ok(());
+        }
         // SAFETY: FFI; reads the host monotonic tick.
         let now = unsafe { mach_absolute_time() };
-        // Anchor the scaled-counter curve here too, so a scaled guest's counter
-        // also resumes at its captured value and only then starts running fast.
-        //
-        // Order matters: the guest base is published first, then the host base
-        // with Release. `counter_scale()` reads `cnt_base_host` with Acquire and
-        // treats zero as "not yet anchored", so a vCPU thread can never observe
-        // an anchored host base without the matching guest base.
-        self.cnt_base_guest.store(snapshot_cntvct, Ordering::Relaxed);
-        self.cnt_base_host.store(now, Ordering::Release);
         let offset = now.wrapping_sub(snapshot_cntvct);
+        self.program_vtimer_offset(offset)
+    }
+
+    /// Write `offset` into HVF's virtual-timer offset for this vCPU and record
+    /// it, so [`Self::current_cntvct`] can derive the counter later.
+    fn program_vtimer_offset(&self, offset: u64) -> CpuResult<()> {
         // SAFETY: FFI on the owning thread.
         let ret = unsafe { hv_vcpu_set_vtimer_offset(self.id, offset) };
         if ret != HV_SUCCESS {
@@ -1154,137 +1528,104 @@ impl HvfVcpu {
                 ret as u32
             )));
         }
-        // Remember the offset so a later checkpoint can derive the live counter.
         self.vtimer_offset.store(offset, Ordering::Relaxed);
         Ok(())
     }
 
-    /// Run the guest's virtual counter at `guest_hz` while the host counter ticks
-    /// at `host_hz`, by continuously re-programming the virtual-timer offset.
+    /// Bind this vCPU to the VM's shared counter clock and program the offset it
+    /// publishes. Must be called on the vCPU's owning thread.
     ///
-    /// A Linux guest reads `CNTFRQ_EL0` once at boot and caches it as
-    /// `arch_timer_rate`; it never re-reads it. A snapshot captured on a host
-    /// with a different counter frequency therefore converts every `CNTVCT_EL0`
-    /// delta with the wrong divisor, and all of its timekeeping is dilated by
-    /// `guest_hz / host_hz` (5.078125x for AWS Graviton2's 121.875 MHz on Apple
-    /// silicon's 24 MHz). Apple exposes no way to change the frequency a guest
-    /// sees, and the guest cannot be made to re-read it.
-    ///
-    /// HVF defines `CNTVCT_EL0 = mach_absolute_time() - offset`, which is an
-    /// offset, not a scale — but the offset is ours to move. Walking it downward
-    /// over time makes the guest's counter advance faster than the host's, which
-    /// is the rate the guest already believes it has. The offset only ever
-    /// decreases (the ratio is > 1), so the guest's counter is still monotonic.
-    ///
-    /// The approximation is piecewise: between re-programs the counter advances
-    /// at the host rate, and each re-program steps it forward onto the intended
-    /// curve. Re-programming happens at every `run()` entry, so the step size is
-    /// bounded by how long the guest runs without exiting.
-    ///
-    /// The ratio is kept as a reduced integer fraction rather than a float, so
-    /// the curve accumulates no drift: 121_875_000/24_000_000 reduces to exactly
-    /// 325/64.
-    pub fn set_counter_scale(&self, guest_hz: u64, host_hz: u64) {
-        if guest_hz == 0 || host_hz == 0 || guest_hz == host_hz {
-            self.cnt_scale_num.store(0, Ordering::Relaxed);
-            return;
-        }
-        let (num, den) = reduce_ratio(guest_hz, host_hz);
+    /// This is the *only* supported way to set a restored guest's virtual
+    /// counter: every vCPU programming one shared offset is what keeps
+    /// `CNTVCT_EL0` coherent across cores. See [`VtimerClock`] for the
+    /// measurements that make that non-negotiable.
+    pub fn attach_clock(&self, clock: Arc<VtimerClock>) -> CpuResult<()> {
+        let (num, den) = clock.scale();
+        // Mirrored for the WFI nap's guest-ticks-to-host-ticks conversion only.
         self.cnt_scale_den.store(den, Ordering::Relaxed);
         self.cnt_scale_num.store(num, Ordering::Relaxed);
+        let _ = self.clock.set(clock);
+        self.sync_vtimer_offset()
     }
 
-    /// The scale as a reduced `(numerator, denominator)`, or `None` when the
-    /// guest counter runs at the host rate — or when the curve has no anchor yet.
+    /// Program the shared clock's current offset if this vCPU has not already.
+    /// A no-op when the epoch has not moved, which is every entry for an
+    /// unscaled clock.
+    fn sync_vtimer_offset(&self) -> CpuResult<()> {
+        let Some(clock) = self.clock.get() else {
+            return Ok(());
+        };
+        let epoch = clock.epoch();
+        if self.programmed_epoch.load(Ordering::Relaxed) == epoch {
+            return Ok(());
+        }
+        self.program_vtimer_offset(clock.offset())?;
+        self.programmed_epoch.store(epoch, Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Program the shared offset before entering the guest, warning once if HVF
+    /// refuses.
     ///
-    /// The anchor is seeded by [`Self::restore_vtimer_offset`]. Until then
-    /// `cnt_base_host` is zero, and evaluating the curve would measure `elapsed`
-    /// from host time zero instead of from resume, producing a counter value
-    /// wildly ahead of the guest's. On an SMP guest that is not hypothetical: a
-    /// secondary vCPU can enter `run()` while rehydrate is still seeding, and one
-    /// such evaluation permanently drags the guest's monotonic clocksource
-    /// forward (measured: a 2-vCPU Graviton capture jumping to 2^58 ticks, ~75
-    /// years, after which RCU reports its kthreads starved for 2.36e12 jiffies).
-    /// Reporting the scale as inactive makes every consumer fall back to the
-    /// plain offset, which is always safe.
+    /// A vCPU running on a stale offset has a `CNTVCT_EL0` that disagrees with
+    /// its siblings', and the guest assumes one coherent counter — so this is
+    /// reported rather than swallowed. It sits in a path that runs ~10^5 times
+    /// per minute, hence once per vCPU rather than per call.
+    fn sync_vtimer_offset_or_warn(&self) {
+        if self.sync_vtimer_offset().is_err()
+            && !self.vtimer_reprogram_failed.swap(true, Ordering::Relaxed)
+        {
+            eprintln!(
+                "chm: warning: hv_vcpu_set_vtimer_offset failed on vcpu {}; \
+                 guest counter on this vcpu will drift from its siblings'",
+                self.id,
+            );
+        }
+    }
+
+    /// The rate scale as a reduced `(numerator, denominator)`, or `None` when
+    /// the guest counter runs at the host rate.
+    ///
+    /// Only the WFI idle nap consumes this: it converts the guest's armed
+    /// `CNTV_CVAL_EL0` deadline, expressed in the guest's faster tick rate, into
+    /// a host-tick wait. The counter value itself comes from the shared
+    /// [`VtimerClock`], never from a per-vCPU curve.
     fn counter_scale(&self) -> Option<(u64, u64)> {
         let num = self.cnt_scale_num.load(Ordering::Relaxed);
         if num == 0 {
             return None;
         }
-        // Acquire pairs with the Release store of the anchor in
-        // `restore_vtimer_offset`: a non-zero host base here guarantees the
-        // matching guest base is visible to this thread.
-        if self.cnt_base_host.load(Ordering::Acquire) == 0 {
-            return None;
-        }
         Some((num, self.cnt_scale_den.load(Ordering::Relaxed)))
     }
 
-    /// The guest `CNTVCT_EL0` the scaled curve calls for at host time `now`.
-    fn scaled_cntvct_at(&self, now: u64, num: u64, den: u64) -> u64 {
-        let base_host = self.cnt_base_host.load(Ordering::Acquire);
-        let base_guest = self.cnt_base_guest.load(Ordering::Relaxed);
-        scaled_cntvct(base_guest, base_host, now, num, den)
-    }
-
-    /// Step the virtual-timer offset onto the scaled curve. Called at every
-    /// `run()` entry; a no-op unless [`Self::set_counter_scale`] is active.
-    ///
-    /// Failures are swallowed deliberately: an un-stepped offset means the guest
-    /// keeps the previous (still monotonic) counter for one more run window,
-    /// which is a degradation, not a correctness break.
-    fn reprogram_scaled_vtimer_offset(&self) {
-        let Some((num, den)) = self.counter_scale() else {
-            return;
-        };
-        // SAFETY: FFI; reads the host monotonic tick.
-        let now = unsafe { mach_absolute_time() };
-        let target = self.scaled_cntvct_at(now, num, den);
-        let offset = now.wrapping_sub(target);
-        if debug_vtimer() {
-            eprintln!(
-                "[vtimer] cpu={} now={now} base_host={} base_guest={} num={num} den={den} \
-                 target={target} offset={offset}",
-                self.id,
-                self.cnt_base_host.load(Ordering::Acquire),
-                self.cnt_base_guest.load(Ordering::Relaxed),
-            );
+    /// Enter the guest-execution window of the shared counter clock. A no-op
+    /// (and a free guard) for a vCPU with no clock attached.
+    fn clock_enter(&self) -> ClockGuard<'_> {
+        let clock = self.clock.get().map(|c| c.as_ref());
+        if let Some(clock) = clock {
+            clock.enter();
         }
-        // SAFETY: FFI on the owning thread.
-        let ret = unsafe { hv_vcpu_set_vtimer_offset(self.id, offset) };
-        if ret == HV_SUCCESS {
-            self.vtimer_offset.store(offset, Ordering::Relaxed);
-        } else if !self.vtimer_reprogram_failed.swap(true, Ordering::Relaxed) {
-            // Do not swallow this. A vCPU whose offset stops tracking the scaled
-            // curve keeps running on the *previous* offset, so under SMP its
-            // CNTVCT diverges from its siblings' while the guest still assumes a
-            // single coherent counter. Warn once per vCPU: this sits in a path
-            // that runs ~10^5 times per minute, so per-call logging would itself
-            // perturb what it is measuring.
-            eprintln!(
-                "chm: warning: hv_vcpu_set_vtimer_offset failed on vcpu {} (ret={ret:#x}); \
-                 guest counter on this vcpu will drift from the scaled curve",
-                self.id,
-            );
-        }
+        ClockGuard(clock)
     }
 
     /// The guest's current `CNTVCT_EL0`, derived as `mach_absolute_time() -
-    /// offset` (HVF's definition) from the offset we last programmed. Used at
-    /// checkpoint time because `hv_vcpu_get_sys_reg(CNTVCT_EL0)` is not reliably
-    /// readable once the vCPU has been forced out of `run()`.
+    /// offset` (HVF's definition) from the offset this vCPU has programmed.
+    /// Used at checkpoint time because `hv_vcpu_get_sys_reg(CNTVCT_EL0)` is not
+    /// reliably readable once the vCPU has been forced out of `run()`, and by
+    /// the WFI nap to compare against the guest's armed deadline.
     ///
-    /// Under [`Self::set_counter_scale`] this reports the scaled curve rather
-    /// than the last-programmed offset, so the WFI park and the virtual-timer
-    /// poll both reason in the guest's own (faster) time base.
+    /// This reports what the guest actually reads, not what the scaled curve
+    /// aims at: between [`VtimerClock::step`]s the offset is fixed, so the
+    /// counter advances at the host rate. Reasoning from the real value is what
+    /// keeps the WFI wake-up and the checkpoint's captured counter honest.
     pub fn current_cntvct(&self) -> u64 {
         // SAFETY: FFI; reads the host monotonic tick.
         let now = unsafe { mach_absolute_time() };
-        match self.counter_scale() {
-            Some((num, den)) => self.scaled_cntvct_at(now, num, den),
-            None => now.wrapping_sub(self.vtimer_offset.load(Ordering::Relaxed)),
-        }
+        let offset = match self.clock.get() {
+            Some(clock) => clock.offset(),
+            None => self.vtimer_offset.load(Ordering::Relaxed),
+        };
+        now.wrapping_sub(offset)
     }
 
     /// How long (in milliseconds) to park a WFI-idle vCPU on its wake fd before
@@ -1578,10 +1919,7 @@ impl HvfVcpu {
     /// Install the VM-global distributor shared by every vCPU (so a reprogram on
     /// any core is visible to all and SPIs route by affinity). On the single-vCPU
     /// path this is that vCPU's own freshly-sized distributor.
-    pub fn usgic_install_shared_dist(
-        &self,
-        dist: Arc<Mutex<crate::hvf::softgic::Distributor>>,
-    ) {
+    pub fn usgic_install_shared_dist(&self, dist: Arc<Mutex<crate::hvf::softgic::Distributor>>) {
         self.usgic.lock().unwrap().dist = dist;
     }
 
@@ -1754,7 +2092,10 @@ impl HvfVcpu {
                 }
                 deassert = !g.should_assert();
                 if trace {
-                    eprintln!("[usgic] vcpu {} read  {name} -> {val:#x} (x{rt})", self.index);
+                    eprintln!(
+                        "[usgic] vcpu {} read  {name} -> {val:#x} (x{rt})",
+                        self.index
+                    );
                 }
             } else {
                 let val = if rt == 31 { 0 } else { self.get_reg(rt)? };
@@ -1818,7 +2159,10 @@ impl HvfVcpu {
                     }
                 }
                 if trace {
-                    eprintln!("[usgic] vcpu {} write {name} <- {val:#x} (x{rt})", self.index);
+                    eprintln!(
+                        "[usgic] vcpu {} write {name} <- {val:#x} (x{rt})",
+                        self.index
+                    );
                 }
             }
         }
@@ -2317,29 +2661,39 @@ impl Vcpu for HvfVcpu {
         // Apple's internal WFI wait not honouring its deadline) stops bumping it,
         // which the watchdog detects and breaks by forcing an exit.
         self.run_gen.fetch_add(1, Ordering::Relaxed);
-        // Step the virtual-counter offset onto the scaled curve when the guest
-        // was captured on a host with a different counter frequency. No-op
-        // otherwise. Done first so everything below reasons in the guest's own
-        // time base.
-        self.reprogram_scaled_vtimer_offset();
-        // Drain any cross-thread injections (device/net-service completions) into
-        // the userspace GIC before we sample the line — they were enqueued off
-        // this vCPU's thread and can only be applied here, on the owning thread.
-        self.usgic_drain_injected();
-        // Self-manage the guest's virtual timer: if its armed CNTV deadline is
-        // due, assert PPI 27 now. HVF's own VTIMER_ACTIVATED delivery is
-        // unreliable across the mask/unmask cycle and wedges an idle guest, so
-        // we poll it here every entry (see usgic_poll_vtimer). The WFI idle park
-        // wakes at that deadline, so this fires promptly on the re-entry.
-        self.usgic_poll_vtimer();
-        // Userspace CPU interface: HVF samples the raw virtual IRQ line at run
-        // ENTRY (not continuously), so — like QEMU's hvf_inject_interrupts — we
-        // must (re)assert it before every entry whenever an interrupt is pending
-        // and none is currently active. This is what makes an injected LPI get
-        // taken once the guest clears PSTATE.I, regardless of intervening exits.
-        self.usgic_refresh_irq_line();
-        // SAFETY: FFI on the owning thread.
-        let ret = unsafe { hv_vcpu_run(self.id) };
+        // Everything from here to `hv_vcpu_run` returning is guest-execution
+        // time as far as the shared counter clock is concerned: while this guard
+        // is held the clock cannot move the virtual-timer offset, so the guest
+        // can never observe a half-applied change. The guard is dropped as soon
+        // as the guest exits — deliberately *before* the WFI idle park below,
+        // which can nap for up to a second and would otherwise stall the clock.
+        let ret = {
+            let _guest = self.clock_enter();
+            // Adopt the shared offset. A no-op unless the clock stepped, which
+            // for an unscaled guest is never.
+            self.sync_vtimer_offset_or_warn();
+            // Drain any cross-thread injections (device/net-service completions)
+            // into the userspace GIC before we sample the line — they were
+            // enqueued off this vCPU's thread and can only be applied here, on
+            // the owning thread.
+            self.usgic_drain_injected();
+            // Self-manage the guest's virtual timer: if its armed CNTV deadline
+            // is due, assert PPI 27 now. HVF's own VTIMER_ACTIVATED delivery is
+            // unreliable across the mask/unmask cycle and wedges an idle guest,
+            // so we poll it here every entry (see usgic_poll_vtimer). The WFI
+            // idle park wakes at that deadline, so this fires promptly on the
+            // re-entry.
+            self.usgic_poll_vtimer();
+            // Userspace CPU interface: HVF samples the raw virtual IRQ line at
+            // run ENTRY (not continuously), so — like QEMU's
+            // hvf_inject_interrupts — we must (re)assert it before every entry
+            // whenever an interrupt is pending and none is currently active.
+            // This is what makes an injected LPI get taken once the guest clears
+            // PSTATE.I, regardless of intervening exits.
+            self.usgic_refresh_irq_line();
+            // SAFETY: FFI on the owning thread.
+            unsafe { hv_vcpu_run(self.id) }
+        };
         if ret != HV_SUCCESS {
             return Err(HypervisorCpuError::RunVcpu(anyhow!(
                 "hv_vcpu_run failed: {:#010x}",
@@ -2378,8 +2732,11 @@ impl Vcpu for HvfVcpu {
                         Ok(VmExit::Ignore)
                     }
                     EC_WFX => {
-                        if std::env::var("CHM_TRACE_VTIMER").is_ok() {
-                            let cv = self.get_sysreg(SYSREG_CNTVCT_EL0).unwrap_or(0);
+                        if std::env::var("CHM_TRACE_VTIMER_WFI").is_ok() {
+                            // NOT `get_sysreg(CNTVCT_EL0)`: HVF does not expose the
+                            // virtual counter that way and returns 0, which made
+                            // this trace read as "the guest counter is stuck at 0".
+                            let cv = self.current_cntvct();
                             let cval = self.get_sysreg(0xDF1A).unwrap_or(0);
                             let ctl = self.get_sysreg(0xDF19).unwrap_or(0);
                             eprintln!(
@@ -2446,9 +2803,17 @@ impl Vcpu for HvfVcpu {
                                 let nap_ms = if timer_live {
                                     let now = self.current_cntvct();
                                     if cval > now {
+                                        // `cval` and `current_cntvct` are GUEST
+                                        // ticks; the mach timebase converts HOST
+                                        // ticks. When the counter is scaled those
+                                        // are different units, so fold the
+                                        // guest->host ratio in first or the nap is
+                                        // computed `guest_hz / host_hz` too long.
+                                        let (num, den) = self.counter_scale().unwrap_or((1, 1));
+                                        let host_ticks =
+                                            (cval - now) as u128 * den as u128 / num as u128;
                                         let tb = mach_timebase();
-                                        let ns = (cval - now) as u128 * tb.numer as u128
-                                            / tb.denom as u128;
+                                        let ns = host_ticks * tb.numer as u128 / tb.denom as u128;
                                         ((ns / 1_000_000) as u64).clamp(1, 10)
                                     } else {
                                         1
