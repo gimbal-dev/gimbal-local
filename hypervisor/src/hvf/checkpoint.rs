@@ -59,6 +59,10 @@ pub struct VcpuCheckpoint {
 
 /// A full live VM checkpoint's hardware state. Guest RAM and disk overlays live
 /// in sibling files; this is the small, structured part.
+///
+/// Multi-vCPU aware: [`Self::vcpus`] and [`Self::usgic_cpus`] are both indexed
+/// by vCPU id. Use [`Self::usgic_for`] rather than reading the userspace-GIC
+/// fields directly, so pre-SMP checkpoints keep resuming.
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct CheckpointState {
     /// Format version ([`CHECKPOINT_VERSION`]).
@@ -70,13 +74,30 @@ pub struct CheckpointState {
     /// Interrupt-line width the GIC was built with (carried from the parent
     /// snapshot so the distributor offset walk matches on resume).
     pub num_irq: u32,
-    /// Userspace-GIC live state, when this checkpoint was taken on the software
-    /// GICv3 path (M-USGIC). `None` on the managed-GIC path, where `gic_dist` +
-    /// the per-vCPU `rdist` carry the interrupt state instead. Kept `#[serde(
-    /// default)]` so a managed checkpoint (which never emits it) still
+    /// Userspace-GIC live state for vCPU 0, when this checkpoint was taken on
+    /// the software GICv3 path (M-USGIC). `None` on the managed-GIC path, where
+    /// `gic_dist` + the per-vCPU `rdist` carry the interrupt state instead. Kept
+    /// `#[serde(default)]` so a managed checkpoint (which never emits it) still
     /// deserializes, and an older reader ignores it.
+    ///
+    /// Retained alongside [`Self::usgic_cpus`] as the compatibility view: a
+    /// checkpoint written before SMP capture existed carries only this field,
+    /// and a reader that predates `usgic_cpus` still finds vCPU 0 here. Prefer
+    /// [`Self::usgic_for`] over reading either field directly.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usgic: Option<UsgicCheckpoint>,
+    /// Per-vCPU userspace-GIC live state, index == vCPU id.
+    ///
+    /// [`UsgicCheckpoint`] mixes one VM-global model (the distributor) with
+    /// three per-vCPU ones (redistributor, pending, active), so a single
+    /// `usgic` can only ever describe a single-vCPU guest. Restoring vCPU 0's
+    /// redistributor onto every core would hand each of them the boot CPU's
+    /// PPI configuration and its in-flight interrupts.
+    ///
+    /// Empty on the managed path and on pre-SMP checkpoints, which is what makes
+    /// this additive: [`Self::usgic_for`] falls back to `usgic` for vCPU 0.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub usgic_cpus: Vec<UsgicCheckpoint>,
 }
 
 /// The live software-GIC state for one userspace-GIC vCPU (M-USGIC). The managed
@@ -97,6 +118,31 @@ pub struct UsgicCheckpoint {
 }
 
 impl CheckpointState {
+    /// This checkpoint's userspace-GIC state for vCPU `id`, or `None` if it does
+    /// not describe that vCPU.
+    ///
+    /// Prefers the per-vCPU [`Self::usgic_cpus`] and falls back to the legacy
+    /// single [`Self::usgic`] for vCPU 0 — which is what lets a checkpoint
+    /// written before SMP capture existed still resume, while refusing to hand
+    /// vCPU 0's redistributor to a secondary core.
+    pub fn usgic_for(&self, id: usize) -> Option<&UsgicCheckpoint> {
+        if !self.usgic_cpus.is_empty() {
+            return self.usgic_cpus.get(id);
+        }
+        if id == 0 { self.usgic.as_ref() } else { None }
+    }
+
+    /// Whether this is a userspace-GIC checkpoint that fully describes an
+    /// `expected`-vCPU guest.
+    ///
+    /// A checkpoint that covers fewer vCPUs than the snapshot declares cannot be
+    /// resumed: [`super::rehydrate::restore_usgic_vcpu`] indexes
+    /// [`Self::vcpus`] by id, so a short one would panic. Callers check this
+    /// before accepting a checkpoint and cold-boot instead when it fails.
+    pub fn covers_usgic_vcpus(&self, expected: usize) -> bool {
+        self.vcpus.len() >= expected && (0..expected).all(|id| self.usgic_for(id).is_some())
+    }
+
     /// The shared virtual-counter reference (vCPU0's captured `CNTVCT_EL0`) used
     /// to re-seed every vCPU's timer offset on resume, mirroring
     /// [`super::rehydrate::Snapshot::reference_cntvct`].
@@ -182,6 +228,7 @@ pub fn capture_all(
         gic_dist,
         num_irq,
         usgic: None,
+        usgic_cpus: Vec::new(),
     })
 }
 
@@ -268,6 +315,108 @@ mod tests {
         assert_eq!(cp.reference_cntvct(), None);
     }
 
+    /// A [`UsgicCheckpoint`] tagged by its `active` INTID, so a test can tell
+    /// which vCPU's state came back out.
+    fn usgic_cp(active: u32) -> UsgicCheckpoint {
+        UsgicCheckpoint {
+            dist: super::super::softgic::Distributor::new(64),
+            redist: super::super::softgic::Redistributor::new(),
+            pending: vec![active],
+            active: Some(active),
+        }
+    }
+
+    fn state_with(vcpus: usize) -> CheckpointState {
+        CheckpointState {
+            version: CHECKPOINT_VERSION,
+            vcpus: (0..vcpus)
+                .map(|_| VcpuCheckpoint {
+                    state: VcpuHvfState::default(),
+                    rdist: Vec::new(),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    /// A checkpoint written before SMP capture existed carries only the single
+    /// `usgic` field. It must still resume as a 1-vCPU guest.
+    #[test]
+    fn usgic_for_falls_back_to_the_legacy_single_field() {
+        let mut cp = state_with(1);
+        cp.usgic = Some(usgic_cp(7));
+
+        assert_eq!(cp.usgic_for(0).and_then(|u| u.active), Some(7));
+        assert!(cp.covers_usgic_vcpus(1));
+    }
+
+    /// …but that fallback must never spread vCPU 0's redistributor and
+    /// in-flight interrupts across secondary cores, which is exactly what
+    /// resuming a legacy checkpoint on an SMP snapshot used to risk.
+    #[test]
+    fn legacy_single_field_does_not_cover_secondary_vcpus() {
+        let mut cp = state_with(2);
+        cp.usgic = Some(usgic_cp(7));
+
+        assert!(cp.usgic_for(1).is_none());
+        assert!(!cp.covers_usgic_vcpus(2));
+    }
+
+    #[test]
+    fn usgic_for_prefers_the_per_vcpu_vector() {
+        let mut cp = state_with(2);
+        // vCPU 0 mirrored into the legacy field, as `collect_usgic_checkpoint`
+        // writes it; the vector is what must actually be read.
+        cp.usgic = Some(usgic_cp(7));
+        cp.usgic_cpus = vec![usgic_cp(7), usgic_cp(9)];
+
+        assert_eq!(cp.usgic_for(0).and_then(|u| u.active), Some(7));
+        assert_eq!(cp.usgic_for(1).and_then(|u| u.active), Some(9));
+        assert!(cp.usgic_for(2).is_none());
+        assert!(cp.covers_usgic_vcpus(2));
+        assert!(!cp.covers_usgic_vcpus(3));
+    }
+
+    /// A checkpoint with per-vCPU GIC state but a short `vcpus` list would panic
+    /// the restore, which indexes `vcpus[id]`. It must be refused up front.
+    #[test]
+    fn coverage_requires_a_register_file_per_vcpu_too() {
+        let mut cp = state_with(1);
+        cp.usgic_cpus = vec![usgic_cp(7), usgic_cp(9)];
+
+        assert!(cp.usgic_for(1).is_some());
+        assert!(!cp.covers_usgic_vcpus(2));
+    }
+
+    /// A managed-GIC checkpoint carries no userspace-GIC state at all.
+    #[test]
+    fn managed_checkpoint_covers_no_usgic_vcpus() {
+        let cp = state_with(2);
+        assert!(cp.usgic_for(0).is_none());
+        assert!(!cp.covers_usgic_vcpus(1));
+    }
+
+    #[test]
+    fn per_vcpu_usgic_survives_json() {
+        let mut cp = state_with(2);
+        cp.usgic_cpus = vec![usgic_cp(7), usgic_cp(9)];
+        let back: CheckpointState =
+            serde_json::from_str(&serde_json::to_string(&cp).unwrap()).unwrap();
+
+        assert_eq!(back.usgic_for(1).and_then(|u| u.active), Some(9));
+        assert!(back.covers_usgic_vcpus(2));
+    }
+
+    /// The new field is additive: a checkpoint serialized without it (an older
+    /// writer) still deserializes, rather than failing the whole resume.
+    #[test]
+    fn json_without_usgic_cpus_still_deserializes() {
+        let json = r#"{"version":1,"vcpus":[],"gic_dist":[],"num_irq":64}"#;
+        let back: CheckpointState = serde_json::from_str(json).unwrap();
+        assert!(back.usgic_cpus.is_empty());
+        assert!(back.usgic.is_none());
+    }
+
     #[test]
     fn checkpoint_state_round_trips_through_json() {
         let mut state = VcpuHvfState::default();
@@ -283,6 +432,7 @@ mod tests {
             gic_dist: vec![(0x0100, 0x1), (0x6000, 0x8000_0000)],
             num_irq: 64,
             usgic: None,
+            usgic_cpus: Vec::new(),
         };
         let json = serde_json::to_string(&cp).unwrap();
         let back: CheckpointState = serde_json::from_str(&json).unwrap();
@@ -324,6 +474,7 @@ mod tests {
             gic_dist: Vec::new(),
             num_irq: 64,
             usgic: Some(usgic),
+            usgic_cpus: Vec::new(),
         };
         let json = serde_json::to_string(&cp).unwrap();
         let back: CheckpointState = serde_json::from_str(&json).unwrap();

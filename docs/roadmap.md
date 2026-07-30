@@ -74,7 +74,7 @@ capture path creates a VGICv3. Three ways to get one:
 delivered. They were not alternatives in value, only in cost: AWS gives the most faithful artifact, the Pi gives the fastest
 independent one.
 
-### 🟡 Blocker B — we can build the agent image, but we cannot save it
+### ✅ Blocker B — CLOSED 2026-07-30: the agent image is built and persisted
 
 **Corrected 2026-07-30.** This was previously written as "the image is 74 % full,
 so a toolchain does not fit". That was wrong, and testing it rather than
@@ -98,8 +98,9 @@ just had to be moved to the end of the device first, which is why `growpart`
 refused. And `build-essential` fits in 633 MB even without growing (703 packages,
 94 % full). **So building an agent image locally is not blocked by anything.**
 
-**The real blocker is that the result cannot be persisted.** Checkpoint capture
-is hardcoded to single-vCPU:
+**The real blocker was that the result could not be persisted**, and it was our
+code rather than a cloud dependency. Checkpoint capture was hardcoded to
+single-vCPU:
 
 ```rust
 // chm/src/imp.rs
@@ -113,18 +114,40 @@ let want_capture = want_checkpoint && n == 1 && id == 0;
 | `graviton-vanilla-1cpu` | 1 | ❌ | ❌ no network | ✅ |
 | `graviton-vanilla-2cpu-net` | 2 | ✅ | ✅ **proved** | ❌ silently no-ops |
 
-Neither does both. **This is our code, not a cloud dependency.** Two cheap ways
-out, and they are not exclusive:
+Neither did both. Two ways out were identified, and **V5.6 shipped the durable
+one the same day**, so no capture round-trip was needed at all:
 
-1. **Ask for `graviton-vanilla-1cpu-net`** — capture A's config with capture B's
-   NIC. A one-line change to their capture script, and it unblocks V5.3 with
-   *zero* code changes on our side. Added as the fast path in
-   [`graviton-capture-request.md`](graviton-capture-request.md).
-2. **Lift checkpoint capture to SMP** (**V5.6**) — the durable fix, and it
-   unblocks fork/branch/push for every multi-vCPU sandbox, not just this one.
+1. Ask for a `graviton-vanilla-1cpu-net` capture — one line on their side, no
+   code on ours. Kept as a nice-to-have, **not** taken.
+2. **Lift checkpoint capture to SMP (V5.6)** — the durable fix, because it
+   unblocks fork/branch/push/rollback for every multi-vCPU sandbox rather than
+   just this one. **This is what shipped.**
 
-Note `--checkpoint` currently **fails silently** on a multi-vCPU snapshot. That
-is its own small bug: it should say so.
+`--checkpoint` also used to **fail silently** on a multi-vCPU snapshot; a
+refused checkpoint now says why and cold-boots.
+
+**The result, measured on a rehydrated 2-vCPU guest:**
+
+```console
+$ cc --version | head -1
+cc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0
+$ git --version
+git version 2.43.0
+$ df -h / | tail -1
+/dev/vda1       6.8G  2.2G  4.6G  33% /
+$ printf 'int main(void){return 7;}' >/tmp/r.c && cc /tmp/r.c -o /tmp/r; /tmp/r; echo "RESUMED_BUILD=$?"
+RESUMED_BUILD=7
+```
+
+That compile happened **after** the checkpoint was resumed, not before it was
+taken — so the toolchain is genuinely part of the image, not a live session.
+
+**One hazard this surfaced, now documented:** guest RAM is restored from the
+snapshot on every run, so a run that writes to disk but does not end in a
+checkpoint comes back with a kernel whose cached filesystem view no longer
+matches the overlay — the files are there, and the resumed guest cannot see
+them. RAM and disk have to be captured together, which is exactly what a
+checkpoint does.
 
 The minimal-rootfs capture (round 3, §9–§12) is still worth having — smaller,
 reproducible from a manifest, far less attack surface — but it is an
@@ -157,7 +180,7 @@ nothing from anyone else.
 | **V2** | Vanilla everywhere in the product | ①③ | ✅ **complete** — CLI, daemon and app all run vanilla, flagless |
 | **V3** | Cloud control plane on the vanilla contract | ②④ | 🟠 partly blocked cross-repo (#21, #36) |
 | **V4** | Security with sane defaults | ③ | ✅ **complete** — threat model, default posture, `chm posture` |
-| **V5** | The coding-agent sandbox | ①③ | 🔴 **the current thrust** — V5.1 and V5.2 shipped; V5.3 needs V5.6 to persist; V5.5 is an open bug |
+| **V5** | The coding-agent sandbox | ①③ | 🔴 **the current thrust** — V5.1 and V5.2 shipped; V5.5 is the open bug |
 | **V6** | The app tells the whole truth | ③④ | ⬜ **ready to start, nothing blocking it** |
 
 **Recommended order of attack:**
@@ -269,9 +292,9 @@ measured rather than assumed, inside a live rehydrated `graviton-1` guest on
 | --- | --- | --- |
 | V5.1 | **Capture with a NIC and 2+ vCPU**, and prove the NAT, the egress policy *and* the V5.2 credential proxy on a real cloud snapshot. | ✅ **Done — 2026-07-31.** gimbal cloud delivered round 2 (`graviton-vanilla-1cpu`, `graviton-vanilla-2cpu-net`; CH v54.0.0 @ `9ea9019d29af`, post-`69637dde6`, captured after cloud-init, `cntfrq: 121875000` recorded in **both** clock blocks). B rehydrated on Apple silicon with `ens3 UP 192.168.249.2/24`, `nproc`=2, virtio-net at `1af4:1041`. **From inside the guest: `curl https://api.github.com/zen` → `HTTP 200`, and `git clone` of a public repo over HTTPS succeeded.** The userspace NAT's DNS responder answers on the gateway. First cloud capture ever to make a network call here. Two real bugs found — see below. |
 | V5.2 | **How a developer's repo enters the sandbox — answered, and shipped.** The decision was that this is a *credentials* problem, not a filesystem one: a sandbox that can authenticate to GitHub clones the repo itself, so I1 stands untouched. A TLS-terminating egress proxy attaches the credential as the request leaves for a rule-named destination; the guest never holds a secret. Proven live against api.github.com (200 with the rule, 401 without, identical request bytes) and against registry.npmjs.org. New invariant **I12**; `chm proxy show/ca/check`; [`credential-proxy.md`](credential-proxy.md). | ✅ done |
-| V5.3 | **A purpose-built agent image.** **Not blocked on the cloud** — proved locally on 2026-07-30 that the disk grows (633 M → 5.0 G free) and `build-essential` installs and compiles over the V5.1 NIC (`cc 13.3.0`, `BUILD_OK`). What is missing is **persistence**: checkpoint capture is single-vCPU (`n == 1`) and the only NIC-bearing capture is 2-vCPU, so the built image cannot be saved. Unblocked either by a `graviton-vanilla-1cpu-net` capture (one line on their side, zero code on ours) or by **V5.6**. A minimal reproducible rootfs ([`graviton-capture-request.md`](graviton-capture-request.md) §9–§12) remains desirable but is an *optimisation*. | 🟡 **unblocked locally, needs V5.6 or a 1-vCPU+NIC capture to persist** |
+| V5.3 | **A purpose-built agent image.** ✅ **Done 2026-07-30, and it never needed the cloud.** Built locally on the round-2 NIC capture: grew the root partition (the 4.5 GiB past the GPT was usable once `sgdisk -e` moved the backup header) from 2.4 G/633 M free to **6.8 G/4.6 G free**, installed `build-essential` + `git` over the V5.1 NIC, and persisted the result with the SMP checkpointing from V5.6. Verified by resuming the checkpoint and compiling a *new* C program inside the rehydrated guest: `cc 13.3.0`, `git 2.43.0`, 703 packages, exit code 7 from a binary built after resume. A minimal reproducible rootfs ([`graviton-capture-request.md`](graviton-capture-request.md) §9–§12) is still wanted — smaller, manifest-built, less attack surface — but as an *optimisation*. | ✅ done |
 | V5.5 | **SMP counter coherence.** Found by V5.1 — the first 2-vCPU capture we have ever held. `CHM_GUEST_CNTFRQ` re-steps the vtimer offset on guest *entry*, so between entries a vCPU runs at the host rate. On one vCPU that is invisible; on two it is not, because each exits at its own cadence (**measured: cpu0 117,950 re-steps vs cpu1 521** — cpu1 sits in `WFI`). The counters drift apart while Linux treats `CNTVCT_EL0` as one system-wide clocksource, so `/proc/uptime` moves **non-monotonically** and occasionally latches an exact multiple of `2^58` ticks (~75 years). Unset, the same capture is a steady `0.197×` = exactly `1/5.078125`. Ruled out: the offset arithmetic (traced healthy over 75 s, zero anomalous values), `wfi_park_ms` (clamped), and a real curve-anchor ordering defect that was fixed anyway. Behaves like a race — tracing it makes it vanish. The fix must make the counter *coherent across vCPUs*, not per-vCPU accurate. | ⬜ **known limitation, documented** |
-| V5.6 | **SMP checkpoint capture.** `chm/src/imp.rs`: `let want_capture = want_checkpoint && n == 1 && id == 0;` — checkpointing only runs on a single-vCPU guest, and **fails silently** on anything larger. That means no `--checkpoint`, and therefore no fork/branch/push/rollback, for any multi-vCPU sandbox. It is what stops us saving the agent image we can already build. Needs all vCPUs quiesced and captured together, then RAM dumped once while still mapped. | ☐ **the real V5.3 blocker, and it is ours** |
+| V5.6 | **SMP checkpoint capture.** ✅ **Done 2026-07-30.** Capture was gated `n == 1 && id == 0`, so `--checkpoint` silently did nothing on a multi-vCPU guest — no suspend/resume, and no fork/branch/push/rollback, for any SMP sandbox. Each vCPU now captures itself on its owning thread and the orchestrator assembles one checkpoint and dumps RAM once. The blocking constraint turned out not to exist: the guest-RAM mappings are owned by `prepared` on the orchestrator thread and outlive the vCPU threads, so the dump never needed to happen on the boot CPU. `CheckpointState` gained a per-vCPU `usgic_cpus`, because `UsgicCheckpoint` mixes one VM-global distributor with three per-vCPU models — restoring vCPU 0's onto every core would have handed secondaries the boot CPU's PPI config and in-flight interrupts. | ✅ done |
 | V5.4 | Cold create-from-image (#101) so a fresh sandbox does not require a pre-existing capture. | ⬜ nothing blocking |
 
 ### V6 · The app tells the whole truth

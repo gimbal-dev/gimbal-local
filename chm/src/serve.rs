@@ -1053,8 +1053,8 @@ fn decode_input(arg: &str) -> Vec<u8> {
 /// supervision policy: drain the guest's serial output into the console ring
 /// and stop on the stop flag, the idle timeout, or the wall-clock cap.
 ///
-/// Like the CLI, live checkpoints here are single-vCPU only; an SMP capture
-/// cold-boots on the next start (the engine reports that itself).
+/// Live checkpoints here cover SMP, same as the CLI: the engine captures each
+/// vCPU on its owning thread and writes one checkpoint for the whole guest.
 fn run_guest_usgic(
     dir: &Path,
     opts: &EngineOpts,
