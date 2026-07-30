@@ -988,10 +988,13 @@ pub fn restore_usgic_vcpu(
         // reprogram on any core is visible to all and SPIs route by affinity.
         concrete.usgic_install_shared_dist(seed.shared_dist.clone());
         concrete.usgic_set_gic_bases(seed.gicd_base, gicr_base);
-        match resume.and_then(|cp| cp.usgic.as_ref()) {
+        match resume.and_then(|cp| cp.usgic_for(id)) {
             // Resume: restore the live software-GIC models captured at suspend
             // (SPI/PPI config the guest may have reprogrammed since the parent
             // snapshot, plus any in-flight interrupt), overriding the cold seed.
+            // Indexed by id: the redistributor, pending set and active INTID are
+            // per-vCPU, so each core gets its own captured state rather than the
+            // boot CPU's.
             Some(usgic_cp) => concrete.usgic_restore_softgic(usgic_cp),
             // Cold: seed from the parent snapshot's captured KVM GIC state. On SMP
             // this seeds the shared distributor identically per vCPU (idempotent).
@@ -1004,7 +1007,17 @@ pub fn restore_usgic_vcpu(
     // set_state seeds the captured ICC bookkeeping into `usgic` instead of a
     // (nonexistent) managed GIC.
     let vcpu_state = match resume {
-        Some(cp) => &cp.vcpus[id].state,
+        Some(cp) => {
+            &cp.vcpus
+                .get(id)
+                .ok_or_else(|| {
+                    RehydrateError::Translate(format!(
+                        "checkpoint describes {} vCPU(s), cannot restore vCPU {id}",
+                        cp.vcpus.len()
+                    ))
+                })?
+                .state
+        }
         None => &snap.vcpus[id],
     };
     vcpu.set_state(&CpuState::Hvf(vcpu_state.clone()))

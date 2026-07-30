@@ -1760,9 +1760,10 @@ pub(crate) struct UsgicSession<'a> {
 /// injection queue + wake back), then builds the cross-vCPU SGI table, wires the
 /// virtio device model + interactive console, releases the vCPU threads, and
 /// drains the console until the session ends. Handles single- and multi-vCPU
-/// (SMP) snapshots; live checkpoint/suspend is currently single-vCPU only (an
-/// SMP checkpoint is future work), so a multi-vCPU resume is always a cold
-/// rehydrate. The shipping managed-GIC path is untouched.
+/// (SMP) snapshots, including live checkpoint/suspend: each vCPU captures its
+/// own state on its owning thread (HVF binds a vCPU to the thread that created
+/// it) and the orchestrator assembles them into one checkpoint. The shipping
+/// managed-GIC path is untouched.
 pub(crate) fn run_usgic_engine(
     cfg: &UsgicConfig<'_>,
     loaded: Loaded,
@@ -1775,28 +1776,37 @@ pub(crate) fn run_usgic_engine(
     }
 
     // Resume from a live checkpoint when one exists and checkpoints are enabled.
-    // Single-vCPU only: the userspace-GIC checkpoint captures one vCPU's software
-    // GIC, so an SMP checkpoint is future work; a multi-vCPU run cold-rehydrates.
-    let resume_state: Option<Arc<CheckpointState>> =
-        if n == 1 && cfg.checkpoint && checkpoint::has_checkpoint(dir) {
-            match checkpoint::read_checkpoint(dir) {
-                Ok(state) if state.usgic.is_some() => Some(Arc::new(state)),
-                Ok(_) => {
-                    eprintln!(
-                        "chm: warning: checkpoint is not a userspace-GIC capture; cold-booting"
-                    );
-                    checkpoint::clear_checkpoint(dir);
-                    None
-                }
-                Err(e) => {
-                    eprintln!("chm: warning: ignoring checkpoint ({e}); cold-booting");
-                    checkpoint::clear_checkpoint(dir);
-                    None
-                }
+    // Accepted only when it describes every vCPU this snapshot declares: the
+    // userspace-GIC redistributor, pending set and active INTID are all
+    // per-vCPU, so a checkpoint that covers fewer cores cannot be spread across
+    // more without handing secondaries the boot CPU's interrupt state.
+    let resume_state: Option<Arc<CheckpointState>> = if cfg.checkpoint
+        && checkpoint::has_checkpoint(dir)
+    {
+        match checkpoint::read_checkpoint(dir) {
+            Ok(state) if state.covers_usgic_vcpus(n) => Some(Arc::new(state)),
+            Ok(state) => {
+                let why = if state.usgic.is_none() && state.usgic_cpus.is_empty() {
+                    "is not a userspace-GIC capture".to_string()
+                } else {
+                    let covered = (0..=state.vcpus.len())
+                        .take_while(|id| state.usgic_for(*id).is_some())
+                        .count();
+                    format!("covers {covered} vCPU(s) but this snapshot declares {n}")
+                };
+                eprintln!("chm: warning: checkpoint {why}; cold-booting");
+                checkpoint::clear_checkpoint(dir);
+                None
             }
-        } else {
-            None
-        };
+            Err(e) => {
+                eprintln!("chm: warning: ignoring checkpoint ({e}); cold-booting");
+                checkpoint::clear_checkpoint(dir);
+                None
+            }
+        }
+    } else {
+        None
+    };
     let resuming = resume_state.is_some();
 
     if !cfg.quiet {
@@ -1827,8 +1837,8 @@ pub(crate) fn run_usgic_engine(
         loaded.mem_ranges.clone()
     };
     let snap = Arc::new(loaded.snap);
-    // The orchestrator keeps the memory layout so vCPU 0 can dump guest RAM into
-    // a checkpoint on suspend (single-vCPU).
+    // The orchestrator keeps the memory layout so it can dump guest RAM into a
+    // checkpoint on suspend, once, after every vCPU thread has joined.
     let mem_mappings = snap.mem_mappings.clone();
     let snap_num_irq = snap.num_irq;
 
@@ -1857,7 +1867,8 @@ pub(crate) fn run_usgic_engine(
     // sends back its id and delivery handles. Once every vCPU reports in, the
     // orchestrator builds the cross-vCPU SGI table + wires the device model, then
     // releases each thread through its go channel (which carries the completed
-    // SGI table). A one-shot capture channel reports vCPU 0's suspend result.
+    // SGI table). At suspend each thread returns its own capture on the capture
+    // channel, keyed by vCPU id.
     struct CpuSetup {
         id: usize,
         inject: Arc<Mutex<Vec<u32>>>,
@@ -1866,13 +1877,12 @@ pub(crate) fn run_usgic_engine(
         handle: UsgicCpuHandle,
     }
     let (setup_tx, setup_rx) = mpsc::channel::<Result<CpuSetup, String>>();
-    let (capture_tx, capture_rx) = mpsc::channel::<Option<Result<(), String>>>();
+    let (capture_tx, capture_rx) = mpsc::channel::<(usize, UsgicCapture)>();
     let mut go_txs: Vec<mpsc::Sender<Arc<Vec<UsgicCpuHandle>>>> = Vec::with_capacity(n);
 
     // Copied out of `cfg` so the per-vCPU thread closures capture plain values
     // rather than a borrow of the caller's config, which cannot outlive it.
     let want_checkpoint = cfg.checkpoint;
-    let checkpoint_source = cfg.checkpoint_source;
 
     let mut threads = Vec::with_capacity(n);
     for id in 0..n {
@@ -1887,12 +1897,7 @@ pub(crate) fn run_usgic_engine(
         let outcome = outcome.clone();
         let setup_tx = setup_tx.clone();
         let resume = resume_state.clone();
-        // Checkpoint capture is single-vCPU: only vCPU 0 on an n==1 run captures.
-        let want_capture = want_checkpoint && n == 1 && id == 0;
         let capture_tx = capture_tx.clone();
-        let ckpt_dir = dir.to_path_buf();
-        let mem_mappings_thread = mem_mappings.clone();
-        let guest_mem_capture = guest_mem.clone();
 
         let t = thread::Builder::new()
             .name(format!("chm-usgic-vcpu{id}"))
@@ -1973,37 +1978,23 @@ pub(crate) fn run_usgic_engine(
                     }
                 }
 
-                // Suspend capture (single-vCPU only): on a clean external stop,
-                // capture + write the checkpoint on this owning thread, where the
-                // guest RAM is still mapped (the COW mmap unmaps when the vCPU
-                // drops at the end of this closure — dumping RAM after that would
-                // be a use-after-munmap).
-                if want_capture {
-                    let outcome_is_none = outcome.lock().unwrap().is_none();
-                    let captured: Option<Result<(), String>> = if outcome_is_none {
-                        match hvf_checkpoint::capture_usgic_vcpu(&mut vcpu) {
-                            Ok((vcpu_cp, usgic_cp)) => {
-                                let state = CheckpointState {
-                                    version: hvf_checkpoint::CHECKPOINT_VERSION,
-                                    vcpus: vec![vcpu_cp],
-                                    gic_dist: Vec::new(),
-                                    num_irq: snap_num_irq,
-                                    usgic: Some(usgic_cp),
-                                };
-                                Some(checkpoint::write_checkpoint(
-                                    &ckpt_dir,
-                                    &state,
-                                    &guest_mem_capture,
-                                    &mem_mappings_thread,
-                                    checkpoint_source,
-                                ))
-                            }
-                            Err(e) => Some(Err(format!("capture: {e}"))),
-                        }
-                    } else {
-                        None
-                    };
-                    let _ = capture_tx.send(captured);
+                // Suspend capture. A vCPU's register file and software-GIC models
+                // can only be read on the thread that created it (HVF binds a
+                // vCPU to its owning thread), so every vCPU captures itself here
+                // and sends the result to the orchestrator, which assembles all
+                // of them and writes one checkpoint. Guest RAM is deliberately
+                // NOT dumped here: the mappings are owned by `prepared` on the
+                // orchestrator thread and outlive these threads, so the dump
+                // belongs there, once, rather than on the boot CPU.
+                //
+                // Capture unconditionally rather than checking the run outcome
+                // first: whether the checkpoint is worth keeping is the
+                // orchestrator's call, and a thread that skipped sending because
+                // it raced another vCPU's error would hang the collector.
+                if want_checkpoint {
+                    let captured = hvf_checkpoint::capture_usgic_vcpu(&mut vcpu)
+                        .map_err(|e| format!("capture: {e}"));
+                    let _ = capture_tx.send((id, captured));
                 }
                 // `vcpu` (and its VM ref) drops here, on the owning thread.
             })
@@ -2172,44 +2163,56 @@ pub(crate) fn run_usgic_engine(
     if let Some(h) = net_service {
         let _ = h.join();
     }
-    // Receive vCPU 0's suspend outcome (single-vCPU capture only). `None` when
-    // nothing was captured (power-off/error, SMP, or checkpoints disabled).
-    let capture_result = if cfg.checkpoint && n == 1 {
-        capture_rx.recv().unwrap_or(None)
-    } else {
-        None
-    };
     for t in threads {
         let _ = t.join();
     }
     drop(raw_console);
 
     let vcpu_outcome = outcome.lock().unwrap().take();
+
+    // Suspend capture. Every vCPU has sent its own register file + software-GIC
+    // state from its owning thread and joined, so assemble them into one
+    // checkpoint and dump guest RAM here — `prepared` still owns the RAM
+    // mappings at this point and is not dropped until the end of this function.
+    //
+    // Only a clean external stop checkpoints. A guest power-off or a vCPU error
+    // means the box is finished, so any stale checkpoint is cleared instead.
+    if cfg.checkpoint {
+        if vcpu_outcome.is_none() {
+            let written = collect_usgic_checkpoint(&capture_rx, snap_num_irq, n).and_then(|state| {
+                checkpoint::write_checkpoint(
+                    dir,
+                    &state,
+                    &guest_mem,
+                    &mem_mappings,
+                    cfg.checkpoint_source,
+                )
+            });
+            match written {
+                Ok(()) => {
+                    if !cfg.quiet {
+                        let cores = if n == 1 { "1 vCPU" } else { &format!("{n} vCPUs") };
+                        eprintln!(
+                            "\nchm: suspended — userspace-GIC checkpoint saved ({cores}); \
+                             resume to continue."
+                        );
+                    }
+                }
+                Err(e) => {
+                    eprintln!("chm: warning: could not write checkpoint: {e}");
+                    checkpoint::clear_checkpoint(dir);
+                }
+            }
+        } else {
+            checkpoint::clear_checkpoint(dir);
+        }
+    }
+
     let final_outcome = match vcpu_outcome {
         Some(Ok(o)) => o,
         Some(Err(e)) => return Err(e),
         None => coordinator.unwrap_or(Outcome::Interrupted),
     };
-
-    // Suspend/resume bookkeeping (single-vCPU): the vCPU thread already wrote the
-    // checkpoint on a clean external stop; report + keep it consistent. Nothing
-    // captured means the box is finished, so clear any stale checkpoint.
-    if cfg.checkpoint && n == 1 {
-        match capture_result {
-            Some(Ok(())) => {
-                if !cfg.quiet {
-                    eprintln!(
-                        "\nchm: suspended — userspace-GIC checkpoint saved (resume to continue)."
-                    );
-                }
-            }
-            Some(Err(e)) => {
-                eprintln!("chm: warning: could not write checkpoint: {e}");
-                checkpoint::clear_checkpoint(dir);
-            }
-            None => checkpoint::clear_checkpoint(dir),
-        }
-    }
 
     // `prepared` (guest-RAM backings + VM) and `hv` are dropped here, after every
     // vCPU thread has joined (so every vCPU is destroyed before `hv_vm_destroy`).
@@ -2921,6 +2924,63 @@ fn collect_checkpoint(
         gic_dist,
         num_irq,
         usgic: None,
+        usgic_cpus: Vec::new(),
+    })
+}
+
+/// One vCPU's userspace-GIC suspend capture: its register file plus its
+/// software distributor/redistributor models, or why the capture failed.
+type UsgicCapture =
+    Result<(hvf_checkpoint::VcpuCheckpoint, hvf_checkpoint::UsgicCheckpoint), String>;
+
+/// Gather the per-vCPU userspace-GIC captures (in id order) into a
+/// [`CheckpointState`] ready to persist.
+///
+/// The software-GIC sibling of [`collect_checkpoint`], and simpler in one
+/// respect: there is no managed distributor to read back, because the whole
+/// GICv3 model lives in userspace and each vCPU already serialized its view of
+/// it. Called at suspend, after every vCPU thread has sent its capture and
+/// joined, while the VM (and so guest RAM) is still alive.
+fn collect_usgic_checkpoint(
+    captured_rx: &mpsc::Receiver<(usize, UsgicCapture)>,
+    num_irq: u32,
+    n: usize,
+) -> Result<CheckpointState, String> {
+    let mut slots: Vec<Option<(hvf_checkpoint::VcpuCheckpoint, hvf_checkpoint::UsgicCheckpoint)>> =
+        (0..n).map(|_| None).collect();
+    for _ in 0..n {
+        let (id, res) = captured_rx
+            .recv()
+            .map_err(|_| "a vCPU thread exited before sending its capture".to_string())?;
+        let cp = res.map_err(|e| format!("vCPU {id}: {e}"))?;
+        *slots
+            .get_mut(id)
+            .ok_or_else(|| format!("captured out-of-range vCPU id {id}"))? = Some(cp);
+    }
+    let (vcpus, usgic_cpus): (Vec<_>, Vec<_>) = slots
+        .into_iter()
+        .enumerate()
+        .map(|(id, c)| c.ok_or_else(|| format!("missing capture for vCPU {id}")))
+        .collect::<Result<Vec<_>, String>>()?
+        .into_iter()
+        .unzip();
+
+    Ok(CheckpointState {
+        version: hvf_checkpoint::CHECKPOINT_VERSION,
+        vcpus,
+        // The managed distributor dump is empty on this path by construction:
+        // there is no managed GIC, and each entry of `usgic_cpus` carries the
+        // software distributor instead.
+        gic_dist: Vec::new(),
+        num_irq,
+        // vCPU 0 is also written to the legacy single-`usgic` field so a reader
+        // that predates SMP capture still resumes a checkpoint we write. Every
+        // vCPU shares one distributor model, so the copies here are identical in
+        // that part and differ only in the per-vCPU redistributor and in-flight
+        // interrupt state — a few KB of duplication against a multi-GB RAM dump,
+        // which is a price worth paying for a format with no cross-references.
+        usgic: usgic_cpus.first().cloned(),
+        usgic_cpus,
     })
 }
 

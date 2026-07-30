@@ -74,8 +74,17 @@ Two things worth knowing about the daemon specifically:
   console again. `chm ctl input <text>` sends the text as-is with no trailing
   newline, so finish a command with `chm ctl input '\n'` — or a bare
   `chm ctl input` — to press Enter.
-- **Daemon checkpoints are single-vCPU.** A multi-vCPU capture runs, but Stop
-  will not write a checkpoint for it yet.
+- **Checkpoints cover SMP.** Stop writes a checkpoint for a multi-vCPU guest as
+  well as a single-vCPU one: each vCPU's state is captured on its owning thread
+  (Hypervisor.framework binds a vCPU to the thread that created it) and the
+  whole set is written as one checkpoint. A checkpoint is only resumed onto a
+  guest with the same vCPU count; anything else cold-boots and says so.
+- **Disk writes need a checkpoint to be safe.** Guest RAM is restored from the
+  snapshot on every run, so a run that changes the disk but does *not* end in a
+  checkpoint comes back with a filesystem the kernel's cached view no longer
+  matches — the files are on the overlay, but the resumed kernel cannot see
+  them. Let the run end cleanly (`--checkpoint`, or Stop under the daemon) and
+  RAM and disk are captured together.
 
 ## Do not confuse the two environment variables
 
