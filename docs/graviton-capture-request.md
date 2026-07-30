@@ -29,6 +29,9 @@
 > general-purpose cloud VM. A toolchain does not fit in it. **See [§9–§12](#9-why-the-current-image-is-the-wrong-shape)
 > at the end of this document** for the full spec.
 >
+> Fastest unblock by far is **[§8b](#8b-the-cheapest-ask-in-this-whole-document--graviton-vanilla-1cpu-net)** — a 1-vCPU capture *with* a NIC, which is a one-line
+> change and lets us build the agent image ourselves with no code changes.
+>
 > The one thing to read if you read nothing else: **do not reuse a Firecracker
 > kernel.** Their aarch64 CI kernel sets `# CONFIG_PCI is not set`; Cloud
 > Hypervisor puts virtio on PCI, so that kernel boots to no disk and no network.
@@ -423,6 +426,35 @@ including the network: from inside the rehydrated guest we get `HTTP 200` from
 This round asks for something different. Not "does it run" but **"is this an
 image worth running"** — a purpose-built sandbox for a coding agent, rather than
 a stock Ubuntu cloud image that happens to boot.
+
+## 8b. The cheapest ask in this whole document — `graviton-vanilla-1cpu-net`
+
+**If you only do one thing from round 3, do this one.** It is a one-line change
+and it unblocks more than the rest of the round combined.
+
+**Capture A's config, with capture B's NIC. 1 vCPU, one virtio-net device.**
+
+Why it matters so much: our checkpoint capture is single-vCPU only
+(`want_capture = want_checkpoint && n == 1 && id == 0`), so the two captures we
+hold split the requirements exactly wrong.
+
+| Capture | vCPUs | NIC | Can install a toolchain | Can save the result |
+| --- | --- | --- | --- | --- |
+| `graviton-vanilla-1cpu` | 1 | ❌ | ❌ no network | ✅ |
+| `graviton-vanilla-2cpu-net` | 2 | ✅ | ✅ proved | ❌ |
+| **`graviton-vanilla-1cpu-net`** | **1** | **✅** | **✅** | **✅** |
+
+We have already proved on capture B that we can grow the disk and install a full
+toolchain from inside the guest (`cc 13.3.0`, compiles and runs). We simply
+cannot *persist* it, because that guest has two vCPUs. A 1-vCPU capture with a
+NIC lets us build the agent image ourselves, today, with no code changes on
+either side — and then §9–§12 below becomes a clean-up exercise rather than a
+blocker.
+
+Everything else identical to capture B: same host, same CH build, GICv3 + ITS,
+same static address contract (§8), quiescent before pause, same metadata block.
+
+---
 
 ## 9. Why the current image is the wrong shape
 
