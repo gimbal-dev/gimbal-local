@@ -1,0 +1,77 @@
+{
+  "date": "2026-07-30",
+  "host": {
+    "machine": "arm64",
+    "os": "macOS 26.5.2",
+    "runtime": "Apple Hypervisor.framework",
+    "rustc": "1.93.1"
+  },
+  "archive_safety_check": {
+    "tool": "bsdtar 3.5.3",
+    "result": "pass",
+    "expected_entries_per_archive": 7,
+    "unexpected_entry_types": 0,
+    "absolute_paths": 0,
+    "parent_traversal_paths": 0,
+    "links_or_devices": 0,
+    "note": "The repository does not provide a hardened tar.zst importer. Archives were listed before extraction, then extracted with no owner or mode preservation into a private 0700 session directory."
+  },
+  "archives": [
+    {
+      "name": "gimbal-vanilla-graviton-snapshot-1.tar.zst",
+      "sha256": "5b9e4807ba1c13d93652f9ae89c417327365ea0147b81c323c027c4ef6dcd0ae",
+      "compressed_bytes": 667157133,
+      "state_sha256": "0d75f3b1e852de501f11061c0d87151f72a0fe7df07d7ff76b81d8189375e615",
+      "memory_sha256": "d716a4bec5eeb6fdaec93854d5ec737a7b56b96ef3a6d08bbee7d2247dbf7b4f",
+      "disk0_sha256": "ae81cf2efb05cc9df853d2b21cc9dcc50067d2fbc748ca8b57fa17082547111f",
+      "disk1_sha256": "0ef7b76ee70a9f56331f13c4ef948c081f8da2de0eedf501cd92e4ef7059449c",
+      "live_resume": "pass",
+      "fresh_login_prompts": 2
+    },
+    {
+      "name": "gimbal-vanilla-graviton-snapshot-2.tar.zst",
+      "sha256": "69a053ccf86f2f4a8036cce9c23a21547315067f49384da68edbbf719efb198b",
+      "compressed_bytes": 667196083,
+      "state_sha256": "b54b5555443ebcb00f996ed1c90351b74bedf96caa381554eab12829aef9dcd0",
+      "memory_sha256": "ffb9728b05481c95c543f81c6f388fbcf846b3c2daca87a7a451da8cdccf4b04",
+      "disk0_sha256": "f86088a66cc80f4f6e278a1b5fbb5b3f4813a46fe3fccc0626ea8fc9b5d4dea4",
+      "disk1_sha256": "98b044e4beaf30cfafc01206068b5a2028b795091ea252da345d953f9bd549de",
+      "live_resume": "pass",
+      "fresh_login_prompts": 3
+    },
+    {
+      "name": "gimbal-vanilla-graviton-snapshot-3.tar.zst",
+      "sha256": "bcd4fbdb8a3e432d7bdd965dd006db4ff8d49ca52a122d9ef6ffd7c72d1dc44a",
+      "compressed_bytes": 667837116,
+      "state_sha256": "dd91fc10f2cdaa7d1bfe293aac4895ff761063b570e374cc5d63e111ff1738ac",
+      "memory_sha256": "40937a8a4da89d19a1824f46fdc3f939092a51a0d2af9285a407d63c83d9f449",
+      "disk0_sha256": "6ba289e719cf2aa444de96799b5ad1c007764a5382cc5eeb12a98289f25e3ae4",
+      "disk1_sha256": "161902f2ba6f07375f38febd163dc711d89ea06521526edbbcfd484317017b7a",
+      "live_resume": "pass",
+      "fresh_login_prompts": 3
+    }
+  ],
+  "common_shape": {
+    "vcpu_count": 1,
+    "memory_bytes": 1073741824,
+    "root_disk_bytes": 8589934592,
+    "network_devices": 0,
+    "virtio_devices_restored": [
+      "block root",
+      "block cloud-init seed",
+      "rng"
+    ],
+    "backend": "userspace GICv3 for ITS/LPI capture",
+    "counter_metadata": "missing; snapshots predate upstream 69637dde6",
+    "aarch32": "capture advertises AArch32 at EL0; strict mode correctly refuses, default mode warns and runs 64-bit workload"
+  },
+  "verification": {
+    "gimbal_local_tests": {
+      "passed": 207,
+      "failed": 0,
+      "ignored": 10
+    },
+    "hvf_test_binary": "compiled with hvf,kvm-snapshot; not automatically executed",
+    "security_check": "no-host-fs-passthrough guard passed"
+  }
+}

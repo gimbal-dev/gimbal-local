@@ -168,6 +168,12 @@ Next:
 AWS setup notes for the later cloud round-trip live in
 [`docs/aws-byo-setup.md`](docs/aws-byo-setup.md).
 
+## Reports
+
+| Date | Report | Summary |
+| --- | --- | --- |
+| 2026-07-30 | [Snapshot portability and security audit](reports/snapshot-portability-security/) | Three Graviton captures resume live, but secure coding-agent readiness is blocked by provenance, image, networking, and CI gaps |
+
 ## Relationship to upstream Cloud Hypervisor
 
 This repository is a fork and is **not** tracking upstream for merge-back; it is
