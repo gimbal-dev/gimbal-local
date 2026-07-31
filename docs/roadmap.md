@@ -335,7 +335,7 @@ tab today counts what the control plane has (`runners`, `snapshots`,
 | --- | --- | --- |
 | V6.1 | **Security panel.** ✅ **Done 2026-07-31.** Every control rendered with its invariant, state and the sentence naming what weakened it; weakened rows sort first, are outlined orange, and the count shows in the sidebar so you do not have to navigate to see it. The milestone turned on a bug that would have made the panel actively harmful: posture resolves from the environment of whichever process computes it, and the app is not the process running the guest — attach to a daemon started with `CHM_ALLOW_LOCAL_EGRESS=1` and a naive panel shows green. Measured, on the shipped build: the app's own environment yields `weakened: 0`, the daemon yields `weakened: 1`. Fixed by adding a `posture-json` verb to the daemon (`chm ctl posture`) so it answers for itself; when it cannot, the panel falls back to a local read **and says so** in a banner rather than implying the two are interchangeable. | M |
 | V6.2 | **Credential proxy UI.** ✅ **Done 2026-07-31.** Rules, their destinations, where each credential comes from (never its value), what is deliberately *not* intercepted, the CA the guest must trust, and a **test-this-rule** button that always runs the control. Measured through the UI: the same request returned `HTTP/1.1 401 Unauthorized` without injection and `HTTP/1.1 200 OK` with it — the guest sent nothing and the origin still authenticated it. Against `/` (an endpoint that answers the same either way) the same button says **“This run proved nothing”**, so it is capable of failing. The milestone was mostly a hunt for one bug class: an answer computed in the wrong process. It was found four times, each on hardware — see below. | M |
-| V6.3 | **Egress + audit view.** The policy in force (with its content hash), and a live decision log — allowed, denied, relayed, injected — per sandbox. Feeds off `chm audit` and `CHM_PROXY_LOG`. | M |
+| V6.3 | **Egress + audit view.** ✅ **Done 2026-07-31.** The policy in force with its content hash, and a decision log — allowed, denied, injected, relayed — per sandbox. The milestone turned on the same bug class as V6.1–V6.2, twice: the durable trail **discarded every allowed event**, so it could only answer "what was blocked"; and the reader could only find a trail while the guest was still running, which is the one moment nobody is reading it. Measured on the 2-vCPU Graviton capture: two `curl` commands produced **19 distinct outbound flows**, eight of them to Ubuntu/Canonical services nobody asked for, two over plaintext HTTP. Under the old code that session's trail was a single line. | M |
 | V6.4 | **Off-box round-trip.** `pull` a cloud snapshot and `push` a local one, with progress, from the Cloud tab. This is the dream expressed as a button. Includes surfacing `state-cdn` so a streamed rehydrate is legible as such. | L |
 | V6.5 | **Capability honesty.** One place that states what this build can and cannot do — HVF backend, vanilla-snapshot support, the V5 gap list — so nobody has to infer it from whether a thing crashed. | S |
 
@@ -395,6 +395,54 @@ the truncation is console rendering, not loss.
 45339c91c1785f8c63da3b8be0a10b5db1fe31c82e04d349c1b69a7397ef2372` equal to
 `expected:`, equal to the fingerprint on the panel, equal to the CA the running
 proxy signs with.
+
+##### A seventh and an eighth, in what the record could answer (V6.3)
+
+The durable trail was written only on refusal — `if !ev.allowed`. A sandbox that
+reached two hundred permitted hosts produced an **empty file**, byte-identical
+to one that never opened a socket. The two are opposite conclusions from the
+same evidence, and the reassuring one is the one a reader reaches for, so the
+record was not merely incomplete: it was misleading in the direction that
+matters.
+
+That is not hypothetical. The real trail left behind by the V5.1 session — the
+one that fetched 37.7 MB with `apt-get` and cloned a repo from GitHub over
+HTTPS — contains **three lines, all denials**. Read at face value it says the
+sandbox barely touched the network.
+
+Allows are now recorded, deduplicated per distinct flow so a retry loop cannot
+flood the file, and capped at 512 distinct flows per session — with a
+`truncated` flag, because an incomplete record that says so is usable and one
+that silently stops is not. A per-session summary carries the exact totals,
+which the deduplicated lines cannot: the measured run below logged **one**
+denial and summarised **four**, so the guest had retried three times and the
+log alone would have understated it.
+
+The eighth was in the fix. The trail is durable precisely so it outlives the
+process — and the moment a sandbox stops is exactly when someone sits down to
+read what it did. But the daemon resolved "no VM running" to the library root,
+which is not a workspace and can never hold a trail, so a stopped sandbox
+reported `present: false` while 21 records sat in its directory. The panel would
+have rendered "no trail recorded yet" over a full history. It now reports
+`no-sandbox-in-scope` and names the sandboxes that *do* have one.
+
+**Measured on hardware**, `graviton-2cpu-net` (the 2-vCPU NIC capture), two
+`curl` commands issued at the guest console, both `200`:
+
+| | |
+| --- | --- |
+| Flows recorded | **19 allowed, 1 denied** — 10 DNS, 10 TCP |
+| Asked for by hand | 2 (`api.github.com`, `example.com`) |
+| Unrequested | 8 — `changelogs.ubuntu.com`, `cdn.fwupd.org`, `contracts.canonical.com`, `motd.ubuntu.com`, `ntp.ubuntu.com`, `ports.ubuntu.com`, `livepatch.canonical.com`, `esm.ubuntu.com` |
+| Plaintext | 2 connections on port 80 |
+| Session summary | `allowed: 25 (19 distinct) · denied: 4 (1 distinct)` |
+| Under the old code | **1 line** |
+
+The panel refuses to round any of this off. A trail with no allow event renders
+`Allowed` as **—**, never `0`, above a sentence saying the absence was never
+recorded rather than never happened; a filter with no matches says so *about the
+filter*; and repeated identical records stay separate rows, so three denials of
+the same host at 11:58, 12:11 and 12:18 read as three attempts and not one.
 
 **Ordering note.** V6.1–V6.3 are all local and can ship without a cloud
 dependency. V6.4 needs the control plane, so it goes last.

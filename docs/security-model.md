@@ -481,10 +481,28 @@ with a UTC timestamp:
   `chm run` / `resume` / `connect`, capturing the resume-vs-cold mode, the
   vCPU/RAM shape, the resolved limits summary, the governing egress label, and
   the stop outcome + duration.
-- **`egress-deny`** — the userspace NAT's denied outbound flows, drained off the
-  net-service thread and recorded once per unique `(domain, target, rule)` so a
-  guest retrying a blocked host in a loop leaves one line, not thousands. This is
-  the "what did the sandbox try to reach that we blocked" signal.
+- **`egress-deny` / `egress-allow`** — the userspace NAT's outbound flows,
+  drained off the net-service thread and recorded once per unique
+  `(domain, target, rule, allowed)` so a guest retrying a host in a loop leaves
+  one line, not thousands.
+
+  **Allows were added in V6.3, and their absence was a defect rather than a
+  gap.** Recording only refusals means a sandbox that reached two hundred
+  permitted hosts produces an empty file — byte-identical to one that never
+  opened a socket, and read by default as the reassuring one of the two. The
+  trail could answer "what did we block" and not "what left", which is the
+  question a credential-bearing sandbox actually raises.
+- **`egress-summary`** — per-session totals written when the net-service loop
+  exits. The per-flow lines are deduplicated and capped at 512 distinct flows
+  (with a `truncated` flag, so an incomplete record says so); the counters behind
+  the summary are neither, so the summary is the only place the *exact* volume
+  appears. Measured: a session whose log held one denial summarised four.
+- **`proxy`** — the credential proxy's per-destination disposition
+  (`inject` / `relay`) and the rule that decided it, fanned out from the
+  in-memory ring so it outlives the process. A diagnostic run
+  (`chm proxy check`) deliberately takes a **disabled** log: that traffic is the
+  operator's, not the guest's, and must not appear in the record used to judge
+  the sandbox.
 - **`verify`** — the runner's bundle-trust decisions (manifest provenance +
   per-object checksum re-hash, M30.4/M30.8) recorded to the same trail the child
   session appends to, so a cloud-run session's log carries verify → start →
@@ -492,9 +510,26 @@ with a UTC timestamp:
 
 Writes are best-effort (an audit failure never crashes or stalls the run) and use
 `O_APPEND`, so the vCPU and net-service threads interleave records safely without
-a shared lock. Read it back with `chm audit show <WORKSPACE_DIR> [--json]`.
-Verified live: a real HVF resume session recorded start + stop records that
-`chm audit show` renders back.
+a shared lock. Read it back with `chm audit show <WORKSPACE_DIR> [--json] [--tail
+N]`, or through the daemon with `chm ctl audit`, which answers for the workspace
+the guest is actually running in.
+
+Because the trail is meant to outlive the process, the reader has to work after
+the sandbox stops — that is when someone reads it. `chm ctl audit` therefore
+reports `no-sandbox-in-scope` and **names the workspaces that have history**
+rather than resolving to the library root, which is not a workspace and would
+report "no records" over a full trail.
+
+Two readings of the same file must stay distinguishable, so the JSON carries
+`records_allow_egress`: false means this trail predates allow-recording, and
+"no allowed traffic" means *not recorded* rather than *none occurred*. The app
+renders that case as `—`, never `0`.
+
+Verified live on a rehydrated 2-vCPU Graviton capture: two `curl` commands at
+the guest console produced **19 distinct allowed flows and 1 denial**, of which
+only 2 were asked for — the other 8 hosts were Ubuntu/Canonical background
+services, 2 of them reached over plaintext HTTP. Under the previous code that
+session's trail was a single line.
 
 ### M30.7 · Threat model + hardening checklist  **[P0, docs]**
 

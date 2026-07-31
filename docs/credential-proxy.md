@@ -279,6 +279,18 @@ requires full response framing, and partial or heuristic parsing is worse than
 none. The consequence is visible in the audit trail: it records the request
 method and target, but **no status code**.
 
+**The decision trail is durable, and separate from the live one.** The proxy
+keeps a bounded in-memory ring for `CHM_PROXY_LOG`, which is a debugging aid and
+dies with the process. Since V6.3 every decision also fans out to the workspace's
+`audit.jsonl` as a `proxy` record carrying the destination, the disposition
+(`inject` / `relay`) and the rule that decided it — so the question "did my
+credential go out, and to where" survives the sandbox stopping.
+
+One deliberate exception: `chm proxy check` opens **real** connections, but they
+are the operator's, not the guest's, and the guest may not even be running. That
+path takes a disabled log on purpose, so a diagnostic never puts decisions the
+sandbox did not take into the record used to judge it.
+
 **No HTTP/2.** Clients negotiate down to HTTP/1.1 via ALPN.
 
 ---
