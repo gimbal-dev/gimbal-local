@@ -23,7 +23,9 @@ capabilities:
    implementation detail.
 2. **Snapshots as a branching filesystem, with lazy rehydration.** Content-
    addressed revisions that fork/branch like git, and a resume that demand-faults
-   only the working set instead of copying whole images.
+   only the working set instead of copying whole images. The product and worker
+   contract for the file-level half is specified in
+   [`living-workspaces.md`](living-workspaces.md).
 3. **Consistent filesystem + network (firewall) policy.** A per-sandbox policy —
    what it can *reach* and what it can *touch* — authored once in the plane and
    enforced identically wherever the sandbox runs.
