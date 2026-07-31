@@ -114,6 +114,25 @@ impl ProxyCa {
         Self::from_parts(key, cert)
     }
 
+    /// Loads the workspace CA if it already exists, without creating one.
+    ///
+    /// Separate from [`Self::load_or_create`] because a caller that only wants
+    /// to *report* the CA — "what will the guest have to trust?" — must not
+    /// bring a trust anchor into existence as a side effect of asking, least of
+    /// all in a directory it does not own.
+    pub(crate) fn load_existing(dir: &Path) -> io::Result<Option<Arc<Self>>> {
+        let key_path = dir.join(CA_KEY_FILE);
+        let cert_path = dir.join(CA_CERT_FILE);
+        if !key_path.exists() || !cert_path.exists() {
+            return Ok(None);
+        }
+        let key = fs::read(&key_path)?;
+        let pem = fs::read_to_string(&cert_path)?;
+        let cert = pem_decode(&pem, "CERTIFICATE")
+            .ok_or_else(|| bad(format!("{} is not a PEM certificate", cert_path.display())))?;
+        Self::from_parts(key, cert).map(Some)
+    }
+
     /// Builds an in-memory CA that is never written to disk.
     ///
     /// Used by tests, and by `chm proxy test`, so exercising the proxy never

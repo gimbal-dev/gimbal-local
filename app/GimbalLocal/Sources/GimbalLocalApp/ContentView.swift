@@ -88,6 +88,9 @@ private struct Sidebar: View {
                 Section("Posture") {
                     SidebarSecurityRow(report: model.posture)
                         .tag(SidebarItem.securityHome)
+
+                    SidebarProxyRow(config: model.proxyConfig)
+                        .tag(SidebarItem.proxyHome)
                 }
 
                 Section("Cloud") {
@@ -201,6 +204,67 @@ private struct SidebarSecurityRow: View {
     }
 }
 
+/// The proxy in the sidebar. Shows the rule count, or a warning when a rule
+/// cannot resolve its credential — that case sends requests out
+/// *unauthenticated* rather than failing, which from inside the guest looks
+/// like a broken API rather than a misconfigured proxy.
+private struct SidebarProxyRow: View {
+    let config: ProxyConfiguration?
+
+    var body: some View {
+        Label {
+            HStack {
+                Text("Credentials").font(.headline)
+                Spacer()
+                badge
+            }
+        } icon: {
+            Image(systemName: symbol).foregroundStyle(tint)
+        }
+        .padding(.vertical, 3)
+    }
+
+    /// Only counted when the **daemon** answered. Credential availability read
+    /// from this app's own environment says nothing about the process that
+    /// injects, and an alarm sourced from the wrong process is worse than no
+    /// alarm: it trains the reader to ignore it.
+    private var broken: Int {
+        guard let config, config.isFromDaemon else { return 0 }
+        return config.rulesMissingCredentials.count
+    }
+
+    @ViewBuilder private var badge: some View {
+        if let config, config.configured {
+            Text(broken > 0 ? "\(broken)!" : "\(config.rules.count)")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(broken > 0 ? Color.white : .secondary)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2)
+                .background(
+                    broken > 0 ? AnyShapeStyle(Theme.orange) : AnyShapeStyle(.quaternary),
+                    in: Capsule()
+                )
+        } else {
+            Text("off")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2)
+                .background(.quaternary, in: Capsule())
+        }
+    }
+
+    private var symbol: String {
+        guard let config, config.configured else { return "key.slash" }
+        return broken > 0 ? "exclamationmark.triangle.fill" : "key.horizontal.fill"
+    }
+
+    private var tint: Color {
+        guard let config, config.configured else { return .gray }
+        return broken > 0 ? Theme.orange : Theme.purple
+    }
+}
+
 private struct SidebarSandboxRow: View {
     let sandbox: Sandbox
 
@@ -265,6 +329,8 @@ private struct Detail: View {
                 CloudSnapshotsPage()
             case .securityHome:
                 SecurityPage()
+            case .proxyHome:
+                ProxyPage()
             case let .sandbox(id):
                 SandboxDetailPage(sandboxID: id)
             case let .snapshot(name):
@@ -287,7 +353,10 @@ private struct Detail: View {
                 // page so the sidebar's weakened count is true without having
                 // to navigate to it — a warning you must go looking for is a
                 // warning nobody sees.
-                if tick % 10 == 0 { await model.refreshPosture() }
+                if tick % 10 == 0 {
+                    await model.refreshPosture()
+                    await model.refreshProxy()
+                }
                 tick += 1
                 try? await Task.sleep(for: .seconds(2))
             }

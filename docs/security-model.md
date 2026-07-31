@@ -165,7 +165,7 @@ a script. `--json` for the app. This is the executable form of the checklist in
 §4 — a checklist in a document says what we *intended*, and a control you
 believe is on but is not is worse than one you know is off.
 
-#### Whose posture is it? (V6.1)
+#### Whose posture is it? (V6.1, extended in V6.2)
 
 Most controls resolve from **`env::var` in the process that computes them**, so
 `chm posture` describes *the process you ran it from*. That is the right answer
@@ -188,6 +188,52 @@ JSON only, and it adds two fields the local form does not have: `source`
 (`daemon`) and `assessed` (`running-vm` | `library-root` | `requested`). The app
 prefers this form and says which one it got, because a security panel that shows
 green over a weakened sandbox is precisely the failure §4 exists to prevent.
+
+The same trap applies to every proxy question, so V6.2 extended the pattern to
+three more verbs:
+
+```console
+$ chm ctl proxy                          # the rules the guest is actually running
+$ chm ctl proxy check --host H [--path P]  # a real request, from the injecting process
+$ chm ctl proxy ca                       # the CA the guest will actually meet
+```
+
+All four splice the same `source` / `assessed` fields, plus `scope_dir` naming
+the directory assessed — without it "add `proxy-rules.json` to the workspace" is
+unactionable, because the library root is never a guest's workspace and a file
+left there is read by nothing.
+
+Each was a real bug, measured with both answers taken at the same moment:
+
+| Verb | App-local answer | Daemon answer |
+| --- | --- | --- |
+| `posture` | `weakened: 0` | `weakened: 1` |
+| `proxy` | `credential: missing` | `present` |
+| `proxy check` | `PASS-THROUGH`, 401 | `INJECT`, 200 against a 401 control |
+| `proxy ca` | `898b834b…` | `79f85a28…` |
+
+`proxy ca` is the most dangerous of the four. A CA is per-workspace, so
+installing the app's answer into a guest whose proxy signs with a different one
+leaves the guest trusting a certificate nothing uses — and every intercepted
+connection then fails a certificate check that looks like a proxy bug. The
+daemon reads the CA **without creating one**: a process answering a question
+about someone else's workspace has no business minting a trust anchor there, so
+absent is reported as absent.
+
+##### Why `proxy check` always runs the control
+
+`--control` re-sends the identical request through a second proxy with an empty
+rule set, and compares the two status lines. Without it the button is a green
+tick that cannot fail: against an endpoint that answers the same either way,
+`check` succeeds even when injection is entirely broken. With it, the panel can
+say **"This run proved nothing"** — and does, measured against `/` on
+`api.github.com`, which answers 200 with or without a credential.
+
+The same reasoning governs the guest-side installer. It verifies with `openssl
+verify -CApath /etc/ssl/certs`, not by re-reading the file it just wrote, because
+the latter is true by construction. Measured on a rehydrated Graviton guest:
+`update-ca-certificates` segfaults and the CA never reaches the trust store,
+while the old check still printed matching fingerprints.
 
 ---
 

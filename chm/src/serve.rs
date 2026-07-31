@@ -26,6 +26,7 @@ use hypervisor::{VmExit, VmOps};
 
 use crate::checkpoint;
 use crate::console::ConsoleInput;
+use crate::credproxy::cli;
 use crate::console_filter::ConsoleFilter;
 use crate::imp::{
     Loaded, Outcome, UsgicConfig, UsgicSession, aarch32_guard, build_vm_ops, cntfrq_guard,
@@ -533,6 +534,15 @@ fn handle_conn(stream: UnixStream, daemon: &Daemon) {
         "posture-json" => {
             let _ = writer.write_all(posture_json(daemon, arg).as_bytes());
         }
+        "proxy-json" => {
+            let _ = writer.write_all(proxy_json(daemon, arg).as_bytes());
+        }
+        "proxy-check-json" => {
+            let _ = writer.write_all(proxy_check_json(daemon, arg).as_bytes());
+        }
+        "proxy-ca-json" => {
+            let _ = writer.write_all(proxy_ca_json(daemon, arg).as_bytes());
+        }
         "start" => {
             let resp = match start_vm(daemon, arg) {
                 Ok(msg) => format!("ok\t{msg}\n"),
@@ -670,6 +680,106 @@ fn posture_json(daemon: &Daemon, arg: &str) -> String {
         &format!("{{\n  \"source\": \"daemon\",\n  \"assessed\": \"{assessed}\","),
         1,
     );
+    format!("{spliced}\n")
+}
+
+/// The credential-proxy rule set **as the daemon resolves it**.
+///
+/// Same provenance argument as `posture_json`: credential availability comes
+/// from `env::var` in the calling process, and the daemon is the process that
+/// injects. A UI asking itself gets an answer about itself.
+fn proxy_json(daemon: &Daemon, arg: &str) -> String {
+    let (dir, assessed) = if arg.is_empty() {
+        match running_vm_dir(daemon) {
+            Some(dir) => (dir, "running-vm"),
+            None => (daemon.library_dir.clone(), "library-root"),
+        }
+    } else {
+        (PathBuf::from(arg), "requested")
+    };
+
+    // Name the directory, not just its kind. "Add proxy-rules.json to the
+    // workspace" is unactionable when the reader cannot tell which of the
+    // library root and the sandbox folder is meant -- and only the latter is
+    // ever a guest's workspace.
+    let body = cli::show_json_for_daemon(&dir);
+    let scope = json_str(&dir.display().to_string());
+    let spliced = body.replacen(
+        '{',
+        &format!(
+            "{{\n  \"source\": \"daemon\",\n  \"assessed\": \"{assessed}\",\n  \
+             \"scope_dir\": {scope},"
+        ),
+        1,
+    );
+    format!("{spliced}\n")
+}
+
+/// The CA the running proxy would actually sign with.
+///
+/// Answered by the daemon for the same reason the rules are: the fingerprint a
+/// UI shows is only worth anything if it is the one the guest will meet, and a
+/// CA is per-workspace. Measured on hardware: the app process resolved the
+/// library root and got `898b834b…`, while the proxy inside the running guest
+/// signed with `79f85a28…`. Installing the former would have made the guest
+/// trust a certificate nothing uses -- and because the installer compares what
+/// it installed against what it was handed, it would have reported success.
+fn proxy_ca_json(daemon: &Daemon, arg: &str) -> String {
+    let (dir, assessed) = if arg.is_empty() {
+        match running_vm_dir(daemon) {
+            Some(dir) => (dir, "running-vm"),
+            None => (daemon.library_dir.clone(), "library-root"),
+        }
+    } else {
+        (PathBuf::from(arg), "requested")
+    };
+
+    let body = cli::ca_json_for_daemon(&dir);
+    let scope = json_str(&dir.display().to_string());
+    let spliced = body.replacen(
+        '{',
+        &format!(
+            "{{\"source\":\"daemon\",\"assessed\":\"{assessed}\",\"scope_dir\":{scope},"
+        ),
+        1,
+    );
+    format!("{spliced}\n")
+}
+
+/// Minimal JSON string encoding for a host path.
+fn json_str(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Run a credential-proxy check **in the daemon's process**.
+///
+/// `arg` is `<host> <port> <path>`. The control run is always requested: a
+/// check without one proves reachability, not injection, and this verb exists
+/// for a UI button whose entire job is to answer "did the credential arrive?".
+fn proxy_check_json(daemon: &Daemon, arg: &str) -> String {
+    let mut parts = arg.splitn(3, ' ');
+    let (Some(host), Some(port), Some(path)) = (parts.next(), parts.next(), parts.next()) else {
+        return "{\"reachable\":false,\"error\":\"usage: proxy-check-json <host> <port> <path>\"}\n"
+            .to_string();
+    };
+    let Ok(port) = port.parse::<u16>() else {
+        return format!("{{\"reachable\":false,\"error\":\"bad port `{port}`\"}}\n");
+    };
+
+    let dir = running_vm_dir(daemon).unwrap_or_else(|| daemon.library_dir.clone());
+    let body = cli::check_json_for_daemon(&dir, host, port, path);
+    let spliced = body.replacen('{', "{\n  \"source\": \"daemon\",", 1);
     format!("{spliced}\n")
 }
 
@@ -1279,18 +1389,68 @@ fn ctl(raw: &[String]) -> Result<(), String> {
 
 /// Map `chm ctl <args>` onto the one-line daemon protocol.
 ///
-/// `posture` is JSON-only. The daemon has no text renderer and adding a second
-/// one would give us two things to keep in step; a human who wants the prose
-/// form has `chm posture <dir>`, which is the same assessment run locally. The
-/// point of the `ctl` form is *whose* environment answered, not its formatting.
+/// `posture` and `proxy` are JSON-only. The daemon has no text renderer and
+/// adding a second one would give us two things to keep in step; a human who
+/// wants the prose form has `chm posture <dir>` / `chm proxy show <dir>`, which
+/// is the same assessment run locally. The point of the `ctl` form is *whose*
+/// environment answered, not its formatting — both read the environment of the
+/// process they run in, and only the daemon's environment describes the guest.
 fn ctl_command(rest: &[String]) -> Result<String, String> {
-    match rest {
-        [cmd] if cmd == "posture" => Ok("posture-json".to_string()),
-        [cmd, json] if cmd == "posture" && json == "--json" => Ok("posture-json".to_string()),
-        [cmd, dir] if cmd == "posture" => Ok(format!("posture-json {dir}")),
-        [cmd, dir, json] if cmd == "posture" && json == "--json" => {
-            Ok(format!("posture-json {dir}"))
+    /// Commands whose answer depends on the answering process's environment.
+    fn provenanced(cmd: &str) -> Option<&'static str> {
+        match cmd {
+            "posture" => Some("posture-json"),
+            "proxy" => Some("proxy-json"),
+            _ => None,
         }
+    }
+
+    // `proxy check --host H [--port P] [--path X]` runs in the daemon too.
+    if rest.first().map(String::as_str) == Some("proxy")
+        && rest.get(1).map(String::as_str) == Some("check")
+    {
+        let f = |name: &str| {
+            rest.iter()
+                .position(|a| a == name)
+                .and_then(|i| rest.get(i + 1))
+                .cloned()
+        };
+        let host = f("--host").ok_or_else(|| "proxy check: --host is required".to_string())?;
+        let port = f("--port").unwrap_or_else(|| "443".to_string());
+        let path = f("--path").unwrap_or_else(|| "/".to_string());
+        return Ok(format!("proxy-check-json {host} {port} {path}"));
+    }
+
+    // `proxy ca [<dir>]` likewise: the CA is per-workspace, so only the daemon
+    // can name the one the running guest will actually meet.
+    if rest.first().map(String::as_str) == Some("proxy")
+        && rest.get(1).map(String::as_str) == Some("ca")
+    {
+        let dir = rest.get(2).filter(|a| !a.starts_with('-')).cloned();
+        return Ok(match dir {
+            Some(d) => format!("proxy-ca-json {d}"),
+            None => "proxy-ca-json".to_string(),
+        });
+    }
+
+    // A `--json` flag is accepted and dropped: these are JSON either way, and
+    // rejecting it would make the ctl form gratuitously different from the
+    // local one a user just came from.
+    let (head, dir) = match rest {
+        [cmd] => (Some(cmd), None),
+        [cmd, a] if a == "--json" => (Some(cmd), None),
+        [cmd, a] => (Some(cmd), Some(a)),
+        [cmd, a, b] if b == "--json" => (Some(cmd), Some(a)),
+        _ => (None, None),
+    };
+    if let Some(verb) = head.and_then(|c| provenanced(c)) {
+        return Ok(match dir {
+            Some(d) => format!("{verb} {d}"),
+            None => verb.to_string(),
+        });
+    }
+
+    match rest {
         [cmd] => Ok(cmd.clone()),
         [cmd, json] if matches!(cmd.as_str(), "list" | "status") && json == "--json" => {
             Ok(format!("{cmd}-json"))
@@ -1371,6 +1531,32 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
         assert_eq!(parsed["assessed"], "requested");
         assert_eq!(parsed["workspace"], dir.to_str().unwrap());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A proxy answer of "nothing configured" is only actionable if it names the
+    /// directory it looked in: rules dropped in the library root are read by
+    /// nothing, because a guest resolves them from its own workspace folder.
+    #[test]
+    fn daemon_proxy_json_names_the_directory_it_assessed() {
+        let dir = std::env::temp_dir().join(format!("chm-proxy-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let daemon = Daemon {
+            library: Vec::new(),
+            library_dir: dir.clone(),
+            idle_exit_secs: 0,
+            max_seconds: 0,
+            socket_path: dir.join("chm.sock"),
+            current: Mutex::new(None),
+        };
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&proxy_json(&daemon, "")).expect("valid JSON");
+        assert_eq!(parsed["source"], "daemon");
+        assert_eq!(parsed["assessed"], "library-root");
+        assert_eq!(parsed["scope_dir"], dir.to_str().unwrap());
+        assert_eq!(parsed["configured"], false);
 
         let _ = fs::remove_dir_all(&dir);
     }

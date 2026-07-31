@@ -59,10 +59,29 @@ $ chm proxy ca ./my-workspace --for-guest
 ```
 
 This prints a self-contained shell block to paste into the guest console. It
-installs the certificate, then prints the fingerprint it installed alongside the
-one it should be, so you can confirm they match. **Scope:** the proxy only ever
+installs the certificate, then asks the guest's own trust store whether it
+accepts it — `openssl verify -CApath /etc/ssl/certs` — and prints `trusted:`
+with the fingerprint or `NOT TRUSTED`. **Scope:** the proxy only ever
 mints a leaf for a host that a rule already names — everything else is relayed
 with the origin's own certificate, so the CA's reach is exactly the allow-list.
+
+Two things that check has to be, learned by getting both wrong:
+
+- **It must ask the question the guest will ask.** An earlier version re-read
+  the file it had just written and reported matching fingerprints on a guest
+  where `update-ca-certificates` had segfaulted and the CA never reached
+  `/etc/ssl/certs`. A check that cannot fail is not evidence. The installer now
+  links the certificate by hand when the helper fails, and says `NOT TRUSTED`
+  when it still cannot verify.
+- **It must survive the console.** Gimbal Local's *Install CA in guest* button
+  types this at a serial line, and typing it line by line does not work:
+  `update-ca-certificates` takes seconds, so every line behind it sits in the
+  tty input queue, gets echoed, and never runs. So the app sends the script as
+  base64 in short appends — nothing is ever typed at a busy shell — and the
+  guest hashes what it received against a digest computed host-side *before*
+  running any of it. A dropped character is then `TRANSFER CORRUPT`, named at
+  the moment it happens, rather than a corrupt certificate that surfaces later
+  as an unexplained TLS error.
 
 ---
 

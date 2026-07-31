@@ -104,6 +104,16 @@ final class AppModel: ObservableObject {
     @Published var postureError: String?
     @Published var isCheckingPosture = false
 
+    /// Credential-proxy state (V6.2). No credential value ever lands here —
+    /// `chm proxy show` does not read one, by design.
+    @Published var proxyConfig: ProxyConfiguration?
+    @Published var proxyCa: ProxyCa?
+    @Published var proxyCheck: ProxyCheckResult?
+    @Published var isCheckingProxy = false
+    @Published var proxyCheckHost = "api.github.com"
+    @Published var proxyCheckPath = "/user"
+    @Published var isInstallingCa = false
+
     private let chm = ChmClient()
     private let controlPlane = CloudControlClient()
     private var daemonProcess: Process?
@@ -197,6 +207,103 @@ final class AppModel: ObservableObject {
             // unknown state on a transient failure, but surface the reason.
             postureError = error.reason
             if posture == nil { appendLog("posture: \(error.reason)") }
+        }
+    }
+
+    /// Re-read the credential-proxy configuration and CA.
+    func refreshProxy() async {
+        proxyConfig = await chm.proxyShow(path: settings.libraryPath, settings: settings)
+        if proxyCa == nil {
+            proxyCa = await chm.proxyCa(path: settings.libraryPath, settings: settings)
+        }
+    }
+
+    /// Send a real request through the proxy, with its control run.
+    func runProxyCheck() async {
+        guard !isCheckingProxy else { return }
+        isCheckingProxy = true
+        defer { isCheckingProxy = false }
+        let host = proxyCheckHost.trimmingCharacters(in: .whitespaces)
+        guard !host.isEmpty else { return }
+        let path = proxyCheckPath.isEmpty ? "/" : proxyCheckPath
+        proxyCheck = await chm.proxyCheck(
+            host: host,
+            path: path,
+            rulesFile: nil,
+            settings: settings
+        )
+        if proxyCheck == nil {
+            appendLog("proxy check: chm returned nothing usable for \(host)\(path)")
+        }
+    }
+
+    /// Install the workspace CA inside the running guest.
+    ///
+    /// Typed at the console rather than copied in, because there is no shared
+    /// filesystem — that is the point of I1, not an oversight. The script is a
+    /// heredoc, so it is sent a line at a time and the guest's shell assembles
+    /// it; the last two lines print the installed fingerprint and the expected
+    /// one, so the console itself is the proof the install took.
+    func installProxyCaInGuest() {
+        guard status.state == .running else {
+            appendLog("cannot install the CA: no sandbox is running")
+            return
+        }
+        guard let ca = proxyCa else {
+            appendLog("cannot install the CA: no workspace CA has been generated yet")
+            return
+        }
+        guard !isInstallingCa else { return }
+        isInstallingCa = true
+        appendLog("installing proxy CA \(ca.fingerprint) in the guest…")
+        Task {
+            defer { isInstallingCa = false }
+            if consoleProcess == nil { attachConsole() }
+            // Prefer the checked transfer. Typing the script line by line was
+            // measured to fail on a rehydrated Graviton guest: because
+            // `update-ca-certificates` takes seconds, every verification line
+            // behind it sat in the tty queue, was echoed, and never ran — so
+            // the console showed the script instead of its output and this
+            // panel had nothing to report. The checked transfer sends only
+            // instant commands until the end and makes the guest hash what it
+            // got before running any of it.
+            let unchecked = ca.installLines.isEmpty
+            let lines: [String] = unchecked
+                ? ca.installScript.split(separator: "\n", omittingEmptySubsequences: false)
+                    .map(String.init)
+                : ca.installLines
+            if unchecked {
+                appendLog(
+                    "note: this chm build predates the checked CA transfer, so the script is "
+                        + "being typed line by line — a console drop will corrupt it silently"
+                )
+            }
+            for line in lines {
+                do {
+                    _ = try await chm.sendInput(
+                        ChmClient.encodeLine(line),
+                        settings: settings
+                    )
+                } catch {
+                    appendLog("CA install failed: \(error.localizedDescription)")
+                    return
+                }
+                // Paced because this is a serial console and the payload is
+                // ~10 lines. With the checked transfer the pacing no longer has
+                // to be *correct* — every line but the last returns in
+                // microseconds, and anything the console still drops is caught
+                // by the digest instead of becoming a corrupt certificate.
+                try? await Task.sleep(for: .milliseconds(60))
+            }
+            consoleHasBeenTypedAt = true
+            appendLog(
+                "CA script sent — the guest prints `trusted:` with the fingerprint if its "
+                    + "trust store now accepts the CA, `NOT TRUSTED` if it does not, or "
+                    + "`TRANSFER CORRUPT` if the console dropped characters on the way in. "
+                    + "Measured on a rehydrated Graviton guest: update-ca-certificates can "
+                    + "segfault and the CA never lands, so the console line is the proof, "
+                    + "not this message."
+            )
         }
     }
 
