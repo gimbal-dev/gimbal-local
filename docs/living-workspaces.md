@@ -3,7 +3,7 @@
 **Status:** Product and engineering specification  
 **Date:** 2026-07-31  
 **Scope:** Gimbal Local, Gimbal Cloud, and Gimbal agent images  
-**Reference implementation:** [`github/sv3`](https://github.com/github/sv3)
+**Implementation ownership:** Gimbal-only; no SV3 dependency or compatibility
 
 ## 1. Executive decision
 
@@ -24,9 +24,30 @@ That workspace must be able to:
 - be governed by the same signed policy on KVM and HVF.
 
 The product name is **Gimbal Living Workspaces**. It is not a separate storage
-product and users do not run `sv3` beside Gimbal. Gimbal owns the lifecycle,
-policy, identity, checkpoint contract, UI, and cloud transport. We reuse or
-adapt the proven file-level primitives in `sv3-core`.
+product. Gimbal owns and builds the lifecycle, policy, identity, checkpoint
+contract, UI, cloud transport, metadata engine, content store, layer model,
+merge engine, guest frontend, and host service.
+
+### SV3 independence requirement
+
+The supplied SV3 demos helped express the desired user experience. **SV3 cannot
+be used to implement this product.**
+
+Gimbal must not:
+
+- depend on, vendor, fork, link, import, or execute any SV3 crate, library,
+  binary, service, or repository content;
+- copy or adapt SV3 source code, database schemas, migrations, wire protocols,
+  manifests, storage formats, tests, or internal APIs;
+- claim read/write compatibility with an SV3 volume or checkpoint;
+- make SV3 availability, behavior, or releases part of a Gimbal runtime or
+  build contract.
+
+All components and formats in this specification are independently designed,
+implemented, tested, secured, and maintained in Gimbal-owned code. General
+filesystem techniques such as FUSE, copy-on-write layers, content-addressed
+blocks, and three-way merge are requirements to implement, not permission to
+reuse SV3 implementation material.
 
 ### Non-negotiable compatibility rule
 
@@ -67,7 +88,8 @@ Gimbal already has the compute half:
   bytes;
 - KVM and HVF workers are required to implement the same runner contract.
 
-`sv3` supplies the missing file-level mechanics:
+The demos validate that the following user-visible mechanics are valuable.
+Gimbal must build its own implementations:
 
 - immutable layer chains and writable heads;
 - per-extent copy-on-write;
@@ -78,11 +100,9 @@ Gimbal already has the compute half:
 - an ephemeral side layer excluded structurally from fork and push;
 - reachability GC and read-only `fsck`.
 
-We are not adopting `sv3`'s product boundary or threat model. Its current FUSE
-daemon, mapping engine, policy, and storage live together in the guest and its
-documentation explicitly treats policy as file-level, not cryptographic. Gimbal
-assumes the guest may be hostile. The mapping engine and policy authority must
-therefore live outside the guest.
+The implementation boundary is derived from Gimbal's own threat model. Gimbal
+assumes the guest may be hostile, so the mapping engine and policy authority
+must live outside the guest.
 
 ## 3. Product principles
 
@@ -112,7 +132,7 @@ therefore live outside the guest.
 
 | ID | Decision |
 | --- | --- |
-| D1 | Living Workspaces is a Gimbal capability plane, not a separately operated `sv3` product. |
+| D1 | Living Workspaces is an entirely Gimbal-owned capability plane with no SV3 code, runtime, format, or dependency. |
 | D2 | `gimbal-workspaced` runs beside the hypervisor and owns metadata, policy, layers, manifests, and content blocks. |
 | D3 | A small Linux FUSE frontend in the guest translates VFS operations to authenticated workspace RPC. It contains no authority and no block-store credentials. |
 | D4 | The v1 transport is a private service route over the existing virtio-net path. No new snapshot device is required. |
@@ -205,7 +225,7 @@ flowchart LR
     subgraph worker["Gimbal worker host"]
         vm["cloud-hypervisor or chm/HVF"]
         nat["private workspace service route"]
-        ws["gimbal-workspaced<br/>policy + sv3-core + SQLite"]
+        ws["gimbal-workspaced<br/>Gimbal workspace engine + SQLite"]
         cache[("encrypted local CAS cache")]
         coord["runner/checkpoint coordinator"]
         ws --> cache
@@ -244,7 +264,7 @@ The guest frontend is replaceable. It is not the source of truth.
 ### 6.2 `gimbal-workspaced`: host sidecar
 
 One sidecar runs per worker process or multiplexes several sessions with hard
-per-session namespaces. It embeds the portable part of `sv3-core`:
+per-session namespaces. It contains Gimbal-owned implementations of:
 
 - layer-stack resolution;
 - inode/dentry/extent metadata;
@@ -319,15 +339,15 @@ synthetic inode metadata, never by joining a guest path onto a host directory.
 | **Carried artifact** | Yes | Yes when trusted | Invalidate, keep target, or provenance reuse | `target/`, `node_modules/`, `.venv/` |
 | **Ephemeral** | No | No | Remains destination-local | secrets, sockets, PIDs, temporary DB/WAL state |
 
-The Git control layer is a Gimbal extension to SV3's head model. It remains
+The Git control layer is part of Gimbal's independent head model. It remains
 mounted at `.git` while a branch workspace head changes. That preserves the
 object database, refs, reflogs, index transactions, and lock semantics instead
 of replacing `.git` with an old branch snapshot. A session fork freezes the
 current control layer and opens an independent copy-on-write child for each
 fork. Parallel agents never write the same `.git` control head.
 
-The ephemeral layer follows SV3's strong structural property: it is parentless
-and is not traversed by snapshot, fork, or push.
+The ephemeral layer is structurally parentless and is not traversed by
+snapshot, fork, or push.
 
 ### 7.2 Safe classification policy
 
@@ -652,7 +672,8 @@ decision.
 
 For non-tracked state:
 
-- **durable untracked:** use SV3's common-ancestor, file-level three-way merge;
+- **durable untracked:** use Gimbal's common-ancestor, file-level three-way
+  merge;
   any unresolved conflict aborts the workspace merge without advancing the
   destination head;
 - **carried artifacts, `invalidate`:** remove the artifact set and rebuild;
@@ -847,9 +868,9 @@ but workspace and RAM key purposes must be domain-separated.
 - preserve hot local blocks across VM stop/start;
 - pin blocks required by published session envelopes.
 
-Block size is an implementation benchmark, not a product constant. Start with
-SV3's extent model and benchmark fixed 256 KiB blocks against larger and
-content-defined chunks for compiler and package-manager workloads.
+Block size is an implementation benchmark, not a product constant. Benchmark a
+Gimbal-owned extent implementation using fixed 256 KiB blocks against larger
+and content-defined chunks for compiler and package-manager workloads.
 
 The TCP/FUSE path is the compatibility baseline, not an unconditional
 performance promise. Phase 0 records per-operation profiles for Rust, Node, and
@@ -920,8 +941,8 @@ workspace size.
 
 ### Phase 0 - contract and spike
 
-Build a throwaway Linux guest frontend that sends FUSE operations to an
-out-of-guest `sv3-core` service over the private network route.
+Build a throwaway Linux guest frontend that sends FUSE operations to a minimal
+Gimbal-owned workspace service over the private network route.
 
 Exit gates:
 
@@ -929,6 +950,8 @@ Exit gates:
 - metadata-only hydrate demand-fetches blocks;
 - sidecar process can restart and reconnect;
 - no host path is configurable or reachable;
+- dependency and provenance inspection proves there is no SV3 code, schema,
+  protocol, storage format, test, binary, or runtime dependency;
 - stock Cloud Hypervisor and `chm` both host the same frontend/protocol.
 
 ### Phase 1 - local Living Workspace
@@ -1035,6 +1058,7 @@ Apple-Silicon hardware CI is required before the feature can leave preview.
 | Sidecar becomes a host escape surface | High | Synthetic namespace, strict RPC, fuzzing, quotas, no host path mapping, security review |
 | GC removes a retained revision | High | Complete root set, tip-last publication, dry-run, fsck and crash gates |
 | Live workspace breaks vanilla contract | High | Outer envelope only, capability routing, vanilla corpus gate on every phase |
+| SV3 implementation material enters Gimbal | High | Independent design and code, dependency/provenance inspection, explicit Phase 0 and release gates |
 | Same commit selects wrong workspace state | Medium | One-to-many bindings scoped to ref, lineage, producer trust, and generation |
 | Git edge cases make transparency surprising | Medium | Explicit v1 command matrix; fail unsupported worktrees/submodules modes visibly |
 | Cloud and Local implementations drift | Medium | One protocol/conformance suite; capability not complete until KVM and HVF pass |
@@ -1062,21 +1086,15 @@ during implementation without reopening the product model:
 2. initial block/chunk strategy;
 3. retention and quota defaults;
 4. which ecosystems receive built-in carry/derivation profiles first;
-5. whether `sv3-core` is consumed as a pinned MIT dependency, vendored, or
-   upstreamed through a shared interface.
+5. the internal Gimbal crate/module boundaries for the metadata, CAS, protocol,
+   policy, and merge engines.
 
 ## 21. Source evidence
 
 This spec was produced from:
 
-- the two-part SV3 demo transcript supplied with this task;
-- `github/sv3`, especially:
-  `README.md`, `docs/architecture.md`,
-  `docs/concepts/ignored-files-and-policy.md`,
-  `docs/concepts/cross-machine.md`, `docs/concepts/roaming.md`,
-  `docs/concepts/gc-and-fsck.md`,
-  `crates/sv3-core/migrations/0001_init.sql`, and
-  `crates/sv3-core/src/merge.rs`;
+- the two-part demo transcript supplied with this task, used only as product UX
+  input;
 - Gimbal Local, especially:
   [`roadmap.md`](roadmap.md),
   [`gimbal-local-fork-model.md`](gimbal-local-fork-model.md),
@@ -1090,3 +1108,7 @@ The PM Booster Pack's `pm-booster-pack:pm-assistant` produced the initial
 cross-repository product synthesis. The final architecture was then reconciled
 against the source code and tightened around Gimbal's hostile-guest and vanilla
 snapshot constraints.
+
+SV3 is not an implementation source. No SV3 code, schema, protocol, migration,
+test, binary, or storage format may enter the Gimbal implementation. This
+constraint is a release gate, not an optional sourcing preference.
