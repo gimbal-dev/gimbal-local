@@ -114,6 +114,15 @@ final class AppModel: ObservableObject {
     @Published var proxyCheckPath = "/user"
     @Published var isInstallingCa = false
 
+    /// The running sandbox's audit trail (V6.3). Optional because "the daemon
+    /// did not answer" and "the sandbox made no calls" are different facts and
+    /// must not render alike — an empty trail is the more alarming of the two,
+    /// not the less.
+    @Published var auditTrail: AuditTrail?
+    @Published var isLoadingAudit = false
+    /// A sandbox the user chose to read history for while nothing is running.
+    private var auditScopeDir: String?
+
     private let chm = ChmClient()
     private let controlPlane = CloudControlClient()
     private var daemonProcess: Process?
@@ -235,6 +244,26 @@ final class AppModel: ObservableObject {
         if proxyCheck == nil {
             appendLog("proxy check: chm returned nothing usable for \(host)\(path)")
         }
+    }
+
+    /// Re-read the running sandbox's audit trail.
+    ///
+    /// A failed read clears the trail rather than leaving the last good one on
+    /// screen. That is the opposite of the posture policy above, and on purpose:
+    /// a stale *posture* is still a description of a configuration that probably
+    /// has not changed, but a stale *trail* is a claim about what a sandbox is
+    /// doing right now, and showing yesterday's decisions as today's is worse
+    /// than showing none.
+    func refreshAudit(dir: String? = nil) async {
+        guard !isLoadingAudit else { return }
+        isLoadingAudit = true
+        defer { isLoadingAudit = false }
+        // A directory the user picked sticks, so a reload does not throw them
+        // back to the picker mid-read. Cleared as soon as a sandbox is running,
+        // because the live one is then unambiguously the subject.
+        if let dir { auditScopeDir = dir }
+        if status.state == .running { auditScopeDir = nil }
+        auditTrail = await chm.auditTrail(settings: settings, dir: auditScopeDir)
     }
 
     /// Install the workspace CA inside the running guest.

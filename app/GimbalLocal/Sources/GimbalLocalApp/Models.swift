@@ -354,6 +354,7 @@ enum SidebarItem: Hashable {
     case cloudHome
     case securityHome
     case proxyHome
+    case activityHome
     case sandbox(String)   // sandbox id
     case snapshot(String)  // snapshot name
 }
@@ -812,5 +813,158 @@ struct ProxyCaReport: Codable {
         case source, assessed, present, sha256, pem, installer, error
         case scopeDir = "scope_dir"
         case installLines = "install_lines"
+    }
+}
+
+// MARK: - Audit trail
+
+/// One durable record from a sandbox's `audit.jsonl`.
+///
+/// Deliberately loose: the trail is append-only and written by whatever version
+/// of `chm` was running at the time, so a reader that refuses to decode an event
+/// it has not seen before would blank the whole page over one unfamiliar line.
+/// Unknown events still render — with their timestamp and whatever fields they
+/// do carry — because a record you cannot fully interpret is still evidence that
+/// *something happened*, which is the one thing an empty list would deny.
+struct AuditRecord: Codable, Identifiable, Equatable {
+    /// Stable only within one decode. The trail has no identifier of its own —
+    /// two identical denials a second apart are genuinely two records — so a
+    /// content-derived id would collapse them in a `ForEach` and hide repeats.
+    var id = UUID()
+    var event: String
+    var ts: String?
+    var domain: String?
+    var target: String?
+    var rule: String?
+    var policy: String?
+    var destination: String?
+    var disposition: String?
+    var allowed: Int?
+    var denied: Int?
+    var distinctAllowed: Int?
+    var distinctDenied: Int?
+    var truncated: Bool?
+    var reason: String?
+    var vcpus: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case event, ts, domain, target, rule, policy, destination, disposition
+        case allowed, denied, truncated, reason, vcpus
+        case distinctAllowed = "distinct_allowed"
+        case distinctDenied = "distinct_denied"
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        event = (try? c.decode(String.self, forKey: .event)) ?? "unknown"
+        ts = try? c.decode(String.self, forKey: .ts)
+        domain = try? c.decode(String.self, forKey: .domain)
+        target = try? c.decode(String.self, forKey: .target)
+        rule = try? c.decode(String.self, forKey: .rule)
+        policy = try? c.decode(String.self, forKey: .policy)
+        destination = try? c.decode(String.self, forKey: .destination)
+        disposition = try? c.decode(String.self, forKey: .disposition)
+        allowed = try? c.decode(Int.self, forKey: .allowed)
+        denied = try? c.decode(Int.self, forKey: .denied)
+        distinctAllowed = try? c.decode(Int.self, forKey: .distinctAllowed)
+        distinctDenied = try? c.decode(Int.self, forKey: .distinctDenied)
+        truncated = try? c.decode(Bool.self, forKey: .truncated)
+        reason = try? c.decode(String.self, forKey: .reason)
+        vcpus = try? c.decode(Int.self, forKey: .vcpus)
+    }
+
+    /// What the record is a decision *about*: an egress event names a target, a
+    /// proxy event names a destination.
+    var subject: String { target ?? destination ?? "" }
+
+    /// The four dispositions the panel groups by. `nil` for session and summary
+    /// records, which are context rather than decisions.
+    var kind: Kind? {
+        switch event {
+        case "egress-allow": return .allowed
+        case "egress-deny": return .denied
+        case "proxy":
+            switch disposition {
+            case "inject": return .injected
+            case "relay": return .relayed
+            default: return nil
+            }
+        default: return nil
+        }
+    }
+
+    enum Kind: String, CaseIterable {
+        case allowed, denied, injected, relayed
+    }
+}
+
+/// A sandbox with recorded history, offered when nothing is running.
+struct AuditCandidate: Codable, Equatable, Identifiable {
+    var name: String
+    var dir: String
+    var bytes: Int
+
+    var id: String { dir }
+}
+
+/// A sandbox's durable audit trail, as the daemon reports it.
+///
+/// The honesty flags are the point of this type. An empty `records` list has two
+/// completely different meanings — "the sandbox never opened a socket" and "this
+/// build never wrote down the ones it did" — and a panel that cannot tell them
+/// apart will present the second as the first, which is a reassuring answer to a
+/// question that was never asked.
+struct AuditTrail: Codable, Equatable {
+    var source: String?
+    var assessed: String?
+    var scopeDir: String?
+    var present: Bool
+    var path: String?
+    var total: Int
+    /// False when nothing in the file proves this `chm` records permitted
+    /// egress. Then "0 allowed" means *not recorded*, never *none*.
+    var recordsAllowEgress: Bool
+    /// True when a session hit the distinct-flow cap, so the per-flow detail is
+    /// known to be incomplete while the totals stay exact.
+    var truncated: Bool
+    var records: [AuditRecord]
+    /// Sandboxes with history, when the daemon has none in scope. Present only
+    /// for `assessed == "no-sandbox-in-scope"`.
+    var candidates: [AuditCandidate]?
+    var error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case source, assessed, present, path, total, truncated, records, candidates, error
+        case scopeDir = "scope_dir"
+        case recordsAllowEgress = "records_allow_egress"
+    }
+
+    var isFromDaemon: Bool { source == "daemon" }
+
+    /// True when the daemon had no sandbox to report on — which is a fact about
+    /// this reader, not about any guest, and must never render as "no activity".
+    var hasNoSandboxInScope: Bool { assessed == "no-sandbox-in-scope" }
+
+    func count(_ kind: AuditRecord.Kind) -> Int {
+        records.filter { $0.kind == kind }.count
+    }
+
+    /// The most recent summary, which carries the exact totals even when the
+    /// per-flow list was capped.
+    var summary: AuditRecord? {
+        records.last { $0.event == "egress-summary" }
+    }
+
+    /// The policy digest the decisions were actually made under, and whether the
+    /// file contains more than one. Two digests in one trail means the policy
+    /// changed mid-session, and the panel must not present the newest as though
+    /// it governed the older decisions.
+    var policyDigests: [String] {
+        var seen: [String] = []
+        for r in records {
+            guard let p = r.policy, !p.isEmpty, !seen.contains(p) else { continue }
+            seen.append(p)
+        }
+        return seen
     }
 }

@@ -17,6 +17,8 @@ use ring::digest::{SHA256, digest};
 use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned, version};
 
+use crate::audit::AuditLog;
+
 use super::ca::ProxyCa;
 use super::nat::RuleDecider;
 use super::rules::{Destination, Disposition, RuleSet};
@@ -95,6 +97,8 @@ pub(crate) fn start_for_workspace(
         rules: resolved.rules.clone(),
         ca: Arc::clone(&ca),
         roots,
+        // The run's own trail, so a decision outlives the process that made it.
+        audit: AuditLog::open(workspace),
     })
     .map_err(|e| format!("start proxy: {e}"))?;
     let decider = RuleDecider::for_proxy(resolved.rules, &proxy)
@@ -627,6 +631,10 @@ fn control_probe(
         rules: RuleSet::default(),
         ca: Arc::clone(ca),
         roots: Arc::clone(roots),
+        // Disabled on purpose. This proxy exists to answer a question the
+        // operator asked; recording it would put traffic in the sandbox's
+        // trail that the sandbox never generated.
+        audit: AuditLog::default(),
     }) {
         Ok(p) => p,
         Err(e) => {
@@ -736,6 +744,9 @@ fn run_check(
         rules,
         ca: Arc::clone(&ca),
         roots: Arc::clone(&roots),
+        // See `control_probe`: a check is the operator's traffic, not the
+        // guest's, and must not appear in the guest's audit trail.
+        audit: AuditLog::default(),
     })
     .map_err(|e| format!("start: {e}"))?;
 
@@ -1136,5 +1147,36 @@ mod tests {
                 "slow command before the end of the transfer: {line}"
             );
         }
+    }
+
+    /// A diagnostic's own traffic must not appear in the subject's trail.
+    ///
+    /// `chm proxy check` opens real connections, but they are the *operator's*
+    /// -- the guest did not make them and may not even be running. Recording
+    /// them would put decisions the sandbox never took into the record used to
+    /// judge it, so both diagnostic paths take a disabled log deliberately,
+    /// while the path that actually serves a guest takes the workspace's.
+    #[test]
+    fn a_diagnostic_does_not_write_into_the_sandboxs_trail() {
+        let ws = env::temp_dir().join(format!("chm-cli-audit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(&ws).unwrap();
+
+        // The disabled handle is what the check paths construct.
+        let quiet = AuditLog::default();
+        quiet.egress_deny("tcp", "1.2.3.4:443", "r", "p");
+        quiet.proxy_decision("api.github.com:443", "inject", "gh");
+        assert!(
+            !ws.join("audit.jsonl").exists(),
+            "a disabled log must not create a trail anywhere"
+        );
+
+        // The workspace handle, which `start_for_workspace` uses, does write.
+        let live = AuditLog::open(&ws);
+        live.proxy_decision("api.github.com:443", "inject", "gh");
+        let body = fs::read_to_string(ws.join("audit.jsonl")).unwrap();
+        assert!(body.contains("\"disposition\":\"inject\""), "{body}");
+
+        let _ = fs::remove_dir_all(&ws);
     }
 }

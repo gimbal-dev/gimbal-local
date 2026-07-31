@@ -24,6 +24,7 @@ use hypervisor::hvf::checkpoint as hvf_checkpoint;
 use hypervisor::hvf::rehydrate::{rehydrate, rehydrate_resume};
 use hypervisor::{VmExit, VmOps};
 
+use crate::audit;
 use crate::checkpoint;
 use crate::console::ConsoleInput;
 use crate::credproxy::cli;
@@ -543,6 +544,9 @@ fn handle_conn(stream: UnixStream, daemon: &Daemon) {
         "proxy-ca-json" => {
             let _ = writer.write_all(proxy_ca_json(daemon, arg).as_bytes());
         }
+        "audit-json" => {
+            let _ = writer.write_all(audit_json(daemon, arg).as_bytes());
+        }
         "start" => {
             let resp = match start_vm(daemon, arg) {
                 Ok(msg) => format!("ok\t{msg}\n"),
@@ -745,6 +749,78 @@ fn proxy_ca_json(daemon: &Daemon, arg: &str) -> String {
     );
     format!("{spliced}\n")
 }
+
+/// The audit trail for the workspace this daemon is actually running, as JSON.
+///
+/// Same provenance rule as the rest: the trail that matters is the one the
+/// running guest is writing to, not whichever directory the caller happened to
+/// resolve. `arg` is `[<dir>] [<tail>]`.
+fn audit_json(daemon: &Daemon, arg: &str) -> String {
+    let mut parts = arg.split_whitespace();
+    let first = parts.next().unwrap_or("");
+    let tail: usize = parts
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(DEFAULT_AUDIT_TAIL);
+
+    let (dir, assessed) = if first.is_empty() || first == "-" {
+        match running_vm_dir(daemon) {
+            Some(dir) => (dir, "running-vm"),
+            // No running sandbox means there is no workspace in scope, and the
+            // library root is not one -- it will never hold a trail. Reading it
+            // would answer "no records" to a question about a sandbox that may
+            // have a full history sitting on disk, so say what is actually true
+            // instead and name the sandboxes that do have one.
+            None => return audit_candidates_json(daemon),
+        }
+    } else {
+        (PathBuf::from(first), "requested")
+    };
+
+    let body = audit::trail_json(&dir, tail);
+    let scope = json_str(&dir.display().to_string());
+    let spliced = body.replacen(
+        '{',
+        &format!("{{\"source\":\"daemon\",\"assessed\":\"{assessed}\",\"scope_dir\":{scope},"),
+        1,
+    );
+    format!("{spliced}\n")
+}
+
+/// What the daemon can say about audit history when nothing is running.
+///
+/// A trail outlives the process that wrote it -- that is the whole point of
+/// making it durable -- so the moment a sandbox stops is exactly when someone
+/// sits down to read what it did. Answering "no records" then, because the
+/// daemon has no VM in scope, would report the reader's own lack of a selection
+/// as a fact about the guest's behaviour.
+fn audit_candidates_json(daemon: &Daemon) -> String {
+    let mut items: Vec<String> = Vec::new();
+    for entry in &daemon.library {
+        let path = entry.dir.join("audit.jsonl");
+        let Ok(meta) = fs::metadata(&path) else { continue };
+        if !meta.is_file() {
+            continue;
+        }
+        items.push(format!(
+            "{{\"name\":{},\"dir\":{},\"bytes\":{}}}",
+            json_str(&entry.name),
+            json_str(&entry.dir.display().to_string()),
+            meta.len()
+        ));
+    }
+    format!(
+        "{{\"source\":\"daemon\",\"assessed\":\"no-sandbox-in-scope\",\"present\":false,\
+         \"total\":0,\"records_allow_egress\":false,\"truncated\":false,\"records\":[],\
+         \"candidates\":[{}]}}\n",
+        items.join(",")
+    )
+}
+
+/// How many trailing records `chm ctl audit` returns when not told otherwise.
+/// Enough to see a session, small enough not to push a megabyte through the
+/// socket for a long-running sandbox.
+const DEFAULT_AUDIT_TAIL: usize = 200;
 
 /// Minimal JSON string encoding for a host path.
 fn json_str(s: &str) -> String {
@@ -1433,6 +1509,38 @@ fn ctl_command(rest: &[String]) -> Result<String, String> {
         });
     }
 
+    // `audit [<dir>] [--tail N]`: the trail that matters is the one the running
+    // guest is writing to, which only the daemon can name.
+    if rest.first().map(String::as_str) == Some("audit") {
+        let tail = rest
+            .iter()
+            .position(|a| a == "--tail")
+            .and_then(|i| rest.get(i + 1))
+            .cloned();
+        let dir = rest
+            .iter()
+            .enumerate()
+            .skip(1)
+            .find(|(i, a)| {
+                !a.starts_with('-')
+                    && rest.get(i.wrapping_sub(1)).map(String::as_str) != Some("--tail")
+                    // `chm audit show <dir>` reads naturally; accept and skip it.
+                    && a.as_str() != "show"
+            })
+            .map(|(_, a)| a.clone());
+        return Ok(match (dir, tail) {
+            (Some(d), Some(t)) => format!("audit-json {d} {t}"),
+            (Some(d), None) => format!("audit-json {d}"),
+            // The tail is the second field, so a tail with no directory still
+            // needs a first one. `-` means "you choose" -- passing `.` here
+            // would name the caller's cwd as a requested directory and quietly
+            // read the wrong trail, which is the whole bug class this pattern
+            // exists to avoid.
+            (None, Some(t)) => format!("audit-json - {t}"),
+            (None, None) => "audit-json".to_string(),
+        });
+    }
+
     // A `--json` flag is accepted and dropped: these are JSON either way, and
     // rejecting it would make the ctl form gratuitously different from the
     // local one a user just came from.
@@ -1684,5 +1792,33 @@ mod tests {
         assert_eq!(peer_uid(&client).unwrap(), me);
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    /// `audit` must reach the daemon, because the trail belongs to the process
+    /// running the guest. The `--tail` value must not be mistaken for a
+    /// directory, and a tail with no directory must not silently name the
+    /// caller's cwd -- that is how a reader ends up looking at the wrong
+    /// sandbox and concluding it was quiet.
+    #[test]
+    fn ctl_audit_reaches_the_daemon_without_inventing_a_directory() {
+        assert_eq!(ctl_command(&s(&["audit"])).unwrap(), "audit-json");
+        assert_eq!(
+            ctl_command(&s(&["audit", "--tail", "50"])).unwrap(),
+            "audit-json - 50",
+            "`-` means the daemon chooses; `.` would name the caller's cwd"
+        );
+        assert_eq!(
+            ctl_command(&s(&["audit", "/w"])).unwrap(),
+            "audit-json /w"
+        );
+        assert_eq!(
+            ctl_command(&s(&["audit", "/w", "--tail", "5"])).unwrap(),
+            "audit-json /w 5"
+        );
+        // `audit show <dir>` reads naturally and must not be taken as the dir.
+        assert_eq!(
+            ctl_command(&s(&["audit", "show", "/w"])).unwrap(),
+            "audit-json /w"
+        );
     }
 }

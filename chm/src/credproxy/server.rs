@@ -42,6 +42,8 @@ use rustls::crypto::ring;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, ServerConfig, ServerConnection, version};
 
+use crate::audit::AuditLog;
+
 use super::ca::ProxyCa;
 use super::http::{BodyMode, ChunkedScanner, ParseError, RequestHead};
 use super::rules::{Destination, Disposition, RuleSet};
@@ -78,9 +80,16 @@ pub(crate) struct AuditEvent {
 /// Deliberately not a general log sink: everything written here is constructed
 /// from destinations, rule names, and request lines. A credential never reaches
 /// it, because no code path passes one in.
+///
+/// The ring answers "what is this proxy doing right now". `durable` answers
+/// "what did it do", which is a different question and the one usually asked
+/// after the guest has stopped — at which point the ring is gone with the
+/// process. Both are fed from the single [`Audit::record`] below so they cannot
+/// drift apart.
 #[derive(Default)]
 pub(crate) struct Audit {
     events: Mutex<Vec<AuditEvent>>,
+    durable: AuditLog,
     pub(crate) injections: AtomicU64,
     pub(crate) passthroughs: AtomicU64,
     pub(crate) failures: AtomicU64,
@@ -97,6 +106,11 @@ impl Audit {
                 event.detail
             );
         }
+        self.durable.proxy_decision(
+            &event.destination,
+            if event.injected { "inject" } else { "relay" },
+            event.rule.as_deref().unwrap_or("-"),
+        );
         let mut events = self.events.lock().expect("audit");
         if events.len() == AUDIT_RING {
             events.remove(0);
@@ -115,6 +129,9 @@ pub(crate) struct ProxyConfig {
     pub(crate) ca: Arc<ProxyCa>,
     /// PEM bundle of trust anchors used to verify origins.
     pub(crate) roots: Arc<rustls::RootCertStore>,
+    /// Where to persist decisions, so they outlive the process. Defaults to a
+    /// disabled log for callers with no workspace (tests, `chm proxy check`).
+    pub(crate) audit: AuditLog,
 }
 
 /// A running proxy.
@@ -180,7 +197,10 @@ pub(crate) fn start(config: ProxyConfig) -> io::Result<RunningProxy> {
     install_provider();
     let listener = TcpListener::bind((IpAddr::from([127, 0, 0, 1]), 0))?;
     let addr = listener.local_addr()?;
-    let audit = Arc::new(Audit::default());
+    let audit = Arc::new(Audit {
+        durable: config.audit.clone(),
+        ..Audit::default()
+    });
     let shutdown = Arc::new(AtomicBool::new(false));
 
     let config = Arc::new(config);
@@ -961,6 +981,7 @@ mod tests {
             rules: RuleSet::parse(rules_json).expect("rules"),
             ca: Arc::clone(&proxy_ca),
             roots: roots_for(origin_ca),
+            audit: AuditLog::default(),
         })
         .expect("proxy starts");
         (proxy, proxy_ca)
@@ -1420,6 +1441,7 @@ mod live_tests {
             rules: RuleSet::parse(&rules).expect("rules"),
             ca: Arc::clone(&proxy_ca),
             roots: load_roots().expect("host trust store"),
+            audit: AuditLog::default(),
         })
         .expect("proxy");
 
@@ -1473,6 +1495,7 @@ mod live_tests {
             rules: RuleSet::default(),
             ca: Arc::clone(&control_ca),
             roots: load_roots().expect("host trust store"),
+            audit: AuditLog::default(),
         })
         .expect("proxy");
         let anonymous = guest_request_trusting(
@@ -1507,6 +1530,7 @@ mod live_tests {
             rules: RuleSet::parse(&rules).expect("rules"),
             ca: Arc::clone(&proxy_ca),
             roots: load_roots().expect("host trust store"),
+            audit: AuditLog::default(),
         })
         .expect("proxy");
 
@@ -1540,6 +1564,7 @@ mod live_tests {
             rules: RuleSet::default(),
             ca: Arc::clone(&proxy_ca),
             roots: load_roots().expect("host trust store"),
+            audit: AuditLog::default(),
         })
         .expect("proxy");
 

@@ -1053,4 +1053,128 @@ final class ConsoleInputEncodingTests: XCTestCase {
         let legacy = try XCTUnwrap(ChmClient.decodeCa(CommandResult(output: old, status: 0)))
         XCTAssertTrue(legacy.installLines.isEmpty)
     }
+
+    // MARK: - Activity / audit trail (V6.3)
+
+    /// The counts are only meaningful if the page can tell "none" from "not
+    /// recorded", so the model must carry that distinction rather than let the
+    /// view infer it from an empty array.
+    func testAnEmptyTrailIsNotEvidenceOfAQuietSandbox() throws {
+        let legacy = """
+        {"source":"daemon","assessed":"running-vm","scope_dir":"/w","present":true,\
+        "path":"/w/audit.jsonl","total":2,"records_allow_egress":false,"truncated":false,\
+        "records":[{"event":"session-start","ts":"2026-08-01T10:00:00.000Z","vcpus":2},\
+        {"event":"egress-deny","ts":"2026-08-01T10:00:01.000Z","domain":"tcp",\
+        "target":"1.2.3.4:443","rule":"deny","policy":"sha256:aa"}]}
+        """
+        let trail = try JSONDecoder().decode(
+            AuditTrail.self, from: XCTUnwrap(legacy.data(using: .utf8))
+        )
+        XCTAssertTrue(trail.present)
+        XCTAssertTrue(trail.isFromDaemon)
+        XCTAssertFalse(
+            trail.recordsAllowEgress,
+            "a denial-only trail must not be read as proof nothing left"
+        )
+        XCTAssertEqual(trail.count(.allowed), 0)
+        XCTAssertEqual(trail.count(.denied), 1)
+        // session-start is context, not a decision, and must not be counted as
+        // one in any of the four buckets.
+        XCTAssertNil(trail.records[0].kind)
+    }
+
+    /// The four dispositions have to survive the wire, including the two that
+    /// live on a `proxy` event rather than an `egress-*` one.
+    func testEachDispositionDecodesToItsOwnBucket() throws {
+        let json = """
+        {"source":"daemon","present":true,"total":4,"records_allow_egress":true,\
+        "truncated":false,"records":[\
+        {"event":"egress-allow","ts":"t","domain":"tcp","target":"a:443","rule":"r",\
+        "policy":"sha256:aa"},\
+        {"event":"egress-deny","ts":"t","domain":"tcp","target":"b:443","rule":"d",\
+        "policy":"sha256:aa"},\
+        {"event":"proxy","ts":"t","destination":"api.github.com:443","disposition":"inject",\
+        "rule":"gh"},\
+        {"event":"proxy","ts":"t","destination":"example.com:443","disposition":"relay"}]}
+        """
+        let trail = try JSONDecoder().decode(
+            AuditTrail.self, from: XCTUnwrap(json.data(using: .utf8))
+        )
+        XCTAssertEqual(trail.count(.allowed), 1)
+        XCTAssertEqual(trail.count(.denied), 1)
+        XCTAssertEqual(trail.count(.injected), 1)
+        XCTAssertEqual(trail.count(.relayed), 1)
+        XCTAssertEqual(trail.records[2].subject, "api.github.com:443")
+        XCTAssertEqual(trail.policyDigests, ["sha256:aa"])
+    }
+
+    /// An unfamiliar event must not blank the page. The trail is append-only and
+    /// written by whichever `chm` was running, so a strict decode would let one
+    /// future record type erase the whole history a reader came to check.
+    func testAnUnknownEventStillDecodes() throws {
+        let json = """
+        {"present":true,"total":1,"records_allow_egress":true,"truncated":false,\
+        "records":[{"event":"something-new-in-v7","ts":"t","weird":123}]}
+        """
+        let trail = try JSONDecoder().decode(
+            AuditTrail.self, from: XCTUnwrap(json.data(using: .utf8))
+        )
+        XCTAssertEqual(trail.records.count, 1)
+        XCTAssertEqual(trail.records[0].event, "something-new-in-v7")
+        XCTAssertNil(trail.records[0].kind)
+    }
+
+    /// Exact totals come from the summary, because the per-flow lines are capped
+    /// and the counters behind the summary are not.
+    func testTheSummaryCarriesTotalsThatOutliveTheCappedDetail() throws {
+        let json = """
+        {"present":true,"total":2,"records_allow_egress":true,"truncated":true,\
+        "records":[{"event":"egress-allow","ts":"t","domain":"tcp","target":"a:443",\
+        "rule":"r","policy":"sha256:aa"},\
+        {"event":"egress-summary","ts":"t","allowed":9000,"denied":3,\
+        "distinct_allowed":512,"distinct_denied":3,"truncated":true}]}
+        """
+        let trail = try JSONDecoder().decode(
+            AuditTrail.self, from: XCTUnwrap(json.data(using: .utf8))
+        )
+        XCTAssertTrue(trail.truncated)
+        let summary = try XCTUnwrap(trail.summary)
+        XCTAssertEqual(summary.allowed, 9000)
+        XCTAssertEqual(
+            trail.count(.allowed), 1,
+            "one line survived the cap, so the line count must not be mistaken for the total"
+        )
+    }
+
+    /// Two policy hashes in one trail means the rules changed mid-session, and
+    /// the newest must not be presented as though it governed the older calls.
+    func testAPolicyChangeMidTrailIsVisible() throws {
+        let json = """
+        {"present":true,"total":2,"records_allow_egress":true,"truncated":false,\
+        "records":[{"event":"egress-allow","ts":"t","domain":"tcp","target":"a:443",\
+        "rule":"r","policy":"sha256:aa"},\
+        {"event":"egress-deny","ts":"t","domain":"tcp","target":"b:443","rule":"d",\
+        "policy":"sha256:bb"}]}
+        """
+        let trail = try JSONDecoder().decode(
+            AuditTrail.self, from: XCTUnwrap(json.data(using: .utf8))
+        )
+        XCTAssertEqual(trail.policyDigests, ["sha256:aa", "sha256:bb"])
+    }
+
+    /// Repeated identical records must stay distinct: two denials of the same
+    /// host a second apart are two facts, and collapsing them would hide a
+    /// retry loop behind a single row.
+    func testIdenticalRecordsAreNotCollapsed() throws {
+        let one = #"{"event":"egress-deny","ts":"t","domain":"tcp","target":"a:443","rule":"d"}"#
+        let json = """
+        {"present":true,"total":2,"records_allow_egress":false,"truncated":false,\
+        "records":[\(one),\(one)]}
+        """
+        let trail = try JSONDecoder().decode(
+            AuditTrail.self, from: XCTUnwrap(json.data(using: .utf8))
+        )
+        XCTAssertEqual(trail.records.count, 2)
+        XCTAssertNotEqual(trail.records[0].id, trail.records[1].id)
+    }
 }
