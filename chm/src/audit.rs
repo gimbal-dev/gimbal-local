@@ -2,19 +2,37 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 
-//! Durable, append-only audit trail (M29).
+//! Durable, append-only audit trail (M29, extended in V6.3).
 //!
 //! A sandbox's security-relevant lifecycle — when it started and stopped, and
-//! every outbound flow the egress policy *denied* — is recorded to a per-workspace
-//! `audit.jsonl` so an operator can answer "what did this sandbox try to do?"
-//! after the fact, independent of the console scrollback (which the guest can
-//! flood). Each line is a self-contained JSON object:
+//! every outbound flow the egress policy decided on — is recorded to a
+//! per-workspace `audit.jsonl` so an operator can answer "what did this sandbox
+//! do?" after the fact, independent of the console scrollback (which the guest
+//! can flood). Each line is a self-contained JSON object:
 //!
 //! ```text
 //! {"event":"session-start","ts":"2026-07-16T…Z","ts_ms":…,"mode":"resume",…}
+//! {"event":"egress-allow","ts":"…","domain":"tcp","target":"140.82.121.6:443",…}
 //! {"event":"egress-deny","ts":"…","domain":"tcp","target":"1.2.3.4:443",…}
+//! {"event":"egress-summary","ts":"…","allowed":347,"denied":2,"truncated":false,…}
 //! {"event":"session-stop","ts":"…","outcome":"powered-off","duration_s":12}
 //! ```
+//!
+//! ## Why allows are recorded, not just denials
+//!
+//! Until V6.3 this trail held denials only. That is the more *interesting*
+//! half, but it is not the half that answers the question people actually ask,
+//! and the asymmetry is dangerous in a specific way: a sandbox that reached two
+//! hundred hosts, all permitted, produced an empty trail — indistinguishable
+//! from a sandbox that made no outbound connection at all. An empty list reads
+//! as "nothing happened", so the record was most misleading exactly when the
+//! most had happened.
+//!
+//! Allows are unbounded where denials are naturally rare, so they are recorded
+//! by *distinct flow* rather than per packet, capped at [`MAX_DISTINCT_FLOWS`],
+//! and totalled in an `egress-summary` at session end. When the cap is hit the
+//! summary says `truncated: true` — an incomplete record that says so is usable,
+//! one that silently stops is not.
 //!
 //! The log is append-only and best-effort: an audit write must never crash or
 //! stall the run, so a failure is warned once and the session continues. Writes
@@ -25,6 +43,7 @@
 //! chm audit show <WORKSPACE_DIR> [--json]   read the trail back
 //! ```
 
+use std::collections::HashSet;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
@@ -40,8 +59,9 @@ pub(crate) const AUDIT_FILE: &str = "audit.jsonl";
 
 /// A handle to a workspace's audit trail. Cheap to clone (shares one inner), so
 /// it can be handed to the net-service thread as well as the main run loop. A
-/// `disabled()` handle drops every record (used where no workspace exists).
-#[derive(Clone)]
+/// default (`disabled`) handle drops every record — used where no workspace
+/// exists, e.g. a unit test or an ephemeral proxy with nowhere to write.
+#[derive(Clone, Default)]
 pub(crate) struct AuditLog {
     inner: Option<Arc<Inner>>,
 }
@@ -135,6 +155,48 @@ impl AuditLog {
         self.record("egress-deny", m);
     }
 
+    /// Record the first time a distinct outbound flow was *permitted*.
+    ///
+    /// One line per distinct flow, not per packet — see [`EgressTally`], which
+    /// owns the deduplication and the cap. Without this the trail cannot answer
+    /// "what did this sandbox reach", only "what was it stopped from reaching",
+    /// and those are very different questions.
+    pub(crate) fn egress_allow(&self, domain: &str, target: &str, rule: &str, policy: &str) {
+        let mut m = Map::new();
+        m.insert("domain".into(), json!(domain));
+        m.insert("target".into(), json!(target));
+        m.insert("rule".into(), json!(rule));
+        m.insert("policy".into(), json!(policy));
+        self.record("egress-allow", m);
+    }
+
+    /// Record the totals for a session's egress, including whether the
+    /// per-flow detail above is complete.
+    pub(crate) fn egress_summary(&self, tally: &EgressTally) {
+        let mut m = Map::new();
+        m.insert("allowed".into(), json!(tally.allowed));
+        m.insert("denied".into(), json!(tally.denied));
+        m.insert("distinct_allowed".into(), json!(tally.distinct_allowed()));
+        m.insert("distinct_denied".into(), json!(tally.distinct_denied()));
+        m.insert("truncated".into(), json!(tally.truncated));
+        self.record("egress-summary", m);
+    }
+
+    /// Record a credential-proxy decision: a destination was intercepted and a
+    /// header injected, or relayed end-to-end untouched.
+    ///
+    /// The proxy keeps its own in-memory ring for the live view, but that dies
+    /// with the process. Without a durable line, "did this sandbox's request
+    /// carry my credential?" becomes unanswerable the moment the guest stops —
+    /// which is usually when someone thinks to ask.
+    pub(crate) fn proxy_decision(&self, destination: &str, disposition: &str, rule: &str) {
+        let mut m = Map::new();
+        m.insert("destination".into(), json!(destination));
+        m.insert("disposition".into(), json!(disposition));
+        m.insert("rule".into(), json!(rule));
+        self.record("proxy", m);
+    }
+
     /// Record a bundle-verification decision (signature / checksum), pass or fail.
     pub(crate) fn verify(&self, subject: &str, ok: bool, detail: &str) {
         let mut m = Map::new();
@@ -142,6 +204,69 @@ impl AuditLog {
         m.insert("result".into(), json!(if ok { "ok" } else { "fail" }));
         m.insert("detail".into(), json!(detail));
         self.record("verify", m);
+    }
+}
+
+/// The most distinct flows recorded per session, allowed and denied each.
+///
+/// A guest can generate distinct destinations without limit — a port scan is
+/// 65535 of them — and an audit file that grows without bound is its own denial
+/// of service. The cap bounds the file; `truncated` in the summary keeps it
+/// honest about having been reached.
+pub(crate) const MAX_DISTINCT_FLOWS: usize = 512;
+
+/// Deduplicates egress decisions and counts them, so the trail gets one line
+/// per distinct flow plus totals, rather than one line per packet.
+///
+/// Deliberately not inside [`AuditLog`]: the tally is owned by the single
+/// net-service thread that drains decisions, so it needs no lock, while the
+/// log itself is shared and append-only.
+#[derive(Default)]
+pub(crate) struct EgressTally {
+    seen_allowed: HashSet<String>,
+    seen_denied: HashSet<String>,
+    /// Total decisions observed, including repeats of a flow already recorded.
+    allowed: u64,
+    denied: u64,
+    /// Set once either set hit [`MAX_DISTINCT_FLOWS`], so the summary can say
+    /// the per-flow detail is incomplete rather than implying it is all there.
+    truncated: bool,
+}
+
+impl EgressTally {
+    /// Count one decision, and return whether it is the first sighting of this
+    /// flow — i.e. whether the caller should write a per-flow audit line.
+    pub(crate) fn observe(&mut self, domain: &str, target: &str, rule: &str, allowed: bool) -> bool {
+        let key = format!("{domain} {target} {rule}");
+        let (seen, total) = if allowed {
+            (&mut self.seen_allowed, &mut self.allowed)
+        } else {
+            (&mut self.seen_denied, &mut self.denied)
+        };
+        *total = total.saturating_add(1);
+        if seen.contains(&key) {
+            return false;
+        }
+        if seen.len() >= MAX_DISTINCT_FLOWS {
+            self.truncated = true;
+            return false;
+        }
+        seen.insert(key);
+        true
+    }
+
+    pub(crate) fn distinct_allowed(&self) -> usize {
+        self.seen_allowed.len()
+    }
+
+    pub(crate) fn distinct_denied(&self) -> usize {
+        self.seen_denied.len()
+    }
+
+    /// True once any decision was made, so a caller can skip writing a summary
+    /// of nothing for a run with no network at all.
+    pub(crate) fn saw_anything(&self) -> bool {
+        self.allowed > 0 || self.denied > 0
     }
 }
 
@@ -195,21 +320,31 @@ pub(crate) fn audit_main(raw: &[String]) -> ExitCode {
 }
 
 fn usage() -> String {
-    "usage: chm audit show <WORKSPACE_DIR> [--json]\n\
+    "usage: chm audit show <WORKSPACE_DIR> [--json] [--tail N]\n\
      \n\
-     Read a sandbox's append-only audit trail (session start/stop, denied\n\
-     egress, and bundle-verification decisions). With --json, print the raw\n\
-     JSON lines; otherwise print a compact one-line-per-record summary.\n"
+     Read a sandbox's append-only audit trail (session start/stop, egress\n\
+     decisions allowed and denied, credential-proxy dispositions, and\n\
+     bundle-verification results). With --json, print the raw JSON lines;\n\
+     otherwise print a compact one-line-per-record summary. --tail N limits\n\
+     output to the most recent N records.\n"
         .to_string()
 }
 
 fn show(raw: &[String]) -> Result<(), String> {
     let json = raw.iter().any(|a| a == "--json");
+    let tail = raw
+        .iter()
+        .position(|a| a == "--tail")
+        .and_then(|i| raw.get(i + 1))
+        .and_then(|n| n.parse::<usize>().ok());
     let dir = raw
         .iter()
-        .find(|a| !a.starts_with('-'))
-        .map(PathBuf::from)
-        .ok_or("usage: chm audit show <WORKSPACE_DIR> [--json]")?;
+        .enumerate()
+        .find(|(i, a)| {
+            !a.starts_with('-') && raw.get(i.wrapping_sub(1)).map(String::as_str) != Some("--tail")
+        })
+        .map(|(_, a)| PathBuf::from(a))
+        .ok_or("usage: chm audit show <WORKSPACE_DIR> [--json] [--tail N]")?;
     let path = dir.join(AUDIT_FILE);
     let text = match fs::read_to_string(&path) {
         Ok(t) => t,
@@ -219,7 +354,9 @@ fn show(raw: &[String]) -> Result<(), String> {
         }
         Err(e) => return Err(format!("read {}: {e}", path.display())),
     };
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let start = tail.map_or(0, |n| lines.len().saturating_sub(n));
+    for line in &lines[start..] {
         if json {
             println!("{line}");
         } else {
@@ -227,6 +364,57 @@ fn show(raw: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// The trail as one JSON object, for the daemon and the app.
+///
+/// Carries the records *and* what the trail cannot tell you, because the second
+/// part is what stops a short list being read as a quiet sandbox:
+///
+/// - `records_allow_egress` is false for a trail written before V6.3, when only
+///   denials were recorded. A view that does not say so would show "0 allowed"
+///   for a sandbox that reached a hundred hosts.
+/// - `truncated` is true when a session hit [`MAX_DISTINCT_FLOWS`], so the
+///   per-flow detail is known-incomplete.
+pub(crate) fn trail_json(workspace: &Path, tail: usize) -> String {
+    let path = workspace.join(AUDIT_FILE);
+    let text = match fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == ErrorKind::NotFound => {
+            return format!(
+                "{{\"present\":false,\"path\":{},\"records\":[],\"total\":0,\
+                 \"records_allow_egress\":false,\"truncated\":false}}",
+                json!(path.to_string_lossy())
+            );
+        }
+        Err(e) => {
+            return format!(
+                "{{\"present\":false,\"error\":{},\"records\":[],\"total\":0,\
+                 \"records_allow_egress\":false,\"truncated\":false}}",
+                json!(e.to_string())
+            );
+        }
+    };
+    let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+    let total = lines.len();
+    // A trail that has never recorded an allow either predates V6.3 or belongs
+    // to a sandbox that never got out. Those look identical in the records and
+    // must not: the first means the log is incomplete, the second is a finding.
+    let records_allow_egress = lines
+        .iter()
+        .any(|l| l.contains("\"egress-allow\"") || l.contains("\"egress-summary\""));
+    let truncated = lines
+        .iter()
+        .any(|l| l.contains("\"truncated\":true"));
+    let start = total.saturating_sub(tail);
+    let records: Vec<&str> = lines[start..].to_vec();
+    format!(
+        "{{\"present\":true,\"path\":{},\"total\":{total},\
+         \"records_allow_egress\":{records_allow_egress},\"truncated\":{truncated},\
+         \"records\":[{}]}}",
+        json!(path.to_string_lossy()),
+        records.join(",")
+    )
 }
 
 /// Render one JSON record as a compact human line for `chm audit show`.
@@ -256,6 +444,38 @@ fn summarize(line: &str) -> String {
             s("target"),
             s("rule"),
             s("policy"),
+        ),
+        "egress-allow" => format!(
+            "{ts}  egress-allow    {} {} ({}) policy={}",
+            s("domain"),
+            s("target"),
+            s("rule"),
+            s("policy"),
+        ),
+        "egress-summary" => {
+            let n = |k: &str| m.get(k).and_then(Value::as_u64).unwrap_or(0);
+            let truncated = m
+                .get("truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            format!(
+                "{ts}  egress-summary  {} allowed ({} distinct), {} denied ({} distinct){}",
+                n("allowed"),
+                n("distinct_allowed"),
+                n("denied"),
+                n("distinct_denied"),
+                if truncated {
+                    " — TRUNCATED: more distinct flows than the cap, detail is incomplete"
+                } else {
+                    ""
+                },
+            )
+        }
+        "proxy" => format!(
+            "{ts}  proxy           {} {} ({})",
+            s("disposition"),
+            s("destination"),
+            s("rule"),
         ),
         "verify" => format!(
             "{ts}  verify          {} {} — {}",
@@ -324,5 +544,104 @@ mod tests {
         let s = summarize(line);
         assert!(s.contains("egress-DENY"), "{s}");
         assert!(s.contains("1.2.3.4:443"), "{s}");
+    }
+
+    /// A guest hammering one host must leave one line, not thousands; a guest
+    /// touching many must leave a bounded number and be *told* it was bounded.
+    #[test]
+    fn the_tally_records_each_flow_once_and_admits_when_it_stops() {
+        let mut t = EgressTally::default();
+
+        assert!(t.observe("tcp", "a:443", "allow", true), "first sighting");
+        assert!(!t.observe("tcp", "a:443", "allow", true), "repeat");
+        assert!(!t.observe("tcp", "a:443", "allow", true), "repeat");
+        assert_eq!(t.distinct_allowed(), 1);
+        assert_eq!(t.allowed, 3, "repeats still count toward the total");
+
+        // Allowed and denied are separate ledgers: the same target both
+        // permitted and refused is two facts, not one.
+        assert!(t.observe("tcp", "a:443", "deny", false));
+        assert_eq!(t.distinct_denied(), 1);
+        assert!(!t.truncated);
+
+        // Fill to the cap and past it.
+        for i in 0..MAX_DISTINCT_FLOWS {
+            t.observe("tcp", &format!("h{i}:443"), "allow", true);
+        }
+        assert_eq!(t.distinct_allowed(), MAX_DISTINCT_FLOWS);
+        assert!(
+            t.truncated,
+            "hitting the cap must be recorded -- a silently short list reads as a quiet sandbox"
+        );
+        assert!(
+            !t.observe("tcp", "beyond:443", "allow", true),
+            "past the cap nothing more is written"
+        );
+        assert!(t.allowed > MAX_DISTINCT_FLOWS as u64, "totals keep counting");
+    }
+
+    /// The trail has to say what it *cannot* tell you. A pre-V6.3 trail recorded
+    /// denials only, so "no allows" there means "not recorded", while in a new
+    /// trail it means "the sandbox never got out" -- opposite conclusions from
+    /// identical-looking records.
+    #[test]
+    fn the_trail_json_distinguishes_not_recorded_from_nothing_happened() {
+        let ws = env::temp_dir().join(format!("chm-trail-{}", process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(&ws).unwrap();
+
+        // Absent: not an error, and explicitly not a claim about egress.
+        let v: Value = serde_json::from_str(&trail_json(&ws, 10)).unwrap();
+        assert_eq!(v["present"], false);
+        assert_eq!(v["records_allow_egress"], false);
+
+        // A legacy trail: denials only.
+        let log = AuditLog::open(&ws);
+        log.session_start("resume", 1, 1024, "x", "unrestricted");
+        log.egress_deny("tcp", "1.2.3.4:443", "deny", "sha256:aa");
+        let v: Value = serde_json::from_str(&trail_json(&ws, 10)).unwrap();
+        assert_eq!(v["present"], true);
+        assert_eq!(
+            v["records_allow_egress"], false,
+            "a trail with no allow event cannot be read as proof nothing left"
+        );
+        assert_eq!(v["total"], 2);
+
+        // Once an allow (or a summary) appears, the trail is answering the
+        // question rather than declining it.
+        log.egress_allow("tcp", "140.82.121.6:443", "allow", "sha256:aa");
+        let v: Value = serde_json::from_str(&trail_json(&ws, 10)).unwrap();
+        assert_eq!(v["records_allow_egress"], true);
+        assert_eq!(v["truncated"], false);
+
+        // Truncation propagates from any session in the file.
+        let mut t = EgressTally::default();
+        t.truncated = true;
+        t.allowed = 9_000;
+        log.egress_summary(&t);
+        let v: Value = serde_json::from_str(&trail_json(&ws, 10)).unwrap();
+        assert_eq!(v["truncated"], true);
+
+        // The tail is a window on the end, and `total` still counts everything.
+        let v: Value = serde_json::from_str(&trail_json(&ws, 2)).unwrap();
+        assert_eq!(v["total"], 4);
+        assert_eq!(v["records"].as_array().unwrap().len(), 2);
+        assert_eq!(v["records"][1]["event"], "egress-summary");
+
+        let _ = fs::remove_dir_all(&ws);
+    }
+
+    /// The proxy's dispositions have to reach the durable trail, or "did my
+    /// credential go out?" becomes unanswerable the moment the guest stops.
+    #[test]
+    fn proxy_decisions_are_summarized_for_a_reader() {
+        let line = r#"{"event":"proxy","ts":"2026-07-16T09:00:00.000Z","destination":"api.github.com:443","disposition":"inject","rule":"github-api"}"#;
+        let s = summarize(line);
+        assert!(s.contains("inject"), "{s}");
+        assert!(s.contains("api.github.com:443"), "{s}");
+
+        let summary = r#"{"event":"egress-summary","ts":"2026-07-16T09:00:00.000Z","allowed":9000,"denied":2,"distinct_allowed":512,"distinct_denied":2,"truncated":true}"#;
+        let s = summarize(summary);
+        assert!(s.contains("TRUNCATED"), "an incomplete record must say so: {s}");
     }
 }

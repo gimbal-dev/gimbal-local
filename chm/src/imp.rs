@@ -4,7 +4,6 @@
 
 //! macOS / Apple-Silicon implementation of the `chm` CLI.
 
-use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -809,23 +808,28 @@ fn spawn_net_service(
     thread::Builder::new()
         .name("chm-net-service".into())
         .spawn(move || {
-            // Record each unique denied target once, so a guest retrying a blocked
-            // host in a tight loop leaves one audit line, not thousands.
-            let mut audited_denials: HashSet<String> = HashSet::new();
+            // One line per distinct flow, allowed or denied, with the totals
+            // written at session end. Recording denials only -- which is what
+            // this did until V6.3 -- leaves a sandbox that reached two hundred
+            // permitted hosts with an empty trail, indistinguishable from one
+            // that never opened a socket.
+            let mut tally = audit::EgressTally::default();
             while running.load(Ordering::Acquire) {
                 let mut delivered = false;
                 for dev in &net_devices {
                     if dev.service_net() {
                         delivered = true;
                     }
-                    // Drain egress decisions and audit the denials. Draining also
+                    // Drain egress decisions and audit them. Draining also
                     // bounds the NAT's event buffer over a long session.
                     for ev in dev.drain_egress_events() {
-                        if !ev.allowed {
-                            let key = format!("{} {} {}", ev.domain, ev.target, ev.rule);
-                            if audited_denials.insert(key) {
-                                audit.egress_deny(ev.domain, &ev.target, &ev.rule, &ev.policy);
-                            }
+                        if !tally.observe(ev.domain, &ev.target, &ev.rule, ev.allowed) {
+                            continue;
+                        }
+                        if ev.allowed {
+                            audit.egress_allow(ev.domain, &ev.target, &ev.rule, &ev.policy);
+                        } else {
+                            audit.egress_deny(ev.domain, &ev.target, &ev.rule, &ev.policy);
                         }
                     }
                 }
@@ -844,6 +848,12 @@ fn spawn_net_service(
                     continue;
                 }
                 kick.wait(NET_SERVICE_INTERVAL);
+            }
+            // The loop only exits when the run is over, so this is the one place
+            // that knows the totals. Written here rather than beside
+            // `session_stop` because the tally lives on this thread.
+            if tally.saw_anything() {
+                audit.egress_summary(&tally);
             }
         })
         .ok()
