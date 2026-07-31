@@ -352,6 +352,7 @@ enum SidebarItem: Hashable {
     case sandboxesHome
     case snapshotsHome
     case cloudHome
+    case securityHome
     case sandbox(String)   // sandbox id
     case snapshot(String)  // snapshot name
 }
@@ -537,6 +538,82 @@ enum ConsoleKey: String, CaseIterable, Identifiable {
         case .interrupt: return "Interrupt the running command"
         case .endOfFile: return "End of input (log out of a shell)"
         case .clearLine: return "Clear the half-typed line"
+        }
+    }
+}
+
+// MARK: - Security posture (`chm posture` / `chm ctl posture`)
+
+/// One security control, as `chm` resolved it.
+struct PostureControl: Codable, Equatable, Hashable, Identifiable {
+    /// The security-model invariant this implements (`I10`), or `—` for a
+    /// control that has no invariant number.
+    var invariant: String
+    var control: String
+    var state: State
+    /// How this was decided — the source, not a restatement of the state. This
+    /// is the field that tells a user *which* env var or file did it, so it is
+    /// never elided in the UI.
+    var detail: String
+
+    var id: String { "\(invariant)/\(control)" }
+
+    enum State: String, Codable, Equatable, Hashable {
+        /// On, at or above the safe default.
+        case active
+        /// On, but deliberately relaxed from the safe default. The only state
+        /// that should ever alarm anyone.
+        case weakened
+        /// Off, and off is the documented posture — not a weakening.
+        case notApplicable = "not-applicable"
+    }
+
+    /// An unrecognised state decodes as `weakened`, not as "fine".
+    ///
+    /// If a future `chm` adds a fourth state, a UI that fell back to `active`
+    /// would quietly show green for something it does not understand. Failing
+    /// towards alarm is the only safe direction for a security panel.
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        invariant = try c.decode(String.self, forKey: .invariant)
+        control = try c.decode(String.self, forKey: .control)
+        detail = try c.decode(String.self, forKey: .detail)
+        let raw = try c.decode(String.self, forKey: .state)
+        state = State(rawValue: raw) ?? .weakened
+    }
+}
+
+/// A whole posture report, and — critically — whose it is.
+struct PostureReport: Codable, Equatable {
+    var workspace: String
+    var weakened: Int
+    var controls: [PostureControl]
+    /// `daemon` when the running daemon answered for itself. Absent on the
+    /// output of a plain `chm posture`, which describes the calling process.
+    var source: String?
+    /// Which directory the daemon chose: `running-vm`, `library-root` or
+    /// `requested`.
+    var assessed: String?
+
+    /// Whether this describes the process that actually runs guests.
+    ///
+    /// Most of the posture is read from the environment of whichever process
+    /// computes it. `chm serve` runs the guest, so only the daemon's answer
+    /// describes the sandbox: a report gathered by the app itself would show
+    /// green over a daemon started with `CHM_ALLOW_LOCAL_EGRESS=1`. The UI says
+    /// which one it has rather than implying they are the same.
+    var isFromDaemon: Bool { source == "daemon" }
+
+    var weakenedControls: [PostureControl] { controls.filter { $0.state == .weakened } }
+
+    /// Where the daemon looked, in words. `nil` when this is not a daemon
+    /// report and there is nothing to disclose.
+    var scopeDescription: String? {
+        switch assessed {
+        case "running-vm": return "the running sandbox"
+        case "library-root": return "the snapshot library (no sandbox running)"
+        case "requested": return "the requested workspace"
+        default: return nil
         }
     }
 }

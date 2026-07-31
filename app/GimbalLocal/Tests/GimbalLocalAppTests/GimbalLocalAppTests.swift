@@ -716,4 +716,89 @@ final class ConsoleInputEncodingTests: XCTestCase {
         XCTAssertEqual(ConsoleKey.clearLine.wireText, "\\x15")
         XCTAssertEqual(ConsoleKey.returnKey.wireText, "\\n")
     }
+
+    // MARK: - Security posture (V6.1)
+
+    /// Verbatim output of `chm ctl posture` against a daemon started with
+    /// `CHM_ALLOW_LOCAL_EGRESS=1`, captured 2026-07-31. Not hand-written: the
+    /// splice that injects `source`/`assessed` is a string edit on the opening
+    /// brace, so a fixture typed from memory would not exercise it.
+    private static let daemonPostureJSON = """
+    {
+      "source": "daemon",
+      "assessed": "library-root",
+      "workspace": "/Users/nebuk89/v61/lib",
+      "weakened": 1,
+      "controls": [
+        {"invariant":"I10","control":"host-network isolation","state":"weakened","detail":"CHM_ALLOW_LOCAL_EGRESS is set — the guest can reach loopback, your LAN and link-local addresses including 169.254.169.254"},
+        {"invariant":"I12","control":"credential custody","state":"not-applicable","detail":"no proxy rules; the guest holds whatever credentials it was given"},
+        {"invariant":"I1","control":"no host FS passthrough","state":"active","detail":"structural — the device model wires only block/net/rng"}
+      ]
+    }
+    """
+
+    func testDecodesDaemonPostureIncludingItsProvenance() throws {
+        let result = CommandResult(output: Self.daemonPostureJSON, status: 1)
+        let report = try XCTUnwrap(ChmClient.decodePosture(result))
+
+        XCTAssertTrue(report.isFromDaemon, "must be attributed to the daemon")
+        XCTAssertEqual(report.scopeDescription, "the snapshot library (no sandbox running)")
+        XCTAssertEqual(report.weakened, 1)
+        XCTAssertEqual(report.controls.count, 3)
+        XCTAssertEqual(report.weakenedControls.map(\.invariant), ["I10"])
+        XCTAssertTrue(
+            report.weakenedControls[0].detail.contains("CHM_ALLOW_LOCAL_EGRESS"),
+            "the detail must name what weakened it, or the panel cannot be acted on"
+        )
+    }
+
+    /// The trap: `chm posture` exits **1** when a control is weakened. Treating
+    /// non-zero as failure would blank the panel in precisely the case it
+    /// exists for — a green-looking empty state over a weakened sandbox.
+    func testAWeakenedExitStatusIsAResultNotAFailure() throws {
+        let report = try XCTUnwrap(
+            ChmClient.decodePosture(CommandResult(output: Self.daemonPostureJSON, status: 1))
+        )
+        XCTAssertEqual(report.weakened, 1)
+    }
+
+    /// A daemon that predates the verb answers `error<TAB>unknown command`, and
+    /// so does any other non-JSON. That must decode to nil so the caller falls
+    /// back to a local read rather than reporting a hard error.
+    func testUnknownDaemonVerbFallsThroughRatherThanErroring() {
+        XCTAssertNil(ChmClient.decodePosture(
+            CommandResult(output: "error\\tunknown command `posture-json`\\n", status: 0)
+        ))
+        XCTAssertNil(ChmClient.decodePosture(
+            CommandResult(output: "chm ctl: cannot connect to daemon", status: 2)
+        ))
+    }
+
+    /// Plain `chm posture --json` carries no `source`, so it must NOT claim to
+    /// be the daemon's. The panel says whose environment it read.
+    func testLocalPostureIsNotAttributedToTheDaemon() throws {
+        let json = """
+        {"workspace":"/tmp/ws","weakened":0,"controls":[
+          {"invariant":"I10","control":"host-network isolation","state":"active","detail":"denied before policy is consulted"}
+        ]}
+        """
+        let report = try XCTUnwrap(ChmClient.decodePosture(CommandResult(output: json, status: 0)))
+        XCTAssertFalse(report.isFromDaemon)
+        XCTAssertNil(report.scopeDescription)
+        XCTAssertTrue(report.weakenedControls.isEmpty)
+    }
+
+    /// A state this build does not recognise must read as weakened, never as
+    /// active. Failing towards alarm is the only safe direction here: showing
+    /// green for something we do not understand is the exact failure mode the
+    /// posture command exists to prevent.
+    func testAnUnrecognisedStateFailsTowardsAlarm() throws {
+        let json = """
+        {"workspace":"/tmp/ws","weakened":0,"controls":[
+          {"invariant":"I99","control":"future control","state":"partially-on","detail":"from a newer chm"}
+        ]}
+        """
+        let report = try XCTUnwrap(ChmClient.decodePosture(CommandResult(output: json, status: 0)))
+        XCTAssertEqual(report.controls[0].state, .weakened)
+    }
 }

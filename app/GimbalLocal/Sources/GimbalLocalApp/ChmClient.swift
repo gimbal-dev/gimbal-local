@@ -23,6 +23,15 @@ enum ChmClientError: LocalizedError {
     }
 }
 
+/// Why a posture read produced nothing to show.
+///
+/// A security panel must not fail silently — an empty panel reads as "nothing
+/// is wrong" — so the reason is carried all the way to the view.
+struct PostureUnavailable: LocalizedError {
+    let reason: String
+    var errorDescription: String? { reason }
+}
+
 struct ChmClient {
     func listSnapshots(settings: AppSettings) async throws -> [SnapshotSummary] {
         let output = try await runChecked(settings: settings, args: ["ctl", "list", "--json"])
@@ -62,6 +71,71 @@ struct ChmClient {
         var encoded = line.replacingOccurrences(of: "\\", with: "\\\\")
         if pressReturn { encoded += "\\n" }
         return encoded
+    }
+
+    /// Read the security posture that governs a sandbox.
+    ///
+    /// Prefers the **daemon's** answer (`chm ctl posture`), because most of the
+    /// posture is resolved from the environment of whichever process computes
+    /// it, and `chm serve` is the process that runs the guest. Shelling out to
+    /// our own `chm posture` would describe *this app*: attach to a daemon
+    /// someone started with `CHM_ALLOW_LOCAL_EGRESS=1` and the panel would show
+    /// green over a sandbox that can reach the LAN and 169.254.169.254.
+    /// Verified: with an identical caller environment, the local read says
+    /// `weakened: 0` and the daemon says `weakened: 1`.
+    ///
+    /// Falls back to a local read only when the daemon is unreachable. The
+    /// result carries `source`, so the view can say which one it got rather
+    /// than implying they are interchangeable.
+    ///
+    /// - Note: `chm posture` exits **1** when a control is weakened. That is a
+    ///   *result*, not a failure, so status 0 and 1 are both decoded and only
+    ///   anything else is an error. Treating non-zero as failure here would
+    ///   blank the panel in exactly the case it exists for.
+    ///
+    /// - Parameter localFallbackPath: the workspace to assess if we have to
+    ///   read locally. Deliberately *not* passed to the daemon: the daemon
+    ///   knows which VM is actually running and which directory it came from,
+    ///   and that is a better answer than one this app guesses.
+    func posture(
+        localFallbackPath: String?,
+        settings: AppSettings
+    ) async -> Result<PostureReport, PostureUnavailable> {
+        let viaDaemon = await runRaw(
+            settings: settings,
+            args: ["ctl", "posture", "--socket", settings.socketPath]
+        )
+        if let report = Self.decodePosture(viaDaemon) {
+            return .success(report)
+        }
+
+        // No daemon (or it answered something unusable): fall back to reading
+        // our own environment, which the view labels as such.
+        guard let path = localFallbackPath else {
+            return .failure(PostureUnavailable(
+                reason: "chm serve is not reachable, and there is no workspace to assess locally."
+            ))
+        }
+        let local = await runRaw(settings: settings, args: ["posture", path, "--json"])
+        if let report = Self.decodePosture(local) {
+            return .success(report)
+        }
+        let text = local.output.trimmingCharacters(in: .whitespacesAndNewlines)
+        return .failure(PostureUnavailable(
+            reason: text.isEmpty ? "chm posture returned nothing." : text
+        ))
+    }
+
+    /// Decode a posture report, accepting the weakened exit status.
+    ///
+    /// `nil` when the output is not a posture report at all — a daemon that
+    /// does not know the verb answers `error\tunknown command`, and an older
+    /// `chm` may not have `ctl posture`, both of which should fall through to
+    /// the local path rather than surfacing as a hard error.
+    static func decodePosture(_ result: CommandResult) -> PostureReport? {
+        guard result.status == 0 || result.status == 1 else { return nil }
+        guard let data = result.output.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(PostureReport.self, from: data)
     }
 
     func shutdown(settings: AppSettings) async throws -> String {
