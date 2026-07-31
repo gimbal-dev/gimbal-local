@@ -22,6 +22,17 @@
 //! Exit status is `0` when every control that has a safe default is at that
 //! default or stronger, and `1` when something has been deliberately weakened —
 //! so it can be used as a gate in a script.
+//!
+//! # Whose posture is this?
+//!
+//! Most of what this reports is read from the **environment of the process that
+//! calls it**, so the answer is only true of a guest that runs in that same
+//! process. `chm serve` runs the guest, so a UI that shells out to `chm posture`
+//! on its own would describe *itself*, not the sandbox — and would show green
+//! over a daemon someone had started with `CHM_ALLOW_LOCAL_EGRESS=1`. That is
+//! precisely the failure this command exists to prevent, so [`assess_json`] is
+//! exposed for the daemon to answer for itself over the control socket
+//! (`chm ctl posture`).
 
 use std::env;
 use std::mem;
@@ -306,6 +317,18 @@ pub(crate) fn posture_main(raw: &[String]) -> ExitCode {
     } else {
         ExitCode::FAILURE
     }
+}
+
+/// The posture of `dir` as JSON, plus the number of weakened controls, assessed
+/// **in the calling process**.
+///
+/// This is the daemon's entry point: `chm serve` is the process that actually
+/// runs the guest, so it is the only process whose environment describes the
+/// sandbox. See the module docs.
+pub(crate) fn assess_json(dir: &Path) -> (String, usize) {
+    let controls = assess(dir);
+    let weakened = controls.iter().filter(|c| c.state == State::Weakened).count();
+    (render_json(dir, &controls, weakened), weakened)
 }
 
 fn render_json(dir: &Path, controls: &[Control], weakened: usize) -> String {

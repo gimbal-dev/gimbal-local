@@ -165,6 +165,30 @@ a script. `--json` for the app. This is the executable form of the checklist in
 §4 — a checklist in a document says what we *intended*, and a control you
 believe is on but is not is worse than one you know is off.
 
+#### Whose posture is it? (V6.1)
+
+Most controls resolve from **`env::var` in the process that computes them**, so
+`chm posture` describes *the process you ran it from*. That is the right answer
+for a script gating its own run, and the wrong answer for anything asking about
+a **running** guest, because the guest belongs to `chm serve` — a process that
+may have been started from a different shell, with a different environment.
+
+Measured: with an identical caller environment, `chm posture` reported
+`weakened: 0` while the daemon that was actually running the guest reported
+`weakened: 1` — the guest could reach the LAN and `169.254.169.254`.
+
+So the daemon answers for itself:
+
+```console
+$ chm ctl posture            # the environment chm serve is running under
+$ chm ctl posture <DIR>      # ...assessing a specific workspace
+```
+
+JSON only, and it adds two fields the local form does not have: `source`
+(`daemon`) and `assessed` (`running-vm` | `library-root` | `requested`). The app
+prefers this form and says which one it got, because a security panel that shows
+green over a weakened sandbox is precisely the failure §4 exists to prevent.
+
 ---
 
 ## 2. Security invariants

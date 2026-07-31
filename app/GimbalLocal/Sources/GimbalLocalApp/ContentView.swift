@@ -85,6 +85,11 @@ private struct Sidebar: View {
                     }
                 }
 
+                Section("Posture") {
+                    SidebarSecurityRow(report: model.posture)
+                        .tag(SidebarItem.securityHome)
+                }
+
                 Section("Cloud") {
                     SidebarPageRow(
                         title: "Cloud snapshots",
@@ -142,6 +147,57 @@ private struct SidebarPageRow: View {
             Image(systemName: systemImage).foregroundStyle(Theme.cyan)
         }
         .padding(.vertical, 3)
+    }
+}
+
+/// Security in the sidebar, with the weakened count visible **without
+/// navigating**. A count you have to go looking for is a count nobody reads;
+/// the whole point of the panel is that a weakened control announces itself.
+private struct SidebarSecurityRow: View {
+    let report: PostureReport?
+
+    var body: some View {
+        Label {
+            HStack {
+                Text("Security").font(.headline)
+                Spacer()
+                badge
+            }
+        } icon: {
+            Image(systemName: symbol).foregroundStyle(tint)
+        }
+        .padding(.vertical, 3)
+    }
+
+    @ViewBuilder private var badge: some View {
+        if let report {
+            Text(report.weakened == 0 ? "OK" : "\(report.weakened)")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(report.weakened == 0 ? .secondary : Color.white)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2)
+                .background(
+                    report.weakened == 0 ? AnyShapeStyle(.quaternary) : AnyShapeStyle(Theme.orange),
+                    in: Capsule()
+                )
+        } else {
+            Text("?")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2)
+                .background(.quaternary, in: Capsule())
+        }
+    }
+
+    private var symbol: String {
+        guard let report else { return "questionmark.shield.fill" }
+        return report.weakened == 0 ? "checkmark.shield.fill" : "exclamationmark.shield.fill"
+    }
+
+    private var tint: Color {
+        guard let report else { return .gray }
+        return report.weakened == 0 ? Theme.green : Theme.orange
     }
 }
 
@@ -207,6 +263,8 @@ private struct Detail: View {
                 SnapshotsPage()
             case .cloudHome:
                 CloudSnapshotsPage()
+            case .securityHome:
+                SecurityPage()
             case let .sandbox(id):
                 SandboxDetailPage(sandboxID: id)
             case let .snapshot(name):
@@ -214,6 +272,7 @@ private struct Detail: View {
             }
         }
         .task {
+            var tick = 0
             while !Task.isCancelled {
                 // Reconcile the session registry (detect ended sessions, reap
                 // dead locks, keep liveness authoritative) every tick, even when
@@ -222,6 +281,14 @@ private struct Detail: View {
                 if model.status.state == .running {
                     await model.refreshLocal()
                 }
+                // Posture on its own slower cadence: it shells out to chm, and
+                // it changes only when the daemon is restarted with a different
+                // environment. Refreshed here rather than only on the Security
+                // page so the sidebar's weakened count is true without having
+                // to navigate to it — a warning you must go looking for is a
+                // warning nobody sees.
+                if tick % 10 == 0 { await model.refreshPosture() }
+                tick += 1
                 try? await Task.sleep(for: .seconds(2))
             }
         }

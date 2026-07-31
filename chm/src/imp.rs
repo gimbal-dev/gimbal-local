@@ -1023,6 +1023,7 @@ fn usage() -> String {
          chm policy show --sandbox ID           (show a sandbox's bound policy)\n    \
          chm firewall set <WORKSPACE_DIR> ...   (author a local egress policy)\n    \
      chm posture <WORKSPACE_DIR> [--json]   (which security controls are on)\n    \
+     chm ctl posture [DIR]                  (the daemon's own posture)\n    \
      chm proxy show [WORKSPACE_DIR]         (credential injection for egress)\n    \
      chm sysregs <SNAPSHOT_DIR> [--all]     (CPU registers this Mac reproduces)\n    \
          chm cloud <COMMAND> aws [OPTIONS]      (BYO cloud helpers)\n    \

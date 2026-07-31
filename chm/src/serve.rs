@@ -32,6 +32,7 @@ use crate::imp::{
     load_snapshot, routes_completions_as_lpis, run_usgic_engine, wire_virtio,
 };
 use crate::limits;
+use crate::posture;
 use hypervisor::hvf::virtio::nat::NatLimits;
 
 /// Set by the daemon's termination-signal handlers so the accept loop exits and
@@ -119,6 +120,9 @@ struct Entry {
 
 struct Daemon {
     library: Vec<Entry>,
+    /// The library root this daemon was started on, so `posture` has something
+    /// to assess when no VM is running.
+    library_dir: PathBuf,
     idle_exit_secs: u64,
     max_seconds: u64,
     socket_path: PathBuf,
@@ -378,6 +382,7 @@ fn serve(raw: &[String]) -> Result<(), String> {
 
     let daemon = Arc::new(Daemon {
         library,
+        library_dir: args.library_dir.clone(),
         idle_exit_secs: args.idle_exit_secs,
         max_seconds: args.max_seconds,
         socket_path: args.socket_path.clone(),
@@ -525,6 +530,9 @@ fn handle_conn(stream: UnixStream, daemon: &Daemon) {
         "status-json" => {
             let _ = writer.write_all(status_json(daemon).as_bytes());
         }
+        "posture-json" => {
+            let _ = writer.write_all(posture_json(daemon, arg).as_bytes());
+        }
         "start" => {
             let resp = match start_vm(daemon, arg) {
                 Ok(msg) => format!("ok\t{msg}\n"),
@@ -628,6 +636,55 @@ fn status_json(daemon: &Daemon) -> String {
             }
         }
     }
+}
+
+/// The security posture the **daemon** would apply, as JSON.
+///
+/// This exists because most of the posture is read from the environment of the
+/// process that computes it, and the daemon is the process that runs the guest.
+/// A UI that shelled out to its own `chm posture` would report *its* env: attach
+/// the app to a `chm serve` someone started with `CHM_ALLOW_LOCAL_EGRESS=1` and
+/// the panel would show green over a sandbox that can reach the LAN. Reporting a
+/// control as on when it is off is the one failure a security panel must not
+/// have, so the answer comes from here.
+///
+/// `arg` optionally names the workspace to assess; empty means the running VM's
+/// directory, falling back to the library root when idle. Emits the same shape
+/// as `chm posture --json` plus `source` and `assessed` so the caller can say
+/// whose posture it is showing.
+fn posture_json(daemon: &Daemon, arg: &str) -> String {
+    let (dir, assessed) = if arg.is_empty() {
+        match running_vm_dir(daemon) {
+            Some(dir) => (dir, "running-vm"),
+            None => (daemon.library_dir.clone(), "library-root"),
+        }
+    } else {
+        (PathBuf::from(arg), "requested")
+    };
+
+    let (body, _weakened) = posture::assess_json(&dir);
+    // Splice the provenance in after the opening brace rather than nesting, so
+    // one decoder handles both this and `chm posture --json`.
+    let spliced = body.replacen(
+        '{',
+        &format!("{{\n  \"source\": \"daemon\",\n  \"assessed\": \"{assessed}\","),
+        1,
+    );
+    format!("{spliced}\n")
+}
+
+/// The library directory of the VM the daemon currently has loaded, if any.
+/// `None` when idle, or when the running VM is not in the library (which cannot
+/// happen today, since `start` resolves through it).
+fn running_vm_dir(daemon: &Daemon) -> Option<PathBuf> {
+    let guard = daemon.current.lock().unwrap();
+    let name = guard.as_ref().map(|vm| vm.name.clone())?;
+    drop(guard);
+    daemon
+        .library
+        .iter()
+        .find(|e| e.name == name)
+        .map(|e| e.dir.clone())
 }
 
 fn json_escape(s: &str) -> String {
@@ -1220,8 +1277,20 @@ fn ctl(raw: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Map `chm ctl <args>` onto the one-line daemon protocol.
+///
+/// `posture` is JSON-only. The daemon has no text renderer and adding a second
+/// one would give us two things to keep in step; a human who wants the prose
+/// form has `chm posture <dir>`, which is the same assessment run locally. The
+/// point of the `ctl` form is *whose* environment answered, not its formatting.
 fn ctl_command(rest: &[String]) -> Result<String, String> {
     match rest {
+        [cmd] if cmd == "posture" => Ok("posture-json".to_string()),
+        [cmd, json] if cmd == "posture" && json == "--json" => Ok("posture-json".to_string()),
+        [cmd, dir] if cmd == "posture" => Ok(format!("posture-json {dir}")),
+        [cmd, dir, json] if cmd == "posture" && json == "--json" => {
+            Ok(format!("posture-json {dir}"))
+        }
         [cmd] => Ok(cmd.clone()),
         [cmd, json] if matches!(cmd.as_str(), "list" | "status") && json == "--json" => {
             Ok(format!("{cmd}-json"))
@@ -1251,6 +1320,59 @@ mod tests {
             "status-json"
         );
         assert_eq!(ctl_command(&s(&["start", "vm1"])).unwrap(), "start vm1");
+    }
+
+    /// `posture` is JSON whether or not `--json` is passed, and an optional
+    /// directory rides through. Bare `posture` must NOT fall through to the
+    /// `[cmd] => cmd` arm, which would send the daemon a verb it does not know.
+    #[test]
+    fn ctl_posture_is_always_json_and_carries_an_optional_dir() {
+        assert_eq!(ctl_command(&s(&["posture"])).unwrap(), "posture-json");
+        assert_eq!(
+            ctl_command(&s(&["posture", "--json"])).unwrap(),
+            "posture-json"
+        );
+        assert_eq!(
+            ctl_command(&s(&["posture", "/tmp/ws"])).unwrap(),
+            "posture-json /tmp/ws"
+        );
+        assert_eq!(
+            ctl_command(&s(&["posture", "/tmp/ws", "--json"])).unwrap(),
+            "posture-json /tmp/ws"
+        );
+    }
+
+    /// The daemon splices provenance into the posture body rather than nesting
+    /// it, so one decoder handles both this and `chm posture --json`. That
+    /// splice is a string edit on `{`, so prove it lands and the result parses.
+    #[test]
+    fn daemon_posture_json_is_valid_and_carries_provenance() {
+        let dir = std::env::temp_dir().join(format!("chm-posture-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let daemon = Daemon {
+            library: Vec::new(),
+            library_dir: dir.clone(),
+            idle_exit_secs: 0,
+            max_seconds: 0,
+            socket_path: dir.join("chm.sock"),
+            current: Mutex::new(None),
+        };
+
+        let out = posture_json(&daemon, "");
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(parsed["source"], "daemon");
+        // Idle, and the library has no entries, so it falls back to the root.
+        assert_eq!(parsed["assessed"], "library-root");
+        assert!(parsed["controls"].is_array(), "controls survived the splice");
+        assert!(parsed["weakened"].is_number());
+
+        // An explicit directory is reported as such and is the one assessed.
+        let out = posture_json(&daemon, dir.to_str().unwrap());
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(parsed["assessed"], "requested");
+        assert_eq!(parsed["workspace"], dir.to_str().unwrap());
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

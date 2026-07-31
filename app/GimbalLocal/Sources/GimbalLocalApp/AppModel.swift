@@ -95,6 +95,15 @@ final class AppModel: ObservableObject {
     @Published var liveLocalSessionIDs: Set<String> = []
     @Published var welcomeDismissed = UserDefaults.standard.bool(forKey: "gimbal.welcomeDismissed")
 
+    /// The last security posture we were able to read, and why we could not.
+    ///
+    /// Held as an optional rather than defaulting to an empty report on
+    /// purpose: "we do not know" and "nothing is wrong" must not render the
+    /// same way. `postureError` carries the reason so the panel can say it.
+    @Published var posture: PostureReport?
+    @Published var postureError: String?
+    @Published var isCheckingPosture = false
+
     private let chm = ChmClient()
     private let controlPlane = CloudControlClient()
     private var daemonProcess: Process?
@@ -163,6 +172,31 @@ final class AppModel: ObservableObject {
             status = SandboxStatus.disconnected
             snapshots = []
             appendLog("local runtime: \(error.localizedDescription)")
+        }
+    }
+
+    /// Re-read which security controls are actually in force.
+    ///
+    /// Asks the **daemon** first (`chm ctl posture`), because posture is
+    /// resolved from the environment of whichever process computes it and
+    /// `chm serve` is the process that owns the guest — this app's own
+    /// environment can differ from it entirely when we attached to a daemon we
+    /// did not start (see `startDaemon`, which only manages a daemon it
+    /// launched itself).
+    func refreshPosture() async {
+        guard !isCheckingPosture else { return }
+        isCheckingPosture = true
+        defer { isCheckingPosture = false }
+
+        switch await chm.posture(localFallbackPath: settings.libraryPath, settings: settings) {
+        case let .success(report):
+            posture = report
+            postureError = nil
+        case let .failure(error):
+            // Keep the last good report on screen rather than flashing to an
+            // unknown state on a transient failure, but surface the reason.
+            postureError = error.reason
+            if posture == nil { appendLog("posture: \(error.reason)") }
         }
     }
 
