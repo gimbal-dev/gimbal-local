@@ -801,4 +801,256 @@ final class ConsoleInputEncodingTests: XCTestCase {
         let report = try XCTUnwrap(ChmClient.decodePosture(CommandResult(output: json, status: 0)))
         XCTAssertEqual(report.controls[0].state, .weakened)
     }
+
+    // MARK: - Credential proxy (V6.2)
+
+    /// Verbatim `chm proxy check --host api.github.com --path /user --control
+    /// --json`, captured 2026-07-31 against the real endpoint with a real
+    /// token. 200 injected, 401 not.
+    private static let checkProvesInjectionJSON = """
+    {"host":"api.github.com","port":443,"path":"/user","address":"20.26.156.210:443",
+     "disposition":"INJECT Authorization (github-api)","intercepted":true,"reachable":true,
+     "origin_status":"HTTP/1.1 200 OK","tls":"TLSv1_3","error":null,
+     "audit":[{"destination":"api.github.com [20.26.156.210]:443","rule":"github-api",
+       "detail":"HEAD /user — Authorization attached","injected":true},
+      {"destination":"api.github.com [20.26.156.210]:443","rule":"github-api",
+       "detail":"upstream TLS TLSv1_3","injected":false}],
+     "control":{"status":"HTTP/1.1 401 Unauthorized","differs":true,"proves_injection":true}}
+    """
+
+    /// The same command against `/` — an endpoint that answers 200 either way.
+    /// Captured in the same session. This run is green and proves nothing.
+    private static let checkProvesNothingJSON = """
+    {"host":"api.github.com","port":443,"path":"/","address":"20.26.156.210:443",
+     "disposition":"INJECT Authorization (github-api)","intercepted":true,"reachable":true,
+     "origin_status":"HTTP/1.1 200 OK","tls":"TLSv1_3","error":null,
+     "audit":[{"destination":"api.github.com [20.26.156.210]:443","rule":"github-api",
+       "detail":"HEAD / — Authorization attached","injected":true}],
+     "control":{"status":"HTTP/1.1 200 OK","differs":false,"proves_injection":false}}
+    """
+
+    private func decodeCheck(_ json: String) throws -> ProxyCheckResult {
+        try JSONDecoder().decode(ProxyCheckResult.self, from: XCTUnwrap(json.data(using: .utf8)))
+    }
+
+    func testADifferingControlProvesTheCredentialArrived() throws {
+        let result = try decodeCheck(Self.checkProvesInjectionJSON)
+        XCTAssertEqual(result.verdict, .provesInjection(without: "HTTP/1.1 401 Unauthorized"))
+        XCTAssertEqual(result.audit.filter(\.injected).count, 1)
+    }
+
+    /// The case that matters most. This run is reachable, intercepted, and
+    /// returns 200 — every naive success signal is green — yet it proves
+    /// nothing, because the origin answers identically without the credential.
+    /// A UI keying off `reachable` would show a tick even if injection were
+    /// completely broken.
+    func testAMatchingControlIsReportedAsProvingNothing() throws {
+        let result = try decodeCheck(Self.checkProvesNothingJSON)
+        XCTAssertTrue(result.reachable)
+        XCTAssertTrue(result.intercepted)
+        XCTAssertEqual(result.originStatus, "HTTP/1.1 200 OK")
+        guard case let .inconclusive(why) = result.verdict else {
+            return XCTFail("expected inconclusive, got \(result.verdict)")
+        }
+        XCTAssertTrue(why.contains("with and without"), "must say why it proved nothing: \(why)")
+    }
+
+    func testAnUnreachableHostCarriesItsError() throws {
+        let json = """
+        {"host":"nope.invalid","port":443,"path":"/","address":null,
+         "disposition":"PASS-THROUGH (no rule)","intercepted":false,"reachable":false,
+         "origin_status":null,"tls":null,"error":"connect timed out","audit":[],"control":null}
+        """
+        XCTAssertEqual(try decodeCheck(json).verdict, .unreachable("connect timed out"))
+    }
+
+    /// A rule with no resolvable credential still intercepts, so the request
+    /// goes out unauthenticated instead of failing. That has to be visible.
+    func testARuleWithNoCredentialIsFlaggedAsWillFail() throws {
+        let json = """
+        {"configured":true,"origin":"/ws/proxy-rules.json","label":"L",
+         "rules":[
+           {"name":"gh","hosts":"api.github.com","header":"Authorization",
+            "source":"env:GH_TOKEN","credential":"missing"},
+           {"name":"ok","hosts":"a.example.com,b.example.com","header":"X-Key",
+            "source":"exec:mint.sh","credential":"on-demand"}],
+         "passthrough":["pinned.example.com"]}
+        """
+        let config = try JSONDecoder().decode(
+            ProxyConfiguration.self, from: XCTUnwrap(json.data(using: .utf8))
+        )
+        XCTAssertEqual(config.rulesMissingCredentials.map(\.name), ["gh"])
+        XCTAssertEqual(config.passthroughHosts, ["pinned.example.com"])
+        XCTAssertEqual(config.rules[1].hostList, ["a.example.com", "b.example.com"])
+        // `on-demand` is the strongest arrangement, not a warning: nothing is
+        // minted until a request arrives, so there is no standing token.
+        XCTAssertFalse(config.rules[1].willFailToInject)
+    }
+
+    func testNoProxyConfigurationDecodesWithoutRules() throws {
+        let config = try JSONDecoder().decode(
+            ProxyConfiguration.self,
+            from: XCTUnwrap(#"{"configured":false,"rules":[]}"#.data(using: .utf8))
+        )
+        XCTAssertFalse(config.configured)
+        XCTAssertTrue(config.passthroughHosts.isEmpty)
+    }
+
+    func testTheCaFingerprintIsLiftedFromTheCommandPreamble() {
+        let output = """
+        # sha256 9f2b1c0daa77
+        # `chm proxy ca <WORKSPACE_DIR> --for-guest` prints an installer to
+        -----BEGIN CERTIFICATE-----
+        """
+        XCTAssertEqual(ChmClient.fingerprint(fromCaOutput: output), "9f2b1c0daa77")
+        XCTAssertNil(ChmClient.fingerprint(fromCaOutput: "no preamble here"))
+    }
+
+    /// Verbatim `chm ctl proxy` against a daemon holding the token, captured
+    /// while the same rule read `missing` from a local `chm proxy show`.
+    func testTheDaemonsProxyAnswerIsMarkedAsSuch() throws {
+        let json = """
+        {
+          "source": "daemon",
+          "assessed": "library-root",
+        "configured":true,"origin":"/Users/nebuk89/v62lib/proxy-rules.json",        "label":"GitHub API for the agent sandbox",        "rules":[{"name":"github-api","hosts":"api.github.com","header":"Authorization",        "source":"env:V62_GH_TOKEN","credential":"present"}],        "passthrough":["pinned.example.com"]}
+        """
+        let config = try JSONDecoder().decode(
+            ProxyConfiguration.self,
+            from: XCTUnwrap(json.data(using: .utf8))
+        )
+        XCTAssertTrue(config.isFromDaemon)
+        XCTAssertEqual(config.assessed, "library-root")
+        XCTAssertTrue(config.rulesMissingCredentials.isEmpty)
+    }
+
+    /// The local read has no `source`, and must not claim to be the daemon's.
+    func testALocalProxyAnswerIsNotMistakenForTheDaemons() throws {
+        let json = #"{"configured":true,"origin":"/x.json","label":null,"#
+            + #""rules":[{"name":"r","hosts":"h","header":"Authorization","#
+            + #""source":"env:T","credential":"missing"}],"passthrough":[]}"#
+        let config = try JSONDecoder().decode(
+            ProxyConfiguration.self,
+            from: XCTUnwrap(json.data(using: .utf8))
+        )
+        XCTAssertFalse(config.isFromDaemon)
+        XCTAssertNil(config.assessed)
+        // The rule really is broken *in this process* — the panel still says so
+        // in the card. What must not happen is the sidebar raising an alarm
+        // sourced from the wrong environment.
+        XCTAssertEqual(config.rulesMissingCredentials.count, 1)
+    }
+
+    /// An older daemon answers `error\tunknown command`, which must fall
+    /// through to the local read rather than blanking the panel.
+    func testAnUnknownDaemonCommandDoesNotDecodeAsAProxyConfiguration() {
+        XCTAssertNil(
+            ChmClient.decodeProxy(CommandResult(output: "error\tunknown command", status: 0))
+        )
+        // A non-zero status is not a proxy report either, even if the body
+        // happens to parse: `proxy show` exits 0 or it has nothing to say.
+        XCTAssertNil(
+            ChmClient.decodeProxy(
+                CommandResult(output: #"{"configured":false,"rules":[]}"#, status: 1)
+            )
+        )
+    }
+
+    /// Verbatim `chm ctl proxy` while a sandbox was running from a library whose
+    /// *root* held the rules — the exact shape that made the panel read "No
+    /// credential proxy configured" and look like a bug in the panel.
+    func testARunningSandboxWithNoRulesIsALiveFindingNotAPlaceholder() throws {
+        let json = """
+        {
+          "source": "daemon",
+          "assessed": "running-vm",
+          "scope_dir": "/Users/nebuk89/v62lib/graviton-agent",
+        "configured":false,"rules":[]}
+        """
+        let config = try JSONDecoder().decode(
+            ProxyConfiguration.self,
+            from: XCTUnwrap(json.data(using: .utf8))
+        )
+        XCTAssertFalse(config.configured)
+        XCTAssertTrue(config.describesRunningVm)
+        // The directory is the actionable part: rules left in the library root
+        // are read by nothing, because a guest's workspace is its own folder.
+        XCTAssertEqual(config.scopeDir, "/Users/nebuk89/v62lib/graviton-agent")
+    }
+
+    /// An idle daemon reports the library root, which is *not* a live finding:
+    /// nothing has been assessed, so the same words would overclaim.
+    func testAnIdleLibraryRootIsNotReportedAsALiveSandbox() throws {
+        let json = """
+        {"source":"daemon","assessed":"library-root",
+         "scope_dir":"/Users/nebuk89/v62lib","configured":false,"rules":[]}
+        """
+        let config = try JSONDecoder().decode(
+            ProxyConfiguration.self,
+            from: XCTUnwrap(json.data(using: .utf8))
+        )
+        XCTAssertTrue(config.isFromDaemon)
+        XCTAssertFalse(config.describesRunningVm)
+    }
+
+    /// Verbatim `chm ctl proxy ca` against the running guest. Measured at the
+    /// same moment the app's own `chm proxy ca <library-root>` returned
+    /// `898b834b…` — install that one and the guest trusts a CA nothing signs
+    /// with, while the installer still reports success.
+    func testTheCaComesFromTheProcessThatWillSignWithIt() throws {
+        let json = #"{"source":"daemon","assessed":"running-vm","#
+            + #""scope_dir":"/Users/nebuk89/v62lib/graviton-agent","present":true,"#
+            + #""sha256":"79f85a28f5fabdf07634b9bef19b91ebfaa0a31abc43fc75fedf005bb28a2d33","#
+            + #""pem":"-----BEGIN CERTIFICATE-----\nAA\n-----END CERTIFICATE-----\n","#
+            + #""installer":"set -e\nsudo tee /usr/local/share/ca-certificates/x.crt\n"}"#
+        let ca = try XCTUnwrap(ChmClient.decodeCa(CommandResult(output: json, status: 0)))
+        XCTAssertTrue(ca.isFromDaemon)
+        XCTAssertEqual(
+            ca.fingerprint,
+            "79f85a28f5fabdf07634b9bef19b91ebfaa0a31abc43fc75fedf005bb28a2d33"
+        )
+        XCTAssertEqual(ca.scopeDir, "/Users/nebuk89/v62lib/graviton-agent")
+        XCTAssertTrue(ca.installScript.contains("sudo tee"))
+    }
+
+    /// Before a proxy has ever run there is no CA. That must not decode as an
+    /// installable one: offering the button would mint a trust anchor the guest
+    /// would then carry for no reason.
+    func testAnAbsentCaIsNotOfferedForInstallation() {
+        XCTAssertNil(
+            ChmClient.decodeCa(
+                CommandResult(
+                    output: #"{"source":"daemon","assessed":"running-vm","present":false}"#,
+                    status: 0
+                )
+            )
+        )
+        // An older daemon that does not know the verb must fall through too.
+        XCTAssertNil(
+            ChmClient.decodeCa(CommandResult(output: "error\tunknown command", status: 0))
+        )
+    }
+
+    /// The checked transfer has to survive the decoder, and its absence has to be
+    /// distinguishable — the two delivery paths are not equivalent, and the app
+    /// says so in the log when it falls back.
+    func testTheCheckedTransferSurvivesDecodingAndItsAbsenceIsVisible() throws {
+        let withLines = """
+        {"source":"daemon","present":true,"sha256":"aa","pem":"p","installer":"set -e\\n",\
+        "install_lines":["rm -f /tmp/gimbal-ca.b64","printf %s 'c2V0' >> /tmp/gimbal-ca.b64",\
+        "CS=$(sha256sum /tmp/gimbal-ca.b64 | cut -d' ' -f1); if [ \\"$CS\\" = \\"bb\\" ]; \
+        then base64 -d /tmp/gimbal-ca.b64 > /tmp/gimbal-ca.sh && bash /tmp/gimbal-ca.sh; \
+        else echo \\"TRANSFER CORRUPT\\"; fi"]}
+        """
+        let ca = try XCTUnwrap(ChmClient.decodeCa(CommandResult(output: withLines, status: 0)))
+        XCTAssertEqual(ca.installLines.count, 3)
+        XCTAssertTrue(ca.installLines.last?.contains("TRANSFER CORRUPT") ?? false)
+
+        // A daemon predating the checked transfer still yields an installable
+        // CA, but with no lines -- which is what makes the fallback sayable
+        // rather than silent.
+        let old = #"{"source":"daemon","present":true,"sha256":"aa","pem":"p","installer":"x"}"#
+        let legacy = try XCTUnwrap(ChmClient.decodeCa(CommandResult(output: old, status: 0)))
+        XCTAssertTrue(legacy.installLines.isEmpty)
+    }
 }

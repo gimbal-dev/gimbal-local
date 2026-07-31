@@ -353,6 +353,7 @@ enum SidebarItem: Hashable {
     case snapshotsHome
     case cloudHome
     case securityHome
+    case proxyHome
     case sandbox(String)   // sandbox id
     case snapshot(String)  // snapshot name
 }
@@ -615,5 +616,201 @@ struct PostureReport: Codable, Equatable {
         case "requested": return "the requested workspace"
         default: return nil
         }
+    }
+}
+
+// MARK: - Credential proxy (V6.2)
+
+/// One injection rule as `chm proxy show --json` reports it.
+///
+/// Deliberately carries no credential **value** and never can: `chm proxy show`
+/// does not read one (an `exec` source is not run), and `credential` is only an
+/// availability word. The app must be able to display the whole rule set
+/// without ever holding a secret, because "the secret is never anywhere the job
+/// can reach" is worth less if it is sitting in a SwiftUI view's memory.
+struct ProxyRule: Codable, Equatable, Hashable, Identifiable {
+    var name: String
+    /// Comma-joined host patterns, as the CLI emits them.
+    var hosts: String
+    /// The header the credential is attached to (`Authorization`).
+    var header: String
+    /// Where the credential comes from — `env:GH_TOKEN`, `exec:...` — never
+    /// what it is.
+    var source: String
+    /// `present` · `empty` · `missing` · `on-demand`.
+    var credential: String
+
+    var id: String { name }
+
+    var hostList: [String] {
+        hosts.split(separator: ",").map {
+            $0.trimmingCharacters(in: .whitespaces)
+        }
+    }
+
+    /// True when a request to a matching host would go out unauthenticated.
+    ///
+    /// `on-demand` is not a problem: it means the credential is minted when a
+    /// request actually arrives, which is the stronger arrangement — there is
+    /// no standing token to steal.
+    var willFailToInject: Bool {
+        credential == "missing" || credential == "empty"
+    }
+}
+
+struct ProxyConfiguration: Codable, Equatable {
+    var configured: Bool
+    var origin: String?
+    var label: String?
+    var rules: [ProxyRule]
+    /// Hosts explicitly never intercepted. The other half of the story: without
+    /// it a reader would assume everything not listed as a rule *is*
+    /// intercepted, when the opposite is true.
+    var passthrough: [String]?
+    /// `"daemon"` when `chm serve` answered. Absent means this app answered
+    /// about *itself*, so credential availability describes the wrong process.
+    var source: String?
+    /// Which directory the daemon resolved rules from: `running-vm`,
+    /// `library-root`, or `requested`.
+    var assessed: String?
+    /// The directory itself. Naming it is the difference between "add
+    /// proxy-rules.json to the workspace" being advice and being actionable:
+    /// the library root is never a guest's workspace, so a file left there is
+    /// read by nothing.
+    var scopeDir: String?
+
+    enum CodingKeys: String, CodingKey {
+        case configured, origin, label, rules, passthrough, source, assessed
+        case scopeDir = "scope_dir"
+    }
+
+    var passthroughHosts: [String] { passthrough ?? [] }
+
+    /// True when the process that will actually inject is the one that answered.
+    var isFromDaemon: Bool { source == "daemon" }
+
+    /// True when the answer describes a sandbox that is running right now, so
+    /// "nothing is intercepted" is a live finding rather than a placeholder.
+    var describesRunningVm: Bool { isFromDaemon && assessed == "running-vm" }
+
+    var rulesMissingCredentials: [ProxyRule] { rules.filter(\.willFailToInject) }
+}
+
+/// One line of the proxy's decision log for a `check` run.
+struct ProxyAuditEvent: Codable, Equatable, Hashable, Identifiable {
+    var destination: String
+    var rule: String?
+    var detail: String
+    var injected: Bool
+
+    var id: String { "\(destination)|\(detail)" }
+}
+
+/// The control run: the same request with injection disabled.
+struct ProxyControlResult: Codable, Equatable {
+    var status: String?
+    var differs: Bool?
+    /// The only field worth rendering as a verdict. `reachable` is table stakes;
+    /// this is whether the credential demonstrably arrived.
+    var provesInjection: Bool?
+    var error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case status, differs, error
+        case provesInjection = "proves_injection"
+    }
+}
+
+/// The result of `chm proxy check --json`.
+struct ProxyCheckResult: Codable, Equatable {
+    var host: String
+    var port: Int
+    var path: String
+    var address: String?
+    var disposition: String
+    var intercepted: Bool
+    var reachable: Bool
+    var originStatus: String?
+    var tls: String?
+    var error: String?
+    var audit: [ProxyAuditEvent]
+    var control: ProxyControlResult?
+
+    enum CodingKeys: String, CodingKey {
+        case host, port, path, address, disposition, intercepted, reachable, tls, error, audit, control
+        case originStatus = "origin_status"
+    }
+
+    /// What to actually tell the user, in one sentence.
+    ///
+    /// Reachability alone is not a pass. A run against an endpoint that answers
+    /// the same with and without a credential is green no matter what the proxy
+    /// does — including if injection were completely broken — so that case is
+    /// reported as inconclusive rather than as success.
+    enum Verdict: Equatable {
+        case unreachable(String)
+        case provesInjection(without: String)
+        case inconclusive(String)
+        case relayed
+        case noControl
+    }
+
+    var verdict: Verdict {
+        guard reachable else { return .unreachable(error ?? "unknown error") }
+        guard intercepted else { return .relayed }
+        guard let control else { return .noControl }
+        if let error = control.error { return .inconclusive("control run failed: \(error)") }
+        if control.provesInjection == true, let status = control.status {
+            return .provesInjection(without: status)
+        }
+        return .inconclusive(
+            "the origin answered \(control.status ?? "the same") with and without the "
+                + "credential, so this run cannot tell whether injection worked"
+        )
+    }
+}
+
+/// The workspace CA, and the script that installs it in a guest.
+struct ProxyCa: Equatable {
+    var fingerprint: String
+    var installScript: String
+    /// The exact console lines to type, with a guest-side digest check.
+    ///
+    /// Empty when the daemon predates the checked transfer. Typing
+    /// `installScript` line by line was measured to drop characters and to
+    /// strand every line behind a slow command in the tty queue, so the two are
+    /// not interchangeable and the caller must say which it used.
+    var installLines: [String] = []
+    /// `"daemon"` when `chm serve` answered. Absent means this app resolved a CA
+    /// in *its own* view of the workspace, which need not be the one the running
+    /// proxy signs with.
+    var source: String?
+    /// The directory the CA was read from.
+    var scopeDir: String?
+
+    var isFromDaemon: Bool { source == "daemon" }
+}
+
+/// Wire shape of `chm ctl proxy ca`.
+///
+/// `present: false` is not an error — the CA is minted when a proxy first runs,
+/// so before the first intercepted connection there is genuinely nothing to
+/// install, and offering an install button then would create a trust anchor the
+/// guest would have to trust for no reason.
+struct ProxyCaReport: Codable {
+    var source: String?
+    var assessed: String?
+    var scopeDir: String?
+    var present: Bool
+    var sha256: String?
+    var pem: String?
+    var installer: String?
+    var installLines: [String]?
+    var error: String?
+
+    enum CodingKeys: String, CodingKey {
+        case source, assessed, present, sha256, pem, installer, error
+        case scopeDir = "scope_dir"
+        case installLines = "install_lines"
     }
 }

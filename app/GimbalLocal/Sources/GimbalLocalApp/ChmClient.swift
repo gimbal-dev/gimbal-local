@@ -138,6 +138,156 @@ struct ChmClient {
         return try? JSONDecoder().decode(PostureReport.self, from: data)
     }
 
+    // MARK: - Credential proxy (V6.2)
+
+    /// Read the credential-proxy rule set.
+    ///
+    /// Runs `chm proxy show --json`, which by contract **never reads a
+    /// credential value** — an `exec` source is not executed, and each rule
+    /// reports only whether its credential is present. The app therefore
+    /// displays the whole configuration without a secret ever entering this
+    /// process.
+    ///
+    /// Prefers the **daemon's** answer (`chm ctl proxy`) for the same reason
+    /// `posture` does: whether a credential resolves is read from `env::var`
+    /// in whichever process answers, and `chm serve` is the process that
+    /// actually injects. Asking ourselves describes this app.
+    ///
+    /// Measured while building this panel: with the token in the daemon's
+    /// environment and not the app's, the local read said `missing` for a rule
+    /// the daemon said was `present`. That direction merely nags. The inverse —
+    /// token in the app, none in the daemon — shows a green panel while every
+    /// request leaves the guest unauthenticated, which is the reason this is
+    /// not a cosmetic preference.
+    ///
+    /// Falls back to reading the rule *file* locally, which still gives the
+    /// rules, hosts and passthrough list; only credential availability is
+    /// then describing the wrong process, and `source` says so.
+    func proxyShow(path: String, settings: AppSettings) async -> ProxyConfiguration? {
+        let viaDaemon = await runRaw(
+            settings: settings,
+            args: ["ctl", "proxy", "--socket", settings.socketPath]
+        )
+        if let config = Self.decodeProxy(viaDaemon) { return config }
+        return Self.decodeProxy(
+            await runRaw(settings: settings, args: ["proxy", "show", path, "--json"])
+        )
+    }
+
+    /// Decode a proxy configuration, returning `nil` when the output is not one
+    /// — an older daemon answers `error\tunknown command`, which must fall
+    /// through to the local read rather than blanking the panel.
+    static func decodeProxy(_ result: CommandResult) -> ProxyConfiguration? {
+        guard result.status == 0, let data = result.output.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(ProxyConfiguration.self, from: data)
+    }
+
+    /// Fetch the workspace CA and the script that installs it in a guest.
+    ///
+    /// Two invocations because the fingerprint goes to stderr on the plain form
+    /// while `--for-guest` emits the installer on stdout. The fingerprint is
+    /// what makes the install verifiable: the script ends by printing the
+    /// certificate it actually installed, so it can be compared against this.
+    /// The CA the guest will actually have to trust.
+    ///
+    /// Daemon-first, and here the stakes are highest of the four provenance
+    /// fixes. A CA is per-workspace, and the app's idea of the workspace is the
+    /// library root while a running guest's proxy uses the sandbox folder.
+    /// Measured: `898b834b…` here against `79f85a28…` in the guest. Installing
+    /// this app's answer would make the guest trust a certificate nothing signs
+    /// with — and because the installer compares what it installed against the
+    /// fingerprint it was handed, both would agree and the panel would report
+    /// success while every intercepted connection failed a certificate check.
+    func proxyCa(path: String, settings: AppSettings) async -> ProxyCa? {
+        let viaDaemon = await runRaw(
+            settings: settings,
+            args: ["ctl", "proxy", "ca", "--socket", settings.socketPath]
+        )
+        if let ca = Self.decodeCa(viaDaemon) { return ca }
+
+        let script = await runRaw(settings: settings, args: ["proxy", "ca", path, "--for-guest"])
+        guard script.status == 0, !script.output.isEmpty else { return nil }
+        let plain = await runRaw(settings: settings, args: ["proxy", "ca", path])
+        let fingerprint = Self.fingerprint(fromCaOutput: plain.output) ?? "unknown"
+        return ProxyCa(
+            fingerprint: fingerprint,
+            installScript: script.output,
+            source: nil,
+            scopeDir: path
+        )
+    }
+
+    /// Decode `chm ctl proxy ca`. Returns nil when the daemon has no CA yet, so
+    /// the caller falls through rather than offering to install nothing.
+    static func decodeCa(_ result: CommandResult) -> ProxyCa? {
+        guard result.status == 0, let data = result.output.data(using: .utf8),
+              let report = try? JSONDecoder().decode(ProxyCaReport.self, from: data),
+              report.present,
+              let sha = report.sha256, let installer = report.installer
+        else {
+            return nil
+        }
+        return ProxyCa(
+            fingerprint: sha,
+            installScript: installer,
+            installLines: report.installLines ?? [],
+            source: report.source,
+            scopeDir: report.scopeDir
+        )
+    }
+
+    /// Pull the sha256 out of `chm proxy ca`'s `# sha256 <hex>` preamble.
+    static func fingerprint(fromCaOutput output: String) -> String? {
+        for line in output.split(separator: "\n") where line.hasPrefix("# sha256 ") {
+            let hex = line.dropFirst("# sha256 ".count).trimmingCharacters(in: .whitespaces)
+            if !hex.isEmpty { return hex }
+        }
+        return nil
+    }
+
+    /// Send a real request through the proxy, with the control run.
+    ///
+    /// `--control` is not optional here. Without it the button is a green tick
+    /// that cannot fail: against an endpoint answering the same either way,
+    /// `check` succeeds even if injection is entirely broken. The control
+    /// repeats the identical request with injection disabled so the two answers
+    /// can be compared, which is the only thing that makes this evidence.
+    ///
+    /// - Note: exits non-zero when the host is unreachable, which is a *result*
+    ///   we want to display, so the payload is decoded on any status.
+    func proxyCheck(
+        host: String,
+        path: String,
+        rulesFile: String?,
+        settings: AppSettings
+    ) async -> ProxyCheckResult? {
+        // Ask the daemon first, for the third time and the strongest reason:
+        // a check run here resolves rules relative to *this* process and reads
+        // credentials from *this* environment, so it truthfully reports "no
+        // rule matches, relayed end-to-end" — correct, and useless, because it
+        // can never exercise the injection the button exists to test. Measured:
+        // the app's own run said PASS-THROUGH/401 against the identical rule
+        // the daemon injected on and got 200.
+        let viaDaemon = await runRaw(
+            settings: settings,
+            args: ["ctl", "proxy", "check", "--host", host, "--path", path,
+                   "--socket", settings.socketPath]
+        )
+        if let report = Self.decodeCheck(viaDaemon) { return report }
+
+        var args = ["proxy", "check", "--host", host, "--path", path, "--control", "--json"]
+        if let rulesFile { args += ["--rules", rulesFile] }
+        return Self.decodeCheck(await runRaw(settings: settings, args: args))
+    }
+
+    /// Decode a check report. Unlike the others this accepts a **non-zero**
+    /// status: `check` exits 1 when the origin was unreachable, and an
+    /// unreachable origin is a result worth showing, not a failure to hide.
+    static func decodeCheck(_ result: CommandResult) -> ProxyCheckResult? {
+        guard let data = result.output.data(using: .utf8) else { return nil }
+        return try? JSONDecoder().decode(ProxyCheckResult.self, from: data)
+    }
+
     func shutdown(settings: AppSettings) async throws -> String {
         try await runChecked(settings: settings, args: ["ctl", "shutdown"])
     }
