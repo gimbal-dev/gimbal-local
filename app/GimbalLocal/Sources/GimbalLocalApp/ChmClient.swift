@@ -217,6 +217,29 @@ struct ChmClient {
         )
     }
 
+    /// The running sandbox's durable audit trail.
+    ///
+    /// Daemon-only, with no local fallback — and that is deliberate. Every other
+    /// reader here degrades to answering from this app's own view when `chm
+    /// serve` is silent, but there is no useful local answer for a *trail*: the
+    /// records are written by the process running the guest, so an app-side read
+    /// of some other directory would either find nothing (rendering as "this
+    /// sandbox made no network calls", the most reassuring possible lie) or find
+    /// a stale file from a previous session and present it as current. Returning
+    /// nil lets the page say it does not know, which is the true answer.
+    func auditTrail(settings: AppSettings, dir: String? = nil, tail: Int = 200) async -> AuditTrail? {
+        var args = ["ctl", "audit"]
+        if let dir { args.append(dir) }
+        args += ["--tail", String(tail), "--socket", settings.socketPath]
+        let result = await runRaw(settings: settings, args: args)
+        guard result.status == 0, let data = result.output.data(using: .utf8),
+              let trail = try? JSONDecoder().decode(AuditTrail.self, from: data)
+        else {
+            return nil
+        }
+        return trail
+    }
+
     /// Decode `chm ctl proxy ca`. Returns nil when the daemon has no CA yet, so
     /// the caller falls through rather than offering to install nothing.
     static func decodeCa(_ result: CommandResult) -> ProxyCa? {

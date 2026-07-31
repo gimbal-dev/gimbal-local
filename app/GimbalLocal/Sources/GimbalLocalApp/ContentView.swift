@@ -91,6 +91,9 @@ private struct Sidebar: View {
 
                     SidebarProxyRow(config: model.proxyConfig)
                         .tag(SidebarItem.proxyHome)
+
+                    SidebarActivityRow(trail: model.auditTrail)
+                        .tag(SidebarItem.activityHome)
                 }
 
                 Section("Cloud") {
@@ -265,6 +268,60 @@ private struct SidebarProxyRow: View {
     }
 }
 
+private struct SidebarActivityRow: View {
+    let trail: AuditTrail?
+
+    var body: some View {
+        Label {
+            HStack {
+                Text("Activity").font(.headline)
+                Spacer()
+                badge
+            }
+        } icon: {
+            Image(systemName: symbol).foregroundStyle(tint)
+        }
+        .padding(.vertical, 3)
+    }
+
+    /// Denials are the number worth carrying into the sidebar: they are the
+    /// events a reader would want to be told about without going looking. The
+    /// count is shown only when the trail came from the daemon and is complete
+    /// enough to mean something — `?` otherwise, because a confident `0` beside
+    /// a trail that cannot record is the same lie the page exists to avoid.
+    @ViewBuilder private var badge: some View {
+        if let trail, trail.isFromDaemon, trail.present {
+            let denied = trail.count(.denied)
+            Text(denied > 0 ? "\(denied)" : "\(trail.total)")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(denied > 0 ? Color.white : .secondary)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2)
+                .background(
+                    denied > 0 ? AnyShapeStyle(Theme.orange) : AnyShapeStyle(.quaternary),
+                    in: Capsule()
+                )
+        } else {
+            Text("?")
+                .font(.caption.weight(.bold))
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 7)
+                .padding(.vertical, 2)
+                .background(.quaternary, in: Capsule())
+        }
+    }
+
+    private var symbol: String {
+        guard let trail, trail.isFromDaemon, trail.present else { return "questionmark.circle" }
+        return trail.count(.denied) > 0 ? "hand.raised.fill" : "arrow.left.arrow.right.circle.fill"
+    }
+
+    private var tint: Color {
+        guard let trail, trail.isFromDaemon, trail.present else { return .gray }
+        return trail.count(.denied) > 0 ? Theme.orange : Theme.cyan
+    }
+}
+
 private struct SidebarSandboxRow: View {
     let sandbox: Sandbox
 
@@ -331,6 +388,8 @@ private struct Detail: View {
                 SecurityPage()
             case .proxyHome:
                 ProxyPage()
+            case .activityHome:
+                ActivityPage()
             case let .sandbox(id):
                 SandboxDetailPage(sandboxID: id)
             case let .snapshot(name):
