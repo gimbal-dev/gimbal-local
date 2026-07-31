@@ -323,7 +323,7 @@ tab today counts what the control plane has (`runners`, `snapshots`,
 | --- | --- | --- |
 | `run` / `ctl` / `fork` / `revisions` / `rollback` / `branches` / `workspace` / `limits` / `firewall` / `runner` | ✅ yes | The local lifecycle is well covered. |
 | **`posture`** | ✅ **yes (V6.1)** | 12 security invariants, including I12 shipped today. The single most important thing to surface, and the only place a user learns what is *weakened*. |
-| **`proxy`** (`show` / `ca` / `check`) | ❌ **no** | Shipped in V5.2 and completely invisible. The CA install step in particular is a *guest-side* action the app should hand to you, not something to find in a doc. |
+| **`proxy`** (`show` / `ca` / `check`) | ✅ **yes (V6.2)** | Rules, what is *not* intercepted, the CA the guest must trust, and a test button that runs a control. All four answered by the process that actually injects. |
 | **`audit`** | ❌ **no** | What did this sandbox actually reach? Answering that in a UI is most of the value of having recorded it. |
 | **`policy`** | ❌ **no** | `firewall` is wired but the control-plane egress policy behind it is not shown, so a governed session looks identical to an ungoverned one. |
 | **`pull` / `push`** | ❌ **no** | *This is the dream, and it is CLI-only.* |
@@ -334,13 +334,114 @@ tab today counts what the control plane has (`runners`, `snapshots`,
 | | Task | Size |
 | --- | --- | --- |
 | V6.1 | **Security panel.** ✅ **Done 2026-07-31.** Every control rendered with its invariant, state and the sentence naming what weakened it; weakened rows sort first, are outlined orange, and the count shows in the sidebar so you do not have to navigate to see it. The milestone turned on a bug that would have made the panel actively harmful: posture resolves from the environment of whichever process computes it, and the app is not the process running the guest — attach to a daemon started with `CHM_ALLOW_LOCAL_EGRESS=1` and a naive panel shows green. Measured, on the shipped build: the app's own environment yields `weakened: 0`, the daemon yields `weakened: 1`. Fixed by adding a `posture-json` verb to the daemon (`chm ctl posture`) so it answers for itself; when it cannot, the panel falls back to a local read **and says so** in a banner rather than implying the two are interchangeable. | M |
-| V6.2 | **Credential proxy UI.** Show the rule set, which destinations are intercepted vs relayed, and where each credential comes from (never its value). A one-click **"install CA in guest"** that runs the `chm proxy ca --for-guest` script through the existing interactive console, and a **"test this rule"** button wrapping `chm proxy check` — including the control run, because a green tick that cannot fail is not evidence. | M |
+| V6.2 | **Credential proxy UI.** ✅ **Done 2026-07-31.** Rules, their destinations, where each credential comes from (never its value), what is deliberately *not* intercepted, the CA the guest must trust, and a **test-this-rule** button that always runs the control. Measured through the UI: the same request returned `HTTP/1.1 401 Unauthorized` without injection and `HTTP/1.1 200 OK` with it — the guest sent nothing and the origin still authenticated it. Against `/` (an endpoint that answers the same either way) the same button says **“This run proved nothing”**, so it is capable of failing. The milestone was mostly a hunt for one bug class: an answer computed in the wrong process. It was found four times, each on hardware — see below. | M |
 | V6.3 | **Egress + audit view.** The policy in force (with its content hash), and a live decision log — allowed, denied, relayed, injected — per sandbox. Feeds off `chm audit` and `CHM_PROXY_LOG`. | M |
 | V6.4 | **Off-box round-trip.** `pull` a cloud snapshot and `push` a local one, with progress, from the Cloud tab. This is the dream expressed as a button. Includes surfacing `state-cdn` so a streamed rehydrate is legible as such. | L |
 | V6.5 | **Capability honesty.** One place that states what this build can and cannot do — HVF backend, vanilla-snapshot support, the V5 gap list — so nobody has to infer it from whether a thing crashed. | S |
 
+##### The four provenance bugs (V6.1–V6.2)
+
+Credential availability, posture and the CA all resolve from **whichever process
+computes them**. Three processes exist: the app, subprocesses it spawns (which
+inherit its environment), and `chm serve` (which runs the guest, and may have
+been started by anyone). Only the last one describes the sandbox. Each was
+measured with both answers taken at the same moment:
+
+| Surface | The app's answer | The daemon's answer | What the wrong answer would have caused |
+| --- | --- | --- | --- |
+| `posture` (V6.1) | `weakened: 0` | `weakened: 1` | A green security panel over a sandbox with local egress allowed. |
+| `proxy show` | `credential: missing` | `present` | An alarm about the wrong environment — or, inverted, a green panel while every request leaves unauthenticated. |
+| `proxy check` | `PASS-THROUGH`, 401 | `INJECT`, 200 vs 401 control | A test button that can never exercise the injection it exists to test. |
+| `proxy ca` | `898b834b…` (library root) | `79f85a28…` (the running guest's workspace) | **The worst of the four.** Install the app's CA and the guest trusts a certificate nothing signs with — and because the installer compared what it wrote against the fingerprint it was handed, it would have reported success while every intercepted connection failed a certificate check. |
+
+Each is fixed the same way: a daemon verb (`chm ctl posture` / `proxy` /
+`proxy check` / `proxy ca`) that splices `source` and `assessed` into the body,
+so one decoder handles both shapes. Where the daemon cannot be reached the panel
+falls back to a local read **and says so**; the sidebar badge stays grey, because
+an alarm sourced from the wrong process is worse than no alarm — it trains the
+reader to ignore it.
+
+A fifth instance of the same class was found in the guest, not the host: the CA
+installer verified the certificate by re-reading **the file it had just
+written**, which is true by construction. On a rehydrated Graviton guest
+`update-ca-certificates` segfaults, the CA never reached `/etc/ssl/certs`, and
+the script still printed matching fingerprints. It now verifies with `openssl
+verify -CApath /etc/ssl/certs`, falls back to linking the hash by hand when the
+helper is broken, and can print `NOT TRUSTED`. Measured after the fix on the
+same guest: `trusted:` matched `expected:` and `openssl verify` exited 0 — via
+the fallback, because the segfault is still there.
+
+##### And a sixth, in the delivery rather than the answer
+
+Clicking *Install CA in guest* for the first time — it had been shipped
+untested — showed the correct script arriving and then doing nothing. The app
+typed it one line at a time, 60 ms apart; `update-ca-certificates` takes
+seconds, so the four verification lines behind it sat in the tty input queue,
+were echoed, and never ran. The console showed the script's own text where its
+output belonged, and the panel truthfully reported the script sent. No fixed
+delay can fix that, because it would have to be as long as the slowest command
+in the script and nothing knows what that is.
+
+The script now crosses as base64 in short `printf` appends — nothing is ever
+typed at a shell that is busy — and the guest hashes what it received against a
+digest computed host-side **before running any of it**, so loss is named
+(`TRANSFER CORRUPT`) at the moment it happens. That check also settled a
+question the console could not: the captured lines come back with their leading
+characters missing, which looks exactly like dropped input, but on the
+successful run the digest matched — so every chunk had arrived byte-perfect and
+the truncation is console rendering, not loss.
+
+**Measured end to end on a live guest**, by clicking the button: `trusted:
+45339c91c1785f8c63da3b8be0a10b5db1fe31c82e04d349c1b69a7397ef2372` equal to
+`expected:`, equal to the fingerprint on the panel, equal to the CA the running
+proxy signs with.
+
 **Ordering note.** V6.1–V6.3 are all local and can ship without a cloud
 dependency. V6.4 needs the control plane, so it goes last.
+
+### V7 · The acceptance test — a real agent doing real work
+
+**One test, end to end, with nothing stubbed:**
+
+> Start an image. Install the Copilot CLI inside it. Give it a GitHub
+> credential **through the proxy, so the credential never enters the guest**.
+> Then have the Copilot CLI write a hello-world JavaScript app — and run it.
+
+This is the whole thesis in a single run, and it is deliberately the *last*
+milestone because it is the only one that cannot be passed by any individual
+piece working. Every layer has to hold simultaneously:
+
+| What it proves | Layer under test |
+| --- | --- |
+| The guest boots, stays up, and its clock is sane enough for TLS and `npm` | V1/V2 rehydration, V5.5 clock coherence |
+| `npm i -g @github/copilot` completes | egress, DNS, NAT, sustained throughput |
+| The CLI authenticates to GitHub | **V5.2 credential proxy** — and `chm proxy check` must show the credential was *injected at the edge*, never present in the guest |
+| The CLI reaches the model endpoint and streams | long-lived TLS through the proxy, no MITM breakage |
+| `node hello.js` prints | the toolchain actually runs — the AArch32 caveat does not bite a 64-bit Node |
+| Nothing was weakened to make it work | `chm ctl posture` before **and after**, both clean |
+
+**The acceptance bar is deliberately hostile to a nice demo:**
+
+1. **No credential in the guest.** Grep the guest's environment, shell history,
+   `~/.config`, and process table for the token. Zero hits, or the milestone
+   fails. This is the V5.2 claim and it is worth nothing unless it is checked
+   adversarially.
+2. **Posture clean throughout.** If it only works with
+   `CHM_ALLOW_LOCAL_EGRESS=1`, it did not work.
+3. **The JS app must execute**, not merely be written. A file on disk proves
+   the model replied; a printed line proves the sandbox is a working computer.
+4. **Transcript recorded** — every proxy decision (`allowed` / `denied` /
+   `injected`) for the whole run, so the claim is auditable rather than
+   asserted.
+
+| | Task | Size |
+| --- | --- | --- |
+| V7.1 | **Agent acceptance run.** The scenario above, start to finish, on real hardware, with the adversarial checks above and a recorded transcript. | L |
+
+**Depends on:** V6.2 (the CA install into the guest is the fiddliest step and
+should be a button before it is a test), M32.1 (agent workload readiness), and
+ideally V5.4/#101 so the run can start from a *cold* image rather than a cloud
+capture. It does **not** depend on the cloud control plane.
 
 ---
 
