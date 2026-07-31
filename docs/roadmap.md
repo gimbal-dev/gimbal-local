@@ -322,7 +322,7 @@ tab today counts what the control plane has (`runners`, `snapshots`,
 | `chm` capability | In the app? | Why it matters that it isn't |
 | --- | --- | --- |
 | `run` / `ctl` / `fork` / `revisions` / `rollback` / `branches` / `workspace` / `limits` / `firewall` / `runner` | ✅ yes | The local lifecycle is well covered. |
-| **`posture`** | ❌ **no** | 12 security invariants, including I12 shipped today. The single most important thing to surface, and the only place a user learns what is *weakened*. |
+| **`posture`** | ✅ **yes (V6.1)** | 12 security invariants, including I12 shipped today. The single most important thing to surface, and the only place a user learns what is *weakened*. |
 | **`proxy`** (`show` / `ca` / `check`) | ❌ **no** | Shipped in V5.2 and completely invisible. The CA install step in particular is a *guest-side* action the app should hand to you, not something to find in a doc. |
 | **`audit`** | ❌ **no** | What did this sandbox actually reach? Answering that in a UI is most of the value of having recorded it. |
 | **`policy`** | ❌ **no** | `firewall` is wired but the control-plane egress policy behind it is not shown, so a governed session looks identical to an ungoverned one. |
@@ -333,7 +333,7 @@ tab today counts what the control plane has (`runners`, `snapshots`,
 
 | | Task | Size |
 | --- | --- | --- |
-| V6.1 | **Security panel.** Render `chm posture --json` as first-class UI: each invariant with its state (on / n/a / **weakened**), what weakened it, and the exact env var or flag responsible. Weakened must be visually loud — that is the whole point of computing it. | M |
+| V6.1 | **Security panel.** ✅ **Done 2026-07-31.** Every control rendered with its invariant, state and the sentence naming what weakened it; weakened rows sort first, are outlined orange, and the count shows in the sidebar so you do not have to navigate to see it. The milestone turned on a bug that would have made the panel actively harmful: posture resolves from the environment of whichever process computes it, and the app is not the process running the guest — attach to a daemon started with `CHM_ALLOW_LOCAL_EGRESS=1` and a naive panel shows green. Measured, on the shipped build: the app's own environment yields `weakened: 0`, the daemon yields `weakened: 1`. Fixed by adding a `posture-json` verb to the daemon (`chm ctl posture`) so it answers for itself; when it cannot, the panel falls back to a local read **and says so** in a banner rather than implying the two are interchangeable. | M |
 | V6.2 | **Credential proxy UI.** Show the rule set, which destinations are intercepted vs relayed, and where each credential comes from (never its value). A one-click **"install CA in guest"** that runs the `chm proxy ca --for-guest` script through the existing interactive console, and a **"test this rule"** button wrapping `chm proxy check` — including the control run, because a green tick that cannot fail is not evidence. | M |
 | V6.3 | **Egress + audit view.** The policy in force (with its content hash), and a live decision log — allowed, denied, relayed, injected — per sandbox. Feeds off `chm audit` and `CHM_PROXY_LOG`. | M |
 | V6.4 | **Off-box round-trip.** `pull` a cloud snapshot and `push` a local one, with progress, from the Cloud tab. This is the dream expressed as a button. Includes surfacing `state-cdn` so a streamed rehydrate is legible as such. | L |
