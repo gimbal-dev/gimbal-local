@@ -28,6 +28,7 @@ use std::io::Write;
 use std::sync::mpsc;
 use std::error::Error;
 use std::io;
+use std::path::Path;
 use std::path::PathBuf;
 use std::thread;
 use std::process::ExitCode;
@@ -62,6 +63,7 @@ use hypervisor::hvf::virtio::nat::{EgressPolicy, NatLimits, NatResponder};
 use hypervisor::hvf::virtio::net::{NetDevice, NetKick};
 
 use crate::coldboot;
+use crate::credproxy;
 use crate::coldboot::ColdBootConfig;
 use crate::coldboot::VirtioKind;
 use crate::console;
@@ -156,6 +158,15 @@ struct CreateArgs {
     /// deny-all posture, which is what an unconfigured sandbox gets everywhere
     /// else in this tree (see `docs/security-model.md` §1a).
     egress_allow: Vec<String>,
+    /// Credential-injection rules for the egress proxy. The guest never holds
+    /// the credential; the header is attached as the request leaves. See
+    /// `docs/credential-proxy.md`.
+    proxy_rules: Option<PathBuf>,
+    /// Where the proxy CA and audit trail live. Defaults to the rules file's
+    /// own directory, so the common case needs one flag rather than two. A CA
+    /// is a persistent trust root, so it belongs somewhere the caller chose,
+    /// never a temporary directory.
+    workspace: Option<PathBuf>,
 }
 
 fn usage() -> String {
@@ -191,6 +202,8 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     let mut egress_allow: Vec<String> = Vec::new();
     let mut cmdline_explicit = false;
     let mut cmdline_extra: Vec<String> = Vec::new();
+    let mut proxy_rules: Option<PathBuf> = None;
+    let mut workspace: Option<PathBuf> = None;
 
     let mut i = 0;
     while i < raw.len() {
@@ -216,6 +229,12 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
             // line, and then you own working out the root partition yourself.
             "--cmdline-extra" => {
                 cmdline_extra.push(value("--cmdline-extra")?);
+            }
+            "--proxy-rules" => {
+                proxy_rules = Some(PathBuf::from(value("--proxy-rules")?));
+            }
+            "--workspace" => {
+                workspace = Some(PathBuf::from(value("--workspace")?));
             }
             "--cpus" => {
                 cfg.vcpus = value("--cpus")?
@@ -246,6 +265,9 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     if !egress_allow.is_empty() && !cfg.net {
         return Err("--egress-allow needs --net; there is no NIC to allow through".into());
     }
+    if proxy_rules.is_some() && !cfg.net {
+        return Err("--proxy-rules needs --net; there is no traffic to intercept".into());
+    }
     // Only when the caller did not write a command line themselves: an explicit
     // `--cmdline` is the caller saying they know what the kernel needs, and
     // appending to it could contradict a `root=` they chose deliberately.
@@ -260,6 +282,8 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
         dry_run,
         max_seconds,
         egress_allow,
+        proxy_rules,
+        workspace,
     })
 }
 
@@ -354,6 +378,39 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         .filter(|(p, _)| p.kind == VirtioKind::Net)
         .map(|(_, d)| d.clone())
         .collect();
+
+    // The credential proxy, if the caller configured one. Installed after the
+    // NIC exists because the hook is per-device and the proxy must bind its
+    // port first. `chm` is already the guest's whole network, so this is the
+    // one chokepoint every outbound call crosses -- the same edge injection a
+    // rehydrated guest gets, on a guest that was never captured anywhere.
+    let _proxy = match args.proxy_rules.as_deref() {
+        Some(rules) => {
+            // The rules file's own directory is the default workspace: a CA is
+            // a persistent trust root, so it must not land in a temp dir the
+            // next run cannot find.
+            let ws = args
+                .workspace
+                .clone()
+                .or_else(|| rules.parent().map(Path::to_path_buf))
+                .ok_or_else(|| "--proxy-rules has no directory; pass --workspace".to_string())?;
+            // Fail closed: rules that cannot be honoured stop the run rather
+            // than booting a guest whose calls go out unsigned and unaudited.
+            match credproxy::cli::start_for_workspace(&ws, Some(rules))
+                .map_err(|e| format!("credential proxy: {e}"))?
+            {
+                Some((proxy, decider)) => {
+                    for dev in &net_devices {
+                        dev.set_net_intercept(Some(Arc::clone(&decider)));
+                    }
+                    Some(proxy)
+                }
+                None => None,
+            }
+        }
+        None => None,
+    };
+
     // vCPU 0 is running because the boot protocol started it there; every
     // secondary waits for the kernel to ask by PSCI `CPU_ON`.
     let psci = PsciCoordinator::cold(usize::from(args.cfg.vcpus).max(1));
