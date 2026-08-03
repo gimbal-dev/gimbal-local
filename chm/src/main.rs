@@ -31,6 +31,15 @@ mod console_filter;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod checkpoint;
 
+// Cold boot: build a guest from a kernel image rather than rehydrate one from
+// a capture (#101).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod coldboot;
+
+// The `chm create` verb: drives a cold guest image on Hypervisor.framework.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod create;
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod console;
 

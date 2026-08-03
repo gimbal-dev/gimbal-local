@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 use std::{env, fs, io, thread};
 
 use crate::checkpoint;
+use crate::create::create_main;
 use crate::cloud;
 use crate::console::{self, RawConsole};
 use crate::console_filter::ConsoleFilter;
@@ -912,6 +913,7 @@ pub fn main() -> ExitCode {
     startup::init();
     let raw: Vec<String> = env::args().skip(1).collect();
     match raw.first().map(String::as_str) {
+        Some("create") => create_main(&raw[1..]),
         Some("cloud") => cloud::cloud_main(&raw[1..]),
         Some("runner") => control_plane::runner_main(&raw[1..]),
         Some("push") => control_plane::push_main(&raw[1..]),

@@ -1048,12 +1048,15 @@ dependencies = [
 name = "gimbal-local"
 version = "0.1.0"
 dependencies = [
+ "arch",
  "hypervisor",
  "libc",
+ "linux-loader",
  "ring",
  "rustls",
  "serde",
  "serde_json",
+ "vm-memory",
 ]
 
 [[package]]
