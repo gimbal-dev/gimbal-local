@@ -183,7 +183,7 @@ nothing from anyone else.
 | **V2** | Vanilla everywhere in the product | ①③ | ✅ **complete** — CLI, daemon and app all run vanilla, flagless |
 | **V3** | Cloud control plane on the vanilla contract | ②④ | 🟠 partly blocked cross-repo (#21, #36) |
 | **V4** | Security with sane defaults | ③ | ✅ **complete** — threat model, default posture, `chm posture` |
-| **V5** | The coding-agent sandbox | ①③ | 🟢 **V5.1, V5.2, V5.3, V5.5 and V5.6 shipped** — no known correctness bug left; V5.4 (cold create-from-image) now boots a stock kernel to a shell, with rootfs / cold virtio / SMP remaining |
+| **V5** | The coding-agent sandbox | ①③ | 🟢 **V5.1, V5.2, V5.3, V5.5 and V5.6 shipped** — no known correctness bug left; V5.4 (cold create-from-image) boots a stock kernel to a shell **with a real disk and NIC**, with rootfs / SMP remaining |
 | **V6** | The app tells the whole truth | ③④ | ⬜ **ready to start, nothing blocking it** |
 
 **Recommended order of attack:**
@@ -298,7 +298,7 @@ measured rather than assumed, inside a live rehydrated `graviton-1` guest on
 | V5.3 | **A purpose-built agent image.** ✅ **Done 2026-07-30, and it never needed the cloud.** Built locally on the round-2 NIC capture: grew the root partition (the 4.5 GiB past the GPT was usable once `sgdisk -e` moved the backup header) from 2.4 G/633 M free to **6.8 G/4.6 G free**, installed `build-essential` + `git` over the V5.1 NIC, and persisted the result with the SMP checkpointing from V5.6. Verified by resuming the checkpoint and compiling a *new* C program inside the rehydrated guest: `cc 13.3.0`, `git 2.43.0`, 703 packages, exit code 7 from a binary built after resume. A minimal reproducible rootfs ([`graviton-capture-request.md`](graviton-capture-request.md) §9–§12) is still wanted — smaller, manifest-built, less attack surface — but as an *optimisation*. | ✅ done |
 | V5.5 | **SMP counter coherence.** Found by V5.1 — the first 2-vCPU capture we have ever held. The vtimer offset was **per-vCPU**, seeded on each vCPU's own thread at its own `mach_absolute_time()`, so the offsets differed permanently; rate correction then re-stepped each one on guest *entry*, at cadences that differ wildly between cores (**measured: cpu0 117,950 re-steps vs cpu1 521** — cpu1 sits in `WFI`). Linux treats `CNTVCT_EL0` as one system-wide clocksource, and `arch_sys_counter` is **56-bit**, so `clocksource_delta()` turns a read one tick behind into `2^56` ticks &asymp; **18.7 guest-years** forward — which is why bounded skew was never an acceptable target. **Measured in-guest with a pinned two-thread ping-pong that establishes strict happens-before between reads: 19,992 of 40,000 ordered samples went backwards uncorrected (guest `date`: July 2101), 19,996 of 40,000 corrected, max 128 ms backwards, RCU stalls, guest wedge.** Fixed by a VM-global `VtimerClock`: one offset shared by every vCPU, moved only by a stop-the-world barrier that abandons the step rather than publish under a running vCPU. | &#9989; **Done — 0 of 40,000 backwards on both paths, `sleep 20` = 20.01 s wall, uptime +20.02 s, correction now on by default at a measured 2.8% of wall time.** |
 | V5.6 | **SMP checkpoint capture.** ✅ **Done 2026-07-30.** Capture was gated `n == 1 && id == 0`, so `--checkpoint` silently did nothing on a multi-vCPU guest — no suspend/resume, and no fork/branch/push/rollback, for any SMP sandbox. Each vCPU now captures itself on its owning thread and the orchestrator assembles one checkpoint and dumps RAM once. The blocking constraint turned out not to exist: the guest-RAM mappings are owned by `prepared` on the orchestrator thread and outlive the vCPU threads, so the dump never needed to happen on the boot CPU. `CheckpointState` gained a per-vCPU `usgic_cpus`, because `UsgicCheckpoint` mixes one VM-global distributor with three per-vCPU models — restoring vCPU 0's onto every core would have handed secondaries the boot CPU's PPI config and in-flight interrupts. | ✅ done |
-| V5.4 | Cold create-from-image (#101) so a fresh sandbox does not require a pre-existing capture. | 🟡 **a stock Ubuntu 6.8 arm64 kernel cold-boots to an interactive shell on HVF, 2026-08-03** — `chm create --kernel --initramfs`, no snapshot and no KVM host anywhere in the path; guest timekeeping measured at 3.00 s per 3 s. Found four more instances of the bug class plus the OS-lock trap. Remaining: rootfs, cold virtio (disk + net), SMP cold boot. |
+| V5.4 | Cold create-from-image (#101) so a fresh sandbox does not require a pre-existing capture. | 🟡 **a stock Ubuntu 6.8 arm64 kernel cold-boots to an interactive shell on HVF, 2026-08-03** — `chm create --kernel --initramfs`, no snapshot and no KVM host anywhere in the path; guest timekeeping measured at 3.00 s per 3 s. Found four more instances of the bug class plus the OS-lock trap. **Cold virtio landed 2026-08-03**: `--disk` and `--net` over a new virtio-mmio transport, verified against a stock kernel — sector-accurate disk reads, a guest write landing in the host file, and an HTTP 301 from api.github.com with port-specific egress denial. Remaining: rootfs image, SMP cold boot. |
 
 ### V6 · The app tells the whole truth
 
@@ -839,9 +839,128 @@ and the divergence surfaces arbitrarily far away.
 
 ##### Still not done
 
-No rootfs, no cold virtio (disk or net), and SMP cold boot is unwired — PSCI
-`CPU_ON` returns `NOT_SUPPORTED` **by design**, so a kernel that asks logs a
-failed secondary rather than hanging. Those are the remainder of #101.
+SMP cold boot is unwired — PSCI `CPU_ON` returns `NOT_SUPPORTED` **by design**,
+so a kernel that asks logs a failed secondary rather than hanging. That, and a
+rootfs image, are the remainder of #101.
+
+#### Cold virtio: a disk and a NIC for a guest that was never captured (2026-08-03)
+
+A kernel and a shell is a demo. A **disk** and a **NIC** is a sandbox. Cold boot
+needed both, and neither existed: every virtio device in this tree was
+`virtio-pci`, reconstructed from a snapshot's `state.json`.
+
+##### Why virtio-mmio, when virtio-pci already worked
+
+The device *model* is the expensive part and it is already correct — queue
+draining, notification re-arming, and the RX/TX asymmetry in the net path each
+took measurement to get right. The **transport** is the cheap part. So the work
+was to separate them rather than to write a second device.
+
+Choosing `virtio-mmio` over `virtio-pci` for the cold path removes a synthetic
+PCIe host bridge, an ECAM window, BAR programming, MSI-X tables and ITS
+translation — and `arch`'s FDT writer *already* emitted `virtio_mmio@` nodes for
+`DeviceType::Virtio(n)`, so the device-tree half was free.
+
+`hypervisor/src/hvf/virtio/devcore.rs` now holds the transport-independent
+`DeviceCore`; `pci.rs` and `mmio.rs` each contribute only their own register
+layout. A cold guest's disk I/O runs through **exactly** the code a rehydrated
+guest's does. The extraction was proven behaviour-preserving before the new
+transport was written: 191 hypervisor tests before, 191 after.
+
+##### What the driver actually demanded
+
+| | virtio-pci (restore) | virtio-mmio (cold) |
+| --- | --- | --- |
+| features | replayed from the snapshot | negotiated with the driver |
+| queue addresses | restored, never written | programmed by the driver |
+| queue size | restored | driver picks, `<= QUEUE_NUM_MAX` |
+| interrupts | MSI-X vector → LPI | one wired SPI, level status |
+
+Four things Linux requires that a reading of the spec alone does not stress, each
+now a test:
+
+- **`VIRTIO_F_VERSION_1` must be offered.** A v2 transport without it is rejected
+  outright, so `VirtioMmioDevice::new` force-adds bit 32 whatever the device says.
+- **`QueueReady` must read back.** The probe writes it, then reads it, and does
+  not trust the queue until it agrees.
+- **A notify for a queue whose `ready` is false must be ignored.** The driver
+  programs six address halves in any order; walking a half-named ring reads
+  garbage GPAs.
+- **Ring features come from `driver_features`, not what the device offered.** A
+  driver is free to decline `EVENT_IDX`.
+
+##### Ordering is a contract, not a detail
+
+Disks are placed before the NIC. Linux names virtio-blk devices in probe order
+and probes `virtio_mmio` nodes in **address** order, so a NIC placed first
+renames `/dev/vda` to `/dev/vdb` — and `root=/dev/vda` stops meaning anything.
+That ordering is asserted by a test rather than left to the reader.
+
+A related trap sits in the FDT writer and is easy to get backwards:
+`create_virtio_node` writes `dev_info.irq()` **verbatim** (SPI-relative), while
+`create_serial_node` subtracts `IRQ_BASE` (absolute INTID). Same struct field,
+two different conventions.
+
+##### Measured, on a stock Ubuntu 6.8.0-31 arm64 kernel
+
+Disk — an 8 MiB raw image with known magic at sectors 0, 1 and 4095:
+
+```
+major minor  #blocks  name
+ 253        0       8192 vda
+   C H M - V I R T I O - B L K - S E C T O R - 0 0 0 0 0 0 0 0 0 0     <- sector 0
+   C H M - V I R T I O - B L K - S E C T O R - 0 0 0 0 0 0 4 0 9 5     <- sector 4095
+ 14:          7     GICv3  34 Edge      virtio0
+```
+
+and the guest's write came back **out of the host file**, not out of its own page
+cache — `host sector 7: b'FINAL-VERIFY-WRITE-FROM-COLD-GUEST'`. The interrupt
+count is the point: completions are delivered on SPI 34, not polled.
+
+Network — the userspace NAT, DNS responder and egress policy, meeting a cold
+guest for the first time:
+
+```
+2: eth0: <BROADCAST,MULTICAST> link/ether 02:00:00:00:00:02
+64 bytes from 192.168.249.1: seq=0 ttl=64 time=0.126 ms
+Name: api.github.com   Address: 20.26.156.210
+HTTP/1.1 301 Moved Permanently
+Location: https://api.github.com/zen
+```
+
+A real HTTP response from the public internet, inside a guest that was never
+captured anywhere.
+
+##### The egress posture held, at two layers
+
+`--net` defaults to deny-all, the same posture as every other entry point
+(`docs/security-model.md` §1a); `--egress-allow host:port` is the only way out,
+and passing it *without* `--net` is a parse error rather than a reassuring no-op.
+
+Running with `--egress-allow api.github.com:80` produced two refusals worth
+recording, because they are different mechanisms:
+
+```
+[egress] DENY dns example.com (default-deny)
+[egress] DENY tcp 93.184.216.34:80 (default-deny)
+```
+
+The first is the DNS responder refusing to resolve a name the policy does not
+allow. The second is the same host refused **by raw IP**, so containment does not
+depend on the guest choosing to use our resolver. Enforcement is also
+port-specific: the allowed `:80` request succeeded, GitHub answered `301` to
+`https://`, and the follow-up to `:443` was denied by the same policy.
+
+##### One honest note on method
+
+The first run reported empty reads and a write that never reached the host file,
+which looks exactly like a broken device. It was not: the test initramfs had no
+`/dev/vda` node, and busybox `dd` had quietly created a *regular file* of that
+name in tmpfs. The 3 interrupts observed were the kernel's own partition scan —
+which is to say the device had been working the whole time and the test was
+measuring itself. `mount -t devtmpfs` fixed it. Worth recording because
+"completes but moves no data" is a plausible enough hypothesis to have sent a
+day into the queue code.
 
 ---
 
