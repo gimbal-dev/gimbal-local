@@ -35,10 +35,7 @@ use hypervisor::arch::aarch64::gic::Vgic;
 use hypervisor::hvf::checkpoint::{self as hvf_checkpoint, CheckpointState};
 use hypervisor::hvf::devices::{MmioBus, Pl011};
 use hypervisor::hvf::gic::GicMsiSink;
-use hypervisor::hvf::rehydrate::{
-    self, PreparedVm, Snapshot, enable_group1_spi_forwarding, prepare_vm, restore_distributor,
-    restore_vcpu_state, snapshot_cntfrq,
-};
+use hypervisor::hvf::rehydrate::{self, Snapshot, snapshot_cntfrq};
 use hypervisor::hvf::UsgicCpuHandle;
 use hypervisor::hvf::VtimerClock;
 use hypervisor::hvf::host_counter_hz;
@@ -134,20 +131,6 @@ pub(crate) struct PsciCoordinator {
 }
 
 impl PsciCoordinator {
-    fn from_snapshot(snap: &Snapshot) -> Arc<Self> {
-        let mut slots = Vec::with_capacity(snap.vcpus.len());
-        for vcpu in &snap.vcpus {
-            slots.push(Arc::new((
-                Mutex::new(CpuPowerState {
-                    online: vcpu.mp_state_running,
-                    cpu_on: None,
-                }),
-                Condvar::new(),
-            )));
-        }
-        Arc::new(Self { slots })
-    }
-
     /// Power state for a guest that was never captured: vCPU 0 is running
     /// because the boot protocol started it there, and every secondary is off
     /// until the kernel asks for it by `CPU_ON`.
@@ -229,9 +212,6 @@ impl ChmVmOps {
         }
     }
 
-    fn set_psci_coordinator(&self, psci: Arc<PsciCoordinator>) {
-        *self.psci.lock().unwrap() = Some(psci);
-    }
 }
 
 impl VmOps for ChmVmOps {
@@ -257,58 +237,6 @@ impl VmOps for ChmVmOps {
         };
         Ok(psci.cpu_on(target_mpidr, entry, context))
     }
-}
-
-/// Reconstruct the native virtio-pci device model from the snapshot's
-/// device-manager state and install each device into `bus` at its restored BAR.
-///
-/// Block devices get a host-backed sparse overlay (under `overlay_dir`) because
-/// cloud-hypervisor snapshots reference external disk images by path and do not
-/// embed them; the overlay lets the data path complete (reads of never-written
-/// sectors return zeroes, writes persist) without the original image. Returns
-/// the number of devices wired and a human description of each.
-/// Load-time interrupt-routing guard.
-///
-/// Apple's managed GIC cannot deliver LPIs to a non-nested EL1 guest
-/// (hardware-proven: ICH List Registers are EL2/nested-only -> HV_UNSUPPORTED,
-/// and there is no PROPBASER/PENDBASER/ITS API). A snapshot whose virtio
-/// completions are routed through the GIC ITS as LPIs would restore and then
-/// hang on its first device wait with no completion interrupt.
-///
-/// Whether this snapshot routes its virtio completion interrupts through the
-/// GIC ITS as LPIs — the routing Apple's managed Hypervisor.framework GIC
-/// physically cannot deliver, and which therefore has to run on the userspace
-/// GICv3 (`run_usgic_engine`).
-///
-/// Both entry points (`chm run` and `chm serve`) use this to route
-/// automatically, so a vanilla upstream capture just works. Only bundles the
-/// managed path would have refused outright are redirected, so nothing that
-/// works on the managed GIC changes path.
-///
-/// `CHM_ALLOW_ITS_LPI=1` forces such a capture onto the managed GIC anyway.
-/// That is a diagnostic for A/B-ing the two backends: the guest restores and
-/// then stalls on its first disk or net I/O, because the completion interrupt
-/// can never arrive.
-pub(crate) fn routes_completions_as_lpis(state_json: &str) -> bool {
-    let Ok(descs) = devmgr::parse_devices(state_json) else {
-        return false;
-    };
-    let wired_devices = descs
-        .iter()
-        .filter(|d| !d.vector_events.is_empty() && d.device_id != 0)
-        .count();
-    if its::classify_routing(state_json, wired_devices) != its::CompletionRouting::ItsLpi {
-        return false;
-    }
-    if env::var_os("CHM_ALLOW_ITS_LPI").is_some() {
-        eprintln!(
-            "chm: warning: CHM_ALLOW_ITS_LPI set -- running an ITS/LPI capture \
-             on the managed GIC; the guest will likely stall on its first I/O \
-             wait because LPI completions cannot be delivered there."
-        );
-        return false;
-    }
-    true
 }
 
 /// The counter frequency an Apple-silicon HVF guest observes, in Hz.
@@ -1529,154 +1457,20 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     // userspace and this Mac has none, so a 32-bit exec wedges the vCPU.
     aarch32_guard(&loaded.snap)?;
 
-    // Userspace-GIC path: rehydrate an ITS/LPI-routed snapshot — the kind Apple's
-    // managed GIC cannot deliver completions for — onto a software GICv3. This is
-    // the path that lifts the "GICv2M capture only" restriction (#81), so a
-    // vanilla upstream capture runs with no flag.
+    // One interrupt path. Apple's managed GIC cannot deliver LPIs (proven on
+    // hardware: ICH List Registers are EL2/nested-only, and no
+    // PROPBASER/PENDBASER/ITS API exists), so it could never run a stock
+    // cloud-hypervisor arm64 capture — every such guest wires its virtio
+    // completions through the ITS. It also cannot cold-boot: `hv_gic_create`
+    // refuses any layout with the redistributors below the distributor, which
+    // is the layout Linux expects. Measured across every capture we hold, the
+    // managed path routed nothing.
     //
-    // Routing is automatic: we only redirect bundles the managed path would have
-    // rejected outright, so nothing that works on the managed GIC changes path.
-    // `CHM_USERSPACE_GIC=1` forces it, for A/B-ing the two backends.
-    if env::var_os("CHM_USERSPACE_GIC").is_some()
-        || routes_completions_as_lpis(&loaded.state_json)
-    {
-        return run_usgic(args, loaded);
-    }
-
-    // Resume from a live checkpoint when one exists and checkpoints are enabled;
-    // a malformed/incompatible checkpoint is discarded so we cold-boot cleanly.
-    let resume_state = if args.checkpoint && checkpoint::has_checkpoint(dir) {
-        match checkpoint::read_checkpoint(dir) {
-            Ok(state) => Some(Arc::new(state)),
-            Err(e) => {
-                eprintln!("chm: warning: ignoring checkpoint ({e}); cold-booting");
-                checkpoint::clear_checkpoint(dir);
-                None
-            }
-        }
-    } else {
-        None
-    };
-    let resuming = resume_state.is_some();
-    // On resume the guest RAM comes from the checkpoint's dump; otherwise from
-    // the parent snapshot's base memory-ranges.
-    let mem_ranges = if resuming {
-        checkpoint::memory_ranges_path(dir)
-    } else {
-        loaded.mem_ranges.clone()
-    };
-
-    if !args.quiet {
-        banner(dir, &mem_ranges, loaded.num_vcpus, loaded.total_ram, "managed GICv3");
-        if resuming {
-            eprintln!("chm: resuming from a saved checkpoint (restored, not cold-booted).");
-        }
-    }
-
-    // Device model: a bus with a real PL011 at the guest's serial base.
-    let (uart, bus) = build_vm_ops(&loaded.state_json);
-    let vm_ops = Arc::new(ChmVmOps::new(bus.clone()));
-
-    let hv = hypervisor::new().map_err(|e| {
-        format!(
-            "hypervisor::new() failed: {e}\n\
-             (is the binary code-signed with the hypervisor entitlement? \
-             see scripts/build-chm.sh)"
-        )
-    })?;
-
-    // Map RAM + create the managed GIC shell (no vCPUs yet). Each vCPU is then
-    // created, restored, and run on its OWN host thread (HVF binds a vCPU to its
-    // creating thread), so the snapshot's secondary cores resume concurrently.
-    let prepared = prepare_vm(hv.as_ref(), &loaded.snap, &mem_ranges)
-        .map_err(|e| format!("prepare VM: {e}"))?;
-
-    let overlay_dir = dir.join(".chm-overlays");
-
-    // Resolve + apply resource limits (M30.6). The launch gate is admission
-    // control: a snapshot's vCPU/RAM shape is fixed, so an over-ceiling snapshot
-    // is refused rather than throttled. Runtime caps (disk overlay, console,
-    // wall-clock) are enforced by the console monitor.
-    let (limits, limits_src) = limits::resolve_limits(dir, args.limits_file.as_deref());
-    if let Some(max) = limits.max_vcpus
-        && loaded.num_vcpus > max
-    {
-        return Err(format!(
-            "snapshot declares {} vCPUs but the limit ({limits_src}) is {max} — refusing to run",
-            loaded.num_vcpus
-        ));
-    }
-    if let Some(max_mb) = limits.max_memory_mb {
-        let ram_mb = loaded.total_ram / (1024 * 1024);
-        if ram_mb > max_mb {
-            return Err(format!(
-                "snapshot needs {ram_mb} MiB RAM but the limit ({limits_src}) is {max_mb} MiB — refusing to run"
-            ));
-        }
-    }
-    if limits.is_bounded() && !args.quiet {
-        eprintln!("chm: resource limits [{limits_src}] — {}", limits.summary());
-    }
-
-    let ckpt = CheckpointMode {
-        resume_from: resume_state,
-        capture_to: args.checkpoint.then(|| dir.clone()),
-    };
-
-    // Durable audit trail (M29): record the session lifecycle and every denied
-    // egress flow to a per-workspace append-only log, so an operator can review
-    // what the sandbox did independent of the (guest-floodable) console.
-    let audit = audit::AuditLog::open(dir);
-    let egress_label = match resolve_egress_policy(&overlay_dir, args.egress_policy.as_deref()) {
-        EgressResolution::Unrestricted => "unrestricted".to_string(),
-        EgressResolution::Policy(p) => p.label().to_string(),
-        EgressResolution::FailClosed(_) => "fail-closed:deny-all".to_string(),
-    };
-    audit.session_start(
-        if resuming { "resume" } else { "cold" },
-        loaded.num_vcpus as usize,
-        loaded.total_ram / (1024 * 1024),
-        &limits.summary(),
-        &egress_label,
-    );
-    let session_started = Instant::now();
-
-    let outcome = resume_smp(
-        prepared, loaded, &bus, &uart, &vm_ops, &overlay_dir, args, &limits, ckpt, &audit,
-    )?;
-
-    let duration_s = session_started.elapsed().as_secs();
-    let outcome_label = match &outcome {
-        Outcome::PoweredOff => "powered-off".to_string(),
-        Outcome::MaxSeconds => "max-seconds".to_string(),
-        Outcome::Idle(_) => "idle".to_string(),
-        Outcome::ConsoleClosed => "console-closed".to_string(),
-        Outcome::Interrupted => "interrupted".to_string(),
-        Outcome::LimitExceeded(reason) => format!("limit-exceeded:{reason}"),
-    };
-    audit.session_stop(&outcome_label, duration_s);
-
-    if !args.quiet {
-        eprintln!();
-        match outcome {
-            Outcome::PoweredOff => eprintln!("chm: guest powered off."),
-            Outcome::MaxSeconds => {
-                eprintln!("chm: reached --max-seconds limit; stopping.");
-            }
-            Outcome::Idle(secs) => eprintln!(
-                "chm: guest produced no console output for {secs}s — stopping \
-                 (it is likely waiting on a device this build does not yet \
-                 model). Use --idle-exit 0 to keep running."
-            ),
-            Outcome::ConsoleClosed => eprintln!("chm: console closed; stopping."),
-            Outcome::Interrupted => eprintln!("chm: session closed; VM shut down."),
-            Outcome::LimitExceeded(reason) => {
-                eprintln!("chm: resource limit hit ({reason}); stopped the guest to protect the host.");
-            }
-        }
-    }
-
-    Ok(ExitCode::SUCCESS)
+    // So the product runs one GIC. The hardware evidence for *why* survives
+    // as pinned boundary tests against `hypervisor::hvf::gic` (see
+    // `hypervisor/tests/hvf_boot.rs`); what is retired is the runtime path,
+    // not the proof.
+    run_usgic(args, loaded)
 }
 
 pub(crate) enum Outcome {
@@ -1726,8 +1520,23 @@ impl its::LpiSink for UsgicLpiSink {
 }
 
 /// `chm run --userspace-gic`: drive the shared engine with an interactive
-/// terminal, then report the outcome the way the CLI always has.
 fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
+    // Session-liveness lock, held for the whole interactive session. The app
+    // reconciles which sandboxes are live by scanning these files, so it has to
+    // be taken on the path the guest actually runs on. Held in a binding rather
+    // than dropped immediately so the file survives until the session returns.
+    let _session_lock = args.session_lock.as_deref().and_then(|path| {
+        match SessionLock::acquire(path) {
+            Ok(lock) => Some(lock),
+            Err(e) => {
+                eprintln!(
+                    "chm: warning: could not write session lock {}: {e}",
+                    path.display()
+                );
+                None
+            }
+        }
+    });
     let cfg = UsgicConfig {
         dir: &args.snapshot_dir,
         quiet: args.quiet,
@@ -1932,6 +1741,9 @@ pub(crate) fn run_usgic_engine(
         inject: Arc<Mutex<Vec<u32>>>,
         wake: Arc<dyn Fn() + Send + Sync>,
         exit: Arc<dyn Fn() + Send + Sync>,
+        /// Run-progress counter, bumped once per `hv_vcpu_run` iteration. Read by
+        /// the run watchdog to detect a vCPU wedged inside a single entry.
+        progress: Option<Arc<AtomicU64>>,
         handle: UsgicCpuHandle,
     }
     let (setup_tx, setup_rx) = mpsc::channel::<Result<CpuSetup, String>>();
@@ -1991,6 +1803,7 @@ pub(crate) fn run_usgic_engine(
                 let exit = vcpu
                     .exit_signal()
                     .unwrap_or_else(|| Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>);
+                let progress = vcpu.run_progress();
                 let handle = match rehydrate::usgic_cpu_handle(&mut vcpu) {
                     Some(h) => h,
                     None => {
@@ -1998,7 +1811,8 @@ pub(crate) fn run_usgic_engine(
                         return;
                     }
                 };
-                if setup_tx.send(Ok(CpuSetup { id, inject, wake, exit, handle })).is_err() {
+                if setup_tx.send(Ok(CpuSetup { id, inject, wake, exit, progress, handle })).is_err()
+                {
                     return;
                 }
 
@@ -2101,12 +1915,32 @@ pub(crate) fn run_usgic_engine(
     let inject0 = setups[0].inject.clone();
     let wake0 = setups[0].wake.clone();
     let all_exits: Vec<Arc<dyn Fn() + Send + Sync>> = setups.iter().map(|s| s.exit.clone()).collect();
+    // Snapshot the run-progress counters alongside the exit signals, before
+    // `setups` is consumed into the shared handle table below.
+    let all_progress: Vec<Arc<AtomicU64>> =
+        setups.iter().filter_map(|s| s.progress.clone()).collect();
     let sgi_table: Arc<Vec<UsgicCpuHandle>> =
         Arc::new(setups.into_iter().map(|s| s.handle).collect());
 
     let (limits, _src) = limits::resolve_limits(dir, cfg.limits_file);
     let overlay_dir = dir.join(".chm-overlays");
+    // Durable audit trail (M29): record the session lifecycle and every denied
+    // egress flow to a per-workspace append-only log, so an operator can review
+    // what the sandbox did independent of the (guest-floodable) console.
     let audit = audit::AuditLog::open(dir);
+    let egress_label = match resolve_egress_policy(&overlay_dir, cfg.egress_policy) {
+        EgressResolution::Unrestricted => "unrestricted".to_string(),
+        EgressResolution::Policy(p) => p.label().to_string(),
+        EgressResolution::FailClosed(_) => "fail-closed:deny-all".to_string(),
+    };
+    audit.session_start(
+        if resuming { "resume" } else { "cold" },
+        n,
+        loaded.total_ram / (1024 * 1024),
+        &limits.summary(),
+        &egress_label,
+    );
+    let session_started = Instant::now();
 
     // Wire the virtio device model onto the shared bus, routing each device's
     // completions through the captured ITS to a deliverable LPI sink that injects
@@ -2116,6 +1950,10 @@ pub(crate) fn run_usgic_engine(
         queue: inject0.clone(),
         wake: wake0.clone(),
     });
+    // Held for the whole session and stopped at teardown. The daemon runs many
+    // VMs in one process, so an accept loop left running past its VM would leak a
+    // thread and hold its port for the life of the daemon.
+    let mut running_proxy: Option<credproxy::server::RunningProxy> = None;
     let net_service = match wire_virtio(
         &bus,
         &guest_mem,
@@ -2145,6 +1983,7 @@ pub(crate) fn run_usgic_engine(
                     eprintln!("chm:   - {d}");
                 }
             }
+            running_proxy = wired.proxy;
             let exits: Arc<Mutex<Vec<ExitSignal>>> = Arc::new(Mutex::new(all_exits.clone()));
             spawn_net_service(wired.net_devices, running.clone(), exits, audit.clone())
         }
@@ -2210,6 +2049,19 @@ pub(crate) fn run_usgic_engine(
     let vtimer_stepper =
         spawn_vtimer_stepper(clock.clone(), all_exits.clone(), running.clone());
 
+    // Run-progress watchdog: bounds how long any vCPU can stay wedged inside a
+    // single `hv_vcpu_run` (#78/#60). Every vCPU publishes a counter it bumps per
+    // entry; a counter that does not move for a full interval means that core is
+    // stuck, so the watchdog forces it out to re-evaluate. Only armed when every
+    // vCPU exposed both a counter and an exit signal, since a partial view would
+    // let a stalled core go unwatched while reporting healthy.
+    let run_watchdog = if env::var_os("CHM_DISABLE_RUN_WATCHDOG").is_none() {
+        (all_progress.len() == all_exits.len() && !all_progress.is_empty())
+            .then(|| spawn_run_watchdog(all_progress.clone(), all_exits.clone(), running.clone()))
+    } else {
+        None
+    };
+
     let coordinator = supervise(&UsgicSession {
         uart: &uart,
         running: &running,
@@ -2229,6 +2081,14 @@ pub(crate) fn run_usgic_engine(
     }
     if let Some(h) = vtimer_stepper {
         let _ = h.join();
+    }
+    // The watchdog observes `running`, cleared above.
+    if let Some(h) = run_watchdog {
+        let _ = h.join();
+    }
+    // Stop accepting new proxied flows; in-flight connections finish on their own.
+    if let Some(p) = running_proxy.take() {
+        p.stop();
     }
     let _ = serial_reassert.join();
     if let Some(h) = net_service {
@@ -2279,11 +2139,28 @@ pub(crate) fn run_usgic_engine(
         }
     }
 
-    let final_outcome = match vcpu_outcome {
-        Some(Ok(o)) => o,
-        Some(Err(e)) => return Err(e),
-        None => coordinator.unwrap_or(Outcome::Interrupted),
+    let resolved = match vcpu_outcome {
+        Some(Ok(o)) => Ok(o),
+        Some(Err(e)) => Err(e),
+        None => Ok(coordinator.unwrap_or(Outcome::Interrupted)),
     };
+
+    // Close the audit trail before returning, on the error path too: a session
+    // that ended because a vCPU failed is precisely the one an operator needs a
+    // durable record of, and an unmatched session-start would read as a session
+    // that never ended.
+    let outcome_label = match &resolved {
+        Ok(Outcome::PoweredOff) => "powered-off".to_string(),
+        Ok(Outcome::MaxSeconds) => "max-seconds".to_string(),
+        Ok(Outcome::Idle(_)) => "idle".to_string(),
+        Ok(Outcome::ConsoleClosed) => "console-closed".to_string(),
+        Ok(Outcome::Interrupted) => "interrupted".to_string(),
+        Ok(Outcome::LimitExceeded(reason)) => format!("limit-exceeded:{reason}"),
+        Err(_) => "error".to_string(),
+    };
+    audit.session_stop(&outcome_label, session_started.elapsed().as_secs());
+
+    let final_outcome = resolved?;
 
     // `prepared` (guest-RAM backings + VM) and `hv` are dropped here, after every
     // vCPU thread has joined (so every vCPU is destroyed before `hv_vm_destroy`).
@@ -2293,19 +2170,6 @@ pub(crate) fn run_usgic_engine(
 }
 
 
-
-/// How a run should treat live checkpoints (suspend/resume).
-///
-/// `resume_from` makes the run restore captured live state (vCPU + GIC + RAM)
-/// instead of cold-restoring from the parent snapshot; `capture_to` makes a
-/// clean external stop (suspend) write a fresh checkpoint to that snapshot dir.
-/// Both can be set: the app resumes a sandbox and re-checkpoints it on the next
-/// stop.
-#[derive(Default)]
-struct CheckpointMode {
-    resume_from: Option<Arc<CheckpointState>>,
-    capture_to: Option<PathBuf>,
-}
 
 /// RAII guard for the interactive session-liveness lock file. Writes this
 /// process's PID on creation and removes the file on drop. Because every
@@ -2330,43 +2194,6 @@ impl SessionLock {
 impl Drop for SessionLock {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
-    }
-}
-
-/// Three-state phase gate used to coordinate the SMP restore handshake between
-/// the orchestrator thread and the per-vCPU threads. A vCPU thread blocks in
-/// [`PhaseGate::wait`] until the orchestrator advances the gate to `Go` (proceed
-/// to the next phase) or `Abort` (a sibling failed; unwind cleanly).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Gate {
-    Pending,
-    Go,
-    Abort,
-}
-
-struct PhaseGate {
-    state: Mutex<Gate>,
-    cv: Condvar,
-}
-
-impl PhaseGate {
-    fn new() -> Self {
-        Self {
-            state: Mutex::new(Gate::Pending),
-            cv: Condvar::new(),
-        }
-    }
-    fn set(&self, g: Gate) {
-        *self.state.lock().unwrap() = g;
-        self.cv.notify_all();
-    }
-    /// Block until the gate leaves `Pending`; return the terminal state.
-    fn wait(&self) -> Gate {
-        let mut s = self.state.lock().unwrap();
-        while *s == Gate::Pending {
-            s = self.cv.wait(s).unwrap();
-        }
-        *s
     }
 }
 
@@ -2584,550 +2411,6 @@ pub(crate) fn apply_psci_cpu_on_state(
     vcpu.set_regs(&regs)
         .map_err(|e| format!("write regs for CPU_ON: {e}"))?;
     Ok(())
-}
-
-/// Resume every vCPU in the snapshot concurrently (SMP) on Hypervisor.framework.
-///
-/// HVF binds a vCPU to the host thread that creates it: that thread must also
-/// restore its register file and run it. So each vCPU runs on its own thread and
-/// the restore is a multi-phase handshake driven by this orchestrator thread:
-///
-/// 1. Each thread creates its vCPU and reports in (the global GIC distributor
-///    must be restored only after every redistributor exists, i.e. after every
-///    vCPU is created).
-/// 2. The orchestrator restores the global distributor, then releases the
-///    threads via `dist_gate`.
-/// 3. Each thread restores its own register file (MPIDR + ICC interface) and
-///    redistributor frame, then reports in.
-/// 4. The orchestrator enables Group1 SPI forwarding, wires the virtio device
-///    model + interactive console, then releases the threads via `go_gate`.
-/// 5. The threads run their vCPUs; the orchestrator drains the shared console
-///    and enforces the stop policy, then stops + joins every thread (each vCPU
-///    is destroyed on its owning thread).
-///
-/// mpsc channels collect the per-phase "ready" reports (rather than a barrier,
-/// which would deadlock if a thread fails early); the gates let the orchestrator
-/// broadcast `Abort` so a partially-restored set unwinds without hanging.
-#[allow(clippy::too_many_arguments)]
-fn resume_smp(
-    prepared: PreparedVm,
-    loaded: Loaded,
-    bus: &Arc<MmioBus>,
-    uart: &Arc<Pl011>,
-    vm_ops: &Arc<ChmVmOps>,
-    overlay_dir: &Path,
-    args: &Args,
-    limits: &limits::LimitsDoc,
-    ckpt: CheckpointMode,
-    audit: &audit::AuditLog,
-) -> Result<Outcome, String> {
-    let Loaded {
-        snap, state_json, ..
-    } = loaded;
-    let n = snap.vcpus.len();
-    let num_irq = snap.num_irq;
-    let snap = Arc::new(snap);
-    let psci = PsciCoordinator::from_snapshot(&snap);
-    vm_ops.set_psci_coordinator(psci.clone());
-
-    let CheckpointMode {
-        resume_from,
-        capture_to,
-    } = ckpt;
-    let capturing = capture_to.is_some();
-
-    let running = Arc::new(AtomicBool::new(true));
-    let dist_gate = Arc::new(PhaseGate::new());
-    let go_gate = Arc::new(PhaseGate::new());
-    let exits: Arc<Mutex<Vec<ExitSignal>>> = Arc::new(Mutex::new(Vec::new()));
-    // WFI wake handles for each vCPU (writes its idle-park fd). Collected so the
-    // serial input pump + re-assert tick can wake a parked vCPU the instant a
-    // keystroke's interrupt is asserted, instead of waiting for its idle poll.
-    let wakes: Arc<Mutex<Vec<ExitSignal>>> = Arc::new(Mutex::new(Vec::new()));
-    // Per-vCPU run-progress counters (bumped once per `run()` iteration). The run
-    // watchdog samples these to detect a vCPU wedged inside a single, non-
-    // returning `hv_vcpu_run` (Apple's internal WFI wait not honouring a due
-    // timer) and forces it out so it re-enters and redelivers the tick.
-    let progress: Arc<Mutex<Vec<Arc<AtomicU64>>>> = Arc::new(Mutex::new(Vec::new()));
-    let outcome: Arc<Mutex<Option<Result<Outcome, String>>>> = Arc::new(Mutex::new(None));
-    let (created_tx, created_rx) = mpsc::channel::<Result<(), String>>();
-    let (restored_tx, restored_rx) = mpsc::channel::<Result<(), String>>();
-    // Per-vCPU live-state captures, collected at suspend (each vCPU must be read
-    // on its own thread, so it sends its capture back here before it exits).
-    let (captured_tx, captured_rx) =
-        mpsc::channel::<(usize, Result<hvf_checkpoint::VcpuCheckpoint, String>)>();
-    // Serialize vCPU creation in index order: the managed GIC associates each
-    // redistributor with a vCPU at create time, so creating them out of order
-    // (two threads racing `hv_vcpu_create`) can misassign a secondary's
-    // redistributor. A turn counter makes vCPU i create only after i-1.
-    let create_turn = Arc::new((Mutex::new(0usize), Condvar::new()));
-    // Same ordered-handshake mechanism for the per-vCPU register/redistributor
-    // restore, which also touches the managed GIC and must be serialized.
-    let restore_turn = Arc::new((Mutex::new(0usize), Condvar::new()));
-
-    let mut handles = Vec::with_capacity(n);
-    for id in 0..n {
-        let vm = prepared.vm.clone();
-        let vm_ops = vm_ops.clone();
-        let snap = snap.clone();
-        let running = running.clone();
-        let dist_gate = dist_gate.clone();
-        let go_gate = go_gate.clone();
-        let exits = exits.clone();
-        let wakes = wakes.clone();
-        let progress = progress.clone();
-        let outcome = outcome.clone();
-        let created_tx = created_tx.clone();
-        let restored_tx = restored_tx.clone();
-        let captured_tx = captured_tx.clone();
-        let resume_from = resume_from.clone();
-        let create_turn = create_turn.clone();
-        let restore_turn = restore_turn.clone();
-        let power_slot = psci.slot(id);
-        let h = thread::Builder::new()
-            .name(format!("chm-vcpu{id}"))
-            .spawn(move || {
-                // --- phase 1: create this vCPU on its own thread, in id order ---
-                {
-                    let (lock, cv) = &*create_turn;
-                    let mut turn = lock.lock().unwrap();
-                    while *turn != id {
-                        turn = cv.wait(turn).unwrap();
-                    }
-                }
-                let mut vcpu = match vm.create_vcpu(id as u32, Some(vm_ops)) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        let _ = created_tx.send(Err(format!("create_vcpu {id}: {e}")));
-                        let (lock, cv) = &*create_turn;
-                        *lock.lock().unwrap() = id + 1;
-                        cv.notify_all();
-                        // Park until the orchestrator aborts the handshake.
-                        let _ = dist_gate.wait();
-                        return;
-                    }
-                };
-                {
-                    let (lock, cv) = &*create_turn;
-                    *lock.lock().unwrap() = id + 1;
-                    cv.notify_all();
-                }
-                if let Some(sig) = vcpu.exit_signal() {
-                    exits.lock().unwrap().push(sig);
-                }
-                if let Some(wake) = vcpu.wake_signal() {
-                    wakes.lock().unwrap().push(wake);
-                }
-                if let Some(p) = vcpu.run_progress() {
-                    progress.lock().unwrap().push(p);
-                }
-                let _ = created_tx.send(Ok(()));
-
-                // --- phase 2: wait for the global distributor restore ---
-                if dist_gate.wait() != Gate::Go {
-                    return;
-                }
-
-                // --- phase 3: restore this vCPU's register file + redist, in id
-                //     order. The managed GIC's redistributor register access is
-                //     not safe to drive concurrently from multiple vCPU threads
-                //     (a concurrent restore lands a secondary's redistributor on
-                //     the wrong one, so it then takes no PPI/SGI), so serialize. ---
-                {
-                    let (lock, cv) = &*restore_turn;
-                    let mut turn = lock.lock().unwrap();
-                    while *turn != id {
-                        turn = cv.wait(turn).unwrap();
-                    }
-                }
-                let restore_res = match &resume_from {
-                    Some(cp) => hvf_checkpoint::apply_vcpu(&mut vcpu, &cp.vcpus[id], cp.reference_cntvct())
-                        .map_err(|e| format!("apply checkpoint vCPU {id}: {e}")),
-                    None => restore_vcpu_state(&mut vcpu, &snap, id)
-                        .map_err(|e| format!("restore vCPU {id}: {e}")),
-                };
-                {
-                    let (lock, cv) = &*restore_turn;
-                    *lock.lock().unwrap() = id + 1;
-                    cv.notify_all();
-                }
-                if let Err(e) = restore_res {
-                    let _ = restored_tx.send(Err(e));
-                    let _ = go_gate.wait();
-                    return;
-                }
-                let _ = restored_tx.send(Ok(()));
-
-                // --- phase 4: wait for device wiring, then run the guest ---
-                if go_gate.wait() != Gate::Go {
-                    return;
-                }
-                let mut online = power_slot.0.lock().unwrap().online;
-                while running.load(Ordering::Acquire) {
-                    if !online {
-                        match wait_for_cpu_on_request(&power_slot, &running) {
-                            Some((entry, context)) => {
-                                if let Err(e) =
-                                    apply_psci_cpu_on_state(vcpu.as_mut(), entry, context)
-                                {
-                                    let mut o = outcome.lock().unwrap();
-                                    if o.is_none() {
-                                        *o = Some(Err(format!(
-                                            "vCPU {id} PSCI CPU_ON state apply failed: {e}"
-                                        )));
-                                    }
-                                    running.store(false, Ordering::Release);
-                                    break;
-                                }
-                                online = true;
-                            }
-                            None => break,
-                        }
-                    }
-                    match vcpu.run() {
-                        Ok(VmExit::Ignore) => {}
-                        Ok(VmExit::Shutdown | VmExit::Reset) => {
-                            let mut o = outcome.lock().unwrap();
-                            if o.is_none() {
-                                *o = Some(Ok(Outcome::PoweredOff));
-                            }
-                            running.store(false, Ordering::Release);
-                            break;
-                        }
-                        Ok(other) => {
-                            let mut o = outcome.lock().unwrap();
-                            if o.is_none() {
-                                *o = Some(Err(format!("vCPU {id} unexpected exit: {other:?}")));
-                            }
-                            running.store(false, Ordering::Release);
-                            break;
-                        }
-                        Err(e) => {
-                            let mut o = outcome.lock().unwrap();
-                            if o.is_none() {
-                                *o = Some(Err(format!("vCPU {id} run: {e}")));
-                            }
-                            running.store(false, Ordering::Release);
-                            break;
-                        }
-                    }
-                }
-                // Suspend: with the run loop stopped (this vCPU paused but the VM
-                // still alive), read this vCPU's live state back on its owning
-                // thread and hand it to the orchestrator. The orchestrator decides
-                // whether to persist it (only a clean external stop is suspended).
-                if capturing {
-                    let _ = captured_tx
-                        .send((id, hvf_checkpoint::capture_vcpu(&mut vcpu).map_err(|e| e.to_string())));
-                }
-                // `vcpu` drops here, on its owning thread (HVF requirement).
-            })
-            .map_err(|e| format!("spawn vCPU {id} thread: {e}"))?;
-        handles.push(h);
-    }
-    drop(created_tx);
-    drop(restored_tx);
-    drop(captured_tx);
-
-    // --- phase 1 join: every vCPU created ---
-    let mut first_err: Option<String> = None;
-    for _ in 0..n {
-        match created_rx.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                first_err.get_or_insert(e);
-            }
-            Err(_) => {
-                first_err.get_or_insert_with(|| "a vCPU thread exited before creation".into());
-            }
-        }
-    }
-    if let Some(e) = first_err {
-        dist_gate.set(Gate::Abort);
-        for h in handles {
-            let _ = h.join();
-        }
-        return Err(e);
-    }
-
-    // --- phase 2: restore the global distributor, then release the threads ---
-    let dist_res = match &resume_from {
-        Some(cp) => hvf_checkpoint::apply_distributor(&prepared.gic, &cp.gic_dist)
-            .map_err(|e| format!("apply checkpoint distributor: {e}")),
-        None => restore_distributor(&prepared.gic, &snap)
-            .map_err(|e| format!("restore distributor: {e}")),
-    };
-    if let Err(e) = dist_res {
-        dist_gate.set(Gate::Abort);
-        for h in handles {
-            let _ = h.join();
-        }
-        return Err(e);
-    }
-    dist_gate.set(Gate::Go);
-
-    // --- phase 3 join: every vCPU's register file + redistributor restored ---
-    for _ in 0..n {
-        match restored_rx.recv() {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                first_err.get_or_insert(e);
-            }
-            Err(_) => {
-                first_err.get_or_insert_with(|| "a vCPU thread exited before restore".into());
-            }
-        }
-    }
-    if let Some(e) = first_err {
-        go_gate.set(Gate::Abort);
-        for h in handles {
-            let _ = h.join();
-        }
-        return Err(e);
-    }
-
-    // --- phase 4 prep: Group1 forwarding, virtio device model, console ---
-    if let Err(e) = enable_group1_spi_forwarding(&prepared.gic) {
-        go_gate.set(Gate::Abort);
-        for h in handles {
-            let _ = h.join();
-        }
-        return Err(format!("enable Group1 forwarding: {e}"));
-    }
-
-    let net_service = match wire_virtio(
-        bus,
-        &prepared.guest_mem,
-        &state_json,
-        overlay_dir,
-        Some(&prepared.gic),
-        resume_from.is_some(),
-        args.egress_policy.as_deref(),
-        &NatLimits {
-            max_connections: limits.max_connections.map(|n| n as usize),
-            // kbps (kilobits/sec) -> bytes/sec: * 1000 / 8 = * 125.
-            max_bytes_per_sec: limits.max_bandwidth_kbps.map(|kbps| kbps * 125),
-        },
-        args.allow_local_egress,
-        None,
-        args.proxy_rules.as_deref(),
-    ) {
-        Ok(wired) => {
-            if !wired.summary.is_empty() && !args.quiet {
-                eprintln!("chm: virtio device model restored:");
-                for d in &wired.summary {
-                    eprintln!("chm:   - {d}");
-                }
-            }
-            // Start relaying guest egress through the userspace NAT.
-            spawn_net_service(wired.net_devices, running.clone(), exits.clone(), audit.clone())
-        }
-        Err(e) => {
-            eprintln!("chm: warning: virtio device model not wired: {e}");
-            None
-        }
-    };
-
-    if !args.quiet {
-        if n > 1 {
-            eprintln!("chm: resuming {n} vCPUs concurrently (SMP).");
-        }
-        eprintln!("chm: guest resumed — serial console follows.\n");
-    }
-
-    // Interactive console: raw-mode terminal + a stdin pump that feeds host
-    // keystrokes into the guest's PL011 receive path, asserting the serial SPI
-    // through the managed GIC. The guard restores the terminal on any exit path.
-    let raw_console = RawConsole::enable();
-    // Install graceful-shutdown signal handlers now that the terminal is in raw
-    // mode: closing the window (SIGHUP) or any kill (SIGTERM/SIGINT) funnels into
-    // the same teardown as Ctrl-A x / power-off, so the HVF VM is always
-    // destroyed and the terminal restored.
-    console::install_signal_handlers(raw_console.handle());
-    // Publish a session-liveness lock (PID file) if asked. It is removed when
-    // this function returns — which now happens on EVERY interactive exit — so a
-    // supervising app can detect that the session ended, even on window close.
-    let _session_lock = args.session_lock.as_deref().and_then(|path| {
-        match SessionLock::acquire(path) {
-            Ok(lock) => Some(lock),
-            Err(e) => {
-                eprintln!(
-                    "chm: warning: could not write session lock {}: {e}",
-                    path.display()
-                );
-                None
-            }
-        }
-    });
-    let serial_sink: Arc<dyn MsiSink> = Arc::new(GicMsiSink::new(prepared.gic.clone()));
-    // A waker that nudges every vCPU out of its WFI idle park, so a keystroke's
-    // serial interrupt is taken immediately. Populated during vCPU creation.
-    let serial_wake: Option<Arc<dyn Fn() + Send + Sync>> = {
-        let wakes = wakes.clone();
-        Some(Arc::new(move || {
-            for w in wakes.lock().unwrap().iter() {
-                w();
-            }
-        }))
-    };
-    console::spawn_stdin_pump(
-        uart.clone(),
-        serial_sink.clone(),
-        raw_console.handle(),
-        serial_wake.clone(),
-    );
-    // Watchdog that restores level-triggered serial RX semantics: re-asserts the
-    // interrupt if input is ever stranded in the FIFO with the guest's RXIM
-    // unmasked (e.g. after cloud-init reopens ttyAMA0), so an interactive
-    // session can never wedge waiting for an edge that already passed.
-    let serial_reassert =
-        console::spawn_serial_reassert(uart.clone(), serial_sink, serial_wake, running.clone());
-    // Run-progress watchdog: bounds how long any vCPU can stay wedged inside a
-    // single `hv_vcpu_run` (Apple's internal WFI wait not honouring a due timer),
-    // forcing it out to re-enter and redeliver the tick. Snapshot the per-vCPU
-    // counters + exit signals now that every vCPU thread has registered them.
-    // Set CHM_DISABLE_RUN_WATCHDOG=1 to opt out (diagnostics / A-B comparison).
-    let run_watchdog = if env::var_os("CHM_DISABLE_RUN_WATCHDOG").is_none() {
-        let progress = progress.lock().unwrap().clone();
-        let exits_snapshot = exits.lock().unwrap().clone();
-        Some(spawn_run_watchdog(progress, exits_snapshot, running.clone()))
-    } else {
-        None
-    };
-    if !args.quiet {
-        eprintln!(
-            "chm: interactive console active — close this window or press Ctrl-A x \
-             to end the session (it shuts the VM down cleanly).\n"
-        );
-    }
-
-    // --- phase 4 go: release the vCPU threads to run the guest ---
-    go_gate.set(Gate::Go);
-
-    // The orchestrator drains the shared console + enforces the stop policy.
-    let coordinator = run_console(uart, &running, args, limits, overlay_dir);
-
-    // Stop every vCPU thread: clear the run flag, force any in-flight `run()` to
-    // return (hv_vcpus_exit), and join — each vCPU is destroyed on its thread.
-    // Each thread captures its live state (if suspending) before it returns.
-    running.store(false, Ordering::Release);
-    psci.wake_all();
-    for sig in exits.lock().unwrap().iter() {
-        sig();
-    }
-    // Stop the net service thread (it observes `running` and exits its poll
-    // loop), then join the vCPU threads.
-    if let Some(h) = net_service {
-        let _ = h.join();
-    }
-    // Stop the serial re-assert watchdog (also observes `running`).
-    let _ = serial_reassert.join();
-    // Stop the run-progress watchdog (observes `running`).
-    if let Some(h) = run_watchdog {
-        let _ = h.join();
-    }
-    for h in handles {
-        let _ = h.join();
-    }
-    drop(raw_console);
-
-    // Suspend: persist a checkpoint ONLY on a clean external stop (the console
-    // coordinator ended the session — window close / Ctrl-A x / idle / max-secs).
-    // A guest power-off or a vCPU error means the box is finished, so the next
-    // start should cold-boot: clear any stale checkpoint instead.
-    let vcpu_outcome = outcome.lock().unwrap().take();
-    let external_stop = vcpu_outcome.is_none()
-        && matches!(
-            coordinator,
-            Ok(Outcome::Interrupted
-                | Outcome::ConsoleClosed
-                | Outcome::Idle(_)
-                | Outcome::MaxSeconds
-                | Outcome::LimitExceeded(_))
-        );
-    if let Some(dir) = &capture_to {
-        if external_stop {
-            match collect_checkpoint(&captured_rx, &prepared, &snap, num_irq, n) {
-                Ok(state) => {
-                    match checkpoint::write_checkpoint(dir, &state, &prepared.guest_mem, &snap.mem_mappings, "connect") {
-                        Ok(()) => {
-                            if !args.quiet {
-                                eprintln!("\nchm: suspended — checkpoint saved (resume to continue).");
-                            }
-                        }
-                        Err(e) => eprintln!("chm: warning: could not write checkpoint: {e}"),
-                    }
-                }
-                Err(e) => eprintln!("chm: warning: checkpoint capture failed ({e}); not suspending"),
-            }
-        } else {
-            // Powered off / errored: drop any prior checkpoint so we cold-boot.
-            checkpoint::clear_checkpoint(dir);
-        }
-    }
-
-    // Tear the VM down now that every vCPU thread has joined: `hv_vm_destroy`
-    // (inside this drop) must run only once all vCPUs are destroyed, which they
-    // are because each thread destroyed its own vCPU before returning and we have
-    // joined them all. `PreparedVm` declares `vm` last so it drops after the GIC,
-    // guest memory and RAM backings. Dropping here (rather than at scope exit)
-    // both makes that ordering explicit and consumes `prepared` by value.
-    drop(prepared);
-
-    // Flush any final console bytes emitted just before the threads stopped.
-    let tail = uart.take_output();
-    if !tail.is_empty() {
-        let mut stdout = io::stdout();
-        let _ = stdout.write_all(&tail).and_then(|()| stdout.flush());
-    }
-
-    // A vCPU-reported terminal result (power-off / error) wins; otherwise the
-    // coordinator's stop reason (max-seconds / idle / console-closed).
-    if let Some(res) = vcpu_outcome {
-        return res;
-    }
-    coordinator
-}
-
-/// Gather the per-vCPU captures (in id order) plus the global GIC distributor
-/// into a [`CheckpointState`] ready to persist. Called at suspend, after every
-/// vCPU thread has sent its capture and joined, while the VM is still alive.
-fn collect_checkpoint(
-    captured_rx: &mpsc::Receiver<(usize, Result<hvf_checkpoint::VcpuCheckpoint, String>)>,
-    prepared: &PreparedVm,
-    snap: &Snapshot,
-    num_irq: u32,
-    n: usize,
-) -> Result<CheckpointState, String> {
-    let mut vcpus: Vec<Option<hvf_checkpoint::VcpuCheckpoint>> = (0..n).map(|_| None).collect();
-    for _ in 0..n {
-        let (id, res) = captured_rx
-            .recv()
-            .map_err(|_| "a vCPU thread exited before sending its capture".to_string())?;
-        let cp = res.map_err(|e| format!("vCPU {id}: {e}"))?;
-        *vcpus
-            .get_mut(id)
-            .ok_or_else(|| format!("captured out-of-range vCPU id {id}"))? = Some(cp);
-    }
-    let vcpus = vcpus
-        .into_iter()
-        .enumerate()
-        .map(|(id, c)| c.ok_or_else(|| format!("missing capture for vCPU {id}")))
-        .collect::<Result<Vec<_>, String>>()?;
-
-    let gic_dist = hvf_checkpoint::capture_distributor(&prepared.gic, num_irq)
-        .map_err(|e| format!("capture distributor: {e}"))?;
-
-    let _ = snap; // mem layout is read by the caller via snap.mem_mappings.
-    Ok(CheckpointState {
-        version: hvf_checkpoint::CHECKPOINT_VERSION,
-        vcpus,
-        gic_dist,
-        num_irq,
-        usgic: None,
-        usgic_cpus: Vec::new(),
-        host_realtime_ns: hvf_checkpoint::now_realtime_ns(),
-    })
 }
 
 /// One vCPU's userspace-GIC suspend capture: its register file plus its
