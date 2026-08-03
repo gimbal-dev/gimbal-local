@@ -298,7 +298,7 @@ measured rather than assumed, inside a live rehydrated `graviton-1` guest on
 | V5.3 | **A purpose-built agent image.** ✅ **Done 2026-07-30, and it never needed the cloud.** Built locally on the round-2 NIC capture: grew the root partition (the 4.5 GiB past the GPT was usable once `sgdisk -e` moved the backup header) from 2.4 G/633 M free to **6.8 G/4.6 G free**, installed `build-essential` + `git` over the V5.1 NIC, and persisted the result with the SMP checkpointing from V5.6. Verified by resuming the checkpoint and compiling a *new* C program inside the rehydrated guest: `cc 13.3.0`, `git 2.43.0`, 703 packages, exit code 7 from a binary built after resume. A minimal reproducible rootfs ([`graviton-capture-request.md`](graviton-capture-request.md) §9–§12) is still wanted — smaller, manifest-built, less attack surface — but as an *optimisation*. | ✅ done |
 | V5.5 | **SMP counter coherence.** Found by V5.1 — the first 2-vCPU capture we have ever held. The vtimer offset was **per-vCPU**, seeded on each vCPU's own thread at its own `mach_absolute_time()`, so the offsets differed permanently; rate correction then re-stepped each one on guest *entry*, at cadences that differ wildly between cores (**measured: cpu0 117,950 re-steps vs cpu1 521** — cpu1 sits in `WFI`). Linux treats `CNTVCT_EL0` as one system-wide clocksource, and `arch_sys_counter` is **56-bit**, so `clocksource_delta()` turns a read one tick behind into `2^56` ticks &asymp; **18.7 guest-years** forward — which is why bounded skew was never an acceptable target. **Measured in-guest with a pinned two-thread ping-pong that establishes strict happens-before between reads: 19,992 of 40,000 ordered samples went backwards uncorrected (guest `date`: July 2101), 19,996 of 40,000 corrected, max 128 ms backwards, RCU stalls, guest wedge.** Fixed by a VM-global `VtimerClock`: one offset shared by every vCPU, moved only by a stop-the-world barrier that abandons the step rather than publish under a running vCPU. | &#9989; **Done — 0 of 40,000 backwards on both paths, `sleep 20` = 20.01 s wall, uptime +20.02 s, correction now on by default at a measured 2.8% of wall time.** |
 | V5.6 | **SMP checkpoint capture.** ✅ **Done 2026-07-30.** Capture was gated `n == 1 && id == 0`, so `--checkpoint` silently did nothing on a multi-vCPU guest — no suspend/resume, and no fork/branch/push/rollback, for any SMP sandbox. Each vCPU now captures itself on its owning thread and the orchestrator assembles one checkpoint and dumps RAM once. The blocking constraint turned out not to exist: the guest-RAM mappings are owned by `prepared` on the orchestrator thread and outlive the vCPU threads, so the dump never needed to happen on the boot CPU. `CheckpointState` gained a per-vCPU `usgic_cpus`, because `UsgicCheckpoint` mixes one VM-global distributor with three per-vCPU models — restoring vCPU 0's onto every core would have handed secondaries the boot CPU's PPI config and in-flight interrupts. | ✅ done |
-| V5.4 | Cold create-from-image (#101) so a fresh sandbox does not require a pre-existing capture. | 🟡 **a stock Ubuntu 6.8 arm64 kernel cold-boots to an interactive shell on HVF, 2026-08-03** — `chm create --kernel --initramfs`, no snapshot and no KVM host anywhere in the path; guest timekeeping measured at 3.00 s per 3 s. Found four more instances of the bug class plus the OS-lock trap. **Cold virtio landed 2026-08-03**: `--disk` and `--net` over a new virtio-mmio transport, verified against a stock kernel — sector-accurate disk reads, a guest write landing in the host file, and an HTTP 301 from api.github.com with port-specific egress denial. Remaining: rootfs image, SMP cold boot. |
+| V5.4 | Cold create-from-image (#101) so a fresh sandbox does not require a pre-existing capture. | 🟡 **a stock Ubuntu 6.8 arm64 kernel cold-boots to an interactive shell on HVF, 2026-08-03** — `chm create --kernel --initramfs`, no snapshot and no KVM host anywhere in the path; guest timekeeping measured at 3.00 s per 3 s. Found four more instances of the bug class plus the OS-lock trap. **Cold virtio landed 2026-08-03**: `--disk` and `--net` over a new virtio-mmio transport, verified against a stock kernel — sector-accurate disk reads, a guest write landing in the host file, and an HTTP 301 from api.github.com with port-specific egress denial. **SMP cold boot landed 2026-08-03**: `--cpus N` brings up secondary cores via PSCI `CPU_ON`, verified at 1/2/4 vCPU with user time, per-core timer PPIs and IPIs on every core. Remaining: rootfs image. |
 
 ### V6 · The app tells the whole truth
 
@@ -963,6 +963,85 @@ measuring itself. `mount -t devtmpfs` fixed it. Worth recording because
 day into the queue code.
 
 ---
+
+#### Cold SMP: bringing up secondary cores on a guest with no capture (2026-08-03)
+
+`chm create --cpus N` now boots a stock Ubuntu 6.8 arm64 kernel onto **N real
+vCPUs**, with PSCI `CPU_ON`, per-core timers and cross-core IPIs. Measured at
+1, 2 and 4 vCPUs.
+
+Every piece of this — the PSCI coordinator, the per-vCPU checkpoint models, the
+SGI router — already existed for the **restore** path. None of it worked cold,
+and the reason is the same each time: **a rehydrated guest never discovers its
+hardware.** It wakes with the GIC already probed, the redistributor already
+matched to its core, and every base register already latched. A cold guest does
+all of that from scratch, and the discovery path was where the bugs were.
+
+Four bugs, in the order the guest hit them.
+
+**1. Each vCPU could only see its own redistributor frame.** The MMIO decode
+was `ipa >= gicr_base && ipa < gicr_base + 0x20000` — the running core's frame
+alone. But `gic_iterate_rdists` runs on the **boot CPU** and walks *every*
+frame in the region reading `GICR_TYPER` until it finds the `Last` bit. On real
+hardware every frame is visible to every core. So the boot CPU data-aborted on
+frame 1: `Internal error: Oops: 0000000096000007` in `gic_iterate_rdists`,
+before a secondary had even been asked for.
+
+The redistributors are now one shared `Arc<Vec<Mutex<Redistributor>>>` with a
+per-vCPU `redist_index`; `redist_frame(ipa)` recovers the region base and
+returns `(frame, offset)` for any address in it. `Default` is a single frame,
+so the single-vCPU and restore paths are byte-identical.
+
+**2. A secondary started at EL0.** `setup_regs` — which sets `PSTATE` to EL1h
+with `DAIF` masked — only ran for the boot CPU, because a secondary has no
+entry point until `CPU_ON` names one. HVF resets a fresh vCPU to EL0, so the
+secondary's first instruction fetch aborted from a lower EL (`EC=0x20`) and
+vectored to `VBAR_EL1 = 0`. PSCI defines the entry state for a core brought up
+by `CPU_ON`: highest implemented non-secure EL, interrupts masked. A parked
+vCPU is now put there at creation.
+
+**3. `GICR_TYPER` was truncated to 32 bits — and this is the one that mattered
+most.** The register models are 32-bit, and `usgic_mmio` returned `u32`. Linux
+reads `GICR_TYPER` as **one doubleword**, and the affinity it matches against
+its own `MPIDR_EL1` lives in **bits [63:32]**. Folded onto the low word, every
+frame reported affinity 0 — so the boot CPU (affinity 0) always found itself,
+and no secondary ever could. The symptom was a silent whole-guest hang, with
+`gic_populate_rdist` spinning on a core with no console.
+
+Accesses now carry their width: a doubleword splits into the two word halves
+the models already implement (`GICR_TYPER` at `+0x8`/`+0xC`, `GICR_PROPBASER`
+at `+0x70`/`+0x74`, `GICD_IROUTER`). This was invisible on the restore path for
+the same reason as the other three: the guest reads `GICR_TYPER` exactly once,
+during discovery.
+
+**4. PSCI returned `NOT_SUPPORTED`.** `ColdVmOps::psci_vcpu_on` was hardcoded
+`Ok(-1)`. `PsciCoordinator` gained a `cold()` constructor — vCPU 0 online
+because the boot protocol started it there, every secondary off until the
+kernel asks — and `create.rs` grew the N-thread setup/go handshake the restore
+path already used, since HVF binds a vCPU to its creating thread.
+
+**Measured, on the signed binary, with a stock Ubuntu 6.8.0-31 kernel:**
+
+| | 1 vCPU | 2 vCPU | 4 vCPU |
+| --- | --- | --- | --- |
+| `/sys/devices/system/cpu/online` | `0` | `0-1` | `0-3` |
+| user jiffies after saturating every core | 9 | 11 / 11 | 11 / 11 / 12 / 11 |
+| `arch_timer` PPI 27, per core | 193 | 127 / 96 | 222 / 197 / 182 / 201 |
+| IPI0 rescheduling, per core | 0 | 27 / 39 | 21 / 10 / 22 / 20 |
+| IPI1 function call, per core | 0 | 154 / 199 | 222 / 218 / 64 / 72 |
+
+Non-zero user time on *every* core is the load-bearing number: it proves the
+secondaries execute work, not merely that they exist. Non-zero IPI rows in both
+directions prove cross-vCPU SGI delivery. `arch_timer` on every core proves
+per-core PPI delivery through the right redistributor frame.
+
+Composed with the virtio work: `--cpus 2 --disk --net` reads the host disk
+magic, pings the NAT gateway at 0.17 ms, and shows virtio SPIs 34/35 alongside
+per-core timers and IPIs.
+
+**Regression, not just progress.** The shared-redistributor and access-width
+changes are on the *restore* path too, so a 2-vCPU Graviton2 capture was
+re-run: 2 cores online, IPI0 1743/1961 and IPI1 3030/7006. Unchanged.
 
 ## 8. Historical milestone detail (M25–M32)
 
