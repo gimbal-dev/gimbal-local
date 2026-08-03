@@ -54,6 +54,10 @@ final class AppModel: ObservableObject {
     @Published var cloud = CloudOverview.offline
     @Published var cloudSnapshots: [CloudSnapshot] = []
     @Published var branches: [PlaneBranch] = []
+    /// Bring-your-own images discovered on disk, including the ones we refuse
+    /// and why -- a directory the user meant as an image should say what is
+    /// wrong with it, not silently vanish from the list.
+    @Published var localImages: [LocalImageLibrary.Entry] = []
     @Published var bringingDownID: String?
     // Live state for cloud-origin sandboxes (they run via the one-shot `chm
     // runner`, not the daemon, so their state is tracked here rather than derived
@@ -186,6 +190,7 @@ final class AppModel: ObservableObject {
         defer { isRefreshing = false }
 
         await refreshLocal()
+        refreshLocalImages()
 
         // Local-only means local-only. Hiding the cloud UI while still calling
         // out to a control plane every refresh would make the setting a
@@ -712,14 +717,6 @@ final class AppModel: ObservableObject {
         // was (live memory + disk), rather than cold-booting. `runPath` is the
         // sandbox's isolated workspace so its state stays separate from other
         // sandboxes launched from the same image.
-        //
-        // Terminal.app's `do script` runs a command *string*, so we cannot hand
-        // it a raw argv for `chm` itself. But we avoid a second escaping layer by
-        // passing the (already single-quoted, control-char-validated by
-        // `InteractiveTerminalCommand`, M30.3) command to `osascript` as an
-        // argv parameter via `on run argv` — never interpolated into the
-        // AppleScript source — so a path can never break out of the script text
-        // into host code (M30.3 follow-up, #67).
         let command = try InteractiveTerminalCommand.shellCommand(
             chmPath: settings.chmPath,
             runPath: runPath,
@@ -727,7 +724,45 @@ final class AppModel: ObservableObject {
             lockPath: lockPath,
             workdir: FileManager.default.currentDirectoryPath
         )
+        try openTerminal(runningShellCommand: command)
+    }
 
+    /// Cold-boot a local image: `chm create` in its own Terminal window, with no
+    /// snapshot and no control plane in the path.
+    ///
+    /// Deliberately the same launch mechanism as `openInteractiveTerminal`. HVF
+    /// allows one VM per process, so a subprocess is the correct shape, not a
+    /// shortcut around the daemon.
+    func coldBoot(image: LocalImage, options: ColdBootTerminalCommand.Options = .init()) {
+        do {
+            let command = try ColdBootTerminalCommand.shellCommand(
+                chmPath: settings.chmPath,
+                image: image,
+                options: options,
+                workdir: FileManager.default.currentDirectoryPath
+            )
+            try openTerminal(runningShellCommand: command)
+            appendLog("cold boot: \(image.name) (kernel \(image.kernelPath))")
+        } catch {
+            appendLog("cold boot failed for \(image.name): \(error.localizedDescription)")
+        }
+    }
+
+    /// Rescan the local image directory. Cheap, and driven by the same refresh
+    /// loop as everything else, so dropping an image into the folder makes it
+    /// appear without restarting the app.
+    func refreshLocalImages() {
+        localImages = LocalImageLibrary.scan(root: settings.localImagesPath)
+    }
+
+    /// Hand an already-quoted, already-validated shell command to Terminal.app.
+    ///
+    /// Terminal.app's `do script` runs a command *string*, so we cannot hand it
+    /// a raw argv for `chm` itself. But we avoid a second escaping layer by
+    /// passing the command to `osascript` as an argv parameter via `on run
+    /// argv` — never interpolated into the AppleScript source — so a path can
+    /// never break out of the script text into host code (M30.3 follow-up, #67).
+    private func openTerminal(runningShellCommand command: String) throws {
         // The script is a constant with no interpolation; the command travels as
         // argv item 1, so AppleScript string-literal escaping is not needed.
         let script = """

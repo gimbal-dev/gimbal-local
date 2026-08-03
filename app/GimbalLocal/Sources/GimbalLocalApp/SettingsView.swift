@@ -232,6 +232,11 @@ private struct PathsSettingsTab: View {
             Section("Runtime paths") {
                 PathField(label: "chm binary", text: $model.settings.chmPath, prompt: "target/debug/chm")
                 PathField(label: "Snapshot library", text: $model.settings.libraryPath, prompt: "snapshots")
+                PathField(label: "Local images", text: $model.settings.localImagesPath, prompt: "images")
+                Text("A directory of bring-your-own images. Each subdirectory holds an uncompressed arm64 `Image` (plus an optional initramfs and raw disks), or an `image.json` naming them. These cold-boot with no snapshot and no control plane.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
                 PathField(label: "Socket", text: $model.settings.socketPath, prompt: "/tmp/gimbal-local/chm.sock")
             }
 

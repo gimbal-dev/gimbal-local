@@ -7,15 +7,32 @@ import Foundation
 struct AppSettings {
     var chmPath: String
     var libraryPath: String
+    /// Directory holding bring-your-own images: a kernel plus optional
+    /// initramfs/disks per subdirectory. Separate from `libraryPath` because a
+    /// snapshot bundle and a cold-boot image are different things with
+    /// different provenance — one was captured on a KVM host, the other is
+    /// files you put on this Mac.
+    var localImagesPath: String
     var socketPath: String
     var controlPlaneURL: String
 
     static let defaults = AppSettings(
         chmPath: defaultChmPath(),
         libraryPath: defaultLibraryPath(),
+        localImagesPath: defaultLocalImagesPath(),
         socketPath: "\(NSTemporaryDirectory())gimbal-local/chm.sock",
         controlPlaneURL: "http://127.0.0.1:8080"
     )
+
+    private static func defaultLocalImagesPath() -> String {
+        if let images = ProcessInfo.processInfo.environment["GIMBAL_IMAGES"], !images.isEmpty {
+            return images
+        }
+        if let root = repoRootCandidate() {
+            return root.appending(path: "images").path
+        }
+        return "images"
+    }
 
     private static func defaultChmPath() -> String {
         if let chm = ProcessInfo.processInfo.environment["CHM_PATH"], !chm.isEmpty {
