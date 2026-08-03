@@ -1184,6 +1184,87 @@ dumped)`**. `node` barely JITs and `npm` JITs heavily, which is the workload
 `CTR_EL0` bit (DIC) that differs between the capture host and Apple silicon —
 recorded there as latent and *"stressed without fault"*. It now has a fault.
 
+## 7c. V6.8 — why npm dies on a rehydrated Graviton guest
+
+`node --version` printed `v22.23.2`. `npm --version` printed
+`Illegal instruction (core dumped)`. Same binary, same guest, seconds apart.
+
+The cause is one bit, and it was already written down. V1.4's audit recorded
+`CTR_EL0.DIC` as the single bit differing between the capture host and Apple
+silicon, filed it as latent, and predicted it would bite *kernel* code patching.
+It was stressed there — module load, ftrace, jump labels — and did not fire. The
+audit then concluded userspace was safe, for a reason that is true but not
+sufficient: the guest applies Neoverse-N1 erratum 1542419, traps EL0 `CTR_EL0`
+reads and reports `DIC = 0`, so a userspace JIT does issue `ic ivau`.
+
+**Userspace being told the truth is not enough, because part of the maintenance
+is the kernel's job.** `__sync_icache_dcache()` runs when userspace makes a page
+executable, and it is backed by `caches_clean_inval_pou()` — the function Linux
+alternative-patched `ic ivau` out of, at boot, on a host that reported
+`DIC = 1`. Those NOPs are baked into the kernel text inside the snapshot.
+
+### Measured
+
+Executing freshly written code and checking whether the value returned is the
+one just written (`scripts/hvf/icache-coherency-probe.py`, rerunnable in any
+guest, no compiler required):
+
+| probe | stale |
+| --- | --- |
+| same page rewritten, no maintenance | 1997 / 2000 |
+| same page rewritten, explicit `ic ivau` | **0 / 2000** |
+| **`mmap(RW)` → write → `mprotect(RX)` → call** | **955 / 1000** |
+| as above, plus explicit `ic ivau` | **0 / 1000** |
+
+Row 3 is the JIT path and must be 0 on a sound kernel. Rows 2 and 4 show the
+hardware and the instruction both work; only the kernel's elided copy is wrong.
+
+### How it was found, and one wrong turn worth recording
+
+The first hypothesis was this exact bit, and an in-guest probe appeared to
+**disprove** it: userspace reads `DIC = 0`, so JITs do the right thing. That was
+a correct measurement of the wrong half, and treating it as decisive would have
+closed the investigation on a true fact and a false conclusion.
+
+What reopened it was refusing to stop at a clean single result. A statistical
+bisect showed the fault was *intermittent* — and that pinning to one vCPU made
+it **worse**, 10/15 versus 2/15. A cross-vCPU coherency problem improves under
+pinning. Staying on one core instead maximises the chance that core's I-cache
+still holds the stale line, which is the signature of a missing invalidate
+rather than a missing broadcast. Only then did the kernel half come into view.
+
+| variant | failures |
+| --- | --- |
+| `npm --version` | 2/15 |
+| `npm --version`, `taskset -c 0` | 10/15 |
+| `--predictable` (single-threaded V8) | 2/15 |
+| `--jitless` | **0/15** |
+
+### Shipped
+
+`icache_dic_guard` warns at load on both the `run` and `serve` paths, and
+`CHM_STRICT_ICACHE=1` refuses. It mirrors `aarch32_guard`: nothing can be
+repaired at rehydrate time, and refusing by default would block every Graviton
+capture over a hazard that only affects workloads generating code at runtime.
+`chm posture` reports it.
+
+### What actually fixes it
+
+- **Cold boot.** A kernel that boots here reads this Mac's own `CTR_EL0`, sees
+  `DIC = 0`, and keeps its `ic ivau`. Immune by construction — which makes the
+  cold-boot path (V5.4 / #101) load-bearing for agent workloads, not just a
+  convenience.
+- **A capture host reporting `DIC = 0`.** This is a property of the capture
+  host, not the workload. Graviton2 is Neoverse-N1 and reports 1. Worth asking
+  gimbal cloud what Graviton3/4 report before assuming a newer instance helps.
+
+### Consequence for V7
+
+`v7-agent-acceptance` runs the Copilot CLI, which is a Node/npm workload, so it
+inherits this. It should run on a cold-booted guest, or on a capture from
+`DIC = 0` hardware — not on a rehydrated Graviton2 capture.
+
+
 ## 8. Historical milestone detail (M25–M32)
 
 The sections below are the **previous** milestone structure, kept for the shipped

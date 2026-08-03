@@ -270,6 +270,28 @@ fn assess(dir: &Path) -> Vec<Control> {
         },
     });
 
+    // V6.8 — the elided `ic ivau`. Like the AArch32 wedge this is a
+    // correctness hazard rather than a security boundary, but it is
+    // guest-reachable and silent, so it belongs in a posture report.
+    let strict_ic = env::var("CHM_STRICT_ICACHE").is_ok();
+    out.push(Control {
+        invariant: "V6.8",
+        name: "stale-icache refusal",
+        state: if strict_ic {
+            State::Active
+        } else {
+            State::NotApplicable
+        },
+        detail: if strict_ic {
+            "CHM_STRICT_ICACHE — a snapshot whose kernel elided `ic ivau` is refused".to_string()
+        } else {
+            "warn-only: a capture taken on CTR_EL0.DIC=1 hardware runs JITs that \
+             intermittently execute stale code (docs/cpu-feature-deltas.md). \
+             CHM_STRICT_ICACHE=1 to refuse."
+                .to_string()
+        },
+    });
+
     out
 }
 
