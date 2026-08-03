@@ -43,8 +43,10 @@ use std::time::Instant;
 use hypervisor::VmExit;
 use hypervisor::VmOps;
 use hypervisor::hvf::VtimerClock;
+use arch::aarch64::layout::LEGACY_RTC_MAPPED_IO_START;
 use hypervisor::hvf::devices::MmioBus;
 use hypervisor::hvf::devices::Pl011;
+use hypervisor::hvf::devices::Pl031;
 use hypervisor::hvf::host_counter_hz;
 use hypervisor::hvf::rehydrate;
 use hypervisor::hvf::UsgicCpuHandle;
@@ -317,6 +319,13 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     let uart = Arc::new(Pl011::new());
     let bus = Arc::new(MmioBus::new());
     bus.add(PL011_BASE, PL011_SIZE, uart.clone());
+    // The wall clock. Cheap, and without it the guest's idea of "now" is a
+    // kernel build constant, which breaks TLS rather than merely being untidy.
+    bus.add(
+        LEGACY_RTC_MAPPED_IO_START.0,
+        coldboot::PL031_SIZE,
+        Arc::new(Pl031::new()),
+    );
 
     // SAFETY: `image` owns the allocation and is kept alive below (it is
     // dropped only after `prepared`, which holds the VM). `host_ptr` is the

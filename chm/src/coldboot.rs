@@ -118,7 +118,16 @@ const VIRTIO_MMIO_BASE: u64 = layout::MEM_32BIT_DEVICES_START.0;
 
 /// `INTID` of the first virtio device. PL011 holds 33; SPIs count up from
 /// `IRQ_BASE` (32), so 34 is the next free one.
-const VIRTIO_IRQ_BASE: u32 = PL011_IRQ + 1;
+/// SPI for the PL031 RTC. The guest never actually takes it -- Linux's pl031
+/// driver only arms the alarm interrupt when userspace sets a wakealarm -- but
+/// the FDT node requires one and an interrupt the tree does not describe is a
+/// worse failure than one that is never raised.
+pub const PL031_IRQ: u32 = PL011_IRQ + 1;
+
+/// Size of the PL031 MMIO window.
+pub const PL031_SIZE: u64 = 0x1000;
+
+const VIRTIO_IRQ_BASE: u32 = PL031_IRQ + 1;
 
 /// The most virtio devices a cold guest can have, bounding both the MMIO
 /// windows and the SPIs they consume out of `COLD_NR_IRQS`.
@@ -660,6 +669,19 @@ pub fn build(cfg: &ColdBootConfig) -> Result<ColdGuestImage, String> {
             addr: layout::LEGACY_SERIAL_MAPPED_IO_START.0,
             irq: PL011_IRQ,
             len: PL011_SIZE,
+        },
+    );
+
+    // A cold guest has no snapshot to inherit a wall clock from, so without
+    // this it boots believing it is whenever the kernel was built. Every TLS
+    // handshake then rejects certificates as "not yet valid", which presents as
+    // a network fault and is not one. See `Pl031`.
+    device_info.insert(
+        (DeviceType::Rtc, DeviceType::Rtc.to_string()),
+        FdtDevice {
+            addr: layout::LEGACY_RTC_MAPPED_IO_START.0,
+            irq: PL031_IRQ,
+            len: PL031_SIZE,
         },
     );
 
