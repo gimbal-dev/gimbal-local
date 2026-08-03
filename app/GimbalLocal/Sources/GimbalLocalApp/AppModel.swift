@@ -95,6 +95,19 @@ final class AppModel: ObservableObject {
     @Published var liveLocalSessionIDs: Set<String> = []
     @Published var welcomeDismissed = UserDefaults.standard.bool(forKey: "gimbal.welcomeDismissed")
 
+    /// Local-only mode: hide every surface that needs the control plane.
+    ///
+    /// Gimbal Local is useful with no control plane at all — it cold-boots its
+    /// own guests and runs images from disk. Showing a Cloud section that can
+    /// only ever say "offline" advertises a dependency the app does not have,
+    /// which is both untrue and discouraging. This lets an install be honestly
+    /// local.
+    ///
+    /// Off by default, because hiding a feature the user has is worse than
+    /// showing one they have not set up yet. `UserDefaults.bool` returns false
+    /// when the key is absent, so the default falls out of the read.
+    @Published var localOnly = UserDefaults.standard.bool(forKey: "gimbal.localOnly")
+
     /// The last security posture we were able to read, and why we could not.
     ///
     /// Held as an optional rather than defaulting to an empty report on
@@ -145,6 +158,7 @@ final class AppModel: ObservableObject {
     private let sandboxesDefaultsKey = "gimbal.sandboxes"
     private let welcomeDefaultsKey = "gimbal.welcomeDismissed"
     private let globalDefaultsKey = "gimbal.globalDefaults"
+    private let localOnlyDefaultsKey = "gimbal.localOnly"
     private let maxRecents = 8
 
     func bootstrap() async {
@@ -172,6 +186,25 @@ final class AppModel: ObservableObject {
         defer { isRefreshing = false }
 
         await refreshLocal()
+
+        // Local-only means local-only. Hiding the cloud UI while still calling
+        // out to a control plane every refresh would make the setting a
+        // cosmetic lie -- the user asked the app not to depend on one, so it
+        // must not reach for one. This also keeps a stale `cloud` snapshot list
+        // from lingering behind the toggle.
+        guard !localOnly else {
+            cloud = CloudOverview(
+                state: .offline("local-only mode"),
+                runners: nil,
+                snapshots: nil,
+                sandboxes: nil,
+                costSummary: nil
+            )
+            cloudSnapshots = []
+            branches = []
+            return
+        }
+
         cloud = await controlPlane.overview(baseURL: settings.controlPlaneURL)
         cloudSnapshots = await controlPlane.listSnapshots(baseURL: settings.controlPlaneURL)
         branches = await chm.branches(api: settings.controlPlaneURL, settings: settings)
@@ -1302,6 +1335,17 @@ final class AppModel: ObservableObject {
     func dismissWelcome() {
         welcomeDismissed = true
         UserDefaults.standard.set(true, forKey: welcomeDefaultsKey)
+    }
+
+    /// Persist local-only mode, and make sure the user is not left staring at a
+    /// page that no longer has a way back. Hiding the section the current
+    /// selection lives in would otherwise strand the detail pane on a view the
+    /// sidebar can no longer reach.
+    func saveLocalOnly() {
+        UserDefaults.standard.set(localOnly, forKey: localOnlyDefaultsKey)
+        if localOnly, selection == .cloudHome {
+            selection = .sandboxesHome
+        }
     }
 
     func loadSandboxes() {

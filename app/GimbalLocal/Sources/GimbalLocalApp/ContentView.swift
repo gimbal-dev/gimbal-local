@@ -99,18 +99,20 @@ private struct Sidebar: View {
                         .tag(SidebarItem.capabilityHome)
                 }
 
-                Section("Cloud") {
-                    SidebarPageRow(
-                        title: "Cloud snapshots",
-                        systemImage: "cloud.fill",
-                        count: model.cloudSnapshots.count
-                    )
-                    .tag(SidebarItem.cloudHome)
+                if !model.localOnly {
+                    Section("Cloud") {
+                        SidebarPageRow(
+                            title: "Cloud snapshots",
+                            systemImage: "cloud.fill",
+                            count: model.cloudSnapshots.count
+                        )
+                        .tag(SidebarItem.cloudHome)
 
-                    if case .offline = model.cloud.state {
-                        Text("Control plane offline.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        if case .offline = model.cloud.state {
+                            Text("Control plane offline.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
                     }
                 }
             }
@@ -477,11 +479,13 @@ private struct EngineStatusBar: View {
                 ProgressView().controlSize(.small).padding(.trailing, 2)
             }
 
-            HStack(spacing: 6) {
-                StatusDot(color: cloudColor, size: 7)
-                Text(cloudLabel)
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
+            if !model.localOnly {
+                HStack(spacing: 6) {
+                    StatusDot(color: cloudColor, size: 7)
+                    Text(cloudLabel)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
             }
 
             SettingsLink {

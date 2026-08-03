@@ -5,18 +5,48 @@
 import SwiftUI
 
 struct SettingsView: View {
+    @EnvironmentObject private var model: AppModel
+
     var body: some View {
         TabView {
+            GeneralSettingsTab()
+                .tabItem { Label("General", systemImage: "gearshape") }
             EngineSettingsTab()
                 .tabItem { Label("Engine", systemImage: "cpu") }
             DefaultsSettingsTab()
                 .tabItem { Label("Defaults", systemImage: "slider.horizontal.3") }
             PathsSettingsTab()
                 .tabItem { Label("Runtime", systemImage: "folder") }
-            ControlPlaneSettingsTab()
-                .tabItem { Label("Control plane", systemImage: "cloud") }
+            if !model.localOnly {
+                ControlPlaneSettingsTab()
+                    .tabItem { Label("Control plane", systemImage: "cloud") }
+            }
         }
         .frame(width: 520, height: 440)
+    }
+}
+
+/// App-wide shape controls. The local-only switch lives here rather than on the
+/// Control plane tab on purpose: a switch that hides the pane it sits on is a
+/// switch you cannot turn back off.
+private struct GeneralSettingsTab: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        Form {
+            Section("Scope") {
+                Toggle("Local only — hide everything that needs a control plane", isOn: $model.localOnly)
+                Text("Gimbal Local runs entirely on this Mac: it cold-boots its own guests and runs images from disk, with no control plane anywhere in the path. Turn this on and the app hides the Cloud section and stops reaching for a control plane at all — no polling, no requests. Off by default, because hiding a feature you have is worse than showing one you have not set up yet.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .formStyle(.grouped)
+        .onChange(of: model.localOnly) { _, _ in
+            model.saveLocalOnly()
+            Task { await model.refreshAll() }
+        }
     }
 }
 
