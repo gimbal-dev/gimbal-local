@@ -1332,9 +1332,27 @@ fn advance_to_wall_clock(
     if guest_hz == 0 {
         return captured;
     }
-    let elapsed_ns = u128::from(now_realtime_ns.saturating_sub(then));
+    let measured_ns = u128::from(now_realtime_ns.saturating_sub(then));
+    let elapsed_ns = forced_advance_ns().unwrap_or(measured_ns);
     let ticks = elapsed_ns * u128::from(guest_hz) / 1_000_000_000;
     captured.wrapping_add(u64::try_from(ticks).unwrap_or(0))
+}
+
+/// A `CHM_FORCE_RESUME_ADVANCE_S` override for the elapsed span used above, in
+/// whole seconds.
+///
+/// Diagnostic only. The guest's virtual counter jumping forward on resume is
+/// invisible to it — a real suspend/resume tells the kernel, and this cannot —
+/// so a large jump lands as "the tick stopped for N seconds" and has to be
+/// caught up. Whether that is survivable is a function of the *jump*, but the
+/// jump is normally a function of how long the checkpoint sat on disk, so the
+/// two cannot be told apart by waiting. This knob varies the jump while holding
+/// elapsed time constant, which is the only way to attribute a resume-time stall
+/// to one or the other.
+fn forced_advance_ns() -> Option<u128> {
+    let raw = std::env::var("CHM_FORCE_RESUME_ADVANCE_S").ok()?;
+    let secs: u64 = raw.trim().parse().ok()?;
+    Some(u128::from(secs) * 1_000_000_000)
 }
 
 /// Host wall clock now, in nanoseconds since the Unix epoch.
