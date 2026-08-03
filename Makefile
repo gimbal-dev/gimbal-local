@@ -14,10 +14,10 @@ help:
 	@echo "  make chm                      Build + code-sign the chm binary"
 	@echo "  make chm-run DIR=<snapshot>   Resume a snapshot, stream console"
 	@echo "  make chm-serve DIR=<library>  Run the daemon over a snapshot library"
-	@echo "  make clippy                   Lint chm + hvf hypervisor configs"
+	@echo "  make clippy                   Lint chm + hvf + arch configs"
 	@echo "  make security-check           Enforce the no-host-FS-passthrough guard"
 	@echo "  make fmt                      Format (nightly rustfmt)"
-	@echo "  make test-hvf                 Build hvf_boot integration tests (no-run)"
+	@echo "  make test-hvf                 Run hvf_boot tests (signs, runs serially)"
 
 # Build and code-sign chm; prints the signed binary path on stdout.
 chm:
@@ -34,6 +34,7 @@ chm-serve: chm
 clippy:
 	cargo clippy -p gimbal-local --bin chm
 	cargo clippy -p hypervisor --no-default-features --features hvf,kvm-snapshot
+	cargo clippy -p arch --features hvf --all-targets
 
 # Security invariant I1 (docs/security-model.md): fail if host-filesystem
 # passthrough (virtiofs/9p/shared-folder) appears in the device model.
@@ -43,6 +44,26 @@ security-check:
 fmt:
 	cargo +nightly fmt --all
 
+# The HVF integration tests create real VMs, so they need two things a plain
+# `cargo test` does not give them:
+#
+#   1. The hypervisor entitlement. Every `cargo build` strips it, so the test
+#      binary must be re-signed after it is built or every test fails with
+#      HV_DENIED — which reads like a broken backend and is not.
+#   2. Serial execution. `hv_vm_create` is process-global; a second concurrent
+#      VM returns HV_BUSY, so the default thread pool fails most of the suite.
+#
+# This target used to stop at `--no-run`, which built the tests and ran none of
+# them. A gate that cannot fail is not a gate.
 test-hvf:
-	cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot \
-		--test hvf_boot --no-run
+	@set -e; \
+	bin=$$(cargo test -p hypervisor --no-default-features \
+		--features hvf,kvm-snapshot --test hvf_boot --no-run \
+		--message-format=json 2>/dev/null \
+		| python3 -c "import sys,json;\
+[print(m['executable']) for m in (json.loads(l) for l in sys.stdin if l.startswith('{'))\
+ if m.get('profile',{}).get('test') and m.get('executable')]" | tail -1); \
+	test -n "$$bin" || { echo "could not locate the hvf_boot test binary"; exit 1; }; \
+	codesign --sign - --entitlements hypervisor/tests/data/hv.entitlements \
+		--force "$$bin" >/dev/null 2>&1; \
+	"$$bin" --test-threads=1
