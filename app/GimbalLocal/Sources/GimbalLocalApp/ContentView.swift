@@ -94,6 +94,9 @@ private struct Sidebar: View {
 
                     SidebarActivityRow(trail: model.auditTrail)
                         .tag(SidebarItem.activityHome)
+
+                    SidebarCapabilityRow(report: model.capabilities)
+                        .tag(SidebarItem.capabilityHome)
                 }
 
                 Section("Cloud") {
@@ -268,6 +271,33 @@ private struct SidebarProxyRow: View {
     }
 }
 
+/// The sidebar's capability row.
+///
+/// Deliberately badge-free when the daemon has not answered. A count here would
+/// be this app's own guess at what `chm` can do, which is precisely the thing
+/// the page refuses to render.
+private struct SidebarCapabilityRow: View {
+    let report: CapabilityReport?
+
+    var body: some View {
+        Label {
+            HStack {
+                Text("Capabilities").font(.headline)
+                Spacer()
+                if let report {
+                    Text("\(report.measuredCount)/\(report.capabilities.count)")
+                        .font(.system(size: 11, weight: .bold, design: .rounded))
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } icon: {
+            Image(systemName: report == nil ? "questionmark.circle" : "checkmark.seal")
+                .foregroundStyle(report == nil ? Color.secondary : Theme.purple)
+        }
+        .padding(.vertical, 3)
+    }
+}
+
 private struct SidebarActivityRow: View {
     let trail: AuditTrail?
 
@@ -390,6 +420,8 @@ private struct Detail: View {
                 ProxyPage()
             case .activityHome:
                 ActivityPage()
+            case .capabilityHome:
+                CapabilityPage()
             case let .sandbox(id):
                 SandboxDetailPage(sandboxID: id)
             case let .snapshot(name):
