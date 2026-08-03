@@ -809,7 +809,9 @@ fn build_virtio(
                     mem.clone(),
                     MmioParams {
                         device_id: device_id::BLOCK,
-                        features: features::RING_INDIRECT_DESC | features::RING_EVENT_IDX,
+                        features: features::RING_INDIRECT_DESC
+                            | features::RING_EVENT_IDX
+                            | features::BLK_FLUSH,
                         num_queues: 1,
                         device_config: mmio::blk_config(nsectors),
                     },
