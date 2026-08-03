@@ -298,7 +298,7 @@ measured rather than assumed, inside a live rehydrated `graviton-1` guest on
 | V5.3 | **A purpose-built agent image.** ✅ **Done 2026-07-30, and it never needed the cloud.** Built locally on the round-2 NIC capture: grew the root partition (the 4.5 GiB past the GPT was usable once `sgdisk -e` moved the backup header) from 2.4 G/633 M free to **6.8 G/4.6 G free**, installed `build-essential` + `git` over the V5.1 NIC, and persisted the result with the SMP checkpointing from V5.6. Verified by resuming the checkpoint and compiling a *new* C program inside the rehydrated guest: `cc 13.3.0`, `git 2.43.0`, 703 packages, exit code 7 from a binary built after resume. A minimal reproducible rootfs ([`graviton-capture-request.md`](graviton-capture-request.md) §9–§12) is still wanted — smaller, manifest-built, less attack surface — but as an *optimisation*. | ✅ done |
 | V5.5 | **SMP counter coherence.** Found by V5.1 — the first 2-vCPU capture we have ever held. The vtimer offset was **per-vCPU**, seeded on each vCPU's own thread at its own `mach_absolute_time()`, so the offsets differed permanently; rate correction then re-stepped each one on guest *entry*, at cadences that differ wildly between cores (**measured: cpu0 117,950 re-steps vs cpu1 521** — cpu1 sits in `WFI`). Linux treats `CNTVCT_EL0` as one system-wide clocksource, and `arch_sys_counter` is **56-bit**, so `clocksource_delta()` turns a read one tick behind into `2^56` ticks &asymp; **18.7 guest-years** forward — which is why bounded skew was never an acceptable target. **Measured in-guest with a pinned two-thread ping-pong that establishes strict happens-before between reads: 19,992 of 40,000 ordered samples went backwards uncorrected (guest `date`: July 2101), 19,996 of 40,000 corrected, max 128 ms backwards, RCU stalls, guest wedge.** Fixed by a VM-global `VtimerClock`: one offset shared by every vCPU, moved only by a stop-the-world barrier that abandons the step rather than publish under a running vCPU. | &#9989; **Done — 0 of 40,000 backwards on both paths, `sleep 20` = 20.01 s wall, uptime +20.02 s, correction now on by default at a measured 2.8% of wall time.** |
 | V5.6 | **SMP checkpoint capture.** ✅ **Done 2026-07-30.** Capture was gated `n == 1 && id == 0`, so `--checkpoint` silently did nothing on a multi-vCPU guest — no suspend/resume, and no fork/branch/push/rollback, for any SMP sandbox. Each vCPU now captures itself on its owning thread and the orchestrator assembles one checkpoint and dumps RAM once. The blocking constraint turned out not to exist: the guest-RAM mappings are owned by `prepared` on the orchestrator thread and outlive the vCPU threads, so the dump never needed to happen on the boot CPU. `CheckpointState` gained a per-vCPU `usgic_cpus`, because `UsgicCheckpoint` mixes one VM-global distributor with three per-vCPU models — restoring vCPU 0's onto every core would have handed secondaries the boot CPU's PPI config and in-flight interrupts. | ✅ done |
-| V5.4 | Cold create-from-image (#101) so a fresh sandbox does not require a pre-existing capture. | ⬜ nothing blocking |
+| V5.4 | Cold create-from-image (#101) so a fresh sandbox does not require a pre-existing capture. | 🟡 **foundation landed 2026-08-03** — the `arch` port it was waiting on was never needed (measured: builds clean with `--features hvf`); FDT generation now proven on this Mac against an independent parser. Remaining: kernel image load, cold virtio construction, the `create` verb. |
 
 ### V6 · The app tells the whole truth
 
@@ -663,10 +663,89 @@ Sandbox's **12.73 s** on the same host.
 
 - **#101 · cold create-from-image.** Every start is a full snapshot rehydrate.
   Reframed from a perf problem to a capability/onboarding gap — warm resume is
-  247 ms and a cold path would be slower.
+  247 ms and a cold path would be slower. **Foundation landed 2026-08-03; the
+  blocker it was waiting on turned out not to exist** — see below.
 - **`GITS_*` MMIO.** Not exercised on the resume path; a guest that re-programs
   its ITS *while running* is untested. No fixture does this.
 - **memfd page-sharing (#4/M25 perf ceiling), postcopy (#5), fork/wake-on-traffic (#6).**
+
+#### A tenth, in this document (#101)
+
+The other nine instances of the bug class were in code. The tenth was here, in
+the plan, and it had stopped work for a month.
+
+This roadmap recorded that cold boot needed a port of `arch` — a 1325-line
+aarch64 FDT generator — because *"the arch crate does not build on macOS at
+all"*. The measurement behind that was real: `--no-default-features` gave 9
+errors, `--features kvm` gave 48. Both numbers were correct and neither was the
+question. With no features, `hypervisor` compiles with no backend at all, so its
+enums are empty and every `match` on them is non-exhaustive; with `kvm`,
+`kvm-ioctls` cannot build on macOS by construction. Nobody had tried
+`--features hypervisor/hvf,hypervisor/kvm-snapshot` — the combination in this
+repo's own Makefile:
+
+| Command | Errors |
+| --- | --- |
+| `cargo build -p arch --no-default-features` | 10 |
+| `cargo build -p arch --features kvm` | 48 (in `kvm-ioctls`) |
+| `cargo build -p arch --features hypervisor/hvf,hypervisor/kvm-snapshot` | **0** |
+
+`arch` builds on macOS, its tests pass, and `linux-loader` builds clean too. The
+port that was blocking #101 was never needed.
+
+It rotted because nothing built it. `make clippy` covered `chm` and
+`hypervisor`; `arch` was in neither, so it could break — or, as it turned out,
+quietly work — without anyone finding out. It is in the lint and test gates now.
+
+The same audit found `make test-hvf` ended at `--no-run`: it built 30 HVF
+integration tests and ran none of them. A gate that cannot fail is not a gate.
+It now signs the test binary (every `cargo build` strips the entitlement, so an
+unsigned run fails all 27 with `HV_DENIED`, which reads like a broken backend
+and is not) and runs it with `--test-threads=1`, because `hv_vm_create` is
+process-global and a concurrent second VM returns `HV_BUSY`. **27 pass.**
+
+##### What actually landed
+
+`arch` gained an `hvf` feature, so the incantation is one flag. The userspace
+GIC had no `Vgic` impl — the trait the FDT writer needs to describe an interrupt
+controller — because a rehydrated guest arrives with a device tree already in
+its RAM and nothing on this side had ever had to write one. `ColdBootGic` is
+that description: the canonical arm64 GIC window, distributor at the top and
+redistributors growing *downward*, which is what the kernel expects and the
+opposite of the ordering the managed GIC forces on the rehydrate path.
+
+It deliberately does **not** implement the save/restore half of `Vgic`. It holds
+no interrupt state — that lives in `softgic` — so `state()` and
+`save_data_tables()` return errors naming where the state really is. The
+tempting empty-`Ok` would produce a snapshot that restores cleanly with every
+pending interrupt missing.
+
+Writing those errors surfaced one more instance in miniature: wrapping the
+explanation in the existing `GicError::CreateGic` variant *discarded* it at the
+display boundary, so a caller would have been told `Failed creating GIC device`
+when nothing was being created. Hence `GicError::Unsupported(String)`, which
+renders its own text.
+
+**Measured**, on this Mac, in `arch/tests/cold_boot_fdt.rs` — a real device tree
+built and then read back with an independent parser rather than the writer that
+produced it:
+
+| | |
+| --- | --- |
+| FDT magic + header `totalsize` | valid, matches the blob |
+| `/intc` | `arm,gic-v3`, dist `0x08ff_0000`+`0x1_0000`, redist `0x08fb_0000`+`0x4_0000` — exactly what `ColdBootGic` reports |
+| `/cpus` | `cpu@0`, `cpu@1`, `enable-method = "psci"` |
+| `/memory@40000000` | base and size as allocated |
+| `/pl011@9000000` | the console a cold guest would print to |
+| `/timer`, `/psci`, `/apb-pclk` | `arm,armv8-timer`, `arm,psci-0.2`/`hvc`, 24 MHz |
+| Tree size, 1–32 vCPUs | inside `FDT_MAX_SIZE` |
+
+More of the boot path already existed than the plan assumed: `setup_regs`
+implements the Linux/PSCI protocol (`PC` = entry, `x0` = FDT, EL1h/DAIF), the
+`EC_HVC64` exit handles PSCI, and `Pl011` is implemented. What remains for a
+kernel that actually boots is wiring, not a port: load an arm64 `Image` into
+guest RAM, write the tree at `FDT_START`, construct virtio devices cold rather
+than from captured state, and add the `create` verb.
 
 ---
 
