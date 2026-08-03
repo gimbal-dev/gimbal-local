@@ -22,10 +22,16 @@ name = "chm"
 path = "src/main.rs"
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+# Cold boot (#101) composes upstream's aarch64 memory layout, FDT writer and PE
+# kernel loader rather than reimplementing them. All three are already in the
+# workspace; none is a new dependency in the tree.
+arch = { path = "../arch", features = ["hvf"] }
 hypervisor = { path = "../hypervisor", default-features = false, features = [
   "hvf",
   "kvm-snapshot",
 ] }
+linux-loader = { workspace = true, features = ["pe"] }
+vm-memory = { workspace = true, features = ["backend-bitmap", "backend-mmap"] }
 libc = { workspace = true }
 # AES-256-GCM to decrypt the state-CDN memory plane's per-tenant chunks. `ring`
 # is already vendored in the workspace tree (via rustls); this is a direct use of

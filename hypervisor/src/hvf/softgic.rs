@@ -26,6 +26,14 @@ pub const SPI_BASE: u32 = 32;
 /// Highest architected SPI INTID + 1 we model (1020; 1020..1023 are special).
 pub const INTID_LIMIT: u32 = 1020;
 
+/// `GICD_PIDR2` / `GICR_PIDR2` value advertising GICv3.
+///
+/// Linux reads these and masks `GIC_PIDR2_ARCH_MASK` (0xf0); 0x30 is v3 and
+/// 0x40 is v4. Anything else and it declines to drive the controller at all:
+/// `"no distributor detected, giving up"` from `gic_validate_dist_version`, or
+/// `-ENODEV` from `gic_iterate_rdists`.
+pub const GIC_PIDR2_ARCH_GICV3: u32 = 0x30;
+
 use serde::{Deserialize, Serialize};
 
 /// The GICv3 distributor (GICD): VM-global SPI configuration + routing.
@@ -94,6 +102,20 @@ impl Distributor {
             // GICD_TYPER: ITLinesNumber = num_irqs/32 - 1; no security ext.
             0x0004 => (self.num_irqs / 32) - 1,
             0x0008 => 0x0000_43B0, // GICD_IIDR (Arm implementer, GICv3-ish)
+            // GICD_PIDR2, architecture revision in bits[7:4].
+            //
+            // This is how Linux decides whether there is a GICv3 here at all:
+            // `gic_validate_dist_version` reads it, masks 0xf0, and gives up
+            // with "no distributor detected" on anything but 0x30 (v3) or
+            // 0x40 (v4). Returning 0 from the catch-all made a cold guest
+            // abandon its interrupt controller — and, because the timer hangs
+            // off it, its clock too.
+            //
+            // A rehydrated guest never read this: it validated the distributor
+            // on the KVM host before capture and does not re-probe on resume.
+            // So the first thing a cold boot did was ask the one question this
+            // model had never been asked.
+            0xFFE8 => GIC_PIDR2_ARCH_GICV3,
             _ if (0x0080..0x0100).contains(&offset) => {
                 self.read_bitmap(&self.group1, offset - 0x0080)
             }
@@ -110,6 +132,21 @@ impl Distributor {
                 self.read_bitmap(&self.pending, offset - 0x0280)
             }
             _ if (0x0400..0x0800).contains(&offset) => self.read_priority(offset - 0x0400),
+            // GICD_ICFGR<n>. `write_cfgr` has always stored this; nothing had
+            // ever read it, so it fell to the catch-all and returned 0.
+            //
+            // Linux does not write this register and move on. `gic_configure_irq`
+            // writes it and then **reads it back and compares**, returning
+            // -EINVAL on a mismatch — so a model that accepts the write and
+            // reports 0 fails every edge-triggered IRQ with
+            // `genirq: Setting trigger mode 1 for irq N failed`. The device then
+            // gets no `request_irq`, and for the PL011 that means no tty: printk
+            // still works (its console write path is polled), but userspace has
+            // nowhere to write at all. A whole running system, minus its output.
+            //
+            // Third register in this model whose only job was to be read back,
+            // in a model that until cold boot had only ever been written to.
+            _ if (0x0C00..0x0D00).contains(&offset) => self.read_cfgr(offset - 0x0C00),
             _ if (0x6000..0x8000).contains(&offset) => {
                 // GICD_IROUTER<n> low word (64-bit reg; caller reads +0 / +4).
                 let intid = ((offset - 0x6000) / 8) as usize;
@@ -228,6 +265,22 @@ impl Distributor {
         }
     }
 
+    /// Read a `GICD_ICFGR<n>` / `GICR_ICFGR<n>` word back out of `edge`.
+    ///
+    /// Two bits per INTID, of which only bit 1 is writable (edge=1, level=0);
+    /// bit 0 is RES0 on GICv3. Mirrors [`Self::write_cfgr`] exactly, because
+    /// the caller that matters is a read-back verifying its own write.
+    fn read_cfgr(&self, reg_off: u64) -> u32 {
+        let base = (reg_off / 4 * 16) as usize;
+        let mut v = 0u32;
+        for i in 0..16 {
+            if self.edge.get(base + i).copied().unwrap_or(false) {
+                v |= 1 << (i * 2 + 1);
+            }
+        }
+        v
+    }
+
     fn write_cfgr(&mut self, reg_off: u64, value: u32) {
         // 2 bits per INTID; bit1 of each field = edge(1)/level(0).
         let base = (reg_off / 4 * 16) as usize;
@@ -315,6 +368,31 @@ pub struct Redistributor {
     pendbaser: u64,
     /// SGI/PPI enable bits (INTID 0..31) from the SGI-frame `GICR_ISENABLER0`.
     ppi_enabled: [bool; 32],
+    /// Raw `GICR_ICFGR0/1` words for INTIDs 0..31 (SGIs and PPIs), stored so a
+    /// read-back sees what was written. Same defect as `GICD_ICFGR`: Linux's
+    /// `gic_configure_irq` verifies its own write, so an unstored PPI trigger
+    /// config fails `request_percpu_irq` — which is how the architected timer
+    /// gets its PPI. Not consulted for delivery: PPIs are asserted explicitly.
+    ///
+    /// Reset value has SGIs (0..15) edge-triggered, which is architectural and
+    /// what Linux expects to read before it writes anything.
+    pub ppi_cfg: [u32; 2],
+
+    /// Which vCPU this redistributor belongs to.
+    ///
+    /// Reported in `GICR_TYPER`, where Linux matches the affinity in bits
+    /// [63:32] against the running CPU's `MPIDR_EL1` to decide which
+    /// redistributor is *its* redistributor. Getting this wrong on a secondary
+    /// core is not a subtle degradation: `gic_populate_rdist` fails, and the
+    /// CPU comes up with no per-CPU interrupt controller and therefore no
+    /// timer.
+    cpu_id: u32,
+    /// Whether this is the last redistributor in the contiguous region.
+    ///
+    /// `gic_iterate_rdists` walks the region until it sees this bit, so
+    /// setting it on every redistributor (as this model used to) means Linux
+    /// stops after the first one and never finds the others.
+    last: bool,
 }
 
 /// Byte offset of the SGI/PPI frame within a redistributor (RD_base + 64 KiB).
@@ -322,11 +400,34 @@ pub const GICR_SGI_OFFSET: u64 = 0x1_0000;
 
 impl Redistributor {
     pub fn new() -> Self {
+        Self::for_cpu(0, true)
+    }
+
+    /// A redistributor that knows which vCPU it belongs to, and whether it is
+    /// the last in the region.
+    ///
+    /// Both facts are only ever *read* by a guest that is discovering its
+    /// interrupt controller for the first time, which is why a rehydrated
+    /// guest — which discovered it on a KVM host, before capture — never
+    /// noticed they were wrong. See the field docs.
+    pub fn for_cpu(cpu_id: u32, last: bool) -> Self {
         Self {
             // Boot state: not asleep so the guest can bring it up.
             waker: 0,
+            // SGIs are always edge-triggered: bit 1 of each 2-bit field.
+            ppi_cfg: [0xaaaa_aaaa, 0],
+            cpu_id,
+            last,
             ..Default::default()
         }
+    }
+
+    /// Set which vCPU this redistributor serves and whether it is the last in
+    /// the contiguous region. See the field docs; both are discovery-time
+    /// facts, so this is applied at construction rather than mid-run.
+    pub fn set_identity(&mut self, cpu_id: u32, last: bool) {
+        self.cpu_id = cpu_id;
+        self.last = last;
     }
 
     /// True once the guest has set `GICR_CTLR.EnableLPIs` — a precondition for
@@ -352,9 +453,18 @@ impl Redistributor {
         match offset {
             0x0000 => self.ctlr,
             0x0004 => 0x0000_43B0, // GICR_IIDR
-            // GICR_TYPER low word: PLPIS(bit0)=1 (supports LPIs). Last(bit4) set
-            // for a single-redistributor model.
-            0x0008 => (1 << 0) | (1 << 4),
+            // GICR_TYPER low word: PLPIS(bit0)=1 (supports LPIs), Last(bit4)
+            // only on the final redistributor, Processor_Number in [23:8].
+            0x0008 => {
+                let last = if self.last { 1 << 4 } else { 0 };
+                (1 << 0) | last | ((self.cpu_id & 0xffff) << 8)
+            }
+            // GICR_TYPER high word: this redistributor's affinity, which Linux
+            // matches against the running CPU's MPIDR_EL1 to find its own.
+            0x000C => self.cpu_id,
+            // GICR_ICFGR0/1 in the SGI frame: see `ppi_cfg`.
+            o if o == GICR_SGI_OFFSET + 0x0C00 => self.ppi_cfg[0],
+            o if o == GICR_SGI_OFFSET + 0x0C04 => self.ppi_cfg[1],
             0x0014 => self.waker,
             0x0070 => self.propbaser as u32,
             0x0074 => (self.propbaser >> 32) as u32,
@@ -370,6 +480,10 @@ impl Redistributor {
                 }
                 v
             }
+            // GICR_PIDR2 in the RD_base frame: architecture revision in
+            // bits[7:4]. `gic_iterate_rdists` refuses the whole controller
+            // with -ENODEV when this is not v3 or v4.
+            0xFFE8 => GIC_PIDR2_ARCH_GICV3,
             _ => 0,
         }
     }
@@ -380,6 +494,9 @@ impl Redistributor {
             0x0000 => self.ctlr = value,
             // GICR_WAKER: writing ProcessorSleep=0 clears ChildrenAsleep too.
             0x0014 => self.waker = if value & 0b10 == 0 { 0 } else { value },
+            // GICR_ICFGR0 is RO for SGIs (they are always edge); ICFGR1 carries
+            // the PPI trigger config the timer driver sets.
+            o if o == GICR_SGI_OFFSET + 0x0C04 => self.ppi_cfg[1] = value,
             0x0070 => self.propbaser = (self.propbaser & !0xffff_ffff) | value as u64,
             0x0074 => self.propbaser = (self.propbaser & 0xffff_ffff) | ((value as u64) << 32),
             0x0078 => self.pendbaser = (self.pendbaser & !0xffff_ffff) | value as u64,
@@ -499,5 +616,81 @@ mod tests {
         assert!(r.is_ppi_enabled(27));
         r.write(GICR_SGI_OFFSET + 0x0180, 1 << 27);
         assert!(!r.is_ppi_enabled(27));
+    }
+
+    /// Every register in this group exists only to be *discovered* — read by a
+    /// guest that has not yet decided this hardware is here. A rehydrated guest
+    /// never reads any of them, so all four were wrong until the first cold
+    /// boot asked. Together they cost a guest its interrupt controller, its
+    /// clocksource and its console.
+
+    /// `gic_validate_dist_version` masks GICD_PIDR2 with 0xf0 and accepts only
+    /// 0x30 (GICv3) or 0x40 (GICv4). Anything else is
+    /// "no distributor detected, giving up" — and the architected timer, which
+    /// hangs off the GIC, goes with it.
+    #[test]
+    fn gicd_pidr2_says_gicv3_or_linux_gives_up() {
+        let d = Distributor::new(256);
+        assert_eq!(d.read(0xFFE8) & 0xf0, 0x30);
+    }
+
+    /// `gic_iterate_rdists` returns -ENODEV on a redistributor whose PIDR2 does
+    /// not announce v3, before it ever looks at the affinity.
+    #[test]
+    fn gicr_pidr2_says_gicv3_too() {
+        assert_eq!(Redistributor::for_cpu(0, true).read(0xFFE8) & 0xf0, 0x30);
+    }
+
+    /// `gic_populate_rdist` matches `GICR_TYPER[63:32]` against the CPU's
+    /// `MPIDR_EL1` affinity, and `gic_iterate_rdists` stops walking the region
+    /// at the first redistributor claiming `Last`. Reporting cpu 0 / last=true
+    /// from every frame — as `Redistributor::new()` did — means cores 1..n find
+    /// no redistributor at all and the walk stops before reaching them.
+    #[test]
+    fn gicr_typer_carries_this_cpus_identity_and_only_the_last_says_last() {
+        const LAST: u32 = 1 << 4;
+        for (cpu, last) in [(0u32, false), (1, false), (2, true)] {
+            let r = Redistributor::for_cpu(cpu, last);
+            assert_eq!(r.read(0x000C), cpu, "GICR_TYPER affinity for cpu {cpu}");
+            assert_eq!(
+                r.read(0x0008) & LAST != 0,
+                last,
+                "GICR_TYPER.Last for cpu {cpu}"
+            );
+        }
+    }
+
+    /// `gic_configure_irq` writes GICD_ICFGR and then **reads it back and
+    /// compares**, failing the IRQ with -EINVAL on a mismatch. The write had
+    /// always been stored; nothing had ever read it, so it returned 0 from the
+    /// catch-all and every edge-triggered IRQ failed with
+    /// `genirq: Setting trigger mode 1 for irq N failed`. For the PL011 that
+    /// meant no `request_irq`, so no tty — printk still worked, because its
+    /// console path is polled, and userspace had nowhere to write at all.
+    #[test]
+    fn gicd_icfgr_reads_back_what_was_written() {
+        let mut d = Distributor::new(256);
+        // SPI 33 edge-triggered: INTID 33 is field 1 of GICD_ICFGR2 (16 per reg,
+        // 33 / 16 = 2), so bit 1*2+1 = 3.
+        let reg = 0x0C00 + (33 / 16) * 4;
+        let val = 1 << 3;
+        d.write(reg, val);
+        assert_eq!(d.read(reg) & val, val, "GICD_ICFGR must survive a read-back");
+        // ...and the neighbouring INTIDs must stay level-triggered, so the
+        // read-back is reporting per-INTID state and not just echoing the word.
+        assert_eq!(d.read(reg), val);
+    }
+
+    /// Same read-back, in the SGI frame, for the PPI the architected timer uses.
+    #[test]
+    fn gicr_icfgr_reads_back_and_sgis_report_edge() {
+        let mut r = Redistributor::for_cpu(0, true);
+        // GICR_ICFGR0 covers INTIDs 0..15 — the SGIs, which are architecturally
+        // always edge-triggered and read-only.
+        assert_eq!(r.read(GICR_SGI_OFFSET + 0x0C00), 0xaaaa_aaaa);
+        // PPI 27 is field 11 of ICFGR1, so bit 11*2+1 = 23.
+        let val = 1 << 23;
+        r.write(GICR_SGI_OFFSET + 0x0C04, val);
+        assert_eq!(r.read(GICR_SGI_OFFSET + 0x0C04), val);
     }
 }

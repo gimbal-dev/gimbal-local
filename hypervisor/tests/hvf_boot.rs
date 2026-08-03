@@ -3473,3 +3473,118 @@ fn hvf_userspace_gic_delivers_vtimer_ppi() {
     assert_eq!(outcome, "Shutdown");
     eprintln!("PROVEN: virtual-timer PPI 27 delivered through the software GIC");
 }
+
+/// Clears the OS lock, the OS *double* lock and the debug powerdown request —
+/// exactly what Linux's `clear_os_lock()` does on every CPU during
+/// `debug_monitors_init` — then reports `OSLSR_EL1` and a sentinel over MMIO
+/// before powering off.
+///
+/// Hypervisor.framework does not implement these registers, so every one of
+/// them traps to us as `EC_MSR_MRS_64`. Before they were handled the vCPU died
+/// on the first `msr osdlr_el1, xzr` with an unhandled-sysreg error, which is
+/// where a real Linux cold boot stopped: a fully working kernel, thirty
+/// milliseconds in, killed by a register nobody had ever asked for. A
+/// rehydrated guest runs `clear_os_lock()` once at boot on the KVM host, long
+/// before capture, so no snapshot could ever have found this.
+#[rustfmt::skip]
+const OS_LOCK_PROBE: [u8; 48] = [
+    0x0a, 0x00, 0xa2, 0xd2, // movz x10, #0x1000, lsl #16 (MMIO_TX)
+    0x9f, 0x13, 0x10, 0xd5, // msr  osdlr_el1, xzr
+    0x9f, 0x10, 0x10, 0xd5, // msr  oslar_el1, xzr
+    0x89, 0x11, 0x30, 0xd5, // mrs  x9, oslsr_el1
+    0x49, 0x01, 0x00, 0xb9, // str  w9, [x10]
+    0x9f, 0x14, 0x10, 0xd5, // msr  dbgprcr_el1, xzr
+    0x49, 0x0b, 0x80, 0xd2, // mov  x9, #0x5a
+    0x49, 0x01, 0x00, 0xb9, // str  w9, [x10]
+    0x00, 0x01, 0x80, 0xd2, // movz x0, #0x8
+    0x00, 0x80, 0xb0, 0xf2, // movk x0, #0x8400, lsl #16 (SYSTEM_OFF)
+    0x02, 0x00, 0x00, 0xd4, // hvc  #0
+    0x00, 0x00, 0x00, 0x14, // b    .
+];
+
+#[test]
+fn hvf_guest_clears_the_os_lock_like_linux_does() {
+    let ram = HostRam::new(RAM_SIZE);
+    ram.load(0, &OS_LOCK_PROBE);
+    let vm_ops = Arc::new(RecordingVmOps {
+        writes: Mutex::new(Vec::new()),
+    });
+    let (_vm, mut vcpu) = build_vm(&ram, vm_ops.clone());
+    vcpu.setup_regs(0, RAM_BASE, 0).expect("setup_regs");
+
+    let exit = run_to_shutdown(vcpu.as_mut());
+    assert!(
+        matches!(exit, VmExit::Shutdown),
+        "guest must reach PSCI SYSTEM_OFF, not die on a debug register: {exit:?}"
+    );
+
+    let writes = vm_ops.writes.lock().unwrap();
+    let vals: Vec<u32> = writes.clone();
+    assert_eq!(
+        vals.len(),
+        2,
+        "expected OSLSR_EL1 then the sentinel, got {vals:?}"
+    );
+    // OSLSR_EL1: OSLM (bits [3,0]) = 0 -> OS lock not implemented, and OSLK
+    // (bit 1) = 0 -> not locked. Consistent with accepting the unlock writes.
+    assert_eq!(vals[0], 0, "OSLSR_EL1 must report an unlocked, unimplemented OS lock");
+    assert_eq!(vals[1], 0x5a, "guest must survive all four accesses");
+}
+
+/// Asks the firmware its PSCI version, then whether `CPU_ON` is implemented,
+/// reporting both over MMIO before powering off.
+///
+/// `PSCI_VERSION` (0x84000000) used to fall to the catch-all and return 0,
+/// which reads as PSCIv0.0. Linux's `psci_probe` then logs
+/// `Conflicting PSCI version detected` and disables PSCI outright — so
+/// `CPU_ON` became unreachable no matter how correctly it was implemented, and
+/// the guest lost its only way to start a secondary core. Nothing had ever
+/// asked, because a restored guest probed PSCI on the KVM host before capture.
+#[rustfmt::skip]
+const PSCI_VERSION_PROBE: [u8; 60] = [
+    0x0a, 0x00, 0xa2, 0xd2, // movz x10, #0x1000, lsl #16 (MMIO_TX)
+    0x00, 0x00, 0x80, 0xd2, // movz x0, #0
+    0x00, 0x80, 0xb0, 0xf2, // movk x0, #0x8400, lsl #16 (PSCI_VERSION)
+    0x02, 0x00, 0x00, 0xd4, // hvc  #0
+    0x40, 0x01, 0x00, 0xb9, // str  w0, [x10]
+    0x40, 0x01, 0x80, 0xd2, // movz x0, #0xa
+    0x00, 0x80, 0xb0, 0xf2, // movk x0, #0x8400, lsl #16 (PSCI_FEATURES)
+    0x61, 0x00, 0x80, 0xd2, // movz x1, #3
+    0x01, 0x80, 0xb0, 0xf2, // movk x1, #0x8400, lsl #16 (...of CPU_ON)
+    0x02, 0x00, 0x00, 0xd4, // hvc  #0
+    0x40, 0x01, 0x00, 0xb9, // str  w0, [x10]
+    0x00, 0x01, 0x80, 0xd2, // movz x0, #0x8
+    0x00, 0x80, 0xb0, 0xf2, // movk x0, #0x8400, lsl #16 (SYSTEM_OFF)
+    0x02, 0x00, 0x00, 0xd4, // hvc  #0
+    0x00, 0x00, 0x00, 0x14, // b    .
+];
+
+#[test]
+fn hvf_psci_reports_a_version_linux_will_accept() {
+    let ram = HostRam::new(RAM_SIZE);
+    ram.load(0, &PSCI_VERSION_PROBE);
+    let vm_ops = Arc::new(RecordingVmOps {
+        writes: Mutex::new(Vec::new()),
+    });
+    let (_vm, mut vcpu) = build_vm(&ram, vm_ops.clone());
+    vcpu.setup_regs(0, RAM_BASE, 0).expect("setup_regs");
+    assert!(matches!(run_to_shutdown(vcpu.as_mut()), VmExit::Shutdown));
+
+    let vals = vm_ops.writes.lock().unwrap().clone();
+    assert_eq!(vals.len(), 2, "expected version then features, got {vals:?}");
+    // Major in bits [31:16], minor in [15:0]. Linux requires major >= 1 to use
+    // the standard v0.2+ function IDs at all.
+    let (major, minor) = (vals[0] >> 16, vals[0] & 0xffff);
+    assert!(
+        major >= 1,
+        "PSCI major version {major}.{minor} — Linux logs \
+         'Conflicting PSCI version detected' and disables PSCI below v1.0"
+    );
+    // PSCI_FEATURES returns 0 (SUCCESS, no extra flags) for a supported call
+    // and NOT_SUPPORTED (-1) otherwise.
+    assert_eq!(
+        vals[1], 0,
+        "CPU_ON must be advertised as implemented, got {:#x}",
+        vals[1]
+    );
+}

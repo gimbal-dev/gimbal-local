@@ -75,10 +75,30 @@ pub const EC_DATA_ABORT_SAME: u64 = 0x25; // from the current EL
 pub const PSTATE_EL1H_DAIF: u64 = 0x3c5;
 
 // PSCI 0.2 function ids issued via HVC.
+pub const PSCI_VERSION: u64 = 0x8400_0000;
+pub const PSCI_FEATURES: u64 = 0x8400_000a;
 pub const PSCI_SYSTEM_OFF: u64 = 0x8400_0008;
 pub const PSCI_SYSTEM_RESET: u64 = 0x8400_0009;
 pub const PSCI_CPU_ON: u64 = 0xc400_0003;
 pub const PSCI_CPU_ON_32: u64 = 0x8400_0003;
+
+/// PSCI version reported to the guest: 1.0, encoded major[31:16].minor[15:0].
+///
+/// The device tree declares `arm,psci-0.2`, which tells the kernel it may call
+/// `PSCI_VERSION` — so the value it gets back has to be at least 0.2 or the
+/// kernel prints *"PSCIv0.0 detected in firmware"* and *"Conflicting PSCI
+/// version detected"* and disables PSCI entirely, taking secondary CPU bringup
+/// and system-reset with it.
+///
+/// This went unnoticed for the whole life of the backend because a *rehydrated*
+/// guest has already probed PSCI before it was captured and never asks again.
+/// The first cold boot asked on its first millisecond.
+pub const PSCI_VERSION_1_0: u64 = 0x0001_0000;
+
+/// `PSCI_FEATURES` return for a supported function.
+pub const PSCI_SUCCESS: u64 = 0;
+/// `PSCI_FEATURES` / dispatch return for an unimplemented function id.
+pub const PSCI_NOT_SUPPORTED: u64 = -1i64 as u64;
 
 // Arm SMCCC TRNG firmware interface (DEN0098). cloud-hypervisor exposes these as
 // a firmware service; a resumed guest calls TRNG_RND* during early boot to seed
