@@ -441,6 +441,77 @@ pub(crate) fn aarch32_guard(snap: &Snapshot) -> Result<(), String> {
     Ok(())
 }
 
+/// Warn when the capture's kernel elided instruction-cache maintenance that
+/// this Mac requires — which silently breaks every JIT in the guest.
+///
+/// `CTR_EL0.DIC = 1` means "instruction cache invalidation to the point of
+/// unification is not required for data-to-instruction coherence". Linux reads
+/// it once at boot and, when it is set, **alternative-patches `ic ivau` out of
+/// `caches_clean_inval_pou()`** — the routine `__sync_icache_dcache()` calls
+/// whenever userspace makes a page executable. AWS Graviton2 (Neoverse-N1)
+/// reports `DIC = 1`; Apple silicon reports `DIC = 0`. So a capture taken on
+/// Graviton rehydrates a kernel whose cache maintenance has been NOP'd out onto
+/// hardware that genuinely needs it.
+///
+/// Measured in a rehydrated guest, executing freshly written code 1,000 times
+/// (`mmap(RW)` → write → `mprotect(RX)` → call — exactly what a JIT does):
+/// **955 of 1,000 executions fetched stale instructions**. Adding an explicit
+/// `ic ivau` took it to 0/1,000, so the hardware and EL0 maintenance are sound;
+/// only the kernel's elided copy is wrong. `npm --version` on Node 22 dies with
+/// `Illegal instruction (core dumped)` roughly one run in seven, and never once
+/// under `--jitless`.
+///
+/// Nothing can be fixed at rehydrate time — the NOPs are baked into the kernel
+/// text inside the snapshot — so this warns rather than refuses, matching
+/// [`aarch32_guard`]. A cold-booted guest is unaffected: its kernel reads this
+/// Mac's real `CTR_EL0` and patches correctly. `CHM_STRICT_ICACHE=1` refuses.
+///
+/// The comparison is against the capture alone. Every Apple part measured
+/// reports `DIC = 0` (`hvf_host_cache_identity_registers` prints the live
+/// value); a Mac that reported 1 would make this a false positive.
+pub(crate) fn icache_dic_guard(snap: &Snapshot) -> Result<(), String> {
+    /// `CTR_EL0` is `S3_3_C0_C0_1`, packed as
+    /// `(op0<<14)|(op1<<11)|(CRn<<7)|(CRm<<3)|op2`.
+    const CTR_EL0: u16 = 0xd801;
+    /// `CTR_EL0.DIC`.
+    const DIC: u64 = 1 << 29;
+
+    let elides_ic_ivau = snap.vcpus.iter().any(|v| {
+        v.sysregs
+            .iter()
+            .any(|&(reg, val)| reg == CTR_EL0 && (val & DIC) != 0)
+    });
+    if !elides_ic_ivau {
+        return Ok(());
+    }
+
+    let detail = "this snapshot's guest kernel skips the instruction-cache maintenance this \
+         Mac requires, so JIT compilers in the guest will intermittently execute stale \
+         code.\n\
+         \n\
+         The capture host reported CTR_EL0.DIC = 1, and Linux latched that at boot by \
+         patching `ic ivau` out of `caches_clean_inval_pou()`. Apple silicon reports \
+         DIC = 0, so that elision is unsound here. Measured in a rehydrated guest, \
+         executing freshly written code (mmap RW, write, mprotect RX, call — what every \
+         JIT does): 955 of 1000 executions fetched stale instructions. An explicit \
+         `ic ivau` took the same test to 0 of 1000, so only the kernel's copy is wrong.\n\
+         \n\
+         Expect `Illegal instruction (core dumped)` from Node, npm, Java, .NET and any \
+         other JIT; roughly 1 run in 7 for `npm --version`, and 0 in 15 under \
+         `node --jitless`. Non-JIT workloads are unaffected, and a cold-booted guest is \
+         immune because its kernel reads this Mac's own CTR_EL0. Set \
+         CHM_STRICT_ICACHE=1 to refuse to start instead of warning. See \
+         docs/cpu-feature-deltas.md.";
+
+    if env::var_os("CHM_STRICT_ICACHE").is_some() {
+        return Err(format!(
+            "{detail}\n\nRefusing to start because CHM_STRICT_ICACHE is set."
+        ));
+    }
+    eprintln!("chm: warning: {detail}");
+    Ok(())
+}
+
 /// Create the per-run overlay directory as a private `0700` dir that `chm`
 /// owns, refusing to reuse a symlink shipped in an (untrusted) snapshot bundle.
 ///
@@ -1456,6 +1527,7 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     // AArch32-at-EL0 check (V1.4): the capture host advertised 32-bit
     // userspace and this Mac has none, so a 32-bit exec wedges the vCPU.
     aarch32_guard(&loaded.snap)?;
+    icache_dic_guard(&loaded.snap)?;
 
     // One interrupt path. Apple's managed GIC cannot deliver LPIs (proven on
     // hardware: ICH List Registers are EL2/nested-only, and no
@@ -2763,6 +2835,56 @@ mod tests {
         assert!(aarch32_guard(&snap_with(0x1100_0000_1111_1111)).is_ok());
         // A capture with no ID_AA64PFR0_EL1 at all cannot be judged.
         assert!(aarch32_guard(&snap_with_no_sysregs()).is_ok());
+    }
+
+    /// The real values, from `chm sysregs` against a Graviton2 capture: the
+    /// capture records `CTR_EL0 = 0xb444c004` (DIC = 1) and this Mac reports
+    /// `0x9444c004` (DIC = 0). Exactly one bit differs, and it is the bit that
+    /// decides whether the guest kernel keeps its `ic ivau`.
+    #[test]
+    fn icache_guard_fires_only_when_the_capture_elided_ic_ivau() {
+        fn snap_with_ctr(ctr: u64) -> Snapshot {
+            Snapshot {
+                mem_mappings: Vec::new(),
+                vcpus: vec![hypervisor::hvf::VcpuHvfState {
+                    gpr: [0; 31],
+                    pc: 0,
+                    cpsr: 0,
+                    sp_el1: 0,
+                    // 0xd801 is CTR_EL0 (S3_3_C0_C0_1).
+                    sysregs: vec![(0xd801, ctr)],
+                    gic_icc: Vec::new(),
+                    mp_state_running: true,
+                }],
+                gic_dist: Vec::new(),
+                gic_rdist: Vec::new(),
+                num_irq: 0,
+                captured_cntfrq: None,
+                captured_realtime_ns: None,
+            }
+        }
+
+        // Graviton2: DIC = 1, so the kernel patched `ic ivau` out. Warns.
+        assert!(icache_dic_guard(&snap_with_ctr(0xb444_c004)).is_ok());
+        // A capture from DIC = 0 hardware keeps its maintenance. Silent.
+        assert!(icache_dic_guard(&snap_with_ctr(0x9444_c004)).is_ok());
+        // No CTR_EL0 recorded at all: nothing to judge, so do not guess.
+        assert!(icache_dic_guard(&snap_with_no_sysregs()).is_ok());
+    }
+
+    /// The bit position is the whole guard, so pin it against the two measured
+    /// values rather than trusting the shift to stay right under edits.
+    #[test]
+    fn icache_guard_reads_bit_29_and_not_a_neighbour() {
+        fn elides(ctr: u64) -> bool {
+            (ctr & (1 << 29)) != 0
+        }
+        assert!(elides(0xb444_c004), "Graviton2 capture");
+        assert!(!elides(0x9444_c004), "Apple silicon");
+        // IDC (bit 28) is 1 on both, so a one-off shift would pass everything.
+        assert!(elides(0x9444_c004 | (1 << 29)));
+        assert!(!elides(0x9444_c004 & !(1 << 28)));
+        assert!(!elides(0), "absent register");
     }
 
     fn snap_with_no_sysregs() -> Snapshot {

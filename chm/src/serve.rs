@@ -26,7 +26,8 @@ use crate::console::ConsoleInput;
 use crate::credproxy::cli;
 use crate::console_filter::ConsoleFilter;
 use crate::imp::{
-    Loaded, Outcome, UsgicConfig, UsgicSession, aarch32_guard, cntfrq_guard, load_snapshot,
+    Loaded, Outcome, UsgicConfig, UsgicSession, aarch32_guard, cntfrq_guard, icache_dic_guard,
+    load_snapshot,
     run_usgic_engine,
 };
 use crate::posture;
@@ -1089,6 +1090,7 @@ fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Resu
     // AArch32-at-EL0 check (V1.4): the capture host advertised 32-bit
     // userspace and this Mac has none, so a 32-bit exec wedges the vCPU.
     aarch32_guard(&loaded.snap)?;
+    icache_dic_guard(&loaded.snap)?;
 
     // One interrupt path — see the note in `imp::run`. Apple's managed GIC
     // cannot deliver LPIs and cannot cold-boot, so it could never run a stock
