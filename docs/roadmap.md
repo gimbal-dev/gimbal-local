@@ -1043,6 +1043,87 @@ per-core timers and IPIs.
 changes are on the *restore* path too, so a 2-vCPU Graviton2 capture was
 re-run: 2 cores online, IPI0 1743/1961 and IPI1 3030/7006. Unchanged.
 
+## 7a. V6.6 — one interrupt backend
+
+**Shipped.** The Apple managed-GIC runtime path is retired. `chm run` and
+`chm serve` no longer choose between two GIC backends, because there is only
+one: the userspace GICv3.
+
+### Why retire rather than fix
+
+Measured, not argued. All three captures we hold route to the userspace GICv3
+today; nothing routes managed. `classify_routing` returns `DeliverableSpi` — the
+only managed route left — when a VM wires **zero** MSI-X devices, and a real
+cloud-hypervisor arm64 VM always wires virtio-blk/net through MSI-X to the ITS.
+GICv2M captures were already refused outright. So the managed path was reachable
+only by a VM with no virtio devices at all.
+
+It also could not be fixed into relevance:
+
+- **It cannot deliver an LPI.** Apple's ICH List Registers are EL2/nested-only
+  (`HV_UNSUPPORTED`), and `hv_gic_*` exposes no `GICR_PROPBASER`,
+  `GICR_PENDBASER` or ITS. A stock capture's disk and net completions arrive as
+  LPIs, so the guest restores and then stalls on its first I/O.
+- **It cannot cold-boot.** `hv_gic_create` returns `HV_BAD_ARGUMENT` unless the
+  redistributors sit *above* the distributor, which is not the layout Linux
+  expects.
+- **It has no shared `VtimerClock`.** Both `attach_clock` call sites are
+  userspace, so the V5.5 counter-coherence fix never applied to it.
+- **The performance A/B is unmeasurable.** There is no workload both backends
+  can run: an ITS/LPI capture stalls on managed by construction, and cold boot
+  cannot use managed at all.
+
+The evidence survives. `hypervisor/src/hvf/gic.rs` and the managed-GIC tests in
+`hypervisor/tests/hvf_boot.rs` still drive Apple's GIC directly on hardware —
+that measurement *is* the justification for building a userspace GIC, so it is
+kept as a test rather than as a runtime path a user can select.
+
+### Retiring it widened the contract rather than narrowing it
+
+The usgic restore path never consulted the ITS config, and `UsgicMsiSink`
+already delivers both SPIs and LPIs. Every capture the managed path could have
+run, the userspace path runs.
+
+### Three real defects the dead path was hiding
+
+Removing it made the compiler point at code nothing called any more — and each
+one turned out to be a guard the *surviving* path had never had:
+
+| Guard | What was wrong |
+| --- | --- |
+| **Session-liveness lock** | `chm connect --session-lock` writes the file the app scans to reconcile which sandboxes are live. It was acquired only inside `resume_smp` (managed), so for every real capture the file was never written. |
+| **Run-progress watchdog** | Bounds how long a vCPU can stay wedged inside one `hv_vcpu_run` (#78/#60). Every vCPU has always bumped `run_gen`; on the userspace path nobody read it. |
+| **Session lifecycle audit (M29)** | `session-start` / `session-stop` were written only on the managed path. A real capture's audit log had denied-egress records but no session boundaries — proven by absence: `~/graviton-r2/b`'s log contained **zero** `session-start` lines across its whole history until this fix wrote one. |
+
+All three now run on the userspace path, and `session-stop` is written on the
+error path too — a session that ended because a vCPU failed is exactly the one
+an operator needs a durable record of. The credential proxy is now also held for
+the session and `stop()`ped at teardown, so the daemon does not leak an accept
+loop per VM.
+
+### Honesty fixes that came with it
+
+- `chm capabilities` reported **`[no] Cold boot from an image`** while we ship
+  cold boot with disk, NIC and 4-way SMP. Now `[yes] … (built)` — `Built`, not
+  `Observed`, because nothing probes it while building the report and
+  `Observed` means "already happening".
+- Posture invariant **I7** was `Active`/`Weakened` on `CHM_ALLOW_ITS_LPI`. That
+  variable now selects nothing, so I7 is structural. The row is kept, not
+  dropped: `CHM_ALLOW_ITS_LPI=1 chm posture` reports no weakened control.
+- `CHM_ALLOW_ITS_LPI` and `CHM_USERSPACE_GIC` are removed from the env-var
+  reference, and the "do not confuse the two variables" section of
+  `hvf-compatible-snapshots.md` is replaced by "there is only one backend now".
+
+### Verified live
+
+Real 2-vCPU Graviton2 capture rehydrated to a login shell; cold boot at
+`--cpus 2 --disk --net` read the host disk magic, pinged the NAT gateway at
+0.24 ms, and showed per-core `arch_timer` plus virtio SPIs 34/35 and IPIs on
+both cores. Session lock observed written with a live PID and removed on exit;
+watchdog observed forcing exits on both cores at its 30 ms cadence.
+
+Net: **1,048 lines deleted, 170 added.**
+
 ## 8. Historical milestone detail (M25–M32)
 
 The sections below are the **previous** milestone structure, kept for the shipped

@@ -241,20 +241,17 @@ fn assess(dir: &Path) -> Vec<Control> {
             .to_string(),
     });
 
-    // I7 — interrupt routing. Structural, but has a diagnostic override that
-    // genuinely produces a broken guest, so it is worth surfacing.
-    let allow_its = env::var("CHM_ALLOW_ITS_LPI").is_ok();
+    // I7 — interrupt routing. Now structural with no override at all: the
+    // managed-GIC runtime path is retired, so there is no second backend a
+    // capture could be routed onto. `CHM_ALLOW_ITS_LPI` used to select it and
+    // now selects nothing.
     out.push(Control {
         invariant: "I7",
         name: "deliverable-interrupt routing",
-        state: if allow_its { State::Weakened } else { State::Active },
-        detail: if allow_its {
-            "CHM_ALLOW_ITS_LPI is set — an ITS/LPI capture may be run on the \
-             managed GIC, which cannot deliver its completions"
-                .to_string()
-        } else {
-            "ITS/LPI captures routed to the userspace GICv3".to_string()
-        },
+        state: State::Active,
+        detail: "structural — every capture runs on the userspace GICv3, the only \
+                 backend that can deliver ITS/LPI completions"
+            .to_string(),
     });
 
     // V1.4 — the AArch32 wedge. Not a security boundary, but it is a

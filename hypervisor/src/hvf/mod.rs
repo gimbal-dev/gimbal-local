@@ -2276,7 +2276,7 @@ impl HvfVcpu {
     /// resumed guest keeps its interrupt configuration. The distributor is shared,
     /// so on SMP this seeds identical values under its mutex (idempotent).
     pub fn usgic_seed_gic(&self, dist_regs: &[(u32, u64)], redist_regs: &[(u32, u64)]) {
-        let mut g = self.usgic.lock().unwrap();
+        let g = self.usgic.lock().unwrap();
         g.dist.lock().unwrap().seed_from_kvm(dist_regs);
         g.my_redist().seed_from_kvm(redist_regs);
     }
@@ -2313,7 +2313,7 @@ impl HvfVcpu {
     /// the low word alone reports affinity 0 for every redistributor, so only
     /// the boot CPU can ever find its own frame.
     fn usgic_mmio(&self, ipa: u64, is_write: bool, write_val: u64, access: usize) -> Option<u64> {
-        let mut g = self.usgic.lock().unwrap();
+        let g = self.usgic.lock().unwrap();
         if g.gicd_base != 0 && ipa >= g.gicd_base && ipa < g.gicd_base + 0x1_0000 {
             let off = ipa - g.gicd_base;
             // The distributor is VM-global (shared): a GICD write from ANY core

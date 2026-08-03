@@ -155,11 +155,8 @@ The capture script downloads these itself:
 does it — MSI-X through the GIC ITS as LPIs. That is the *vanilla* shape and it
 is what we now want. Our userspace GICv3 delivers those LPIs on HVF.
 
-> **Do not set `CHM_ALLOW_ITS_LPI=1` anywhere.** That is a debugging bypass on a
-> different (managed-GIC) code path: it forces a vanilla capture onto the GIC
-> that cannot deliver its completions, so the guest restores and then stalls on
-> its first I/O. Running vanilla needs no flag at all — the Mac side reads the
-> capture and picks the right backend itself.
+> Running vanilla needs no flag at all. There is one interrupt backend on the
+> Mac side — the userspace GICv3 — and it delivers exactly this shape.
 
 ---
 
