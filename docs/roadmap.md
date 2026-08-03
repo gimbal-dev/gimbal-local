@@ -1124,6 +1124,66 @@ watchdog observed forcing exits on both cores at its 30 ms cadence.
 
 Net: **1,048 lines deleted, 170 added.**
 
+## 7b. V6.7 — the resume wedge, and what it is not
+
+While rebuilding the agent image a guest wedged: `rcu_preempt kthread timer
+wakeup didn't happen for 60013 jiffies`, `Possible timer handling issue on
+cpu=1`, then silence. It recurred, and on one occasion a `kworker` was
+`blocked for more than 245 seconds` — an I/O that never completed.
+
+This landed immediately after V6.6 retired the managed GIC and moved the run
+watchdog onto the surviving path, so the first duty was to find out whether we
+had broken something. **We had not**, and saying so required disproving three
+plausible explanations rather than one.
+
+### The elimination
+
+Every row is a run on real hardware, counting only kernel-emitted stall lines
+(`^\[ *[0-9]+\.[0-9]+\] rcu:`).
+
+| Hypothesis | Test | Result |
+| --- | --- | --- |
+| The new run watchdog cancels `hv_vcpu_run` and the vtimer is not redelivered | 4-way CPU burn, 50 s, watchdog **on** | **0 stalls** |
+| …then it must need a checkpoint resume to show | Same image resumed from a checkpoint, watchdog **off** via `CHM_DISABLE_RUN_WATCHDOG=1` | **Reproduced identically** — watchdog cleared outright |
+| The resume-time counter jump (V5.5 §8b) buries the guest in missed ticks | `CHM_FORCE_RESUME_ADVANCE_S=3600` on an image that had just resumed clean, holding elapsed time constant | **0 stalls**, guest healthy, wall clock correct |
+| It is simply how long the checkpoint sat on disk | Same image, ~1 min gap vs ~5 min gap | Short **clean**; long **clean** once the jump was isolated |
+| Disk-heavy work loses a virtio completion | 600 MB `dd … conv=fsync` on the pristine capture | **0 stalls, 0 hung tasks**, 165 MB/s |
+| Idle guests stop getting timer wakeups | Idle 200 s, watchdog on | **0 stalls** |
+
+Two things fell out of this that were worth the trouble on their own.
+
+**A guard, because one cause is now understood.** A session that writes to disk
+and exits *without* `--checkpoint` leaves guest RAM describing a filesystem that
+has moved underneath it. The guest then serves RAM-only work normally and wedges
+the moment it touches the diverged tree — and the teardown capture writes that
+**hung** kernel over the last good checkpoint, so every later resume starts
+wedged. Checkpoints now record the overlay identity they were taken against and
+resume refuses a mismatch, naming the two recoveries. `CHM_ALLOW_OVERLAY_DRIFT=1`
+overrides.
+
+**A knob, because the obvious experiment was not available.** The counter jump
+on resume is normally a function of how long the checkpoint sat on disk, so
+waiting cannot separate the two. `CHM_FORCE_RESUME_ADVANCE_S` varies the jump
+while holding elapsed time constant, and is what turned a one-hour experiment
+into a three-minute one — and disproved the leading hypothesis.
+
+### What is still open
+
+The surviving correlation is narrow and specific: **every wedge happened on a
+root filesystem that had been `growpart`/`resize2fs`d to fill the virtual disk;
+the un-resized pristine capture is clean under idle, CPU burn, 600 MB of
+`fsync`ed writes, checkpoint/resume and a forced one-hour counter jump.** That
+points at how the CoW overlay handles writes to the region past the original
+filesystem extent, not at interrupts or timekeeping. It is not yet proven, and
+it is the next thing to test.
+
+Also found, and unrelated: on a rehydrated Graviton2 guest `node --version`
+returns `v22.23.2` but `npm --version` dies with **`Illegal instruction (core
+dumped)`**. `node` barely JITs and `npm` JITs heavily, which is the workload
+[`cpu-feature-deltas.md`](cpu-feature-deltas.md) predicted would stress the one
+`CTR_EL0` bit (DIC) that differs between the capture host and Apple silicon —
+recorded there as latent and *"stressed without fault"*. It now has a fault.
+
 ## 8. Historical milestone detail (M25–M32)
 
 The sections below are the **previous** milestone structure, kept for the shipped

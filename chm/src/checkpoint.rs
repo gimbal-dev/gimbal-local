@@ -53,6 +53,11 @@ const LIVE_OVERLAYS_DIR: &str = ".chm-overlays";
 /// dir alongside `memory-ranges` so a revision is a consistent RAM+disk pair.
 const OVERLAYS_SUBDIR: &str = "overlays";
 
+/// Sidecar recording the live overlay identity a checkpoint was taken against,
+/// so resume can tell whether the disk has moved on under it. See
+/// [`overlay_drift`].
+const OVERLAY_FINGERPRINT: &str = "overlay.fingerprint";
+
 /// How many revisions keep their full (resumable) guest-RAM dump. Older
 /// revisions are pruned to manifest-only so the lineage graph survives without
 /// the store growing by a full RAM image on every suspend. Overridable via
@@ -203,6 +208,10 @@ pub(crate) fn write_checkpoint(
     // RAM image while the live overlay still held later disk writes -- an
     // inconsistent pair that can corrupt the guest fs on resume (#62).
     snapshot_overlays(snapshot_dir, &tmp)?;
+
+    // Record what the overlays looked like at the instant this RAM was captured.
+    // Read from the live dir (not the copy) so resume compares like with like.
+    let _ = fs::write(tmp.join(OVERLAY_FINGERPRINT), overlay_fingerprint(snapshot_dir));
 
     let json =
         serde_json::to_string(&revision).map_err(|e| format!("serialize revision: {e}"))?;
@@ -435,6 +444,82 @@ fn snapshot_overlays(snapshot_dir: &Path, rev_dir: &Path) -> Result<(), String> 
         return Ok(());
     }
     copy_tree(&live, &rev_dir.join(OVERLAYS_SUBDIR))
+}
+
+/// A cheap identity for the live disk overlays: every file's name, length and
+/// modification time, sorted so the result is stable across directory-read
+/// order. Empty string when there are no overlays.
+///
+/// Deliberately not a content hash. The overlays are multi-gigabyte, this runs
+/// on the resume path, and the question being asked is only "is this the same
+/// overlay the checkpoint was taken against", which a length/mtime pair answers
+/// for every way the overlay actually changes (a guest writing through it).
+fn overlay_fingerprint(snapshot_dir: &Path) -> String {
+    let live = snapshot_dir.join(LIVE_OVERLAYS_DIR);
+    let Ok(entries) = fs::read_dir(&live) else {
+        return String::new();
+    };
+    let mut lines: Vec<String> = entries
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let meta = e.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let mtime = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos());
+            Some(format!(
+                "{}:{}:{mtime}",
+                e.file_name().to_string_lossy(),
+                meta.len()
+            ))
+        })
+        .collect();
+    lines.sort();
+    lines.join("\n")
+}
+
+/// Whether the live disk overlays have moved on since this checkpoint's RAM was
+/// captured — i.e. whether resuming would pair a guest's remembered filesystem
+/// with a different one on disk.
+///
+/// **This is a correctness guard, not a tidiness check.** Guest RAM holds the
+/// kernel's page cache, inode cache and journal head for the filesystem it had
+/// mounted. Resume restores that RAM but reattaches whatever the overlay
+/// contains *now*, so a session that wrote to disk and then exited **without**
+/// `--checkpoint` leaves the next resume describing blocks that have since
+/// moved. Measured consequence: the guest comes up, serves RAM-only work
+/// normally, and then wedges — `rcu_preempt kthread timer wakeup didn't happen
+/// for 60006 jiffies`, no further output — the first time anything touches the
+/// diverged part of the tree. Worse, it is self-perpetuating: capturing at
+/// teardown then writes the *hung* kernel over the last good checkpoint, so
+/// every later resume starts wedged.
+///
+/// `None` (no drift reported) when the checkpoint predates this guard or
+/// captured no overlays, so older checkpoints still resume.
+pub(crate) fn overlay_drift(snapshot_dir: &Path) -> Option<OverlayDrift> {
+    let recorded =
+        fs::read_to_string(checkpoint_dir(snapshot_dir).join(OVERLAY_FINGERPRINT)).ok()?;
+    let live = overlay_fingerprint(snapshot_dir);
+    if recorded == live {
+        return None;
+    }
+    Some(OverlayDrift {
+        recorded_files: recorded.lines().count(),
+        live_files: live.lines().count(),
+    })
+}
+
+/// The result of an [`overlay_drift`] check that found a mismatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct OverlayDrift {
+    /// How many overlay files the checkpoint was taken against.
+    pub(crate) recorded_files: usize,
+    /// How many are present now.
+    pub(crate) live_files: usize,
 }
 
 /// Restore a revision's captured overlays back to the snapshot's live overlay
@@ -772,7 +857,72 @@ mod tests {
             },
         };
         fs::write(dir.join(MANIFEST), serde_json::to_string(&rev).unwrap()).unwrap();
+        fs::write(
+            dir.join(OVERLAY_FINGERPRINT),
+            overlay_fingerprint(snapshot_dir),
+        )
+        .unwrap();
         prune_revisions(snapshot_dir);
+    }
+
+    /// A checkpoint taken against the overlays that are still there reports no
+    /// drift, and one taken before the overlay moved on does.
+    ///
+    /// This is the guard against the failure that produced
+    /// `rcu_preempt kthread timer wakeup didn't happen for 60006 jiffies` and a
+    /// wedged guest: a session wrote ~200 MB to disk and exited without
+    /// `--checkpoint`, so the next resume restored a kernel whose cached view of
+    /// the filesystem no longer matched the blocks underneath it.
+    #[test]
+    fn overlay_drift_is_flagged_only_when_the_disk_moved_on() {
+        let snap = env::temp_dir().join(format!("chm-drift-{}-{}", process::id(), now_ms()));
+        let _ = fs::remove_dir_all(&snap);
+        fs::create_dir_all(snap.join(LIVE_OVERLAYS_DIR)).unwrap();
+        fs::write(snap.join(LIVE_OVERLAYS_DIR).join("d-cow.raw"), b"disk-v1").unwrap();
+
+        write_test_checkpoint(&snap, b"ram-v1", "connect");
+        assert_eq!(
+            overlay_drift(&snap),
+            None,
+            "RAM and disk were captured together, so resuming them together is safe"
+        );
+
+        // A session that writes to disk and exits without checkpointing.
+        fs::write(
+            snap.join(LIVE_OVERLAYS_DIR).join("d-cow.raw"),
+            b"disk-v2-is-longer",
+        )
+        .unwrap();
+        let drift = overlay_drift(&snap).expect("the overlay moved on under the checkpoint");
+        assert_eq!((drift.recorded_files, drift.live_files), (1, 1));
+
+        // A brand-new file in the overlay dir counts too.
+        fs::write(snap.join(LIVE_OVERLAYS_DIR).join("e-cow.raw"), b"another").unwrap();
+        assert_eq!(overlay_drift(&snap).map(|d| d.live_files), Some(2));
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    /// A checkpoint written before this guard existed carries no fingerprint, and
+    /// must still resume rather than being refused for a question it cannot
+    /// answer.
+    #[test]
+    fn overlay_drift_is_silent_for_a_checkpoint_that_predates_the_guard() {
+        let snap = env::temp_dir().join(format!("chm-driftold-{}-{}", process::id(), now_ms()));
+        let _ = fs::remove_dir_all(&snap);
+        fs::create_dir_all(snap.join(LIVE_OVERLAYS_DIR)).unwrap();
+        fs::write(snap.join(LIVE_OVERLAYS_DIR).join("d-cow.raw"), b"disk-v1").unwrap();
+        write_test_checkpoint(&snap, b"ram-v1", "connect");
+
+        fs::remove_file(checkpoint_dir(&snap).join(OVERLAY_FINGERPRINT)).unwrap();
+        fs::write(snap.join(LIVE_OVERLAYS_DIR).join("d-cow.raw"), b"changed!").unwrap();
+
+        assert_eq!(
+            overlay_drift(&snap),
+            None,
+            "no recorded fingerprint means no claim either way, so do not block"
+        );
+        let _ = fs::remove_dir_all(&snap);
     }
 
     #[test]
