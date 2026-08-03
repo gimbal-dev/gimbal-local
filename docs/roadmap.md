@@ -337,7 +337,7 @@ tab today counts what the control plane has (`runners`, `snapshots`,
 | V6.2 | **Credential proxy UI.** ✅ **Done 2026-07-31.** Rules, their destinations, where each credential comes from (never its value), what is deliberately *not* intercepted, the CA the guest must trust, and a **test-this-rule** button that always runs the control. Measured through the UI: the same request returned `HTTP/1.1 401 Unauthorized` without injection and `HTTP/1.1 200 OK` with it — the guest sent nothing and the origin still authenticated it. Against `/` (an endpoint that answers the same either way) the same button says **“This run proved nothing”**, so it is capable of failing. The milestone was mostly a hunt for one bug class: an answer computed in the wrong process. It was found four times, each on hardware — see below. | M |
 | V6.3 | **Egress + audit view.** ✅ **Done 2026-07-31.** The policy in force with its content hash, and a decision log — allowed, denied, injected, relayed — per sandbox. The milestone turned on the same bug class as V6.1–V6.2, twice: the durable trail **discarded every allowed event**, so it could only answer "what was blocked"; and the reader could only find a trail while the guest was still running, which is the one moment nobody is reading it. Measured on the 2-vCPU Graviton capture: two `curl` commands produced **19 distinct outbound flows**, eight of them to Ubuntu/Canonical services nobody asked for, two over plaintext HTTP. Under the old code that session's trail was a single line. | M |
 | V6.4 | **Off-box round-trip.** `pull` a cloud snapshot and `push` a local one, with progress, from the Cloud tab. This is the dream expressed as a button. Includes surfacing `state-cdn` so a streamed rehydrate is legible as such. | L |
-| V6.5 | **Capability honesty.** One place that states what this build can and cannot do — HVF backend, vanilla-snapshot support, the V5 gap list — so nobody has to infer it from whether a thing crashed. | S |
+| V6.5 | **Capability honesty.** ✅ **Done 2026-08-03.** One place that states what this build can and cannot do — HVF backend, vanilla-snapshot support, the V5 gap list — so nobody has to infer it from whether a thing crashed. Every claim carries the grade of evidence behind it, because "we created a VM two seconds ago" and "someone wrote this down" are not the same sentence and must not look alike. Building it turned up a **ninth** instance of the bug class, and this one had been in the tree since the port began: `is_available()` answered a question about the machine with a compile-time constant. | S |
 
 ##### The four provenance bugs (V6.1–V6.2)
 
@@ -446,6 +446,79 @@ the same host at 11:58, 12:11 and 12:18 read as three attempts and not one.
 
 **Ordering note.** V6.1–V6.3 are all local and can ship without a cloud
 dependency. V6.4 needs the control plane, so it goes last.
+
+##### A ninth, in the oldest line of the backend (V6.5)
+
+The other eight were bugs written during this port. The ninth was there from
+the first commit that created the HVF backend, and nothing had ever asked it a
+question it could get wrong:
+
+```rust
+/// HVF is available on Apple Silicon Macs with the hypervisor entitlement.
+pub fn is_available() -> Result<bool> { Ok(cfg!(target_os = "macos")) }
+```
+
+The doc comment describes a property of the running machine. The body is a
+constant baked in at compile time. It never touched Hypervisor.framework, and
+it returned `true` for an Intel Mac — there was no `target_arch` check — and,
+far more often, for a binary that `hv_vm_create` would refuse outright with
+`HV_DENIED`, because a plain `cargo build` in this repo strips the
+`com.apple.security.hypervisor` entitlement. Every developer build in this tree
+was a binary that HVF rejects and `is_available()` called available. It is not
+dead code: `hypervisor::new()` picks the backend with it.
+
+The distinction the fix draws is the whole milestone. `is_available()` now
+answers only the question it can answer — *was this compiled for arm64 macOS* —
+and says so. A new `probe_availability()` answers the other one the only way it
+can be answered, by creating a VM and destroying it, and returns the decoded
+`hv_return_t` when the answer is no.
+
+Proving that gap is real took one binary and two files:
+
+| | `codesign`ed by `scripts/build-chm.sh` | same build, `--remove-signature` |
+| --- | --- | --- |
+| `is_available()` | `true` | `true` |
+| `probe_availability()` | ok | `HV_DENIED` |
+| Panel says | `hvf: yes (probed)` | `hvf: no (probed)`, naming the fix |
+
+Same source, same compiler, opposite truths — and only the probe can tell them
+apart.
+
+Two rules fell out of it and are enforced in `chm/src/capability.rs`. Every
+claim carries an `Evidence` grade — `probed` (done just now) beats `observed`
+(happening as you read this) beats `recorded` (read out of the capture) beats
+`built` (compiled in) beats `documented` (a human asserted it, nothing checks
+it) — because otherwise a written-down sentence borrows the credibility of the
+probe sitting next to it. And a snapshot preflight may report only *"nothing I
+checked refuses this"*; never *"supported"*, never *"will boot"*. Unchecked must
+not round up to working.
+
+The diagnostic must also not perturb what it measures. `hv_vm_create` is
+process-global, so probing while a guest runs would contend with it: with a VM
+up the panel reports `observed` and says why it did not probe; otherwise it
+spawns a child. The child is the more honest test anyway, since the entitlement
+lives on the **file**, not in the asking process's memory.
+
+**Measured on hardware**, against `graviton-2cpu-net` — the real 2-vCPU
+Graviton2 capture:
+
+| | |
+| --- | --- |
+| Preflight | 8 checks, none refuse it; **1 will not run as captured** |
+| The one | `121875000 Hz` captured against this host's `24000000 Hz` — ratio `325/64`, a 5.08× dilation, reported `degraded` rather than passed |
+| Truncate `memory-ranges` by 700 MB | `no`, *"short by 700 MiB"*, exit 1 |
+| A v52.0 capture (no `clock` block) | `unknown` — names commit `69637dde6` and the dilation it cannot rule out |
+| Panel, no snapshot | 2 measured, 4 written down, of 9 claims |
+
+The last two rows are the point. A capture that predates the counter-frequency
+commit cannot say what rate it ran at, so the honest verdict is `unknown` and
+not a pass — and the truncated capture is refused *before* anything is opened,
+which the runner also does, but only after side effects.
+
+One claim in the module was wrong when first written, and it was a claim about
+not overclaiming: the truncation finding said resuming would hand the guest
+zeroes for its own memory. Tested, the runner refuses it too. The text now says
+what was measured — the preflight says it first, and without side effects.
 
 ### V7 · The acceptance test — a real agent doing real work
 

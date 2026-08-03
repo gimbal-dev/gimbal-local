@@ -658,6 +658,54 @@ name at connect time).
 
 ---
 
+### M32 · Capability honesty — every claim carries its evidence  **[P1, chm] — shipped**
+
+A security posture is a set of claims, and a claim is only as good as what was
+done to reach it. This build states what it can and cannot do in one place —
+`chm capabilities [DIR]`, the daemon's `capabilities-json` verb, and the
+Capabilities panel — and every line carries the grade of evidence behind it:
+
+| Grade | Means |
+| --- | --- |
+| `probed` | An operation was performed just now to find out. |
+| `observed` | It is happening as you read this (a guest is running). |
+| `recorded` | Read out of the capture on disk. |
+| `built` | Compiled in. Says nothing about this machine. |
+| `documented` | A human asserted it and nothing checks it. |
+
+Without the grade, a sentence somebody typed inherits the credibility of the
+probe rendered next to it. `built` is the grade the pre-M32 `is_available()`
+carried while presenting itself as a runtime check: it returned
+`cfg!(target_os = "macos")`, so a binary stripped of the
+`com.apple.security.hypervisor` entitlement — which is *every* plain
+`cargo build` in this repo — was reported available while `hv_vm_create` would
+refuse it with `HV_DENIED`. `probe_availability()` now creates and destroys a
+real VM and returns the decoded `hv_return_t`.
+
+Two boundaries this deliberately holds:
+
+- **A preflight reports only that nothing it checked objects.** Never
+  "supported", never "will boot". Unchecked must not round up to working, and
+  the summary line says how many checks were made so the size of the claim is
+  visible.
+- **An unrecognised wire value decodes to the weakest grade, and to
+  `unknown` — never to a yes.** A newer daemon talking to an older panel must
+  degrade toward doubt.
+
+The diagnostic does not contend with its subject: `hv_vm_create` is
+process-global, so with a guest running the answer is `observed` (with the
+reason it did not probe); otherwise a child process is spawned — which is the
+better test regardless, because the entitlement is a property of the file, not
+of the process doing the asking. Verified: a live guest executed a command 29 s
+after being diagnosed.
+
+Exit status is a scope statement, not a verdict on the build: `chm capabilities`
+exits `1` only when a preflight *refuses* a specific capture. A build-level
+`documented: no` — cold boot (#101), GICv2M — is a statement about scope and
+exits `0`.
+
+---
+
 ## 4. Hardening checklist (the "hostile-agent ready" bar)
 
 - [x] **File boundary** — bundles confined (symlink-reject, path-confine,

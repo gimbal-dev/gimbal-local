@@ -25,6 +25,7 @@ use hypervisor::hvf::rehydrate::{rehydrate, rehydrate_resume};
 use hypervisor::{VmExit, VmOps};
 
 use crate::audit;
+use crate::capability;
 use crate::checkpoint;
 use crate::console::ConsoleInput;
 use crate::credproxy::cli;
@@ -547,6 +548,9 @@ fn handle_conn(stream: UnixStream, daemon: &Daemon) {
         "audit-json" => {
             let _ = writer.write_all(audit_json(daemon, arg).as_bytes());
         }
+        "capabilities-json" => {
+            let _ = writer.write_all(capabilities_json(daemon, arg).as_bytes());
+        }
         "start" => {
             let resp = match start_vm(daemon, arg) {
                 Ok(msg) => format!("ok\t{msg}\n"),
@@ -871,6 +875,54 @@ fn running_vm_dir(daemon: &Daemon) -> Option<PathBuf> {
         .iter()
         .find(|e| e.name == name)
         .map(|e| e.dir.clone())
+}
+
+/// What this build can do, answered by the process that would do it.
+///
+/// The app must not compute this itself. A capability list rendered from the
+/// app's own constants describes a binary it is not talking to: the daemon may
+/// be an older `chm`, or the same source re-signed differently, and the panel
+/// would be confidently wrong in exactly the case a user opened it to check.
+///
+/// The hypervisor question is settled differently depending on what is going
+/// on. A running guest is proof, and stronger than any probe; with nothing
+/// running the daemon spawns a child to try it for real, because
+/// `hv_vm_create` is process-global and a diagnostic must not contend with the
+/// thing it is diagnosing.
+fn capabilities_json(daemon: &Daemon, arg: &str) -> String {
+    let running = daemon.current.lock().unwrap().is_some();
+    let evidence = if running {
+        capability::HvfEvidence::GuestRunning
+    } else {
+        capability::HvfEvidence::ProbeAllowed
+    };
+    let caps = capability::build_report(evidence);
+
+    let arg = arg.trim();
+    // `-` means "the daemon chooses"; an empty string would be ambiguous with a
+    // caller that meant the current directory, and `.` would resolve against
+    // the daemon's cwd rather than the caller's.
+    let (dir, assessed) = if arg.is_empty() || arg == "-" {
+        match running_vm_dir(daemon) {
+            Some(dir) => (Some(dir), "running-vm"),
+            None => (None, "no-snapshot-in-scope"),
+        }
+    } else {
+        (Some(PathBuf::from(arg)), "requested")
+    };
+
+    let pre = dir.as_deref().map(capability::preflight);
+    let body = capability::render_json(&caps, pre.as_ref());
+    let scope = match &dir {
+        Some(d) => json_str(&d.display().to_string()),
+        None => "null".to_string(),
+    };
+    let spliced = body.replacen(
+        '{',
+        &format!("{{\"source\":\"daemon\",\"assessed\":\"{assessed}\",\"scope_dir\":{scope},"),
+        1,
+    );
+    format!("{spliced}\n")
 }
 
 fn json_escape(s: &str) -> String {
@@ -1509,10 +1561,20 @@ fn ctl_command(rest: &[String]) -> Result<String, String> {
         });
     }
 
+    // `capabilities [<dir>]`: what the daemon's own binary can do. Asking the
+    // caller's `chm` instead would describe a different file — possibly a
+    // different build, and certainly a different signature.
+    if rest.first().map(String::as_str) == Some("capabilities") {
+        let dir = rest.get(1).filter(|a| !a.starts_with('-')).cloned();
+        return Ok(match dir {
+            Some(d) => format!("capabilities-json {d}"),
+            None => "capabilities-json -".to_string(),
+        });
+    }
+
     // `audit [<dir>] [--tail N]`: the trail that matters is the one the running
     // guest is writing to, which only the daemon can name.
-    if rest.first().map(String::as_str) == Some("audit") {
-        let tail = rest
+    if rest.first().map(String::as_str) == Some("audit") {        let tail = rest
             .iter()
             .position(|a| a == "--tail")
             .and_then(|i| rest.get(i + 1))
@@ -1819,6 +1881,28 @@ mod tests {
         assert_eq!(
             ctl_command(&s(&["audit", "show", "/w"])).unwrap(),
             "audit-json /w"
+        );
+    }
+
+    /// `capabilities` must reach the daemon, because it describes the daemon's
+    /// own binary. Answering from the caller's `chm` would describe a different
+    /// file -- possibly a different build, and certainly a different signature,
+    /// which is exactly the distinction the panel exists to draw.
+    #[test]
+    fn ctl_capabilities_asks_the_binary_that_would_run_the_guest() {
+        assert_eq!(
+            ctl_command(&s(&["capabilities"])).unwrap(),
+            "capabilities-json -",
+            "`-` means the daemon chooses; `.` would name the caller's cwd"
+        );
+        assert_eq!(
+            ctl_command(&s(&["capabilities", "/snap"])).unwrap(),
+            "capabilities-json /snap"
+        );
+        // A flag is not a directory.
+        assert_eq!(
+            ctl_command(&s(&["capabilities", "--json"])).unwrap(),
+            "capabilities-json -"
         );
     }
 }

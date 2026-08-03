@@ -120,6 +120,8 @@ final class AppModel: ObservableObject {
     /// not the less.
     @Published var auditTrail: AuditTrail?
     @Published var isLoadingAudit = false
+    @Published var capabilities: CapabilityReport?
+    @Published var isLoadingCapabilities = false
     /// A sandbox the user chose to read history for while nothing is running.
     private var auditScopeDir: String?
 
@@ -264,6 +266,21 @@ final class AppModel: ObservableObject {
         if let dir { auditScopeDir = dir }
         if status.state == .running { auditScopeDir = nil }
         auditTrail = await chm.auditTrail(settings: settings, dir: auditScopeDir)
+    }
+
+    /// What the daemon's binary can do, and what it makes of the snapshot in
+    /// scope.
+    ///
+    /// Cleared on failure rather than left stale. Posture can survive a missed
+    /// refresh because a configuration probably has not changed, but a
+    /// capability answer is partly a probe of *this moment* — the binary may
+    /// have been rebuilt out from under the daemon, losing its entitlement —
+    /// and a stale yes is the exact shape of the bug this panel exists to end.
+    func refreshCapabilities(dir: String? = nil) async {
+        guard !isLoadingCapabilities else { return }
+        isLoadingCapabilities = true
+        defer { isLoadingCapabilities = false }
+        capabilities = await chm.capabilities(settings: settings, dir: dir)
     }
 
     /// Install the workspace CA inside the running guest.

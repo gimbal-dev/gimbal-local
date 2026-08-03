@@ -355,6 +355,7 @@ enum SidebarItem: Hashable {
     case securityHome
     case proxyHome
     case activityHome
+    case capabilityHome
     case sandbox(String)   // sandbox id
     case snapshot(String)  // snapshot name
 }
@@ -967,4 +968,116 @@ struct AuditTrail: Codable, Equatable {
         }
         return seen
     }
+}
+
+// MARK: - Capabilities (V6.5)
+
+/// How strongly a capability claim is held, strongest first.
+///
+/// Rendering these identically would throw away the only thing that makes the
+/// panel more useful than a README. `built` in particular is the grade of the
+/// bug this milestone was named for: true of the compiler, silent about the
+/// machine.
+enum CapabilityEvidence: String, Codable {
+    case probed
+    case observed
+    case recorded
+    case built
+    case documented
+
+    /// Whether the claim was established by doing something, now, rather than
+    /// by having been written down.
+    var isMeasured: Bool { self == .probed || self == .observed }
+
+    var label: String {
+        switch self {
+        case .probed: return "probed just now"
+        case .observed: return "observed running"
+        case .recorded: return "read from the capture"
+        case .built: return "compiled in"
+        case .documented: return "written down, unchecked"
+        }
+    }
+}
+
+/// The verdict on one capability.
+enum CapabilitySupport: String, Codable {
+    case yes
+    case degraded
+    case no
+    case unknown
+
+    var label: String {
+        switch self {
+        case .yes: return "Yes"
+        case .degraded: return "Degraded"
+        case .no: return "No"
+        case .unknown: return "Unknown"
+        }
+    }
+}
+
+/// One claim, with the evidence behind it.
+struct CapabilityClaim: Codable, Identifiable, Equatable {
+    var id: String
+    var title: String
+    var detail: String
+    /// Unknown wire values decode to `.unknown`, never to a yes. A newer daemon
+    /// must not be able to make this app render a verdict it does not
+    /// understand as a working one.
+    var support: CapabilitySupport
+    var evidence: CapabilityEvidence
+
+    enum CodingKeys: String, CodingKey { case id, title, support, evidence, detail }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = (try? c.decode(String.self, forKey: .id)) ?? UUID().uuidString
+        title = (try? c.decode(String.self, forKey: .title)) ?? id
+        detail = (try? c.decode(String.self, forKey: .detail)) ?? ""
+        let s = (try? c.decode(String.self, forKey: .support)) ?? ""
+        support = CapabilitySupport(rawValue: s) ?? .unknown
+        let e = (try? c.decode(String.self, forKey: .evidence)) ?? ""
+        // An unrecognised grade is the weakest, not the strongest: a claim this
+        // app cannot grade has not been shown to be measured.
+        evidence = CapabilityEvidence(rawValue: e) ?? .documented
+    }
+}
+
+/// The result of checking one snapshot against this build.
+struct CapabilityPreflight: Codable, Equatable {
+    var dir: String
+    var readable: Bool
+    var refusals: Int
+    var degraded: Int
+    var unknowns: Int
+    var summary: String
+    var findings: [CapabilityClaim]
+}
+
+/// `chm ctl capabilities` — what the daemon's binary can do, plus (when there is
+/// one in scope) what it makes of a specific snapshot.
+struct CapabilityReport: Codable, Equatable {
+    var source: String?
+    var assessed: String?
+    var scopeDir: String?
+    var capabilities: [CapabilityClaim]
+    var preflight: CapabilityPreflight?
+
+    enum CodingKeys: String, CodingKey {
+        case source, assessed, capabilities, preflight
+        case scopeDir = "scope_dir"
+    }
+
+    var isFromDaemon: Bool { source == "daemon" }
+
+    /// True when no snapshot was in scope. A fact about this reader, not about
+    /// any capture, and it must not read as "nothing to check".
+    var hasNoSnapshotInScope: Bool { assessed == "no-snapshot-in-scope" }
+
+    /// Claims established by doing something rather than by assertion.
+    var measuredCount: Int { capabilities.filter { $0.evidence.isMeasured }.count }
+
+    /// Claims that are only as good as the last person to edit them.
+    var documentedCount: Int { capabilities.filter { $0.evidence == .documented }.count }
 }

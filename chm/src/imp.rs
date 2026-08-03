@@ -18,6 +18,7 @@ use crate::cloud;
 use crate::console::{self, RawConsole};
 use crate::console_filter::ConsoleFilter;
 use crate::audit;
+use crate::capability;
 use crate::control_plane;
 use crate::credproxy;
 use crate::firewall;
@@ -921,6 +922,10 @@ pub fn main() -> ExitCode {
         Some("limits") => limits::limits_main(&raw[1..]),
         Some("audit") => audit::audit_main(&raw[1..]),
         Some("posture") => posture::posture_main(&raw[1..]),
+        Some("capabilities") => capability::capabilities_main(&raw[1..]),
+        // Not in the help: this is the child half of the HVF probe, which has to
+        // run in its own process because `hv_vm_create` is process-global.
+        Some(capability::PROBE_ARG) => capability::probe_main(),
         Some("proxy") => credproxy::cli::proxy_main(&raw[1..]),
         Some("sysregs") => sysregs::sysregs_main(&raw[1..]),
         Some("manifest") => signing::manifest_main(&raw[1..]),
