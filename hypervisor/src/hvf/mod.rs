@@ -2008,6 +2008,18 @@ impl HvfVcpu {
         g.gicr_base = gicr_base;
     }
 
+    /// Tell this vCPU's redistributor who it belongs to and whether it is the
+    /// last in the region.
+    ///
+    /// Only a guest *discovering* its GIC reads these — `gic_populate_rdist`
+    /// matches the affinity against `MPIDR_EL1`, and `gic_iterate_rdists` walks
+    /// until it sees `Last`. A rehydrated guest discovered its GIC on the KVM
+    /// host before it was captured, which is why this was never needed until
+    /// something cold-booted. See `softgic::Redistributor::for_cpu`.
+    pub fn usgic_set_redist_identity(&self, cpu_id: u32, last: bool) {
+        self.usgic.lock().unwrap().redist.set_identity(cpu_id, last);
+    }
+
     /// Install the VM-global distributor shared by every vCPU (so a reprogram on
     /// any core is visible to all and SPIs route by affinity). On the single-vCPU
     /// path this is that vCPU's own freshly-sized distributor.
@@ -2429,6 +2441,85 @@ impl HvfVcpu {
         g.redist = cp.redist.clone();
         g.pending = cp.pending.clone();
         g.active = cp.active;
+    }
+
+    /// Service a trapped self-hosted-debug system register that Hypervisor.framework
+    /// does not implement. Returns `Ok(false)` if this is not one of them, so the
+    /// caller still fails loudly on a register nobody has reasoned about.
+    ///
+    /// **Why this is not a blanket "ignore unknown MSR" catch-all.** Silently
+    /// swallowing a system-register write is the most expensive kind of lie a
+    /// hypervisor can tell: the guest believes it changed the machine, the
+    /// machine did not change, and the divergence surfaces arbitrarily far away.
+    /// So every register below is named, and — for the ones that carry state —
+    /// only the write that requests the state we *actually* provide is accepted.
+    /// A guest asking for something else still gets a hard error naming the
+    /// register, which is how we found this path in the first place.
+    ///
+    /// A rehydrated guest never reaches here, which is why this was missing:
+    /// `clear_os_lock()` runs once during `debug_monitors_init` at boot, long
+    /// before any snapshot is taken. Cold boot is the first thing to execute it.
+    fn handle_debug_sysreg_trap(&self, esr: u64) -> CpuResult<bool> {
+        let iss = esr & 0x1ff_ffff;
+        let is_read = (iss & 1) == 1;
+        let crm = ((iss >> 1) & 0xf) as u8;
+        let rt = ((iss >> 5) & 0x1f) as u32;
+        let crn = ((iss >> 10) & 0xf) as u8;
+        let op1 = ((iss >> 14) & 0x7) as u8;
+        let op2 = ((iss >> 17) & 0x7) as u8;
+        let op0 = ((iss >> 20) & 0x3) as u8;
+        // The whole self-hosted debug register file is op0=2, op1=0.
+        if op0 != 2 || op1 != 0 {
+            return Ok(false);
+        }
+        // Value the guest is writing (XZR reads as zero, and Rt=31 means XZR
+        // for MSR — not the stack pointer).
+        let wval = if is_read || rt == 31 {
+            0
+        } else {
+            self.get_reg(rt)?
+        };
+        let (name, rval): (&str, Option<u64>) = match (crn, crm, op2) {
+            // OSLAR_EL1 (write-only). Writing 0 unlocks the OS lock; the lock is
+            // a debugger handshake we do not implement, so it is permanently
+            // unlocked and a write of 0 is genuinely a no-op. A write of 1 asks
+            // us to lock out debug, which we cannot honour, so it falls through
+            // to the hard error rather than being quietly dropped.
+            (1, 0, 4) if !is_read && wval & 1 == 0 => ("OSLAR_EL1", None),
+            // OSLSR_EL1 (read-only). OSLM = 0b00 in bits [3,0]: OS lock not
+            // implemented. OSLK (bit 1) = 0: not locked. Consistent with the
+            // OSLAR_EL1 answer above.
+            (1, 1, 4) if is_read => ("OSLSR_EL1", Some(0)),
+            // OSDLR_EL1. Same argument as OSLAR_EL1: the OS *double* lock is not
+            // implemented, so clearing it (DLK=0) is a no-op; setting it is not
+            // something we can honour.
+            (1, 3, 4) if wval & 1 == 0 => ("OSDLR_EL1", Some(0)),
+            // DBGPRCR_EL1. CORENPDRQ=0 means "no powerdown request held", which
+            // is the state of a vCPU that has no power controller behind it.
+            (1, 4, 4) if wval & 1 == 0 => ("DBGPRCR_EL1", Some(0)),
+            _ => return Ok(false),
+        };
+        if is_read {
+            let Some(v) = rval else {
+                // A read of a write-only register: architecturally UNDEFINED, so
+                // do not invent an answer.
+                return Ok(false);
+            };
+            if rt != 31 {
+                self.set_reg(rt, v)?;
+            }
+        }
+        if std::env::var_os("CHM_TRACE_DEBUGREG").is_some() {
+            let dir = if is_read { "read" } else { "write" };
+            eprintln!(
+                "[dbgreg] vcpu {} {dir} {name} val={:#x}",
+                self.index,
+                if is_read { rval.unwrap_or(0) } else { wval }
+            );
+        }
+        let pc = self.get_reg(HV_REG_PC)?;
+        self.set_reg(HV_REG_PC, pc.wrapping_add(4))?;
+        Ok(true)
     }
 
     /// Service a stage-2 data abort (MMIO) by decoding ESR and calling VmOps.
@@ -2940,6 +3031,38 @@ impl Vcpu for HvfVcpu {
                             eprintln!("[hvc] vcpu {} func={func:#x}", self.index);
                         }
                         match func {
+                            // The device tree says `arm,psci-0.2`, so the kernel
+                            // asks what version it is actually talking to before
+                            // it uses anything else. Answering 0 (the old
+                            // catch-all) reads as v0.0, which makes the kernel
+                            // disable PSCI outright — no secondary CPUs, no
+                            // reset. A rehydrated guest never asked, because it
+                            // probed PSCI before it was ever captured.
+                            PSCI_VERSION => {
+                                self.set_reg(0, PSCI_VERSION_1_0)?;
+                                Ok(VmExit::Ignore)
+                            }
+                            PSCI_FEATURES => {
+                                let fid = self.get_reg(1)?;
+                                let supported = matches!(
+                                    fid,
+                                    PSCI_VERSION
+                                        | PSCI_FEATURES
+                                        | PSCI_SYSTEM_OFF
+                                        | PSCI_SYSTEM_RESET
+                                        | PSCI_CPU_ON
+                                        | PSCI_CPU_ON_32
+                                );
+                                self.set_reg(
+                                    0,
+                                    if supported {
+                                        PSCI_SUCCESS
+                                    } else {
+                                        PSCI_NOT_SUPPORTED
+                                    },
+                                )?;
+                                Ok(VmExit::Ignore)
+                            }
                             PSCI_SYSTEM_OFF => Ok(VmExit::Shutdown),
                             PSCI_SYSTEM_RESET => Ok(VmExit::Reset),
                             PSCI_CPU_ON | PSCI_CPU_ON_32 => {
@@ -3022,16 +3145,23 @@ impl Vcpu for HvfVcpu {
                             }
                         }
                     }
-                    EC_MSR_MRS_64 if self.usgic_enabled() => {
+                    EC_MSR_MRS_64 => {
                         // Userspace GICv3 CPU interface: the guest touched an
                         // ICC_*_EL1 register with no managed GIC present, so HVF
                         // trapped it to us. Emulate it (this is what lets us hand
                         // the guest an LPI the managed GIC could never deliver).
-                        if self.handle_icc_trap(esr)? {
+                        // The debug arm is checked on BOTH GIC paths, because
+                        // that trap has nothing to do with the interrupt
+                        // controller — it only ever looked that way because the
+                        // userspace GIC was the one thing that had claimed an
+                        // MSR/MRS exit.
+                        let handled = (self.usgic_enabled() && self.handle_icc_trap(esr)?)
+                            || self.handle_debug_sysreg_trap(esr)?;
+                        if handled {
                             Ok(VmExit::Ignore)
                         } else {
                             Err(HypervisorCpuError::RunVcpu(anyhow!(
-                                "usgic: unhandled sysreg trap ESR={esr:#x} (vcpu {})",
+                                "unhandled sysreg trap ESR={esr:#x} (vcpu {})",
                                 self.index
                             )))
                         }

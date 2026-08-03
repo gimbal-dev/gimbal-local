@@ -903,6 +903,10 @@ pub struct UsgicSeed {
     /// The VM-global software distributor, installed into every vCPU so a
     /// reprogram on any core is visible to all and SPIs route by affinity.
     shared_dist: Arc<Mutex<Distributor>>,
+    /// How many vCPUs the VM has, so each redistributor can say whether it is
+    /// the last in the region. `gic_iterate_rdists` stops walking at the first
+    /// one that claims to be.
+    vcpu_count: u64,
 }
 
 /// Create the userspace-GIC VM and map its guest RAM (no managed GIC, no vCPUs).
@@ -961,6 +965,7 @@ pub fn prepare_usgic_vm(
             gicr_region_base,
             dist_pairs: Arc::new(dist_pairs),
             shared_dist,
+            vcpu_count,
         },
     })
 }
@@ -999,6 +1004,11 @@ pub fn restore_usgic_vcpu(
         // reprogram on any core is visible to all and SPIs route by affinity.
         concrete.usgic_install_shared_dist(seed.shared_dist.clone());
         concrete.usgic_set_gic_bases(seed.gicd_base, gicr_base);
+        // Set on the rehydrate path too. A restored guest normally never
+        // re-probes, which is why these registers could be wrong for so long
+        // without anyone noticing — but a guest that kexecs, or reloads the
+        // driver, does, and then a wrong answer costs it its timer.
+        concrete.usgic_set_redist_identity(id as u32, id as u64 + 1 == seed.vcpu_count);
         match resume.and_then(|cp| cp.usgic_for(id)) {
             // Resume: restore the live software-GIC models captured at suspend
             // (SPI/PPI config the guest may have reprogrammed since the parent
@@ -1039,6 +1049,146 @@ pub fn restore_usgic_vcpu(
     // cores; seeding an offset per vCPU (as this used to) leaves them
     // permanently skewed and wraps the guest's 56-bit clocksource. See
     // [`VtimerClock`].
+    {
+        let concrete = vcpu
+            .as_any_concrete_mut()
+            .downcast_mut::<HvfVcpu>()
+            .expect("HVF vCPU");
+        concrete
+            .attach_clock(clock.clone())
+            .map_err(|e| RehydrateError::Hv(anyhow!("vCPU {id} attach counter clock: {e}")))?;
+    }
+    Ok(vcpu)
+}
+
+/// Create a userspace-GIC VM over guest RAM the CALLER allocated and filled.
+///
+/// The cold-boot counterpart to [`prepare_usgic_vm`]. Three things differ, and
+/// each of them is the absence of a snapshot rather than a different mechanism:
+///
+/// - **RAM comes from the caller.** A rehydrate maps the capture's
+///   `memory-ranges` file; a cold boot has a kernel and a device tree already
+///   written into an anonymous allocation, so this takes the host pointer and
+///   maps it as-is. `ram` is therefore empty: this struct does not own the
+///   backing, the caller does, and the caller must keep it alive for the VM's
+///   lifetime.
+/// - **There is no distributor dump to seed.** A cold GIC starts at its
+///   architectural reset state, which is what `Distributor::new` already
+///   produces, so `dist_pairs` is empty rather than a translation of somebody
+///   else's captured registers.
+/// - **The GIC bases are the canonical ones.** Same arithmetic as the
+///   rehydrate path, but they must also match what the device tree says, which
+///   is why `hvf::coldgic` and this function are checked against each other by
+///   test rather than by comment.
+///
+/// # Safety
+///
+/// `host_ptr` must point to at least `ram_size` bytes that stay valid, and
+/// stay unaliased by Rust, for the whole lifetime of the returned VM.
+pub unsafe fn prepare_cold_usgic_vm(
+    hv: &dyn Hypervisor,
+    ram_base: u64,
+    ram_size: usize,
+    host_ptr: *mut u8,
+    vcpu_count: u64,
+    num_irq: u32,
+) -> Result<UsgicPrepared, RehydrateError> {
+    if vcpu_count == 0 {
+        return Err(RehydrateError::Translate(
+            "a cold guest needs at least one vCPU".into(),
+        ));
+    }
+    let vm = hv
+        .create_vm(HypervisorVmConfig {
+            nested: false,
+            smt_enabled: false,
+        })
+        .map_err(|e| RehydrateError::Hv(anyhow!("create_vm: {}", full_chain(&e))))?;
+
+    let guest_mem = Arc::new(GuestMemory::new());
+    // SAFETY: the caller's contract above — `host_ptr` is valid for `ram_size`
+    // bytes and outlives the VM. Slot 0 because a cold guest has exactly one
+    // contiguous RAM region, unlike a capture's several.
+    unsafe {
+        vm.create_user_memory_region(0, ram_base, ram_size, host_ptr, false, false)
+            .map_err(|e| RehydrateError::Hv(anyhow!("map cold RAM @ {ram_base:#x}: {e}")))?;
+        guest_mem.register(ram_base, host_ptr, ram_size);
+    }
+
+    let gicd_base = MAPPED_IO_START - GIC_V3_DIST_SIZE;
+    let gicr_region_base = gicd_base - vcpu_count * GIC_V3_REDIST_SIZE;
+
+    Ok(UsgicPrepared {
+        guest_mem,
+        ram: Vec::new(),
+        vm,
+        seed: UsgicSeed {
+            gicd_base,
+            gicr_region_base,
+            dist_pairs: Arc::new(Vec::new()),
+            shared_dist: Arc::new(Mutex::new(Distributor::new(num_irq))),
+            vcpu_count,
+        },
+    })
+}
+
+/// Create one cold-boot vCPU on the CURRENT thread (HVF binds a vCPU to its
+/// creating thread).
+///
+/// The cold-boot counterpart to [`restore_usgic_vcpu`]. It does not call
+/// `set_state`: there is no captured register file, so the vCPU keeps HVF's
+/// reset state and gets only what the arm64 boot protocol specifies.
+///
+/// `boot` is `Some((entry, fdt))` for the CPU that starts executing — normally
+/// only vCPU 0. Secondaries pass `None` and stay at their reset state until the
+/// kernel brings them up through PSCI `CPU_ON`, which is exactly what the
+/// device tree's `enable-method = "psci"` promises the kernel it can do.
+pub fn create_cold_usgic_vcpu(
+    vm: &Arc<dyn Vm>,
+    seed: &UsgicSeed,
+    id: usize,
+    vm_ops: &Arc<dyn VmOps>,
+    clock: &Arc<VtimerClock>,
+    boot: Option<(u64, u64)>,
+) -> Result<Box<dyn Vcpu>, RehydrateError> {
+    let mut vcpu = vm
+        .create_vcpu(id as u32, Some(vm_ops.clone()))
+        .map_err(|e| RehydrateError::Hv(anyhow!("create_vcpu {id}: {e}")))?;
+
+    let gicr_base = seed.gicr_region_base + id as u64 * GIC_V3_REDIST_SIZE;
+    {
+        let concrete = vcpu
+            .as_any_concrete_mut()
+            .downcast_mut::<HvfVcpu>()
+            .ok_or_else(|| RehydrateError::Translate("vCPU is not an HVF vCPU".into()))?;
+        concrete.set_usgic_enabled(true);
+        concrete.usgic_install_shared_dist(seed.shared_dist.clone());
+        concrete.usgic_set_gic_bases(seed.gicd_base, gicr_base);
+        // The guest is about to discover this GIC for the first time, so the
+        // redistributor has to be able to identify itself.
+        concrete.usgic_set_redist_identity(id as u32, id as u64 + 1 == seed.vcpu_count);
+        // No seed: a cold GIC is already at its reset state. Seeding with the
+        // empty `dist_pairs` would be a no-op, but calling it would imply
+        // there was something to restore.
+    }
+
+    if let Some((entry, fdt)) = boot {
+        vcpu.setup_regs(id as u32, entry, fdt)
+            .map_err(|e| RehydrateError::Hv(anyhow!("cold boot regs for vCPU {id}: {e}")))?;
+    } else {
+        // A parked secondary still needs its MPIDR to match the device tree's
+        // `/cpus/cpu@N` reg, or PSCI CPU_ON targets a core the kernel cannot
+        // find. `setup_regs` sets MPIDR as part of the boot protocol; do the
+        // same here without giving the core an entry point.
+        let concrete = vcpu
+            .as_any_concrete_mut()
+            .downcast_mut::<HvfVcpu>()
+            .expect("HVF vCPU");
+        concrete
+            .set_mpidr_affinity(id as u32)
+            .map_err(|e| RehydrateError::Hv(anyhow!("MPIDR for parked vCPU {id}: {e}")))?;
+    }
+
     {
         let concrete = vcpu
             .as_any_concrete_mut()
