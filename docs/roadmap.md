@@ -22,12 +22,19 @@ Four sentences, in dependency order. This is the honest score:
 | **1. A vanilla cloud snapshot runs on a Mac.** | ✅ **true, hardware-proven** | Stock upstream, unforked, Graviton2-captured, **no flags and no environment variables**, through all three entry points (`chm run`, `chm serve`, the app). |
 | **2. It is a *secure* sandbox.** | ✅ **true, and it is enforced rather than asserted** | 12 invariants, default-on posture, `chm posture` reports what is actually in force and exits non-zero if anything is weakened. |
 | **3. It round-trips with the cloud.** | 🟡 **half true** | Cross-substrate mobility is proven (a cloud session resumed on HVF *past its marker*). The signed-manifest contract (V3) is not finished, and it is cross-repo. |
-| **4. A coding agent works inside it.** | 🔴 **not yet** | Measured, not guessed. Two blockers left: the capture has **no NIC**, and the image has **no toolchain**. |
+| **4. A coding agent works inside it.** | 🟡 **closer than it was, and the last gap is a CPU bit** | The two blockers this row used to name are both closed: the capture has a NIC (V5.1) and the image has a toolchain (V5.3). What replaced them was measured, not guessed — on a **rehydrated Graviton capture every JIT is unsound**, because that guest's kernel elided its I-cache maintenance at boot (V6.8). Node runs; `npm` dies intermittently. The fix is not a patch, it is a *path*: a **cold-booted** guest is immune by construction. |
 
 **What changed the shape of the plan:** V1–V4 were about making it *work*. That
 part is done. What remains is making it a *product* — evidence for the parts we
 built and now proved end-to-end (V5.1 ✅), an image worth running (V5.3), and a
-UI that shows any of it (V6).
+UI that shows any of it (V6.1–V6.3, V6.5 ✅).
+
+**And one thing changed the shape of the *architecture*.** Cold boot (V5.4/#101)
+was planned as a convenience — a fresh sandbox without needing a capture. V6.8
+made it **load-bearing**: it is now the only path on which a code-generating
+workload is sound, which is to say the only path to sentence 4. Everything a
+rehydrated capture inherits from its capture host, a cold-booted guest reads
+from this Mac.
 
 ---
 
@@ -164,14 +171,40 @@ future. Fixed in V5.5 by advancing the counter over the elapsed wall time.
 **After the fix, on the same capture, `apt-get update` fetched 37.7 MB with zero
 errors.**
 
+### 🔴 Blocker D — a rehydrated Graviton guest cannot JIT (2026-08-03)
+
+The newest blocker, and the only one that is a property of the *capture host*
+rather than of anything we build. `CTR_EL0.DIC` is set on Graviton2 and clear on
+Apple silicon; Linux reads it **once at boot** and, when set, patches `ic ivau`
+out of the routine behind `__sync_icache_dcache()` — the code that runs whenever
+userspace makes a page executable. Those NOPs are baked into the kernel text
+inside the snapshot, so **nothing can repair them at rehydrate time.**
+
+Measured: the `mmap(RW) → write → mprotect(RX) → call` sequence every JIT
+performs returns stale instructions **955 times in 1000**; the same test with an
+explicit `ic ivau` is **0 in 1000**. `node --version` works, `npm --version`
+dies with `Illegal instruction` about 2 runs in 15.
+
+**Two ways out, and only one is ours:**
+
+| Route | Ours? | Notes |
+| --- | --- | --- |
+| **Cold boot (V5.4/#101)** | ✅ **yes** | The kernel reads *this Mac's* `CTR_EL0`, sees `DIC = 0`, keeps its maintenance. Immune by construction. This is the route. |
+| A capture host reporting `DIC = 0` | ❌ theirs | Unknown whether Graviton3/4 do. Worth asking gimbal cloud, but we cannot depend on it. |
+
+Guarded meanwhile: `chm` warns at load, `CHM_STRICT_ICACHE=1` refuses, and
+`chm posture` reports it. Full detail in §7c and
+[`cpu-feature-deltas.md`](cpu-feature-deltas.md).
+
 ### 🟠 Blocker C — cross-repo, not ours to close
 
 V3.1 and V3.3 need `gctl` changes. Our side of V3.1 is already corrected.
 
 ### ✅ Not blocked — we can start today
 
-**V6 (the app tells the whole truth)** and **V5.4 (cold create-from-image)** need
-nothing from anyone else.
+**V5.4's remaining rootfs work.** Kernel, disk, NIC and SMP all cold-boot on HVF
+today with no snapshot and no KVM anywhere in the path; what is missing is an
+image to boot into. It needs nobody, and Blocker D makes it the critical path.
 
 ---
 
@@ -184,16 +217,23 @@ nothing from anyone else.
 | **V3** | Cloud control plane on the vanilla contract | ②④ | 🟠 partly blocked cross-repo (#21, #36) |
 | **V4** | Security with sane defaults | ③ | ✅ **complete** — threat model, default posture, `chm posture` |
 | **V5** | The coding-agent sandbox | ①③ | 🟢 **V5.1, V5.2, V5.3, V5.5 and V5.6 shipped** — no known correctness bug left; V5.4 (cold create-from-image) boots a stock kernel to a shell **with a real disk and NIC**, with rootfs / SMP remaining |
-| **V6** | The app tells the whole truth | ③④ | ⬜ **ready to start, nothing blocking it** |
+| **V6** | The app tells the whole truth | ③④ | 🟢 **V6.1, V6.2, V6.3 and V6.5 shipped** — security panel, credential-proxy UI, egress audit and capability honesty are all in the app. **V6.4 (off-box round-trip) remains**, and it is the one that needs the control plane |
+| **V6.8** | Why a rehydrated guest cannot JIT | ① | ✅ **root-caused, guarded, documented** — and it is what makes V5.4 a prerequisite for V7 rather than a nicety |
 
 **Recommended order of attack:**
 
 1. ~~**V5.1**~~ — ✅ done. gimbal cloud delivered the capture; the guest reaches
    the real internet and clones from GitHub. Blocker A is closed.
-2. **V5.3** — a real agent image. Spec is written (round 3 of the capture
-   request); it is an *image* problem, so the next move is a capture, not code.
-3. **V6.1–V6.3** — the local half of the UI. Needs nobody.
-4. **V6.4 / V3** — the off-box round-trip, once the contract lands.
+2. ~~**V5.3**~~ — ✅ done, and it never needed the cloud. Built locally on the
+   round-2 capture and persisted with V5.6 SMP checkpointing.
+3. ~~**V6.1–V6.3**~~ — ✅ done. The local half of the UI needed nobody, and
+   shipping it found nine instances of one bug class.
+4. **V5.4 — finish cold boot (rootfs).** Promoted to the top by V6.8: it is no
+   longer "a fresh sandbox without a capture", it is *the only substrate on which
+   an agent workload is sound*. Kernel, disk, NIC and SMP all cold-boot today;
+   what is left is an image to boot into.
+5. **V7.1** — the acceptance test, on that cold-booted guest.
+6. **V6.4 / V3** — the off-box round-trip, once the contract lands.
 
 ---
 
