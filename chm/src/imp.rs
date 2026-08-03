@@ -2122,6 +2122,7 @@ pub(crate) fn run_usgic_engine(
             serial_sink.clone(),
             raw.handle(),
             serial_wake.clone(),
+            console::serial_spi(),
         );
         raw
     });
@@ -2133,10 +2134,12 @@ pub(crate) fn run_usgic_engine(
         serial_sink.clone(),
         serial_wake.clone(),
         running.clone(),
+        console::serial_spi(),
     );
     // Also available to a non-interactive supervisor (the daemon), so a console
     // consumer can type into the guest without owning this process's stdin.
-    let console_input = console::console_input(uart.clone(), serial_sink, serial_wake);
+    let console_input =
+        console::console_input(uart.clone(), serial_sink, serial_wake, console::serial_spi());
     if !cfg.quiet {
         eprintln!(
             "chm: interactive console active — close this window or press Ctrl-A x \
