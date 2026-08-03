@@ -883,7 +883,7 @@ impl UsgicPrepared {
     /// table, so a device/console thread's SPI lands on the core its
     /// `GICD_IROUTER` affinity names (not always the boot CPU).
     pub fn spi_router(&self, cpus: Arc<Vec<UsgicCpuHandle>>) -> UsgicSpiRouter {
-        UsgicSpiRouter::new(self.seed.shared_dist.clone(), cpus)
+        self.seed.spi_router(cpus)
     }
 }
 
@@ -907,6 +907,19 @@ pub struct UsgicSeed {
     /// the last in the region. `gic_iterate_rdists` stops walking at the first
     /// one that claims to be.
     vcpu_count: u64,
+}
+
+impl UsgicSeed {
+    /// Build an SPI router over this seed's VM-global distributor and the
+    /// per-vCPU delivery table.
+    ///
+    /// Lives on the seed as well as on [`UsgicPrepared`] because the vCPU
+    /// handles a router needs do not exist until each vCPU has been created on
+    /// its own thread — and `UsgicPrepared` cannot cross a thread boundary,
+    /// while the seed is `Send` precisely so that it can.
+    pub fn spi_router(&self, cpus: Arc<Vec<UsgicCpuHandle>>) -> UsgicSpiRouter {
+        UsgicSpiRouter::new(self.shared_dist.clone(), cpus)
+    }
 }
 
 /// Create the userspace-GIC VM and map its guest RAM (no managed GIC, no vCPUs).

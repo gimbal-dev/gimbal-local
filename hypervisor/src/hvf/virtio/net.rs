@@ -298,8 +298,17 @@ impl NetDevice {
     /// offloads the guest agreed to. A rehydrated guest bound its features at
     /// capture time and cannot renegotiate, so this is read from the snapshot.
     pub fn with_features(mut self, acked: u64) -> Self {
-        self.guest_csum = acked & VIRTIO_NET_F_GUEST_CSUM != 0;
+        self.apply_features(acked);
         self
+    }
+
+    /// Record a negotiated feature set in place.
+    ///
+    /// The `virtio-mmio` transport learns the features only when the driver
+    /// writes `FEATURES_OK`, which is after the device is built — so unlike the
+    /// restore path it cannot use the consuming builder above.
+    pub fn apply_features(&mut self, acked: u64) {
+        self.guest_csum = acked & VIRTIO_NET_F_GUEST_CSUM != 0;
     }
 
     /// The virtio-net header flags to stamp on frames delivered to the guest.

@@ -63,6 +63,11 @@ impl DescChain {
 }
 
 /// A split virtqueue bound to its rings in guest RAM.
+///
+/// `Default` is the unprogrammed state: a cold guest's transport starts every
+/// queue here and the driver fills it in, whereas a restored one arrives with
+/// every field already known.
+#[derive(Default, Clone, Copy)]
 pub struct Queue {
     /// Number of entries (a power of two).
     pub size: u16,
