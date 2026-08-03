@@ -63,7 +63,23 @@ known-good path, not for normal operation.
 | `CHM_FULL_BARRIER=1` | Opt back into the full media barrier on virtio-blk flush. | Comparing durability posture against throughput. |
 | `CHM_RAW_CONSOLE=1` | Disable console filtering; pass guest bytes through untouched. | The filter is suspected of eating something. |
 | `CHM_DISABLE_RUN_WATCHDOG=1` | Disable the run watchdog. | Long single-step debugging sessions the watchdog would otherwise cut short. |
+| `CHM_FORCE_RESUME_ADVANCE_S=<n>` | Force the resume-time guest counter jump to `n` seconds instead of the real elapsed time. | Attributing a resume-time stall. The jump is normally a function of how long the checkpoint sat on disk, so waiting cannot separate "the jump was large" from "a lot of time passed"; this varies one and holds the other. |
+| `CHM_ALLOW_OVERLAY_DRIFT=1` | Resume even though the disk overlays changed after the checkpoint's RAM was captured. | Deliberately pairing a remembered filesystem with a different one. Expect the guest to wedge — see below. |
 | `CHM_MAX_RESUMABLE_REVISIONS=<n>` | How many checkpoint revisions stay resumable before older ones are pruned. | Each revision costs a full RAM image; this bounds the store. |
+
+### Why overlay drift is refused rather than warned about
+
+Guest RAM holds the kernel's page cache, inode cache and journal head for the
+filesystem it had mounted. Resume restores that RAM but reattaches whatever the
+overlay holds **now**, so a session that writes to disk and exits *without*
+`--checkpoint` leaves the next resume describing blocks that have moved.
+
+The failure is not a clean error. The guest comes up, serves RAM-only work
+normally, and then wedges the first time it touches the diverged part of the
+tree — `rcu_preempt kthread timer wakeup didn't happen for 60006 jiffies`, then
+silence. It is also self-perpetuating: capturing at teardown writes that *hung*
+kernel over the last good checkpoint, so every later resume starts wedged. That
+is why the check refuses up front instead of warning and continuing.
 
 ## Policy and control-plane bindings
 
