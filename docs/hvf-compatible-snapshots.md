@@ -86,17 +86,23 @@ Two things worth knowing about the daemon specifically:
   them. Let the run end cleanly (`--checkpoint`, or Stop under the daemon) and
   RAM and disk are captured together.
 
-## Do not confuse the two environment variables
+## There is only one interrupt backend now
 
-Neither is needed on the supported path. Both are diagnostics.
+`CHM_USERSPACE_GIC=1` and `CHM_ALLOW_ITS_LPI=1` used to pick between two GIC
+backends. Both are gone, because the choice is gone: the Apple managed-GIC
+runtime path is retired and every capture runs on the userspace GICv3.
 
-| variable | what it does |
-| --- | --- |
-| `CHM_USERSPACE_GIC=1` | **Forces** the software GICv3 even for a capture that would have gone to the managed GIC. Useful for A/B-ing the two backends; not required for vanilla captures, which route there anyway. |
-| `CHM_ALLOW_ITS_LPI=1` | **Forces the opposite, and is almost never what you want.** It pushes an ITS/LPI capture onto the *managed* GIC, which cannot deliver LPIs, so the guest restores and then stalls on its first disk or net I/O. It exists to reproduce that failure deliberately, and it warns. |
+That is not a narrowing. Apple's managed GIC could never deliver an LPI — its
+List Registers are EL2/nested-only and it exposes no `GICR_PROPBASER`,
+`GICR_PENDBASER` or ITS at all — so it could never have run a stock
+cloud-hypervisor capture, and `hv_gic_create` rejects the
+redistributor-below-distributor layout Linux expects, so it could never cold-boot
+either. Keeping it as a selectable path only ever meant keeping a way to select a
+guest that hangs on its first disk or network I/O.
 
-Anything describing `CHM_ALLOW_ITS_LPI=1` as "the USGIC path" is wrong; it is the
-opposite, and it will look like a hang.
+The hardware measurements behind that are kept as tests in
+`hypervisor/tests/hvf_boot.rs`, which still drives Apple's GIC directly. The
+evidence survives; the footgun does not.
 
 ## Counter frequency: a capture-host property you cannot fix on restore
 

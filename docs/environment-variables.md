@@ -51,8 +51,6 @@ known-good path, not for normal operation.
 
 | Variable | Effect | Why it exists |
 | --- | --- | --- |
-| `CHM_USERSPACE_GIC=1` | Force the userspace GICv3 even for a capture that would auto-route to Apple's managed GIC. | A/B the two interrupt backends against each other. Auto-routing (I7) picks correctly on its own; this is for proving that. |
-| `CHM_ALLOW_ITS_LPI=1` | Allow an ITS/LPI capture onto the **managed** GIC, which cannot deliver its completions. | Reproducing the failure mode that motivated the userspace GIC. Produces a broken guest by design. |
 | `CHM_DISABLE_SPI_1_OF_N_FALLBACK=1` | Disable 1-of-N SPI target-selection fallback. | Isolating an interrupt-affinity bug. |
 | `CHM_SERIAL_SPI=<n>` | Override the serial console's SPI INTID. | A capture whose device/IRQ ordering differs from what we infer. |
 | `CHM_GUEST_CNTFRQ=<Hz>` | Override the guest counter rate the VM-global clock synthesizes. | Not normally needed: a capture including upstream `69637dde6` records its own frequency and is corrected automatically. Set it for an older capture that records none, or `0` to decline the correction and accept the dilation. See [`hvf-compatible-snapshots.md`](hvf-compatible-snapshots.md#how-the-correction-works). |
