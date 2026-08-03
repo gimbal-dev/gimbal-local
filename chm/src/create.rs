@@ -33,7 +33,9 @@ use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::Condvar;
 use std::sync::atomic::Ordering;
+use std::fs;
 use std::time::Duration;
 use std::time::Instant;
 
@@ -46,11 +48,45 @@ use hypervisor::hvf::host_counter_hz;
 use hypervisor::hvf::rehydrate;
 
 use hypervisor::hvf::HvfHypervisor;
+use hypervisor::hvf::UsgicSpiRouter;
+use hypervisor::hvf::virtio::GuestMemory;
+use hypervisor::hvf::virtio::block::{BlockDevice, FileBackend};
+use hypervisor::hvf::virtio::devcore::{Backend, MsiSink, MsiSpiInjector};
+use hypervisor::hvf::virtio::features;
+use hypervisor::hvf::virtio::mmio::{self, MmioParams, VirtioMmioDevice, device_id};
+use hypervisor::hvf::virtio::nat::{EgressPolicy, NatLimits, NatResponder};
+use hypervisor::hvf::virtio::net::{NetDevice, NetKick};
 
 use crate::coldboot;
+use crate::coldboot::ColdBootConfig;
+use crate::coldboot::VirtioKind;
 use crate::imp::PL011_BASE;
 use crate::imp::PL011_SIZE;
-use crate::coldboot::ColdBootConfig;
+
+/// The NAT gateway the guest talks to, and the MAC we hand its NIC.
+///
+/// Same subnet the restore path's NAT uses, so a guest image built for one
+/// works unchanged on the other.
+const GATEWAY_IP: [u8; 4] = [192, 168, 249, 1];
+const GATEWAY_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
+const GUEST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 2];
+
+/// How long the net service thread waits for a guest transmit before servicing
+/// anyway. Matches the restore path's interval; a transmit wakes it at once.
+const NET_SERVICE_INTERVAL: Duration = Duration::from_millis(2);
+
+/// An [`MsiSink`] that hands an `INTID` to the userspace GIC's SPI router, so a
+/// device thread's completion is delivered on the vCPU the interrupt is routed
+/// to rather than asserted from a thread that does not own the line.
+struct ColdSpiSink {
+    router: Arc<UsgicSpiRouter>,
+}
+
+impl MsiSink for ColdSpiSink {
+    fn deliver_spi(&self, intid: u32) {
+        self.router.deliver_spi(intid);
+    }
+}
 
 /// Number of interrupt lines the cold GIC distributor is sized for.
 ///
@@ -106,6 +142,10 @@ struct CreateArgs {
     /// Stop after this many seconds. A cold boot that produces no output is
     /// the normal early failure mode, so this is not optional.
     max_seconds: u64,
+    /// Hosts the guest may reach, as `host:port`. Empty means the default
+    /// deny-all posture, which is what an unconfigured sandbox gets everywhere
+    /// else in this tree (see `docs/security-model.md` §1a).
+    egress_allow: Vec<String>,
 }
 
 fn usage() -> String {
@@ -122,6 +162,11 @@ fn usage() -> String {
      \x20 --cmdline <str>     Kernel command line.\n\
      \x20 --cpus <n>          vCPUs (default 1).\n\
      \x20 --memory <MiB>      Guest RAM in MiB (default 1024).\n\
+     \x20 --disk <path>       Raw disk image as virtio-blk. Repeatable; the\n\
+     \x20                     first becomes /dev/vda.\n\
+     \x20 --net               Attach a virtio-net NIC on the userspace NAT.\n\
+     \x20 --egress-allow <h:p>  Permit egress to host:port. Repeatable.\n\
+     \x20                     Without any, the NIC is up but reaches nothing.\n\
      \x20 --seconds <n>       Stop after n seconds (default 30).\n\
      \x20 --dry-run           Build and describe the guest image; do not run it.\n"
         .to_string()
@@ -132,6 +177,8 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     let mut dry_run = false;
     let mut max_seconds = 30_u64;
     let mut kernel: Option<PathBuf> = None;
+    let mut egress_allow: Vec<String> = Vec::new();
+    let mut cmdline_explicit = false;
 
     let mut i = 0;
     while i < raw.len() {
@@ -147,7 +194,10 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
             "--initramfs" | "--initrd" => {
                 cfg.initramfs = Some(PathBuf::from(value("--initramfs")?));
             }
-            "--cmdline" => cfg.cmdline = value("--cmdline")?,
+            "--cmdline" => {
+                cfg.cmdline = value("--cmdline")?;
+                cmdline_explicit = true;
+            }
             "--cpus" => {
                 cfg.vcpus = value("--cpus")?
                     .parse()
@@ -163,6 +213,9 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
                     .parse()
                     .map_err(|e| format!("--seconds: {e}"))?;
             }
+            "--disk" => cfg.disks.push(PathBuf::from(value("--disk")?)),
+            "--net" => cfg.net = true,
+            "--egress-allow" => egress_allow.push(value("--egress-allow")?),
             "--dry-run" => dry_run = true,
             "-h" | "--help" => return Err(usage()),
             other => return Err(format!("unknown option {other}\n\n{}", usage())),
@@ -171,10 +224,22 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     }
 
     cfg.kernel = kernel.ok_or_else(|| format!("--kernel is required\n\n{}", usage()))?;
+    if !egress_allow.is_empty() && !cfg.net {
+        return Err("--egress-allow needs --net; there is no NIC to allow through".into());
+    }
+    // Only when the caller did not write a command line themselves: an explicit
+    // `--cmdline` is the caller saying they know what the kernel needs, and
+    // appending to it could contradict a `root=` they chose deliberately.
+    if !cmdline_explicit
+        && let Some(extra) = coldboot::implied_root_args(&cfg)
+    {
+        cfg.cmdline = format!("{} {extra}", cfg.cmdline);
+    }
     Ok(CreateArgs {
         cfg,
         dry_run,
         max_seconds,
+        egress_allow,
     })
 }
 
@@ -234,7 +299,6 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     let uart = Arc::new(Pl011::new());
     let bus = Arc::new(MmioBus::new());
     bus.add(PL011_BASE, PL011_SIZE, uart.clone());
-    let vm_ops: Arc<dyn VmOps> = Arc::new(ColdVmOps { bus });
 
     // SAFETY: `image` owns the allocation and is kept alive below (it is
     // dropped only after `prepared`, which holds the VM). `host_ptr` is the
@@ -250,6 +314,20 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         )
     }
     .map_err(|e| format!("preparing the cold VM: {e}"))?;
+
+    // virtio devices go on the bus at exactly the windows the device tree
+    // named, and their guest memory is the same `GuestMemory` the VM was mapped
+    // with -- the device walks the guest's rings through the host mapping.
+    let devices = build_virtio(&image, &prepared.guest_mem, args)?;
+    for (place, dev) in &devices {
+        bus.add(place.base, place.size, dev.clone());
+    }
+    let net_devices: Vec<Arc<VirtioMmioDevice>> = devices
+        .iter()
+        .filter(|(p, _)| p.kind == VirtioKind::Net)
+        .map(|(_, d)| d.clone())
+        .collect();
+    let vm_ops: Arc<dyn VmOps> = Arc::new(ColdVmOps { bus });
 
     // A cold guest reads the host's own counter frequency, so there is no rate
     // to synthesize and no stepper to run: an unscaled clock, anchored now.
@@ -288,6 +366,13 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     let seed = prepared.seed();
     let deadline = Instant::now() + Duration::from_secs(args.max_seconds);
 
+    // The vCPU's GIC handle only exists once the vCPU does, and the vCPU can
+    // only be created on the thread that will run it. So the device injectors
+    // are installed inside that thread, before its first `run()`: a device that
+    // completed a request before its injector was live would set the ISR bit
+    // and drop the interrupt, and the guest would wait on it forever.
+    let ready = Arc::new((Mutex::new(false), Condvar::new()));
+
     // The guest runs on its own thread because HVF binds a vCPU to the thread
     // that created it, and the deadline has to be enforced from outside it.
     let outcome: Arc<Mutex<Option<Result<String, String>>>> = Arc::new(Mutex::new(None));
@@ -296,6 +381,9 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         let outcome = outcome.clone();
         let entry = image.entry.0;
         let fdt = image.fdt.0;
+        let devices = devices.clone();
+        let spi_seed = prepared.seed();
+        let ready = ready.clone();
         thread::Builder::new()
             .name("cold-vcpu0".into())
             .spawn(move || {
@@ -311,9 +399,24 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                     Err(e) => {
                         *outcome.lock().unwrap() = Some(Err(format!("creating vCPU 0: {e}")));
                         running.store(false, Ordering::Release);
+                        signal_ready(&ready);
                         return;
                     }
                 };
+                if let Some(handle) = rehydrate::usgic_cpu_handle(&mut vcpu) {
+                    let router = Arc::new(spi_seed.spi_router(Arc::new(vec![handle])));
+                    let sink: Arc<dyn MsiSink> = Arc::new(ColdSpiSink { router });
+                    for (place, dev) in &devices {
+                        // One wired interrupt per device, so the vector table
+                        // has a single entry and every queue signals vector 0.
+                        dev.set_injector(Box::new(MsiSpiInjector::new(
+                            dev.name().to_string(),
+                            vec![place.intid],
+                            sink.clone(),
+                        )));
+                    }
+                }
+                signal_ready(&ready);
                 while running.load(Ordering::Acquire) {
                     match vcpu.run() {
                         Ok(VmExit::Ignore) => {}
@@ -350,6 +453,34 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
             .map_err(|e| format!("spawning the vCPU thread: {e}"))?
     };
 
+    // The NAT lives on its own thread: a guest transmit only enqueues the frame
+    // and wakes it, so the vCPU returns to the guest from its MMIO exit instead
+    // of running a TCP stack inside it.
+    let net_thread = if net_devices.is_empty() {
+        None
+    } else {
+        let running = running.clone();
+        let ready = ready.clone();
+        let kick = Arc::new(NetKick::default());
+        for dev in &net_devices {
+            dev.set_net_kick(kick.clone());
+        }
+        Some(
+            thread::Builder::new()
+                .name("cold-net".into())
+                .spawn(move || {
+                    await_ready(&ready);
+                    while running.load(Ordering::Acquire) {
+                        for dev in &net_devices {
+                            dev.service_net();
+                        }
+                        kick.wait(NET_SERVICE_INTERVAL);
+                    }
+                })
+                .map_err(|e| format!("spawning the net service thread: {e}"))?,
+        )
+    };
+
     while running.load(Ordering::Acquire) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(50));
     }
@@ -358,6 +489,9 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
 
     let _ = vcpu_thread.join();
     let _ = console.join();
+    if let Some(t) = net_thread {
+        let _ = t.join();
+    }
 
     // `image` must outlive the VM: `prepared` holds the VM and unmaps guest RAM
     // on drop, and the pointer it was given belongs to `image`.
@@ -379,6 +513,100 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     }
 }
 
+
+/// Release everyone waiting on the vCPU thread's setup, whether it succeeded or
+/// not: a failed vCPU still has to unblock the threads that would otherwise
+/// wait out the whole deadline for it.
+fn signal_ready(ready: &Arc<(Mutex<bool>, Condvar)>) {
+    let (lock, cv) = &**ready;
+    *lock.lock().unwrap() = true;
+    cv.notify_all();
+}
+
+/// Wait for the vCPU thread to finish installing device injectors.
+fn await_ready(ready: &Arc<(Mutex<bool>, Condvar)>) {
+    let (lock, cv) = &**ready;
+    let mut done = lock.lock().unwrap();
+    while !*done {
+        done = cv.wait(done).unwrap();
+    }
+}
+
+/// Build a `virtio-mmio` device for each placement the image reserved.
+///
+/// The device model is shared with the restore path — same queue walker, same
+/// backends — so a cold guest's disk I/O is serviced by exactly the code a
+/// rehydrated one's is. Only the transport differs, because only the discovery
+/// differs.
+fn build_virtio(
+    image: &coldboot::ColdGuestImage,
+    mem: &Arc<GuestMemory>,
+    args: &CreateArgs,
+) -> Result<Vec<(coldboot::VirtioPlacement, Arc<VirtioMmioDevice>)>, String> {
+    let mut out = Vec::new();
+    for place in &image.virtio {
+        let dev = match place.kind {
+            VirtioKind::Block => {
+                let path = place
+                    .path
+                    .as_ref()
+                    .ok_or_else(|| "a block placement with no backing file".to_string())?;
+                // The capacity is the file's own size, rounded down: a raw
+                // image with a partial trailing sector has no sector there to
+                // read, and reporting one would hand the guest an EIO at the
+                // end of every whole-device read.
+                let bytes = fs::metadata(path)
+                    .map_err(|e| format!("stat disk {}: {e}", path.display()))?
+                    .len();
+                let nsectors = bytes / 512;
+                if nsectors == 0 {
+                    return Err(format!("disk {} is smaller than one sector", path.display()));
+                }
+                let backend = FileBackend::open(path, nsectors)
+                    .map_err(|e| format!("opening disk {}: {e}", path.display()))?;
+                let serial = format!("chm-disk{}", place.index);
+                VirtioMmioDevice::new(
+                    format!("blk{}", place.index),
+                    Backend::Block(BlockDevice::new(Box::new(backend), &serial)),
+                    mem.clone(),
+                    MmioParams {
+                        device_id: device_id::BLOCK,
+                        features: features::RING_INDIRECT_DESC | features::RING_EVENT_IDX,
+                        num_queues: 1,
+                        device_config: mmio::blk_config(nsectors),
+                    },
+                )
+            }
+            VirtioKind::Net => {
+                // Deny-all unless the caller named destinations, matching the
+                // default posture every other entry point starts from.
+                let policy = EgressPolicy::from_profile(
+                    "deny",
+                    &args.egress_allow,
+                    &[],
+                    "chm create --egress-allow",
+                );
+                let responder =
+                    NatResponder::new(GATEWAY_IP, GATEWAY_MAC, policy, NatLimits::default());
+                VirtioMmioDevice::new(
+                    "net0",
+                    Backend::Net(NetDevice::new(Box::new(responder))),
+                    mem.clone(),
+                    MmioParams {
+                        device_id: device_id::NET,
+                        features: features::RING_INDIRECT_DESC
+                            | features::RING_EVENT_IDX
+                            | mmio::VIRTIO_NET_F_MAC,
+                        num_queues: 2,
+                        device_config: mmio::net_config(GUEST_MAC),
+                    },
+                )
+            }
+        };
+        out.push((place.clone(), Arc::new(dev)));
+    }
+    Ok(out)
+}
 
 #[cfg(test)]
 mod tests {
@@ -468,5 +696,65 @@ mod tests {
         let img = coldboot::build(&cfg).expect("building a guest image from a real kernel");
         assert!(img.fdt_len > 1000, "device tree suspiciously small");
         assert!(img.entry.0 > img.fdt.0, "kernel must land above the tree");
+    }
+
+    #[test]
+    fn egress_allow_without_a_nic_is_a_parse_error_not_a_silent_no_op() {
+        // Accepting this would read as "egress is restricted to this host" when
+        // in fact there is no NIC at all — a misleading kind of safe.
+        let e = parse(&args(&[
+            "--kernel", "/tmp/Image", "--egress-allow", "api.github.com:443",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("--net"), "error must name the missing flag: {e}");
+    }
+
+    #[test]
+    fn disks_accumulate_in_order_and_net_is_off_by_default() {
+        let a = parse(&args(&[
+            "--kernel", "/tmp/Image", "--disk", "/tmp/a.img", "--disk", "/tmp/b.img",
+        ]))
+        .unwrap();
+        assert_eq!(a.cfg.disks.len(), 2);
+        assert!(a.cfg.disks[0].ends_with("a.img"));
+        assert!(a.cfg.disks[1].ends_with("b.img"));
+        assert!(!a.cfg.net);
+        assert!(a.egress_allow.is_empty(), "default posture is deny-all");
+    }
+
+    #[test]
+    fn a_disk_with_no_initramfs_gets_root_appended() {
+        let a = parse(&args(&["--kernel", "/tmp/Image", "--disk", "/tmp/a.img"])).unwrap();
+        assert!(
+            a.cfg.cmdline.ends_with("root=/dev/vda rw"),
+            "cmdline was {:?}",
+            a.cfg.cmdline
+        );
+        assert!(a.cfg.cmdline.contains("console=ttyAMA0"), "default kept");
+    }
+
+    #[test]
+    fn an_explicit_cmdline_is_never_appended_to() {
+        // The caller may have chosen a different root deliberately; appending
+        // a second root= would silently override it.
+        let a = parse(&args(&[
+            "--kernel", "/tmp/Image", "--disk", "/tmp/a.img",
+            "--cmdline", "console=ttyAMA0 root=/dev/vda2 ro",
+        ]))
+        .unwrap();
+        assert_eq!(a.cfg.cmdline, "console=ttyAMA0 root=/dev/vda2 ro");
+    }
+
+    #[test]
+    fn an_initramfs_suppresses_the_implied_root() {
+        let a = parse(&args(&[
+            "--kernel", "/tmp/Image", "--disk", "/tmp/a.img", "--initramfs", "/tmp/i.gz",
+        ]))
+        .unwrap();
+        assert!(
+            !a.cfg.cmdline.contains("root="),
+            "an initramfs is the root fs: {:?}",
+            a.cfg.cmdline
+        );
     }
 }
