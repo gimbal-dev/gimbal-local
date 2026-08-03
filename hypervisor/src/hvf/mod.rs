@@ -233,10 +233,63 @@ impl HvfHypervisor {
         Ok(Arc::new(HvfHypervisor))
     }
 
-    /// HVF is available on Apple Silicon Macs with the hypervisor entitlement.
+    /// Whether this backend *could* apply to the target it was compiled for.
+    ///
+    /// This is backend selection in [`crate::new`], not an availability check,
+    /// and the distinction is load-bearing: it answers a question about the
+    /// **compiler**, so it cannot see the two things that actually stop HVF
+    /// working — a missing `com.apple.security.hypervisor` entitlement (which
+    /// every `cargo build` strips, making this the most common local failure by
+    /// a wide margin) or a host that has no hypervisor device.
+    ///
+    /// It used to be documented as "available on Apple Silicon Macs with the
+    /// hypervisor entitlement" while returning `cfg!(target_os = "macos")`,
+    /// which is neither: it was `true` on Intel macOS and `true` for an
+    /// unentitled binary that `hv_vm_create` would immediately refuse with
+    /// `HV_DENIED`. The arch is now part of the answer; the entitlement cannot
+    /// be, because knowing it requires asking the kernel.
+    ///
+    /// For "will this actually work here", use [`probe_availability`], which
+    /// does ask.
     pub fn is_available() -> crate::hypervisor::Result<bool> {
-        Ok(cfg!(target_os = "macos"))
+        Ok(cfg!(all(target_os = "macos", target_arch = "aarch64")))
     }
+}
+
+/// Ask the kernel whether this process can actually create a VM, by creating
+/// one and immediately destroying it.
+///
+/// The only honest answer to "is HVF available" comes from HVF. Everything
+/// cheaper — the target triple, the presence of the framework, a previous
+/// success — is a proxy that is wrong in exactly the case that matters most: a
+/// freshly `cargo build`-ed binary has lost its entitlement and looks identical
+/// to a working one until `hv_vm_create` returns `HV_DENIED`.
+///
+/// `hv_vm_create` is **process-global**: a process that already has a VM gets
+/// `HV_BUSY`, which says nothing about entitlement. A caller that might be
+/// hosting a guest must therefore either skip the probe (a running guest is
+/// already stronger evidence than any probe) or run it in a child process.
+/// `HV_BUSY` is reported as-is rather than folded into a yes or a no.
+///
+/// Returns the decoded `hv_return_t` description on failure.
+pub fn probe_availability() -> Result<(), String> {
+    // SAFETY: FFI; NULL config selects HVF defaults, exactly as `create_vm`
+    // does. The VM is destroyed before returning, so the process-global slot is
+    // left as it was found.
+    let ret = unsafe { hv_vm_create(ptr::null_mut()) };
+    if ret != HV_SUCCESS {
+        return Err(format!("{:#010x} — {}", ret as u32, hv_return_str(ret)));
+    }
+    // SAFETY: FFI; releases the VM created immediately above.
+    let ret = unsafe { ffi::hv_vm_destroy() };
+    if ret != HV_SUCCESS {
+        return Err(format!(
+            "created a VM but could not destroy it: {:#010x} — {}",
+            ret as u32,
+            hv_return_str(ret)
+        ));
+    }
+    Ok(())
 }
 
 impl crate::Hypervisor for HvfHypervisor {
@@ -695,6 +748,40 @@ impl UserGic {
     /// interrupt keeps the guest in its handler until it EOIs/deactivates).
     fn should_assert(&self) -> bool {
         !self.pending.is_empty() && self.active.is_none()
+    }
+}
+
+#[cfg(test)]
+mod availability_tests {
+    use super::HvfHypervisor;
+
+    /// `is_available` selects a backend; it does not establish availability, and
+    /// the difference is the whole reason `probe_availability` exists.
+    ///
+    /// This used to return `cfg!(target_os = "macos")` under a doc comment that
+    /// said "Apple Silicon Macs with the hypervisor entitlement" — so it was
+    /// `true` on Intel macOS, and `true` for a binary that `hv_vm_create` would
+    /// refuse with `HV_DENIED`, which is what every `cargo build` in this
+    /// repository produces. Backend selection believed it.
+    #[test]
+    fn is_available_answers_about_the_target_and_says_nothing_about_the_host() {
+        assert_eq!(
+            HvfHypervisor::is_available().unwrap(),
+            cfg!(all(target_os = "macos", target_arch = "aarch64")),
+            "is_available must track the compiled target, arch included"
+        );
+    }
+
+    /// The probe is the honest answer, and it is only meaningful because it
+    /// costs a real syscall. Running it here would take the process-global VM
+    /// slot from anything else in the test binary, so this only checks that a
+    /// failure is reported with the detail a human needs — the entitlement fix
+    /// is the single most common local failure and a bare code hides it.
+    #[test]
+    fn a_refused_probe_names_the_entitlement() {
+        let msg = super::hv_return_str(super::HV_DENIED);
+        assert!(msg.contains("com.apple.security.hypervisor"), "{msg}");
+        assert!(msg.contains("codesign"), "{msg}");
     }
 }
 
