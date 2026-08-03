@@ -1636,6 +1636,41 @@ pub(crate) fn run_usgic_engine(
         return Err("snapshot declares no vCPUs".into());
     }
 
+    // Refuse to pair a guest's remembered filesystem with a different one on
+    // disk. See `checkpoint::overlay_drift` for the measured failure this
+    // prevents: the guest resumes, serves RAM-only work, then wedges the first
+    // time it touches the diverged tree -- and the teardown capture then writes
+    // that hung kernel over the last good checkpoint.
+    let drift = if cfg.checkpoint && checkpoint::has_checkpoint(dir) {
+        checkpoint::overlay_drift(dir)
+    } else {
+        None
+    };
+    if let Some(drift) = drift {
+        if env::var_os("CHM_ALLOW_OVERLAY_DRIFT").is_none() {
+            return Err(format!(
+                "disk overlays have changed since this checkpoint's RAM was captured \
+                 ({} overlay file(s) recorded, {} now). Resuming would hand the guest \
+                 kernel a filesystem it does not remember, which wedges it. This happens \
+                 when a session writes to disk and exits without --checkpoint.\n  \
+                 To resume the consistent RAM+disk pair a revision stored: \
+                 chm revisions {} then chm rollback {} <rev-id>\n  \
+                 To discard the checkpoint and cold-boot: remove {}\n  \
+                 To proceed anyway: CHM_ALLOW_OVERLAY_DRIFT=1",
+                drift.recorded_files,
+                drift.live_files,
+                dir.display(),
+                dir.display(),
+                checkpoint::checkpoint_dir(dir).display(),
+            ));
+        }
+        eprintln!(
+            "chm: warning: resuming despite overlay drift ({} recorded, {} live) \
+             because CHM_ALLOW_OVERLAY_DRIFT is set; the guest may wedge",
+            drift.recorded_files, drift.live_files
+        );
+    }
+
     // Resume from a live checkpoint when one exists and checkpoints are enabled.
     // Accepted only when it describes every vCPU this snapshot declares: the
     // userspace-GIC redistributor, pending set and active INTID are all
