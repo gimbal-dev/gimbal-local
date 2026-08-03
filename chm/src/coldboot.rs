@@ -93,7 +93,7 @@ const KERNEL_ALIGNMENT: u64 = 0x20_0000;
 /// this is the number the *interrupt controller* uses, and the tree ends up
 /// with the SPI-relative one. Matches upstream's `AARCH64_UART_IRQ` + `IRQ_BASE`
 /// and, more importantly, matches what our own PL011 asserts.
-const PL011_IRQ: u32 = 33;
+pub const PL011_IRQ: u32 = 33;
 
 /// Size of the PL011 MMIO window. Matches `imp::PL011_SIZE`, which is what the
 /// bus actually registers; a test below holds the two together.
@@ -118,7 +118,16 @@ const VIRTIO_MMIO_BASE: u64 = layout::MEM_32BIT_DEVICES_START.0;
 
 /// `INTID` of the first virtio device. PL011 holds 33; SPIs count up from
 /// `IRQ_BASE` (32), so 34 is the next free one.
-const VIRTIO_IRQ_BASE: u32 = PL011_IRQ + 1;
+/// SPI for the PL031 RTC. The guest never actually takes it -- Linux's pl031
+/// driver only arms the alarm interrupt when userspace sets a wakealarm -- but
+/// the FDT node requires one and an interrupt the tree does not describe is a
+/// worse failure than one that is never raised.
+pub const PL031_IRQ: u32 = PL011_IRQ + 1;
+
+/// Size of the PL031 MMIO window.
+pub const PL031_SIZE: u64 = 0x1000;
+
+const VIRTIO_IRQ_BASE: u32 = PL031_IRQ + 1;
 
 /// The most virtio devices a cold guest can have, bounding both the MMIO
 /// windows and the SPIs they consume out of `COLD_NR_IRQS`.
@@ -224,21 +233,114 @@ pub fn default_cmdline() -> String {
     "console=ttyAMA0 earlycon=pl011,0x9000000 reboot=k panic=1".to_string()
 }
 
+/// The largest guest RAM a single low-memory region can hold: everything from
+/// `RAM_START` (1 GiB) up to the 32-bit device window at `MEM_32BIT_RESERVED_START`
+/// (0xfc00_0000), which works out at 3008 MiB.
+pub const MAX_MEMORY_MIB: u64 = (layout::MEM_32BIT_RESERVED_START.0 - layout::RAM_START.0) >> 20;
+
+/// GPT partition type GUID for "Linux filesystem data" — the type every distro
+/// cloud image gives its root partition.
+const GPT_LINUX_FS_DATA: &str = "0fc63daf-8483-4772-8e79-3d69d8477de4";
+
+/// Render 16 raw GPT GUID bytes as the canonical mixed-endian string.
+///
+/// GPT stores the first three fields little-endian and the last two big-endian,
+/// so a straight hex dump of the bytes is *not* the GUID anyone else prints. Get
+/// this wrong and `root=PARTUUID=` silently fails to match, which the kernel
+/// reports only as an unhelpful `VFS: Unable to mount root fs`.
+fn gpt_guid_to_string(raw: &[u8; 16]) -> String {
+    let d1 = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+    let d2 = u16::from_le_bytes([raw[4], raw[5]]);
+    let d3 = u16::from_le_bytes([raw[6], raw[7]]);
+    let mut tail = String::new();
+    for b in &raw[8..16] {
+        let _ = write!(tail, "{b:02x}");
+    }
+    format!(
+        "{d1:08x}-{d2:04x}-{d3:04x}-{}-{}",
+        &tail[0..4],
+        &tail[4..16]
+    )
+}
+
+/// The unique GUID of the largest Linux-filesystem-data partition on `disk`.
+///
+/// Returns `None` when the disk has no GPT (a bare filesystem image, which is
+/// the whole device and needs no partition selector) or has a GPT with no Linux
+/// data partition (an image shaped in a way we cannot reason about — better to
+/// leave the caller's fallback in place than to invent a partition number).
+///
+/// Reading the *type* GUID rather than trusting a partition index is what makes
+/// this survive real cloud images: Ubuntu's arm64 image puts root at index 1 but
+/// also carries an ESP and a `/boot`, and other distros order them differently.
+fn gpt_root_partuuid(disk: &Path) -> Option<String> {
+    const SECTOR: u64 = 512;
+    let mut f = File::open(disk).ok()?;
+    let mut header = [0u8; 92];
+    f.seek(SeekFrom::Start(SECTOR)).ok()?;
+    f.read_exact(&mut header).ok()?;
+    if &header[0..8] != b"EFI PART" {
+        return None;
+    }
+    let entries_lba = u64::from_le_bytes(header[72..80].try_into().ok()?);
+    let n_entries = u32::from_le_bytes(header[80..84].try_into().ok()?);
+    let entry_size = u32::from_le_bytes(header[84..88].try_into().ok()?);
+    // Guard against a corrupt header turning into a multi-GB read.
+    if !(128..=4096).contains(&entry_size) || n_entries > 1024 {
+        return None;
+    }
+    f.seek(SeekFrom::Start(entries_lba.checked_mul(SECTOR)?))
+        .ok()?;
+    let mut entry = vec![0u8; entry_size as usize];
+    let mut best: Option<(u64, String)> = None;
+    for _ in 0..n_entries {
+        if f.read_exact(&mut entry).is_err() {
+            break;
+        }
+        let ty: [u8; 16] = entry[0..16].try_into().ok()?;
+        if ty == [0u8; 16] {
+            continue;
+        }
+        if gpt_guid_to_string(&ty) != GPT_LINUX_FS_DATA {
+            continue;
+        }
+        let uniq: [u8; 16] = entry[16..32].try_into().ok()?;
+        let first = u64::from_le_bytes(entry[32..40].try_into().ok()?);
+        let last = u64::from_le_bytes(entry[40..48].try_into().ok()?);
+        let sectors = last.saturating_sub(first);
+        if best.as_ref().is_none_or(|(n, _)| sectors > *n) {
+            best = Some((sectors, gpt_guid_to_string(&uniq)));
+        }
+    }
+    best.map(|(_, guid)| guid)
+}
+
 /// The `root=` a cold guest needs when its only filesystem is a disk.
 ///
 /// A kernel with no initramfs and no `root=` reaches `prepare_namespace` with
-/// nothing to mount and panics. The first `--disk` is `/dev/vda` by
-/// construction — [`place_virtio`] emits disks before the NIC and Linux probes
-/// `virtio_mmio` nodes in address order — so `root=/dev/vda` is not a guess.
+/// nothing to mount and panics.
+///
+/// **`/dev/vdaN` is not a stable name.** Ubuntu's `virtio_blk` probes
+/// asynchronously, so with more than one disk attached the letters are assigned
+/// in completion order, not bus order — adding a second `--disk` to a working
+/// command line moved root and panicked the guest with `unknown-block(253,1)`.
+/// So when the first disk carries a GPT we name the root partition by its own
+/// GUID, which the kernel resolves itself with no initramfs and no ambiguity.
+///
+/// A bare (unpartitioned) filesystem image keeps `root=/dev/vda`: there is no
+/// partition to name, and with one disk the letter is not in doubt.
 ///
 /// Returns `None` when an initramfs was given (it *is* the root filesystem, and
 /// forcing a pivot would break the common case of a self-contained initramfs)
 /// or when there is no disk to point at.
-pub fn implied_root_args(cfg: &ColdBootConfig) -> Option<&'static str> {
-    if cfg.initramfs.is_none() && !cfg.disks.is_empty() {
-        Some("root=/dev/vda rw")
-    } else {
-        None
+pub fn implied_root_args(cfg: &ColdBootConfig) -> Option<String> {
+    if cfg.initramfs.is_some() {
+        return None;
+    }
+    let first = cfg.disks.first()?;
+    match gpt_root_partuuid(first) {
+        Some(guid) => Some(format!("root=PARTUUID={guid} rw")),
+        None => Some("root=/dev/vda rw".to_string()),
     }
 }
 
@@ -445,6 +547,23 @@ pub fn build(cfg: &ColdBootConfig) -> Result<ColdGuestImage, String> {
         return Err("a guest needs some RAM".to_string());
     }
 
+    // Guest RAM starts at 1 GiB and the window from `MEM_32BIT_RESERVED_START`
+    // to 4 GiB is reserved for 32-bit device BARs, so a single contiguous region
+    // cannot cross it. Upstream's FDT generator supports a second region above
+    // 4 GiB, but this cold-boot path builds one; asking for more than the gap
+    // allows would otherwise `panic!` deep inside `arch`'s FDT writer with a raw
+    // address dump, which is not a usable answer to "why won't my VM start".
+    if cfg.memory_mib > MAX_MEMORY_MIB {
+        return Err(format!(
+            "{} MiB of RAM does not fit below the 32-bit device window: guest RAM \
+             starts at {:#x} and a single region must end by {:#x}. The most this \
+             cold-boot path can give a guest is {MAX_MEMORY_MIB} MiB.",
+            cfg.memory_mib,
+            layout::RAM_START.0,
+            layout::MEM_32BIT_RESERVED_START.0
+        ));
+    }
+
     let (image_size, text_offset) = read_arm64_header(&cfg.kernel)?;
     let ram_size = (cfg.memory_mib << 20) as usize;
     let ram_base = layout::RAM_START.0;
@@ -550,6 +669,19 @@ pub fn build(cfg: &ColdBootConfig) -> Result<ColdGuestImage, String> {
             addr: layout::LEGACY_SERIAL_MAPPED_IO_START.0,
             irq: PL011_IRQ,
             len: PL011_SIZE,
+        },
+    );
+
+    // A cold guest has no snapshot to inherit a wall clock from, so without
+    // this it boots believing it is whenever the kernel was built. Every TLS
+    // handshake then rejects certificates as "not yet valid", which presents as
+    // a network fault and is not one. See `Pl031`.
+    device_info.insert(
+        (DeviceType::Rtc, DeviceType::Rtc.to_string()),
+        FdtDevice {
+            addr: layout::LEGACY_RTC_MAPPED_IO_START.0,
+            irq: PL031_IRQ,
+            len: PL031_SIZE,
         },
     );
 
@@ -930,7 +1062,10 @@ mod tests {
             disks: disks.clone(),
             ..Default::default()
         };
-        assert_eq!(implied_root_args(&with_disk), Some("root=/dev/vda rw"));
+        assert_eq!(
+            implied_root_args(&with_disk).as_deref(),
+            Some("root=/dev/vda rw")
+        );
         // An initramfs IS the root filesystem; forcing a pivot would break it.
         let with_both = ColdBootConfig {
             disks,
@@ -940,5 +1075,128 @@ mod tests {
         assert_eq!(implied_root_args(&with_both), None);
         // Nothing to point root= at.
         assert_eq!(implied_root_args(&ColdBootConfig::default()), None);
+    }
+
+    /// Build a minimal but structurally real GPT: protective MBR, header at
+    /// LBA 1, entry array at LBA 2. `parts` is `(type guid, unique guid, first
+    /// lba, last lba)`.
+    fn synth_gpt(parts: &[(&str, &str, u64, u64)]) -> Vec<u8> {
+        fn guid_bytes(s: &str) -> [u8; 16] {
+            let hex: Vec<u8> = s
+                .chars()
+                .filter(|c| *c != '-')
+                .collect::<Vec<_>>()
+                .chunks(2)
+                .map(|c| u8::from_str_radix(&c.iter().collect::<String>(), 16).unwrap())
+                .collect();
+            let mut out = [0u8; 16];
+            out[0..4].copy_from_slice(&u32::from_str_radix(&s[0..8], 16).unwrap().to_le_bytes());
+            out[4..6].copy_from_slice(&u16::from_str_radix(&s[9..13], 16).unwrap().to_le_bytes());
+            out[6..8].copy_from_slice(&u16::from_str_radix(&s[14..18], 16).unwrap().to_le_bytes());
+            out[8..16].copy_from_slice(&hex[8..16]);
+            out
+        }
+        let mut d = vec![0u8; 512 * 34];
+        d[512..520].copy_from_slice(b"EFI PART");
+        d[512 + 72..512 + 80].copy_from_slice(&2u64.to_le_bytes());
+        d[512 + 80..512 + 84].copy_from_slice(&(parts.len() as u32).to_le_bytes());
+        d[512 + 84..512 + 88].copy_from_slice(&128u32.to_le_bytes());
+        for (i, (ty, uniq, first, last)) in parts.iter().enumerate() {
+            let off = 512 * 2 + i * 128;
+            d[off..off + 16].copy_from_slice(&guid_bytes(ty));
+            d[off + 16..off + 32].copy_from_slice(&guid_bytes(uniq));
+            d[off + 32..off + 40].copy_from_slice(&first.to_le_bytes());
+            d[off + 40..off + 48].copy_from_slice(&last.to_le_bytes());
+        }
+        d
+    }
+
+    #[test]
+    fn gpt_guid_round_trips_mixed_endian() {
+        // The byte order is the whole point: the first three fields are little
+        // endian on disk, the last two big endian. A straight hex dump would
+        // render this as 5e89825e-9c9a-0e46-... and never match.
+        let raw = [
+            0x5e, 0x89, 0x82, 0x5e, 0x9c, 0x9a, 0x0e, 0x46, 0x9a, 0x0f, 0x96, 0xa5, 0xe8, 0xf3,
+            0x95, 0x24,
+        ];
+        assert_eq!(
+            gpt_guid_to_string(&raw),
+            "5e82895e-9a9c-460e-9a0f-96a5e8f39524"
+        );
+    }
+
+    #[test]
+    fn gpt_root_picks_the_largest_linux_partition() {
+        let dir = std::env::temp_dir().join(format!("chm-gpt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("gpt.raw");
+        // An Ubuntu-shaped image: root first, then an ESP and a /boot, both of
+        // which a naive "first partition" or "largest partition" rule could
+        // pick. Only the type GUID distinguishes them.
+        std::fs::write(
+            &img,
+            synth_gpt(&[
+                (
+                    "0fc63daf-8483-4772-8e79-3d69d8477de4",
+                    "11111111-2222-3333-4444-555555555555",
+                    227328,
+                    16777182,
+                ),
+                (
+                    "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
+                    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                    2048,
+                    227327,
+                ),
+                (
+                    "bc13c2ff-59e6-4262-a352-b275fd6f7172",
+                    "99999999-8888-7777-6666-555555555555",
+                    1024,
+                    2047,
+                ),
+            ]),
+        )
+        .unwrap();
+        assert_eq!(
+            gpt_root_partuuid(&img).as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
+
+        let cfg = ColdBootConfig {
+            disks: vec![img.clone()],
+            ..Default::default()
+        };
+        assert_eq!(
+            implied_root_args(&cfg).as_deref(),
+            Some("root=PARTUUID=11111111-2222-3333-4444-555555555555 rw")
+        );
+
+        // A GPT with no Linux data partition tells us nothing, so the caller's
+        // whole-disk fallback stands rather than us inventing a partition index.
+        let esp_only = dir.join("esponly.raw");
+        std::fs::write(
+            &esp_only,
+            synth_gpt(&[(
+                "c12a7328-f81f-11d2-ba4b-00a0c93ec93b",
+                "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                2048,
+                227327,
+            )]),
+        )
+        .unwrap();
+        assert_eq!(gpt_root_partuuid(&esp_only), None);
+
+        // A bare filesystem image has no GPT signature and stays /dev/vda.
+        let bare = dir.join("bare.raw");
+        std::fs::write(&bare, vec![0u8; 512 * 34]).unwrap();
+        assert_eq!(gpt_root_partuuid(&bare), None);
+        let cfg = ColdBootConfig {
+            disks: vec![bare],
+            ..Default::default()
+        };
+        assert_eq!(implied_root_args(&cfg).as_deref(), Some("root=/dev/vda rw"));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

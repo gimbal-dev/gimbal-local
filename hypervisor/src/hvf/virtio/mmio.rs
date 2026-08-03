@@ -277,6 +277,20 @@ impl VirtioMmioDevice {
         }
     }
 
+    /// Install the interception hook on this device's NAT, if it is a NIC.
+    ///
+    /// The mirror of [`super::pci::VirtioPciDevice::set_net_intercept`]: the
+    /// credential proxy is a property of the *network*, not of the transport
+    /// the guest happens to reach it through, so a cold-booted guest on
+    /// virtio-mmio gets the same edge injection a rehydrated one on virtio-pci
+    /// does. Set after construction because the proxy must bind its port first.
+    pub fn set_net_intercept(&self, decider: Option<Arc<dyn super::nat::InterceptDecider>>) {
+        let mut core = self.core.lock().unwrap();
+        if let Backend::Net(n) = &mut core.backend {
+            n.set_intercept(decider);
+        }
+    }
+
     /// Apply the negotiated feature set to the backend, once the driver has
     /// written `FEATURES_OK`.
     fn commit_features(&self, acked: u64) {

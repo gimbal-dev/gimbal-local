@@ -265,22 +265,35 @@ impl Queue {
     /// capture-side device's stale values: under EVENT_IDX `avail_event` may sit
     /// ahead of the current `avail.idx`, so the guest adds its next buffer (e.g.
     /// a jbd2 journal commit) WITHOUT kicking and then blocks forever waiting for
-    /// a completion this device never sees. Re-pointing `avail_event` at the
-    /// current `avail.idx` (and clearing NO_NOTIFY) makes the very next
-    /// submission notify us, restoring forward progress. No-op when the device
-    /// has no queue memory mapped yet.
+    /// a completion this device never sees. Re-pointing `avail_event` (and
+    /// clearing NO_NOTIFY) makes the very next submission notify us, restoring
+    /// forward progress. No-op when the device has no queue memory mapped yet.
+    ///
+    /// The published index is `next_avail` — the entry the device will consume
+    /// NEXT — and deliberately **not** a fresh read of `avail.idx`. `avail.idx`
+    /// is the driver's cursor and can move between the device's last `pop` and
+    /// this write; publishing it would promise "do not kick me until you pass
+    /// N+1" for an entry N the device never consumed, and `vring_need_event` is
+    /// edge-triggered, so the driver would never kick again. `next_avail` can
+    /// never run ahead of what the device has consumed, so the first unseen
+    /// submission always kicks.
     pub fn arm_notification(&self, mem: &GuestMemory) -> Result<(), GuestMemError> {
         if self.event_idx {
             // used ring: flags(2) + idx(2) + ring[size]*8, then avail_event(2).
             let avail_event_addr = self.used + 4 + 8 * self.size as u64;
-            let cur = self.avail_idx(mem)?;
-            mem.write_u16(avail_event_addr, cur)?;
+            mem.write_u16(avail_event_addr, self.next_avail)?;
         } else {
             // Clear VRING_USED_F_NO_NOTIFY (bit 0) so the driver kicks again.
             let flags = mem.read_u16(self.used)?;
             mem.write_u16(self.used, flags & !1)?;
         }
         Ok(())
+    }
+
+    /// True when the driver has made a chain available that the device has not
+    /// consumed yet. Checked after re-arming to close the submit/arm race.
+    pub fn has_pending(&self, mem: &GuestMemory) -> Result<bool, GuestMemError> {
+        Ok(self.next_avail != self.avail_idx(mem)?)
     }
 
     /// Restore the engine's progress cursors from the live rings: the device
@@ -436,15 +449,34 @@ mod tests {
     }
 
     #[test]
-    fn arm_notification_points_avail_event_at_current_idx() {
+    fn arm_notification_publishes_the_devices_own_cursor_not_the_drivers() {
         let avail_event_addr = USED + 4 + 8 * QSZ as u64;
         let m = mem();
         let mut q = queue();
         q.event_idx = true;
+        // The driver has raced ahead: it published entry 42 while the device
+        // had consumed only up to 40.
         m.write_u16(AVAIL + 2, 42).unwrap(); // avail.idx
         m.write_u16(avail_event_addr, 7).unwrap(); // stale capture-side value
+        q.next_avail = 40;
         q.arm_notification(&m).unwrap();
-        assert_eq!(m.read_u16(avail_event_addr).unwrap(), 42);
+        // Publishing 42 here would promise "do not kick until you pass 42" for
+        // entries 40 and 41 the device never consumed, and `vring_need_event` is
+        // edge-triggered, so the driver would never kick again.
+        assert_eq!(m.read_u16(avail_event_addr).unwrap(), 40);
+    }
+
+    #[test]
+    fn has_pending_sees_work_that_raced_in_after_the_ring_looked_empty() {
+        let m = mem();
+        let mut q = queue();
+        m.write_u16(AVAIL + 2, 9).unwrap();
+        q.next_avail = 9;
+        assert!(!q.has_pending(&m).unwrap(), "drained ring reports empty");
+        // The driver appends one entry after the device's last `pop` returned
+        // None. Nothing will kick the device for it, so the device must notice.
+        m.write_u16(AVAIL + 2, 10).unwrap();
+        assert!(q.has_pending(&m).unwrap());
     }
 
     #[test]

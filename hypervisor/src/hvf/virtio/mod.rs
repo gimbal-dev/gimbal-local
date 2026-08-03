@@ -255,6 +255,17 @@ pub mod features {
     pub const RING_EVENT_IDX: u64 = 1 << 29;
     /// `VIRTIO_F_VERSION_1`: modern (non-legacy) virtio.
     pub const VERSION_1: u64 = 1 << 32;
+    /// `VIRTIO_BLK_F_FLUSH`: the device has a volatile write cache, so the
+    /// driver must issue `VIRTIO_BLK_T_FLUSH` to make writes durable.
+    ///
+    /// **This has to be offered.** Without it Linux calls
+    /// `blk_queue_write_cache(q, false, false)` and stops emitting barriers
+    /// altogether, having been told the device is already write-through. A
+    /// file-backed disk is not: it sits behind the host page cache. The guest
+    /// then builds a journal whose ordering nothing enforces, and a guest that
+    /// stops without unmounting comes back with a filesystem the journal cannot
+    /// repair -- measured here as `EXT4-fs error: deleted inode referenced`.
+    pub const BLK_FLUSH: u64 = 1 << 9;
 }
 
 #[cfg(test)]

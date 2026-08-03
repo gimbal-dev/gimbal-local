@@ -179,65 +179,81 @@ impl DeviceCore {
             self.notify_net(queue_index);
             return;
         }
-        let Some(queue) = self.queues.get_mut(queue_index as usize) else {
-            return;
-        };
         // Snapshot the queue out so we can borrow backend + mem mutably/immutably
         // without aliasing `self`.
         let mem = self.mem.clone();
-        let mut completed_any = false;
-        let old_used = queue.next_used;
+        // Drain, re-arm, then re-check. The re-check is load-bearing: the driver
+        // can append an entry between the `pop` that returned empty and the
+        // re-arm, having already read a suppression index that says "do not
+        // kick". Nothing would then wake this device and the guest blocks
+        // forever on a completion that never comes -- observed as `jbd2` and
+        // `ext4lazyinit` stuck for minutes while the VMM sat idle. Looping on
+        // fresh work after arming means the device, not the driver, has the last
+        // word on whether the ring is really empty.
         loop {
-            let chain = match queue.pop(&mem) {
-                Ok(Some(c)) => c,
-                Ok(None) => break,
-                Err(e) => {
-                    if std::env::var_os("CHM_TRACE_MMIO").is_some() {
-                        eprintln!("[virtio] queue read error: {e}");
+            let Some(queue) = self.queues.get_mut(queue_index as usize) else {
+                return;
+            };
+            let mut completed_any = false;
+            let old_used = queue.next_used;
+            loop {
+                let chain = match queue.pop(&mem) {
+                    Ok(Some(c)) => c,
+                    Ok(None) => break,
+                    Err(e) => {
+                        if std::env::var_os("CHM_TRACE_MMIO").is_some() {
+                            eprintln!("[virtio] queue read error: {e}");
+                        }
+                        break;
                     }
-                    break;
+                };
+                let used_len = match &mut self.backend {
+                    Backend::Block(b) => b.process(&mem, &chain).used_len,
+                    Backend::Rng(r) => r.process(&mem, &chain),
+                    // Net is dispatched to notify_net before this loop is reached.
+                    Backend::Net(_) => 0,
+                };
+                let _ = queue.add_used(&mem, chain.head, used_len);
+                completed_any = true;
+            }
+            if completed_any {
+                self.isr_status |= 0x1;
+                let needs = queue
+                    .needs_interrupt(&mem, old_used, queue.next_used)
+                    .unwrap_or(true);
+                if std::env::var_os("CHM_TRACE_NOTIFY").is_some() {
+                    let ue = mem
+                        .read_u16(queue.avail + 4 + 2 * queue.size as u64)
+                        .unwrap_or(0);
+                    eprintln!(
+                        "[notify] q{queue_index} completed: old_used={old_used} \
+                         new_used={} used_event={ue} event_idx={} needs_irq={needs}",
+                        queue.next_used, queue.event_idx
+                    );
                 }
-            };
-            let used_len = match &mut self.backend {
-                Backend::Block(b) => b.process(&mem, &chain).used_len,
-                Backend::Rng(r) => r.process(&mem, &chain),
-                // Net is dispatched to notify_net before this loop is reached.
-                Backend::Net(_) => 0,
-            };
-            let _ = queue.add_used(&mem, chain.head, used_len);
-            completed_any = true;
-        }
-        if completed_any {
-            self.isr_status |= 0x1;
-            let needs = queue
-                .needs_interrupt(&mem, old_used, queue.next_used)
-                .unwrap_or(true);
-            if std::env::var_os("CHM_TRACE_NOTIFY").is_some() {
-                let ue = mem
-                    .read_u16(queue.avail + 4 + 2 * queue.size as u64)
-                    .unwrap_or(0);
-                eprintln!(
-                    "[notify] q{queue_index} completed: old_used={old_used} \
-                     new_used={} used_event={ue} event_idx={} needs_irq={needs}",
-                    queue.next_used, queue.event_idx
-                );
+                if needs {
+                    let vector = self
+                        .queue_vectors
+                        .get(queue_index as usize)
+                        .copied()
+                        .unwrap_or(0);
+                    self.injector.signal(vector);
+                }
             }
-            if needs {
-                let vector = self
-                    .queue_vectors
-                    .get(queue_index as usize)
-                    .copied()
-                    .unwrap_or(0);
-                self.injector.signal(vector);
+            // Re-arm notification suppression so the driver kicks us for its NEXT
+            // submission. A restored queue carries the capture-side device's stale
+            // avail_event/NO_NOTIFY state; without re-arming, a post-resume guest
+            // adds buffers (e.g. a jbd2 journal commit) silently and wedges. Done
+            // on every notify (and thus on drain_on_resume) regardless of whether
+            // anything completed this pass.
+            let _ = queue.arm_notification(&mem);
+            // Anything that raced in while we were draining is ours to finish:
+            // the driver has already made its kick decision and will not make
+            // another one.
+            if !queue.has_pending(&mem).unwrap_or(false) {
+                break;
             }
         }
-        // Re-arm notification suppression so the driver kicks us for its NEXT
-        // submission. A restored queue carries the capture-side device's stale
-        // avail_event/NO_NOTIFY state; without re-arming, a post-resume guest
-        // adds buffers (e.g. a jbd2 journal commit) silently and wedges. Done
-        // on every notify (and thus on drain_on_resume) regardless of whether
-        // anything completed this pass.
-        let _ = queue.arm_notification(&mem);
     }
 
     /// Service a virtio-net queue notification.

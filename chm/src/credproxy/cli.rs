@@ -132,8 +132,8 @@ const USAGE: &str = "\
 chm proxy — the credential-injecting egress proxy
 
 USAGE:
-    chm proxy show [WORKSPACE_DIR] [--rules FILE] [--json]
-    chm proxy ca   <WORKSPACE_DIR> [--out FILE]
+    chm proxy show [WORKSPACE_DIR|--workspace DIR] [--rules FILE] [--json]
+    chm proxy ca   <WORKSPACE_DIR|--workspace DIR> [--out FILE]
     chm proxy check --host HOST [--port N] [--path P] [--rules FILE]
                     [--control] [--json]
 
@@ -161,26 +161,58 @@ fn flag<'a>(args: &'a [String], name: &str) -> Option<&'a str> {
         .map(String::as_str)
 }
 
+/// Flags that take a value, so an argument scan knows what to skip. Unknown
+/// flags are refused rather than assumed to take one: assuming cost us a
+/// confusing session, where `proxy show --workspace DIR` swallowed the
+/// directory as an unknown flag's value and then reported "not configured" —
+/// a wrong answer that looked like a correct one.
+const VALUED: [&str; 5] = ["--rules", "--out", "--host", "--port", "--path"];
+const VALUELESS: [&str; 3] = ["--json", "--control", "--workspace"];
+
+/// The workspace directory, however the caller chose to say it.
+///
+/// `chm create` spells this `--workspace`, so accept that spelling here too.
+/// One concept with two spellings across sibling subcommands is a papercut
+/// that only ever shows up mid-task.
+fn workspace_arg(args: &[String]) -> Option<&str> {
+    flag(args, "--workspace").or_else(|| positional(args))
+}
+
+/// Reject flags this command does not know, naming the offender.
+fn reject_unknown(cmd: &str, args: &[String], known: &[&str]) -> Result<(), ExitCode> {
+    for a in args {
+        if a.starts_with("--") && !known.contains(&a.as_str()) {
+            eprintln!("chm proxy {cmd}: unknown flag `{a}`\n\n{USAGE}");
+            return Err(ExitCode::FAILURE);
+        }
+    }
+    Ok(())
+}
+
 fn positional(args: &[String]) -> Option<&str> {
     let mut skip = false;
-    for (i, a) in args.iter().enumerate() {
+    for a in args {
         if skip {
             skip = false;
             continue;
         }
         if a.starts_with("--") {
-            // Every flag this command takes has a value except --json.
-            skip = a != "--json";
+            // `--workspace` is listed as valueless here on purpose: its value
+            // is exactly the positional we are looking for, so letting the
+            // scan see it is what makes both spellings resolve alike.
+            skip = VALUED.contains(&a.as_str()) || !VALUELESS.contains(&a.as_str());
             continue;
         }
-        let _ = i;
         return Some(a);
     }
     None
 }
 
 fn show(args: &[String]) -> ExitCode {
-    let workspace = positional(args).map(PathBuf::from);
+    if let Err(e) = reject_unknown("show", args, &["--rules", "--json", "--workspace"]) {
+        return e;
+    }
+    let workspace = workspace_arg(args).map(PathBuf::from);
     let over = flag(args, "--rules").map(PathBuf::from);
     let resolved = match resolve_rules(workspace.as_deref(), over.as_deref()) {
         Ok(r) => r,
@@ -321,7 +353,10 @@ fn quote(s: &str) -> String {
 }
 
 fn ca(args: &[String]) -> ExitCode {
-    let Some(ws) = positional(args) else {
+    if let Err(e) = reject_unknown("ca", args, &["--out", "--workspace"]) {
+        return e;
+    }
+    let Some(ws) = workspace_arg(args) else {
         eprintln!("chm proxy ca: a workspace directory is required\n\n{USAGE}");
         return ExitCode::FAILURE;
     };
@@ -1056,6 +1091,49 @@ mod tests {
             verdict("HTTP/1.1 200 OK", &Err("connect refused".to_string())),
             Verdict::Failed("connect refused".to_string())
         );
+    }
+
+    #[test]
+    fn the_workspace_resolves_the_same_however_the_caller_spells_it() {
+        // `chm create` takes `--workspace DIR`; this command originally took
+        // only a bare positional. Worse, the argument scan assumed every
+        // unrecognised flag carried a value, so `--workspace DIR` consumed the
+        // directory as that flag's value and the command reported "not
+        // configured" -- a wrong answer wearing the costume of a right one.
+        let args = |v: &[&str]| -> Vec<String> { v.iter().map(ToString::to_string).collect() };
+
+        assert_eq!(workspace_arg(&args(&["/ws"])).unwrap(), "/ws");
+        assert_eq!(
+            workspace_arg(&args(&["--workspace", "/ws"])).unwrap(),
+            "/ws"
+        );
+        assert_eq!(
+            workspace_arg(&args(&["--workspace", "/ws", "--json"])).unwrap(),
+            "/ws"
+        );
+        // A valued flag before the positional must not swallow it.
+        assert_eq!(
+            workspace_arg(&args(&["--rules", "/r.json", "/ws"])).unwrap(),
+            "/ws"
+        );
+        assert_eq!(workspace_arg(&args(&["--json"])), None);
+    }
+
+    #[test]
+    fn an_unknown_flag_is_refused_rather_than_silently_eating_its_neighbour() {
+        // The failure this prevents is not a rejected command, it is an
+        // accepted one that quietly did the wrong thing.
+        let args: Vec<String> = ["--workspce", "/ws"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(reject_unknown("show", &args, &["--rules", "--json", "--workspace"]).is_err());
+
+        let ok: Vec<String> = ["--workspace", "/ws", "--json"]
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert!(reject_unknown("show", &ok, &["--rules", "--json", "--workspace"]).is_ok());
     }
 
     #[test]

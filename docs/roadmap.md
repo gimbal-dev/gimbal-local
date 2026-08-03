@@ -22,12 +22,23 @@ Four sentences, in dependency order. This is the honest score:
 | **1. A vanilla cloud snapshot runs on a Mac.** | ✅ **true, hardware-proven** | Stock upstream, unforked, Graviton2-captured, **no flags and no environment variables**, through all three entry points (`chm run`, `chm serve`, the app). |
 | **2. It is a *secure* sandbox.** | ✅ **true, and it is enforced rather than asserted** | 12 invariants, default-on posture, `chm posture` reports what is actually in force and exits non-zero if anything is weakened. |
 | **3. It round-trips with the cloud.** | 🟡 **half true** | Cross-substrate mobility is proven (a cloud session resumed on HVF *past its marker*). The signed-manifest contract (V3) is not finished, and it is cross-repo. |
-| **4. A coding agent works inside it.** | 🔴 **not yet** | Measured, not guessed. Two blockers left: the capture has **no NIC**, and the image has **no toolchain**. |
+| **4. A coding agent works inside it.** | ✅ **true, hardware-proven 2026-08-03** | The **GitHub Copilot CLI installed, authenticated, and wrote and ran a JavaScript app** inside a Gimbal Local guest — and did it **holding no credential**, which was attached at the network edge. The route is the cold-booted guest V6.8 predicted would be immune: `npm` installs and runs with no SIGILL. Verified independently of the agent's own claim, and the real token's sha256 appears nowhere in the guest. §5 has the transcript. |
 
 **What changed the shape of the plan:** V1–V4 were about making it *work*. That
 part is done. What remains is making it a *product* — evidence for the parts we
-built and now proved end-to-end (V5.1 ✅), an image worth running (V5.3), and a
-UI that shows any of it (V6).
+built and now proved end-to-end (V5.1 ✅), an image worth running (V5.3 ✅), and
+a UI that shows any of it (V6.1–V6.3, V6.5 ✅).
+
+**And one thing changed the shape of the *architecture*.** Cold boot (V5.4/#101)
+was planned as a convenience — a fresh sandbox without needing a capture. V6.8
+made it **load-bearing**: it is now the only path on which a code-generating
+workload is sound, which is to say the only path to sentence 4. Everything a
+rehydrated capture inherits from its capture host, a cold-booted guest reads
+from this Mac. **That prediction has now been tested rather than argued**: V7.1
+ran on exactly that path and `npm` never faulted once.
+
+**Three of the four sentences are now true and hardware-proven.** The one that
+is not — round-tripping with the cloud — is the one that needs another team.
 
 ---
 
@@ -164,14 +175,49 @@ future. Fixed in V5.5 by advancing the counter over the elapsed wall time.
 **After the fix, on the same capture, `apt-get update` fetched 37.7 MB with zero
 errors.**
 
+### 🟢 Blocker D (ROUTED AROUND 2026-08-03) — a rehydrated Graviton guest cannot JIT
+
+The newest blocker, and the only one that is a property of the *capture host*
+rather than of anything we build. `CTR_EL0.DIC` is set on Graviton2 and clear on
+Apple silicon; Linux reads it **once at boot** and, when set, patches `ic ivau`
+out of the routine behind `__sync_icache_dcache()` — the code that runs whenever
+userspace makes a page executable. Those NOPs are baked into the kernel text
+inside the snapshot, so **nothing can repair them at rehydrate time.**
+
+Measured: the `mmap(RW) → write → mprotect(RX) → call` sequence every JIT
+performs returns stale instructions **955 times in 1000**; the same test with an
+explicit `ic ivau` is **0 in 1000**. `node --version` works, `npm --version`
+dies with `Illegal instruction` about 2 runs in 15.
+
+**Two ways out, and only one is ours:**
+
+| Route | Ours? | Notes |
+| --- | --- | --- |
+| **Cold boot (V5.4/#101)** | ✅ **yes, and taken** | The kernel reads *this Mac's* `CTR_EL0`, sees `DIC = 0`, keeps its maintenance. Immune by construction. **Proven 2026-08-03**: `npm i -g @github/copilot` installed 3 packages on a cold-booted guest with no fault, and the Copilot CLI then ran. |
+| A capture host reporting `DIC = 0` | ❌ theirs | Unknown whether Graviton3/4 do. Worth asking gimbal cloud, but we no longer depend on it. |
+
+The blocker itself is **not fixed and cannot be** — a rehydrated Graviton guest
+still cannot JIT soundly, which is why the guard stays. What changed is that the
+capability it blocked no longer needs that path. `chm` warns at load,
+`CHM_STRICT_ICACHE=1` refuses, and `chm posture` reports it. Full detail in §7c
+and [`cpu-feature-deltas.md`](cpu-feature-deltas.md).
+
 ### 🟠 Blocker C — cross-repo, not ours to close
 
 V3.1 and V3.3 need `gctl` changes. Our side of V3.1 is already corrected.
 
 ### ✅ Not blocked — we can start today
 
-**V6 (the app tells the whole truth)** and **V5.4 (cold create-from-image)** need
-nothing from anyone else.
+**Nothing on the critical path.** V5.4 finished with a real rootfs and V7.1 ran
+on it, so every milestone that needed only us is shipped. What remains —
+**V6.4 and V3** — is the off-box round-trip, and it needs the control plane.
+
+The best local work now is ergonomics found while running V7.1 for real:
+proxy-rule hosts should imply egress allowance (naming a host in a rule is an
+explicit statement of intent, and requiring it twice fails closed but
+confusingly), `chm proxy show --workspace` does not honour its own flag, and a
+`--seconds` expiry should attempt a graceful shutdown rather than acting as a
+power cut on a guest with a writable disk.
 
 ---
 
@@ -183,17 +229,27 @@ nothing from anyone else.
 | **V2** | Vanilla everywhere in the product | ①③ | ✅ **complete** — CLI, daemon and app all run vanilla, flagless |
 | **V3** | Cloud control plane on the vanilla contract | ②④ | 🟠 partly blocked cross-repo (#21, #36) |
 | **V4** | Security with sane defaults | ③ | ✅ **complete** — threat model, default posture, `chm posture` |
-| **V5** | The coding-agent sandbox | ①③ | 🟢 **V5.1, V5.2, V5.3, V5.5 and V5.6 shipped** — no known correctness bug left; V5.4 (cold create-from-image) boots a stock kernel to a shell **with a real disk and NIC**, with rootfs / SMP remaining |
-| **V6** | The app tells the whole truth | ③④ | ⬜ **ready to start, nothing blocking it** |
+| **V5** | The coding-agent sandbox | ①③ | ✅ **complete** — V5.1, V5.2, V5.3, V5.5, V5.6 and now **V5.4** all shipped. Cold create-from-image boots a stock kernel with a real disk, NIC and SMP into a **real Ubuntu rootfs**, no snapshot and no KVM host in the path |
+| **V6** | The app tells the whole truth | ③④ | 🟢 **V6.1, V6.2, V6.3 and V6.5 shipped** — security panel, credential-proxy UI, egress audit and capability honesty are all in the app. **V6.4 (off-box round-trip) remains**, and it is the one that needs the control plane |
+| **V6.8** | Why a rehydrated guest cannot JIT | ① | ✅ **root-caused, guarded, documented** — and it is what makes V5.4 a prerequisite for V7 rather than a nicety |
+| **V7** | The agent acceptance run | ①③ | ✅ **V7.1 done 2026-08-03** — the Copilot CLI installed, authenticated **holding no credential**, and wrote and ran a JS app, on a cold-booted guest. §5 has the transcript |
 
 **Recommended order of attack:**
 
 1. ~~**V5.1**~~ — ✅ done. gimbal cloud delivered the capture; the guest reaches
    the real internet and clones from GitHub. Blocker A is closed.
-2. **V5.3** — a real agent image. Spec is written (round 3 of the capture
-   request); it is an *image* problem, so the next move is a capture, not code.
-3. **V6.1–V6.3** — the local half of the UI. Needs nobody.
-4. **V6.4 / V3** — the off-box round-trip, once the contract lands.
+2. ~~**V5.3**~~ — ✅ done, and it never needed the cloud. Built locally on the
+   round-2 capture and persisted with V5.6 SMP checkpointing.
+3. ~~**V6.1–V6.3**~~ — ✅ done. The local half of the UI needed nobody, and
+   shipping it found nine instances of one bug class.
+4. ~~**V5.4 — finish cold boot (rootfs)**~~ — ✅ done. Promoted to the top by
+   V6.8: it was no longer "a fresh sandbox without a capture", it was *the only
+   substrate on which an agent workload is sound*. Kernel, disk, NIC, SMP and
+   now a real rootfs all cold-boot.
+5. ~~**V7.1**~~ — ✅ done, on that cold-booted guest. See §5.
+6. **V6.4 / V3** — the off-box round-trip, once the contract lands. **This is
+   now the top of the queue**, and it is the one thing left that needs somebody
+   else.
 
 ---
 
@@ -298,7 +354,7 @@ measured rather than assumed, inside a live rehydrated `graviton-1` guest on
 | V5.3 | **A purpose-built agent image.** ✅ **Done 2026-07-30, and it never needed the cloud.** Built locally on the round-2 NIC capture: grew the root partition (the 4.5 GiB past the GPT was usable once `sgdisk -e` moved the backup header) from 2.4 G/633 M free to **6.8 G/4.6 G free**, installed `build-essential` + `git` over the V5.1 NIC, and persisted the result with the SMP checkpointing from V5.6. Verified by resuming the checkpoint and compiling a *new* C program inside the rehydrated guest: `cc 13.3.0`, `git 2.43.0`, 703 packages, exit code 7 from a binary built after resume. A minimal reproducible rootfs ([`graviton-capture-request.md`](graviton-capture-request.md) §9–§12) is still wanted — smaller, manifest-built, less attack surface — but as an *optimisation*. | ✅ done |
 | V5.5 | **SMP counter coherence.** Found by V5.1 — the first 2-vCPU capture we have ever held. The vtimer offset was **per-vCPU**, seeded on each vCPU's own thread at its own `mach_absolute_time()`, so the offsets differed permanently; rate correction then re-stepped each one on guest *entry*, at cadences that differ wildly between cores (**measured: cpu0 117,950 re-steps vs cpu1 521** — cpu1 sits in `WFI`). Linux treats `CNTVCT_EL0` as one system-wide clocksource, and `arch_sys_counter` is **56-bit**, so `clocksource_delta()` turns a read one tick behind into `2^56` ticks &asymp; **18.7 guest-years** forward — which is why bounded skew was never an acceptable target. **Measured in-guest with a pinned two-thread ping-pong that establishes strict happens-before between reads: 19,992 of 40,000 ordered samples went backwards uncorrected (guest `date`: July 2101), 19,996 of 40,000 corrected, max 128 ms backwards, RCU stalls, guest wedge.** Fixed by a VM-global `VtimerClock`: one offset shared by every vCPU, moved only by a stop-the-world barrier that abandons the step rather than publish under a running vCPU. | &#9989; **Done — 0 of 40,000 backwards on both paths, `sleep 20` = 20.01 s wall, uptime +20.02 s, correction now on by default at a measured 2.8% of wall time.** |
 | V5.6 | **SMP checkpoint capture.** ✅ **Done 2026-07-30.** Capture was gated `n == 1 && id == 0`, so `--checkpoint` silently did nothing on a multi-vCPU guest — no suspend/resume, and no fork/branch/push/rollback, for any SMP sandbox. Each vCPU now captures itself on its owning thread and the orchestrator assembles one checkpoint and dumps RAM once. The blocking constraint turned out not to exist: the guest-RAM mappings are owned by `prepared` on the orchestrator thread and outlive the vCPU threads, so the dump never needed to happen on the boot CPU. `CheckpointState` gained a per-vCPU `usgic_cpus`, because `UsgicCheckpoint` mixes one VM-global distributor with three per-vCPU models — restoring vCPU 0's onto every core would have handed secondaries the boot CPU's PPI config and in-flight interrupts. | ✅ done |
-| V5.4 | Cold create-from-image (#101) so a fresh sandbox does not require a pre-existing capture. | 🟡 **a stock Ubuntu 6.8 arm64 kernel cold-boots to an interactive shell on HVF, 2026-08-03** — `chm create --kernel --initramfs`, no snapshot and no KVM host anywhere in the path; guest timekeeping measured at 3.00 s per 3 s. Found four more instances of the bug class plus the OS-lock trap. **Cold virtio landed 2026-08-03**: `--disk` and `--net` over a new virtio-mmio transport, verified against a stock kernel — sector-accurate disk reads, a guest write landing in the host file, and an HTTP 301 from api.github.com with port-specific egress denial. **SMP cold boot landed 2026-08-03**: `--cpus N` brings up secondary cores via PSCI `CPU_ON`, verified at 1/2/4 vCPU with user time, per-core timer PPIs and IPIs on every core. Remaining: rootfs image. |
+| V5.4 | Cold create-from-image (#101) so a fresh sandbox does not require a pre-existing capture. | ✅ **a stock Ubuntu 6.8 arm64 kernel cold-boots to an interactive shell on HVF, 2026-08-03** — `chm create --kernel --initramfs`, no snapshot and no KVM host anywhere in the path; guest timekeeping measured at 3.00 s per 3 s. Found four more instances of the bug class plus the OS-lock trap. **Cold virtio landed 2026-08-03**: `--disk` and `--net` over a new virtio-mmio transport, verified against a stock kernel — sector-accurate disk reads, a guest write landing in the host file, and an HTTP 301 from api.github.com with port-specific egress denial. **SMP cold boot landed 2026-08-03**: `--cpus N` brings up secondary cores via PSCI `CPU_ON`, verified at 1/2/4 vCPU with user time, per-core timer PPIs and IPIs on every core. **Cold rootfs landed 2026-08-03**: a real 8 GiB Ubuntu 24.04 arm64 root on GPT, named by PARTUUID so the guest is not hostage to device probe order, plus a PL031 RTC so its clock is real and TLS works. V7.1 then ran the Copilot CLI on it. **Complete.** |
 
 ### V6 · The app tells the whole truth
 
@@ -557,7 +613,37 @@ piece working. Every layer has to hold simultaneously:
 
 | | Task | Size |
 | --- | --- | --- |
-| V7.1 | **Agent acceptance run.** The scenario above, start to finish, on real hardware, with the adversarial checks above and a recorded transcript. | L |
+| V7.1 | **Agent acceptance run.** The scenario above, start to finish, on real hardware, with the adversarial checks above and a recorded transcript. | ✅ **done 2026-08-03** |
+
+**Achieved 2026-08-03, on a cold-booted guest** — no snapshot, no KVM host,
+nothing captured anywhere in the path. The measured run:
+
+- `npm i -g @github/copilot` → `added 3 packages in 12s`. **No SIGILL**: a cold
+  guest reads this Mac's own `CTR_EL0`, sees `DIC = 0` and keeps its `ic ivau`,
+  so it is immune to V6.8 by construction. The prediction held.
+- **GitHub Copilot CLI 1.0.77** installed and answering.
+- The CLI wrote `hello.js` and ran it → **`COLD BOOT HVF`**.
+- Verified independently of the agent's own claim: `cat` showed
+  `console.log("COLD BOOT HVF");`, and a separate `node ~/hello/hello.js`
+  printed the same. The JavaScript really executes.
+- **The guest never held a credential.** It was attached at the network edge by
+  the V5.2 proxy, and `curl https://api.github.com/user` from inside returned
+  200 with no token present.
+- `chm posture` reported *"No control is weakened from its default"*, exit 0.
+
+**Adversarial check, done by hashing rather than reading.** The real token was
+sha256'd host-side, the guest hashed every token-shaped string on its filesystem
+and in its environment, and the two lists were compared — so nothing was ever
+printed. **The real token's hash appears nowhere.** Exactly two token-shaped
+strings exist in the guest: our own placeholder (in `.bash_history`, where we
+typed it), and a string-table fragment inside the Copilot CLI's own prebuilt
+`runtime.node`, which is a token-*prefix* table and not a credential.
+
+Three real defects had to be closed to get here, and all three are worth more
+than the milestone: a missing PL031 RTC (TLS cannot work if the clock is a
+kernel build constant), a lost virtio kick racing the re-arm (§10a), and the
+discovery that credential injection must cover the Copilot API hosts and not
+just the `api.github.com` token exchange.
 
 **Depends on:** V6.2 (the CA install into the guest is the fiddliest step and
 should be a button before it is a test), M32.1 (agent workload readiness), and
@@ -1177,6 +1263,21 @@ points at how the CoW overlay handles writes to the region past the original
 filesystem extent, not at interrupts or timekeeping. It is not yet proven, and
 it is the next thing to test.
 
+**Resolved 2026-08-03, and the answer was none of the above — see §10a.** The
+same signature (`jbd2`, `ext4lazyinit` and kworkers "blocked for more than 122
+seconds") reproduced on a **cold-booted** guest with no CoW overlay in the path
+at all, which refutes `overlay-extent-writes` outright. The cause was a lost
+virtio kick racing the notification re-arm: an interrupt bug after all, just not
+in the interrupt controller. The correlation with resized roots was real but
+incidental — a bigger filesystem means more journal traffic, which means more
+chances to lose the race.
+
+**Worth keeping as method.** A correlation that survives six clean A/B tests can
+still be a coincidence, and the thing that finally broke it open was noticing
+`chm` itself sitting at 2.3% CPU in state `S`. An *idle* device with a *blocked*
+guest is not slow I/O; it is a notification that never arrived. One `ps` reading
+was worth more than the whole correlation table.
+
 Also found, and unrelated: on a rehydrated Graviton2 guest `node --version`
 returns `v22.23.2` but `npm --version` dies with **`Illegal instruction (core
 dumped)`**. `node` barely JITs and `npm` JITs heavily, which is the workload
@@ -1529,6 +1630,66 @@ vs. real builds), so they double as end-to-end validation of M30/M31.
 - **arm64 KVM capacity.** Producing real snapshots needs a genuine arm64 `/dev/kvm`
   host (a Lima nested-KVM guest for $0, or Graviton bare metal); the Mac itself
   can only *run* snapshots, never capture them.
+
+---
+
+## 10a. The lost virtio kick (2026-08-03)
+
+The bug that had been hiding behind `overlay-extent-writes` since V6.7, found
+while running V7.1 and fixed in the same session.
+
+**The symptom** was familiar: `jbd2/vda1-8`, `ext4lazyinit` and several
+`kworker`s all "blocked for more than 122 seconds". **The datum that broke it
+open was new**: this time it happened on a *cold-booted* guest, which has no CoW
+overlay at all — so the standing theory could not be right. And `ps` showed
+`chm` at **2.3% CPU in state `S`**. An idle device with a blocked guest is not
+slow I/O. It is a notification that never arrived.
+
+**The mechanism.** `VIRTIO_F_EVENT_IDX` is edge-triggered, not level-triggered:
+
+```
+vring_need_event(event, new, old) = (u16)(new - event - 1) < (u16)(new - old)
+```
+
+It fires only when the published index falls inside the window `(old, new]`. So
+an event index that is **too old suppresses kicks just as effectively as one
+that is too new** — which is the part that is easy to get wrong, because "stale"
+intuitively sounds like it would cause *spurious* kicks rather than none.
+
+The device's only writer of `avail_event` published a **fresh read of
+`avail.idx`**:
+
+1. `pop()` returns `None`; the device has consumed up to N.
+2. The driver appends entry N, sets `avail.idx = N+1`, reads `avail_event`, sees
+   a stale value, and decides **not to kick**.
+3. The device re-reads `avail.idx` — now `N+1` — and publishes it, promising
+   *"do not kick until you pass N+1"* for an entry **it never consumed**.
+4. Nothing ever wakes the device. The guest blocks forever.
+
+**Both halves of the fix are required.** Publish `next_avail`, the device's own
+cursor, which can never run ahead of what was actually consumed, so the first
+unseen submission always kicks. And because the driver may *already* have made
+its no-kick decision, only the device can notice: after arming, re-check for
+pending work and drain again. **The order matters** — arm, then re-check; the
+reverse reopens the same window.
+
+`VIRTIO_BLK_F_FLUSH` did not cause this. It exposed it, by turning every ext4
+journal commit into another request and widening the window — which is why a
+durability improvement looked like a regression.
+
+**Very likely the same bug as the historical V6.7 resume wedges**: identical
+signature, identical code path, and the resized-root correlation is explained as
+"more filesystem, more journal traffic, more chances to lose the race".
+
+### Method notes
+
+- **A test can encode a bug.** `arm_notification_points_avail_event_at_current_idx`
+  asserted precisely the broken behaviour, and had passed since it was written.
+  It was replaced, not adjusted.
+- **Check whether the emulator is busy before assuming the guest is waiting on
+  it.** One `ps` reading discriminated "slow" from "asleep", which no amount of
+  guest-side logging would have.
+- A correlation surviving six clean A/B tests is still not a cause.
 
 ---
 

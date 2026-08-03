@@ -223,12 +223,19 @@ pub(crate) fn install_signal_handlers(restore: RestoreHandle) {
 pub(crate) type ConsoleInput = Arc<dyn Fn(&[u8]) + Send + Sync>;
 
 /// Build a [`ConsoleInput`] over a guest's PL011 and its serial interrupt sink.
+///
+/// `spi` is the INTID the console's device tree gave the PL011, and it differs
+/// per machine: a rehydrated capture inherits whatever the capturing VMM chose
+/// (see [`serial_spi`]), while a cold-booted guest gets the one *we* wrote into
+/// the tree we built. Passing it explicitly is what stops a `CHM_SERIAL_SPI`
+/// set for a snapshot from silently retargeting a cold guest's keystrokes at an
+/// interrupt nothing is listening on.
 pub(crate) fn console_input(
     uart: Arc<Pl011>,
     sink: Arc<dyn MsiSink>,
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    spi: u32,
 ) -> ConsoleInput {
-    let spi = serial_spi();
     let trace = env::var_os("CHM_TRACE_INPUT").is_some();
     Arc::new(move |bytes: &[u8]| {
         if bytes.is_empty() {
@@ -260,8 +267,9 @@ pub(crate) fn spawn_stdin_pump(
     sink: Arc<dyn MsiSink>,
     restore: RestoreHandle,
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    spi: u32,
 ) {
-    let deliver = console_input(uart, sink, wake);
+    let deliver = console_input(uart, sink, wake, spi);
     thread::spawn(move || {
         let mut stdin = io::stdin();
         let mut buf = [0u8; 64];
@@ -329,8 +337,8 @@ pub(crate) fn spawn_serial_reassert(
     sink: Arc<dyn MsiSink>,
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
     running: Arc<AtomicBool>,
+    spi: u32,
 ) -> thread::JoinHandle<()> {
-    let spi = serial_spi();
     let trace = env::var_os("CHM_TRACE_INPUT").is_some();
     thread::Builder::new()
         .name("chm-serial-reassert".into())

@@ -374,6 +374,125 @@ impl MmioDevice for Pl011 {
     }
 }
 
+/// PL031 real-time clock registers.
+const RTCDR: u64 = 0x000; // data (current value), seconds since the epoch
+const RTCMR: u64 = 0x004; // match
+const RTCLR: u64 = 0x008; // load
+const RTCCR: u64 = 0x00c; // control
+const RTCIMSC: u64 = 0x010; // interrupt mask
+const RTCRIS: u64 = 0x014; // raw interrupt status
+const RTCMIS: u64 = 0x018; // masked interrupt status
+const RTCICR: u64 = 0x01c; // interrupt clear
+const RTC_ID_LOW: u64 = 0xfe0; // PeriphID0..3 + PCellID0..3
+
+/// PrimeCell identification bytes for the PL031, one per 4-byte slot.
+const PL031_ID: [u8; 8] = [0x31, 0x10, 0x14, 0x00, 0x0d, 0xf0, 0x05, 0xb1];
+
+#[derive(Default)]
+struct Pl031State {
+    /// Guest-visible time minus host time, in seconds. Non-zero only after the
+    /// guest writes `RTCLR`, which is the guest saying "the clock is wrong, it
+    /// is actually this" -- honoured rather than ignored, so `hwclock -w`
+    /// behaves, but kept as an offset because the host clock is what actually
+    /// advances.
+    offset: i64,
+    mr: u32,
+    imsc: u32,
+    /// Set when the counter has passed `mr` since the last clear.
+    ris: u32,
+}
+
+/// A PL031 real-time clock reading the host's wall clock.
+///
+/// **A guest with no RTC does not know what year it is**, and on a cold boot
+/// there is no snapshot to inherit a time from. Linux falls back to the epoch
+/// or to a build-time constant, `systemd-timesyncd` cannot correct it without
+/// network, and the network cannot come up cleanly because *every* TLS
+/// handshake rejects certificates that are "not yet valid". That failure is
+/// silent and looks like a network fault, which is why it is worth a device.
+///
+/// Deliberately read-only in effect: the guest sees host wall-clock seconds.
+/// It is the same clock the vtimer is stepped against, so the two cannot drift
+/// apart the way a separately-seeded RTC would.
+pub struct Pl031 {
+    state: Mutex<Pl031State>,
+}
+
+impl Default for Pl031 {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Pl031 {
+    /// Create a PL031 tracking the host wall clock with no offset.
+    pub fn new() -> Self {
+        Self {
+            state: Mutex::new(Pl031State::default()),
+        }
+    }
+
+    /// Host wall-clock seconds since the Unix epoch.
+    fn host_now() -> i64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+
+    fn now(&self, st: &Pl031State) -> u32 {
+        // Saturating rather than wrapping: a clock that reads 1970 is a
+        // recognisable failure, one that wraps to 2106 is not.
+        Self::host_now()
+            .saturating_add(st.offset)
+            .clamp(0, u32::MAX as i64) as u32
+    }
+}
+
+impl MmioDevice for Pl031 {
+    fn read(&self, offset: u64, data: &mut [u8]) {
+        let mut st = self.state.lock().unwrap();
+        let now = self.now(&st);
+        if now >= st.mr {
+            st.ris = 1;
+        }
+        let val = match offset {
+            RTCDR => now,
+            RTCMR => st.mr,
+            // The load register reads back the same counter it set.
+            RTCLR => now,
+            // Bit 0 reads as 1: the counter is always enabled. Writing it is a
+            // no-op on real silicon too.
+            RTCCR => 1,
+            RTCIMSC => st.imsc,
+            RTCRIS => st.ris,
+            RTCMIS => st.ris & st.imsc,
+            RTC_ID_LOW..0x1000 => u32::from(PL031_ID[((offset - RTC_ID_LOW) >> 2) as usize & 7]),
+            _ => 0,
+        };
+        read_u32(data, val);
+    }
+
+    fn write(&self, offset: u64, data: &[u8]) {
+        let val = write_u32(data);
+        let mut st = self.state.lock().unwrap();
+        match offset {
+            RTCLR => {
+                let now = Self::host_now();
+                st.offset = i64::from(val) - now;
+            }
+            RTCMR => st.mr = val,
+            RTCIMSC => st.imsc = val & 1,
+            RTCICR => {
+                if val & 1 != 0 {
+                    st.ris = 0;
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
