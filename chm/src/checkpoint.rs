@@ -365,9 +365,24 @@ fn prune_revisions_keeping(snapshot_dir: &Path, max_resumable: usize) {
 /// descends from the target (append-only — history is preserved, not rewound).
 /// The target must still be resumable (its RAM dump retained).
 pub(crate) fn rollback(snapshot_dir: &Path, rev_id: &str) -> Result<(), String> {
-    let target = revisions_dir(snapshot_dir).join(rev_id);
+    let mut target = revisions_dir(snapshot_dir).join(rev_id);
     if !target.join(MANIFEST).is_file() {
-        return Err(format!("revision {rev_id} is not in the store"));
+        // The live HEAD is listed by `chm revisions` but lives in the checkpoint
+        // dir rather than the archive, so looking only in the archive rejected an
+        // id we had just printed. Rolling back to HEAD is not a no-op and is the
+        // documented recovery from overlay drift: it restores the overlays that
+        // were captured with that RAM over the diverged live ones. Archive it
+        // first, then take the ordinary path.
+        match read_revision(snapshot_dir) {
+            Ok(head) if head.id == rev_id => {
+                archive_head(snapshot_dir, rev_id);
+                target = revisions_dir(snapshot_dir).join(rev_id);
+                if !target.join(MANIFEST).is_file() {
+                    return Err(format!("revision {rev_id} could not be archived"));
+                }
+            }
+            _ => return Err(format!("revision {rev_id} is not in the store")),
+        }
     }
     if !target.join(MEMORY_RANGES).is_file() {
         return Err(format!(
@@ -863,6 +878,49 @@ mod tests {
         )
         .unwrap();
         prune_revisions(snapshot_dir);
+    }
+
+    /// `chm revisions` lists HEAD, so `chm rollback` must accept it. It did not:
+    /// HEAD lives in the checkpoint dir rather than the archive, so the lookup
+    /// rejected an id we had just printed — which made the overlay-drift guard's
+    /// recovery advice non-actionable, since rolling back to HEAD is exactly how
+    /// you restore the overlays captured with that RAM.
+    #[test]
+    fn rollback_accepts_the_head_revision_that_revisions_lists() {
+        let snap = env::temp_dir().join(format!("chm-rbhead-{}-{}", process::id(), now_ms()));
+        let _ = fs::remove_dir_all(&snap);
+        fs::create_dir_all(snap.join(LIVE_OVERLAYS_DIR)).unwrap();
+        fs::write(snap.join(LIVE_OVERLAYS_DIR).join("disk0.raw"), b"aaaa").unwrap();
+
+        write_test_checkpoint(&snap, b"ram-one", "connect");
+        let head = read_revision(&snap).unwrap().id;
+
+        // It is the id `chm revisions` reports as HEAD.
+        let listed = list_revisions(&snap);
+        assert!(
+            listed.iter().any(|r| r.is_head && r.revision.id == head),
+            "HEAD should be listed"
+        );
+
+        // The disk then moves on, which is the drift the guard refuses.
+        fs::write(snap.join(LIVE_OVERLAYS_DIR).join("disk0.raw"), b"bbbbbbbb").unwrap();
+        assert!(overlay_drift(&snap).is_some(), "drift should be detected");
+
+        rollback(&snap, &head).expect("rollback to HEAD must be accepted");
+
+        // And it is a real recovery: the overlays captured with that RAM are back,
+        // so the pair is consistent again.
+        assert_eq!(
+            fs::read(snap.join(LIVE_OVERLAYS_DIR).join("disk0.raw")).unwrap(),
+            b"aaaa",
+            "rollback should restore the overlay captured with the RAM"
+        );
+        assert!(overlay_drift(&snap).is_none(), "drift should be cleared");
+
+        // An id that genuinely is not in the store still fails.
+        assert!(rollback(&snap, "rev-does-not-exist").is_err());
+
+        let _ = fs::remove_dir_all(&snap);
     }
 
     /// A checkpoint taken against the overlays that are still there reports no
