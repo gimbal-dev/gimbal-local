@@ -54,6 +54,10 @@ final class AppModel: ObservableObject {
     @Published var cloud = CloudOverview.offline
     @Published var cloudSnapshots: [CloudSnapshot] = []
     @Published var branches: [PlaneBranch] = []
+    /// Bring-your-own images discovered on disk, including the ones we refuse
+    /// and why -- a directory the user meant as an image should say what is
+    /// wrong with it, not silently vanish from the list.
+    @Published var localImages: [LocalImageLibrary.Entry] = []
     @Published var bringingDownID: String?
     // Live state for cloud-origin sandboxes (they run via the one-shot `chm
     // runner`, not the daemon, so their state is tracked here rather than derived
@@ -94,6 +98,19 @@ final class AppModel: ObservableObject {
     /// and independent of which session's console the app happens to be tracking.
     @Published var liveLocalSessionIDs: Set<String> = []
     @Published var welcomeDismissed = UserDefaults.standard.bool(forKey: "gimbal.welcomeDismissed")
+
+    /// Local-only mode: hide every surface that needs the control plane.
+    ///
+    /// Gimbal Local is useful with no control plane at all — it cold-boots its
+    /// own guests and runs images from disk. Showing a Cloud section that can
+    /// only ever say "offline" advertises a dependency the app does not have,
+    /// which is both untrue and discouraging. This lets an install be honestly
+    /// local.
+    ///
+    /// Off by default, because hiding a feature the user has is worse than
+    /// showing one they have not set up yet. `UserDefaults.bool` returns false
+    /// when the key is absent, so the default falls out of the read.
+    @Published var localOnly = UserDefaults.standard.bool(forKey: "gimbal.localOnly")
 
     /// The last security posture we were able to read, and why we could not.
     ///
@@ -145,6 +162,7 @@ final class AppModel: ObservableObject {
     private let sandboxesDefaultsKey = "gimbal.sandboxes"
     private let welcomeDefaultsKey = "gimbal.welcomeDismissed"
     private let globalDefaultsKey = "gimbal.globalDefaults"
+    private let localOnlyDefaultsKey = "gimbal.localOnly"
     private let maxRecents = 8
 
     func bootstrap() async {
@@ -172,6 +190,26 @@ final class AppModel: ObservableObject {
         defer { isRefreshing = false }
 
         await refreshLocal()
+        refreshLocalImages()
+
+        // Local-only means local-only. Hiding the cloud UI while still calling
+        // out to a control plane every refresh would make the setting a
+        // cosmetic lie -- the user asked the app not to depend on one, so it
+        // must not reach for one. This also keeps a stale `cloud` snapshot list
+        // from lingering behind the toggle.
+        guard !localOnly else {
+            cloud = CloudOverview(
+                state: .offline("local-only mode"),
+                runners: nil,
+                snapshots: nil,
+                sandboxes: nil,
+                costSummary: nil
+            )
+            cloudSnapshots = []
+            branches = []
+            return
+        }
+
         cloud = await controlPlane.overview(baseURL: settings.controlPlaneURL)
         cloudSnapshots = await controlPlane.listSnapshots(baseURL: settings.controlPlaneURL)
         branches = await chm.branches(api: settings.controlPlaneURL, settings: settings)
@@ -679,14 +717,6 @@ final class AppModel: ObservableObject {
         // was (live memory + disk), rather than cold-booting. `runPath` is the
         // sandbox's isolated workspace so its state stays separate from other
         // sandboxes launched from the same image.
-        //
-        // Terminal.app's `do script` runs a command *string*, so we cannot hand
-        // it a raw argv for `chm` itself. But we avoid a second escaping layer by
-        // passing the (already single-quoted, control-char-validated by
-        // `InteractiveTerminalCommand`, M30.3) command to `osascript` as an
-        // argv parameter via `on run argv` — never interpolated into the
-        // AppleScript source — so a path can never break out of the script text
-        // into host code (M30.3 follow-up, #67).
         let command = try InteractiveTerminalCommand.shellCommand(
             chmPath: settings.chmPath,
             runPath: runPath,
@@ -694,7 +724,45 @@ final class AppModel: ObservableObject {
             lockPath: lockPath,
             workdir: FileManager.default.currentDirectoryPath
         )
+        try openTerminal(runningShellCommand: command)
+    }
 
+    /// Cold-boot a local image: `chm create` in its own Terminal window, with no
+    /// snapshot and no control plane in the path.
+    ///
+    /// Deliberately the same launch mechanism as `openInteractiveTerminal`. HVF
+    /// allows one VM per process, so a subprocess is the correct shape, not a
+    /// shortcut around the daemon.
+    func coldBoot(image: LocalImage, options: ColdBootTerminalCommand.Options = .init()) {
+        do {
+            let command = try ColdBootTerminalCommand.shellCommand(
+                chmPath: settings.chmPath,
+                image: image,
+                options: options,
+                workdir: FileManager.default.currentDirectoryPath
+            )
+            try openTerminal(runningShellCommand: command)
+            appendLog("cold boot: \(image.name) (kernel \(image.kernelPath))")
+        } catch {
+            appendLog("cold boot failed for \(image.name): \(error.localizedDescription)")
+        }
+    }
+
+    /// Rescan the local image directory. Cheap, and driven by the same refresh
+    /// loop as everything else, so dropping an image into the folder makes it
+    /// appear without restarting the app.
+    func refreshLocalImages() {
+        localImages = LocalImageLibrary.scan(root: settings.localImagesPath)
+    }
+
+    /// Hand an already-quoted, already-validated shell command to Terminal.app.
+    ///
+    /// Terminal.app's `do script` runs a command *string*, so we cannot hand it
+    /// a raw argv for `chm` itself. But we avoid a second escaping layer by
+    /// passing the command to `osascript` as an argv parameter via `on run
+    /// argv` — never interpolated into the AppleScript source — so a path can
+    /// never break out of the script text into host code (M30.3 follow-up, #67).
+    private func openTerminal(runningShellCommand command: String) throws {
         // The script is a constant with no interpolation; the command travels as
         // argv item 1, so AppleScript string-literal escaping is not needed.
         let script = """
@@ -1302,6 +1370,17 @@ final class AppModel: ObservableObject {
     func dismissWelcome() {
         welcomeDismissed = true
         UserDefaults.standard.set(true, forKey: welcomeDefaultsKey)
+    }
+
+    /// Persist local-only mode, and make sure the user is not left staring at a
+    /// page that no longer has a way back. Hiding the section the current
+    /// selection lives in would otherwise strand the detail pane on a view the
+    /// sidebar can no longer reach.
+    func saveLocalOnly() {
+        UserDefaults.standard.set(localOnly, forKey: localOnlyDefaultsKey)
+        if localOnly, selection == .cloudHome {
+            selection = .sandboxesHome
+        }
     }
 
     func loadSandboxes() {

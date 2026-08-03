@@ -370,15 +370,38 @@ struct NewSandboxMenu: View {
 
     var body: some View {
         let menu = Menu {
-            if model.snapshots.isEmpty {
-                Text("No snapshot images in the library")
-            } else {
-                ForEach(model.snapshots) { snapshot in
-                    Button {
-                        model.newSandbox(fromSnapshotNamed: snapshot.name)
-                    } label: {
-                        Text("\(snapshot.name)  ·  \(snapshot.vcpus) vCPU, \(snapshot.ramMib) MiB")
+            Section("From a snapshot") {
+                if model.snapshots.isEmpty {
+                    Text("No snapshot images in the library")
+                } else {
+                    ForEach(model.snapshots) { snapshot in
+                        Button {
+                            model.newSandbox(fromSnapshotNamed: snapshot.name)
+                        } label: {
+                            Text("\(snapshot.name)  ·  \(snapshot.vcpus) vCPU, \(snapshot.ramMib) MiB")
+                        }
                     }
+                }
+            }
+
+            // Cold boot needs nothing captured anywhere: no KVM host, no
+            // control plane, no snapshot. It is the only path here that works
+            // on a Mac that has never talked to either.
+            Section("Cold boot from a local image") {
+                let bootable = model.localImages.compactMap(\.image)
+                if bootable.isEmpty {
+                    Text("No local images — add one to \(model.settings.localImagesPath)")
+                } else {
+                    ForEach(bootable) { image in
+                        Button {
+                            model.coldBoot(image: image)
+                        } label: {
+                            Text(image.name)
+                        }
+                    }
+                }
+                ForEach(model.localImages.filter { $0.image == nil }, id: \.name) { entry in
+                    Text("\(entry.name) — \(entry.rejection?.reason ?? "unusable")")
                 }
             }
         } label: {

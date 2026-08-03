@@ -40,6 +40,35 @@ ran on exactly that path and `npm` never faulted once.
 **Three of the four sentences are now true and hardware-proven.** The one that
 is not — round-tripping with the cloud — is the one that needs another team.
 
+### The consequence nobody planned for: this thing can ship on its own
+
+The dream sentence is about the cloud, and for a year that framed everything. But
+add up what is actually true and a **second, smaller product falls out of it that
+needs no cloud at all**:
+
+- it cold-boots a stock Linux kernel into a real Ubuntu rootfs with disk, NIC and
+  SMP, from files on this Mac (V5.4);
+- that guest is a *secure* sandbox — 12 invariants, default-deny egress, a
+  posture command that exits non-zero when anything is weakened (V4);
+- credentials attach at the network edge, so the guest never holds one (V5.2);
+- and a coding agent runs inside it and writes working code (V7.1) — **on the
+  cold-boot path, with nothing captured anywhere**.
+
+Every one of those was proved on hardware **without a control plane in the path**.
+The cloud round-trip is the *bigger* product and still the destination; it is also
+the only part gated on another team. Continuing to ship the local half behind it
+would be holding a finished thing hostage to an unfinished one.
+
+So **V8 is a deliberate decoupling**: make the local app a product that stands up
+on its own, with the cloud as an additive feature rather than a load-bearing
+dependency. It is not a retreat from the dream — the same binary, the same
+engine, the same invariants — it is admitting that a working thing should be
+allowed to ship. §5a has the detail.
+
+| | | |
+| --- | --- | --- |
+| **5. It is useful with no cloud at all.** | ✅ **true, hardware-proven 2026-08-04** | Bring-your-own images cold-boot from the app with no snapshot, no KVM host and no control plane; local-only mode hides *and stops calling* the cloud half. V8.1–V8.3. |
+
 ---
 
 ## 2. What is actually blocking us — one place
@@ -232,9 +261,13 @@ power cut on a guest with a writable disk.
 | **V5** | The coding-agent sandbox | ①③ | ✅ **complete** — V5.1, V5.2, V5.3, V5.5, V5.6 and now **V5.4** all shipped. Cold create-from-image boots a stock kernel with a real disk, NIC and SMP into a **real Ubuntu rootfs**, no snapshot and no KVM host in the path |
 | **V6** | The app tells the whole truth | ③④ | 🟢 **V6.1, V6.2, V6.3 and V6.5 shipped** — security panel, credential-proxy UI, egress audit and capability honesty are all in the app. **V6.4 (off-box round-trip) remains**, and it is the one that needs the control plane |
 | **V6.8** | Why a rehydrated guest cannot JIT | ① | ✅ **root-caused, guarded, documented** — and it is what makes V5.4 a prerequisite for V7 rather than a nicety |
-| **V7** | The agent acceptance run | ①③ | ✅ **V7.1 done 2026-08-03** — the Copilot CLI installed, authenticated **holding no credential**, and wrote and ran a JS app, on a cold-booted guest. §5 has the transcript |
+| **V7** | The agent acceptance run | ①③ | ✅ **V7.1 done 2026-08-03** — the Copilot CLI installed, authenticated **holding no credential**, and wrote and ran a JS app, on a cold-booted guest. §5 has the transcript. Merged to main as `894e86f80` (#141) |
+| **V8** | **A local app that ships on its own** | ①③ | 🟢 **V8.1, V8.2, V8.3 shipped 2026-08-04** — cold boot and BYO images from the app, and a local-only mode that actually stops calling a control plane. V8.4–V8.6 remain; none is blocked. §5a |
 
-**Recommended order of attack:**
+**Recommended order of attack — re-prioritised 2026-08-04 around shipping the
+local app.** The previous ordering put V6.4/V3 at the top, which is correct by
+*value* and wrong by *what we can do*: it is the one item gated on another team,
+and everything behind it was finished. V8 is what unblocks a release.
 
 1. ~~**V5.1**~~ — ✅ done. gimbal cloud delivered the capture; the guest reaches
    the real internet and clones from GitHub. Blocker A is closed.
@@ -244,12 +277,15 @@ power cut on a guest with a writable disk.
    shipping it found nine instances of one bug class.
 4. ~~**V5.4 — finish cold boot (rootfs)**~~ — ✅ done. Promoted to the top by
    V6.8: it was no longer "a fresh sandbox without a capture", it was *the only
-   substrate on which an agent workload is sound*. Kernel, disk, NIC, SMP and
-   now a real rootfs all cold-boot.
+   substrate on which an agent workload is sound*.
 5. ~~**V7.1**~~ — ✅ done, on that cold-booted guest. See §5.
-6. **V6.4 / V3** — the off-box round-trip, once the contract lands. **This is
-   now the top of the queue**, and it is the one thing left that needs somebody
-   else.
+6. ~~**V8.1–V8.3**~~ — ✅ done. The app can now start a guest from files on this
+   Mac, and local-only mode makes the cloud half genuinely optional.
+7. **V8.4–V8.6 — finish the local MVP.** Persist settings, make the empty state
+   teach, ship a build someone can run. **Top of the queue**; blocked on nobody.
+8. **V6.4 / V3** — the off-box round-trip, once the contract lands. Still the
+   larger prize, still the one thing that needs somebody else. Moving it below
+   V8 is not a demotion — it is refusing to let it gate a finished product.
 
 ---
 
@@ -655,10 +691,161 @@ capture. It does **not** depend on the cloud control plane.
 
 ---
 
+## 5a. V8 · A local app that ships on its own
+
+**Why this track exists.** Every capability the local app needs is finished and
+hardware-proven; the only unfinished part of the dream is the cloud round-trip,
+and it is the only part that needs another team. V8 decouples the two so the
+local half can ship. The engine, the invariants and the binary are unchanged —
+what changes is that the control plane becomes **additive rather than
+load-bearing**.
+
+### V8.1 · Cold boot from the app ✅ (2026-08-04)
+
+**#101, finally, from the UI.** Before this, every sandbox in the app began with
+something captured on a KVM host: a library snapshot, or a bundle brought down
+from a control plane. `chm create` — the cold-boot path V5.4 built — was
+CLI-only, so the app's most basic capability, *start a Linux guest*, depended on
+infrastructure the user may not have. `New sandbox` now offers **Cold boot from a
+local image** alongside the snapshot list.
+
+**The design question, and why the obvious answer was wrong.** The instinct was
+to add a cold-create route to the daemon, and that is a substantial refactor:
+`serve.rs::scan_library` only recognises directories holding a `state.json`,
+`start_vm` starts a library entry *by name*, and `create.rs::run` is one 437-line
+function that owns console I/O. But the app **already** runs guests as
+subprocesses — `chm connect` in a Terminal.app window — and that is not a legacy
+wart, it is correct: `hv_vm_create` is process-global, so **one HVF VM per
+process** is a platform constraint, and the daemon owns a single VM slot. Routing
+cold boots through the daemon would have serialised them behind whatever it was
+already running, for a much larger diff. The subprocess is the right shape.
+
+So V8.1 is a second command builder beside the audited connect one, under the
+same invariant I5 discipline: every interpolated value single-quoted, every path
+screened for control characters, egress hosts screened by shape as a second
+layer.
+
+**Verified on hardware, running the command the app's own builder emitted** — not
+a hand-written approximation:
+
+```console
+chm create: 2 vCPU, 2048 MiB, kernel ~/gimbal-images/ubuntu-cold/Image
+  virtio-blk  0x0010000000..0x0010000200  (SPI 35)
+  built in   30.9 ms
+[    0.685821] EXT4-fs (vda1): mounted filesystem … r/w with ordered data mode
+[    0.690764] Run /sbin/init as init process
+ubuntu@ch-snap:~$ V81_MARK=aarch64/2/ch-snap
+ubuntu@ch-snap:~$ byo cold boot
+67108864 bytes (67 MB, 64 MiB) copied, 0.233179 s, 288 MB/s
+V81_RTC=2026-08-03T20:07:55      # host 21:08:28 BST — correct, no intervention
+V81_DONE=0
+```
+
+No snapshot, no KVM host, no control plane anywhere in that path.
+
+### V8.2 · Local-only mode ✅ (2026-08-04)
+
+A switch that hides the Cloud sidebar section, the control-plane status dot and
+the Control plane settings tab. **Off by default** — hiding a feature you have is
+worse than showing one you have not set up yet.
+
+Two decisions that are the actual content of this milestone:
+
+1. **It stops the app *reaching* for a control plane, not just displaying one.**
+   `refreshAll` would otherwise have kept polling every cycle for state nobody
+   can see. A user who says "local only" is making a statement about network
+   behaviour, and a toggle that only rearranges pixels would be a cosmetic lie.
+   Stale cloud state is cleared on the way, and the offline reason names the
+   cause (`local-only mode`) rather than implying a network fault.
+2. **The switch is not on the Control plane tab.** That was the obvious home for
+   it and it is a trap: enabling it would hide the pane holding the switch that
+   turns it off. It lives on a new always-visible General tab.
+
+Turning it on while the Cloud page is selected also moves the selection, or the
+detail pane strands on a page the sidebar can no longer reach.
+
+### V8.3 · Bring-your-own images ✅ (2026-08-04)
+
+A settings path pointing at a directory of images. Each subdirectory holds an
+uncompressed arm64 `Image`, optionally an initramfs and raw disks, optionally an
+`image.json` naming them. A manifest beats convention — someone who wrote one
+meant it — but a manifest naming a file that is not present is an **error**, not
+a silent fallback, or a typo would quietly boot the wrong disk.
+
+**The refusals are the feature.** An image directory the app cannot use says why,
+in terms that name the remedy:
+
+| Refused | Reason given |
+| --- | --- |
+| `vmlinuz`, `Image.gz`, `zImage` | gzip-compressed; cold boot needs an uncompressed arm64 Image (gunzip it first) |
+| a disk that is a **symlink** | disks are opened no-follow, so a link cannot redirect guest writes onto a host file — use `cp -c` (an APFS clone is instant and costs no space) |
+| a manifest naming a missing file | named in `image.json` but not in the directory |
+| no kernel at all | expected an `Image`, or an `image.json` naming one |
+
+**The symlink rule was found by using it, not by reading the code.** The first
+real cold boot died 25 seconds in with `Too many levels of symbolic links`, which
+reads like a broken image. It is not: `FileBackend::open` uses
+`open_rw_create_nofollow` **on purpose** (M30.1 — a bundle must not be able to
+substitute a symlink for a disk and redirect guest writes onto a host file). The
+app therefore **does not resolve the link itself**; laundering it in the UI would
+defeat the control everywhere it applies. It names it at discovery time instead.
+A symlinked *kernel* stays accepted, because the rule does not apply there — and
+the verified boot above used one.
+
+### Still open in V8 — none of it blocked
+
+| | Milestone | Why | Size |
+| --- | --- | --- | --- |
+| **V8.4** (#142) | **Persist `AppSettings`** | `AppSettings` is **not persisted at all** — chm path, library path, socket and control-plane URL reset to defaults on every launch, so a user who points the app at their own paths must redo it each time. Every other piece of UI state already goes through `UserDefaults`. Found while shipping V8.2. | S |
+| **V8.5** (#143) | **An empty state that teaches** | A first-run user with no snapshots and no images sees an empty list. It should say what an image *is*, where to put one, and offer the kernel/rootfs layout — the discovery rejections already carry the vocabulary. | S |
+| **V8.6** (#144) | **A build someone else can run** | Everything is verified against `target/debug/chm` in a git checkout with a re-sign step. A local MVP means a signed `.app` that finds its own `chm`, and an honest statement of what it needs (HVF entitlement, an image). | M |
+| **V8.7** (#145) | **Proxy rules should imply egress allowance** | Naming a host in a credential-injection rule *is* the intent to reach it; requiring it again in `--egress-allow` fails closed but confusingly. Found by using V7.1 in anger. `create.rs:822`. | S |
+
+
 ## 6. Shipped & proven — how we got here
 
 The port was built as a long series of hardware-proven milestones (`M1`–`M24`),
 then the cloud-integration work that followed. Grouped by theme:
+
+### The merged ledger, V1 → V8 (PRs #88–#146)
+
+Reconciled 2026-08-04 across git history, merged PRs, the session plan and the
+issue tracker, so the record is what *shipped* rather than what was planned.
+
+| PR | Landed | What it actually changed |
+| --- | --- | --- |
+| #89, #90 | 07-23 | Userspace GIC: SMP resume with cross-core IPIs; VM-global distributor + SPI affinity routing. |
+| #91 | 07-23 | NAT accepts the guest's offloaded checksums, so external egress works at all. |
+| #92 | 07-27 | M28.4 allow-list egress demo + policy-digest teleport. |
+| #93, #96, #97, #100 | 07-27 | The performance pass the Docker benchmark forced: I/O bottlenecks, receive coalescing + NAT off the vCPU thread (1.62×), RAM populated off the critical path, startup latency instrumented **and then fixed by what the instrument found**. |
+| #103, #106 | 07-28 | The correction that reshaped everything: **vanilla is the supported capture shape**, and a replan on a vanilla-first spine. |
+| #107 | 07-28 | **The Graviton acid test passed** — and exposed the 5.08× clock dilation. |
+| #109, #111 | 07-28 | Roadmap trued up; stop silently keeping a stale overlay bitmap over a truncated overlay. |
+| #112 | 07-28 | **The 5.08× dilation fixed** (`325/64` reduces exactly, so u128 math drifts zero) and the rootfs corruption it caused. |
+| #113, #114 | 07-28/29 | Vanilla runs from the **daemon** (#102), then from the **app** — flagless on both. Sentence 1 of the dream became true through all three entry points. |
+| #115, #116 | 07-29 | Retired three vestigial userspace-GIC forcing mechanisms — including a *library* crate letting a process-global env var change per-vCPU interrupt semantics. |
+| #117 | 07-29 | V1.4 CPU feature delta audit (`chm sysregs`), V4.1 threat model, V4.2 secure defaults, `chm posture`. Found the **inverse** bug it went looking for: `ID_AA64PFR0_EL1` restores *perfectly*, so a 32-bit binary permanently wedges the vCPU. |
+| #118, #120 | 07-30 | Measured the coding-agent gap rather than assuming it; re-laid the roadmap around what actually blocks. |
+| #119 | 07-30 | **V5.2 — credentials at the network edge.** The guest never holds one. `200` with a rule, `401` without, against production `api.github.com`. |
+| #123 | 07-30 | **V5.1 — Blocker A closed.** First capture with a NIC and 2 vCPU; `curl https://api.github.com/zen` → 200 and `git clone` from inside a rehydrated Graviton guest. |
+| #124, #125, #128 | 07-30 | Capture request round 3; **corrected Blocker B** — the agent image was never blocked on the cloud, and testing that took ~20 minutes. |
+| #126 | 07-30 | **V5.6 — multi-vCPU checkpoints.** `--checkpoint` had been *silently doing nothing* on SMP guests. The constraint that made it look hard did not exist. |
+| #127 | 07-30 | **V5.5 — a coherent, current guest clock.** Two independent bugs; 19,992/40,000 backwards `CNTVCT_EL0` reads → **0/40,000**. |
+| #129–#132 | 07-31/08-03 | **V6.1, V6.2, V6.3, V6.5** — the local half of the UI: security panel, credential-proxy UI, egress audit, and capability honesty (every claim carries its evidence). |
+| #133, #134 | 08-03 | **`arch` builds on macOS** — the blocker #101 named — then a **stock Linux kernel cold-boots on HVF**. |
+| #135, #137 | 08-03 | A cold-booted guest gets a real disk and a real NIC; then more than one vCPU. |
+| #138 | 08-03 | Retired the managed-GIC runtime path. One interrupt backend. |
+| #139 | 08-03 | **V6.7** — refuse to resume a checkpoint whose disk moved on. The failure that cost a day: a wedged kernel gets captured over the last good checkpoint, so every later resume starts wedged. |
+| #140 | 08-03 | **V6.8** — why `npm` dies on a rehydrated Graviton guest. `CTR_EL0.DIC`, filed one severity too low by V1.4. 955/1000 stale → 0/1000. Makes cold boot a **prerequisite**, not a nicety. |
+| #141 | 08-03 | **V7.1 — the final smoke test.** Copilot CLI installed, authenticated holding no credential, wrote and ran a JS app on a cold-booted guest. Merged `894e86f80`. Carried the **lost virtio kick** fix, which refuted `overlay-extent-writes` after it survived six clean A/B tests. |
+| #146 | 08-04 | **V8.1–V8.3** — cold boot and BYO images from the app; local-only mode that actually stops calling a control plane; and `chm proxy show --workspace` fixed (it silently ate its own flag's value). |
+
+**What this ledger is for.** Two milestones in it were *wrong when written* and
+only corrected by measuring — Blocker B ("the image does not fit": it did) and
+`overlay-extent-writes` (six clean A/B tests, still false). Keeping the record of
+what changed our minds is the point; a ledger of only the wins would teach
+nothing.
+
 
 ### The in-tree HVF port — hardware-proven
 
@@ -1707,9 +1894,17 @@ V1–V4 spine:
 | V2.1 `chm serve` + userspace GIC | ~~#102~~ shipped |
 | V2.2 the app on vanilla | ~~#114~~ shipped |
 | V2.3 retire the forcing env var | ~~#115~~ shipped |
+| V5.4 / V8.1 cold create-from-image | ~~#101~~ **shipped** — the engine in #134/#135/#137, the app in #146 |
 | V3 cloud contract / signing / postcopy | #21, #36, #5 |
 | V4 security umbrella / defaults | #39, #20 |
-| Deferred | #101 (cold create), #4, #6 |
+| **V8 local MVP (V8.4–V8.7)** | #142, #143, #144, #145 |
+| Deferred | #4, #6 |
 
 The four pillars remain the capability contract (#21); a pillar is only "done"
 when it holds for a **vanilla** snapshot on both substrates.
+
+**Two release lines, deliberately.** *Gimbal Local* (V8) ships on the Mac alone
+and is gated on nobody. *Gimbal* (V3/V6.4 — the cloud round-trip) is the larger
+product and is gated on the control plane. Keeping them separate is what stops a
+finished thing waiting on an unfinished one; it does **not** fork the codebase —
+same binary, same engine, same invariants, one additive feature switched off.

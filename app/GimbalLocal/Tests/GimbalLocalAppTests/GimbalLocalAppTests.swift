@@ -1271,4 +1271,64 @@ final class CapabilityTests: XCTestCase {
         """)
         XCTAssertEqual(Set(r.capabilities.map(\.id)).count, 2)
     }
+
+    // MARK: - Local-only mode (V8.2)
+
+    /// The setting has to actually stop the app reaching for a control plane,
+    /// not merely hide the section that shows one. A cosmetic toggle would
+    /// leave the app making requests the user explicitly asked it not to make.
+    @MainActor
+    func testLocalOnlyStopsTheAppReachingForAControlPlane() async {
+        let model = AppModel()
+        model.cloudSnapshots = [
+            CloudSnapshot(
+                id: "left-over",
+                status: "available",
+                kind: "full",
+                sourceKind: "cloud-runner",
+                gicMode: "its-lpi",
+                originSubstrate: "linux-kvm",
+                vcpus: 2,
+                ramMib: 2048,
+                compatibility: "runnable",
+                hasLocalCopy: false
+            )
+        ]
+
+        model.localOnly = true
+        await model.refreshAll()
+
+        XCTAssertTrue(model.cloudSnapshots.isEmpty, "stale cloud state must not survive the toggle")
+        XCTAssertTrue(model.branches.isEmpty)
+        guard case let .offline(reason) = model.cloud.state else {
+            return XCTFail("local-only must report the plane as offline")
+        }
+        XCTAssertEqual(reason, "local-only mode", "the reason must name the cause, not guess at a network fault")
+    }
+
+    /// Hiding the section the selection lives in would strand the detail pane
+    /// on a page the sidebar can no longer reach.
+    @MainActor
+    func testTurningOnLocalOnlyMovesTheUserOffTheCloudPage() {
+        let model = AppModel()
+        model.selection = .cloudHome
+
+        model.localOnly = true
+        model.saveLocalOnly()
+
+        XCTAssertEqual(model.selection, .sandboxesHome)
+    }
+
+    /// Turning it off must not move the user, or the setting would be
+    /// destructive in the harmless direction.
+    @MainActor
+    func testTurningOffLocalOnlyLeavesTheSelectionAlone() {
+        let model = AppModel()
+        model.selection = .securityHome
+
+        model.localOnly = false
+        model.saveLocalOnly()
+
+        XCTAssertEqual(model.selection, .securityHome)
+    }
 }
