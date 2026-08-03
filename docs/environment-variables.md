@@ -35,6 +35,7 @@ stderr, so `2> trace.log` separates it from guest console output.
 | `CHM_TRACE_DRAIN` | The device-side drain of a virtqueue. | You saw the kick (above) but the request was not serviced. |
 | `CHM_TRACE_MSI` | MSI-X writes and their translation to interrupts. | Completions are not reaching the guest. |
 | `CHM_TRACE_ITS` | GIC ITS command queue processing — `MAPD`, `MAPTI`, `INV`, `INT`. | LPI delivery is broken; a device's interrupt never arrives. |
+| `CHM_TRACE_DEBUGREG` | Self-hosted debug system registers HVF does not implement (`OSDLR_EL1`, `OSLAR_EL1`, `OSLSR_EL1`, `DBGPRCR_EL1`), each as `[dbgreg] vcpu N read/write NAME val=0x…`. | A cold-booting guest dies in `debug_monitors_init` with `unhandled sysreg trap ESR=0x…`. Decode `ESR` bits [24:0] as op0/op1/CRn/CRm/op2 to name the register the guest wanted and we do not answer. |
 | `CHM_TRACE_USGIC` | The userspace GICv3: distributor/redistributor register access, pending-state changes, injection. | The hardest class of bug in this codebase. Pair with `CHM_TRACE_EXIT`. |
 | `CHM_TRACE_NET` | virtio-net frames in and out of the device. | Networking is silent. Confirms whether the guest is even transmitting. |
 | `CHM_TRACE_NAT` | NAT flow decisions: connect/allow/deny, per-flow lifecycle. | Egress is being refused and you need to know by which rule — the reserved-address guard, the allow-list, or a connection cap. |

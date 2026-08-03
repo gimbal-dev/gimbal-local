@@ -183,7 +183,7 @@ nothing from anyone else.
 | **V2** | Vanilla everywhere in the product | ①③ | ✅ **complete** — CLI, daemon and app all run vanilla, flagless |
 | **V3** | Cloud control plane on the vanilla contract | ②④ | 🟠 partly blocked cross-repo (#21, #36) |
 | **V4** | Security with sane defaults | ③ | ✅ **complete** — threat model, default posture, `chm posture` |
-| **V5** | The coding-agent sandbox | ①③ | 🟢 **V5.1, V5.2, V5.3, V5.5 and V5.6 shipped** — no known correctness bug left; V5.4 (cold create-from-image) is the remainder |
+| **V5** | The coding-agent sandbox | ①③ | 🟢 **V5.1, V5.2, V5.3, V5.5 and V5.6 shipped** — no known correctness bug left; V5.4 (cold create-from-image) now boots a stock kernel to a shell, with rootfs / cold virtio / SMP remaining |
 | **V6** | The app tells the whole truth | ③④ | ⬜ **ready to start, nothing blocking it** |
 
 **Recommended order of attack:**
@@ -298,7 +298,7 @@ measured rather than assumed, inside a live rehydrated `graviton-1` guest on
 | V5.3 | **A purpose-built agent image.** ✅ **Done 2026-07-30, and it never needed the cloud.** Built locally on the round-2 NIC capture: grew the root partition (the 4.5 GiB past the GPT was usable once `sgdisk -e` moved the backup header) from 2.4 G/633 M free to **6.8 G/4.6 G free**, installed `build-essential` + `git` over the V5.1 NIC, and persisted the result with the SMP checkpointing from V5.6. Verified by resuming the checkpoint and compiling a *new* C program inside the rehydrated guest: `cc 13.3.0`, `git 2.43.0`, 703 packages, exit code 7 from a binary built after resume. A minimal reproducible rootfs ([`graviton-capture-request.md`](graviton-capture-request.md) §9–§12) is still wanted — smaller, manifest-built, less attack surface — but as an *optimisation*. | ✅ done |
 | V5.5 | **SMP counter coherence.** Found by V5.1 — the first 2-vCPU capture we have ever held. The vtimer offset was **per-vCPU**, seeded on each vCPU's own thread at its own `mach_absolute_time()`, so the offsets differed permanently; rate correction then re-stepped each one on guest *entry*, at cadences that differ wildly between cores (**measured: cpu0 117,950 re-steps vs cpu1 521** — cpu1 sits in `WFI`). Linux treats `CNTVCT_EL0` as one system-wide clocksource, and `arch_sys_counter` is **56-bit**, so `clocksource_delta()` turns a read one tick behind into `2^56` ticks &asymp; **18.7 guest-years** forward — which is why bounded skew was never an acceptable target. **Measured in-guest with a pinned two-thread ping-pong that establishes strict happens-before between reads: 19,992 of 40,000 ordered samples went backwards uncorrected (guest `date`: July 2101), 19,996 of 40,000 corrected, max 128 ms backwards, RCU stalls, guest wedge.** Fixed by a VM-global `VtimerClock`: one offset shared by every vCPU, moved only by a stop-the-world barrier that abandons the step rather than publish under a running vCPU. | &#9989; **Done — 0 of 40,000 backwards on both paths, `sleep 20` = 20.01 s wall, uptime +20.02 s, correction now on by default at a measured 2.8% of wall time.** |
 | V5.6 | **SMP checkpoint capture.** ✅ **Done 2026-07-30.** Capture was gated `n == 1 && id == 0`, so `--checkpoint` silently did nothing on a multi-vCPU guest — no suspend/resume, and no fork/branch/push/rollback, for any SMP sandbox. Each vCPU now captures itself on its owning thread and the orchestrator assembles one checkpoint and dumps RAM once. The blocking constraint turned out not to exist: the guest-RAM mappings are owned by `prepared` on the orchestrator thread and outlive the vCPU threads, so the dump never needed to happen on the boot CPU. `CheckpointState` gained a per-vCPU `usgic_cpus`, because `UsgicCheckpoint` mixes one VM-global distributor with three per-vCPU models — restoring vCPU 0's onto every core would have handed secondaries the boot CPU's PPI config and in-flight interrupts. | ✅ done |
-| V5.4 | Cold create-from-image (#101) so a fresh sandbox does not require a pre-existing capture. | 🟡 **foundation landed 2026-08-03** — the `arch` port it was waiting on was never needed (measured: builds clean with `--features hvf`); FDT generation now proven on this Mac against an independent parser. Remaining: kernel image load, cold virtio construction, the `create` verb. |
+| V5.4 | Cold create-from-image (#101) so a fresh sandbox does not require a pre-existing capture. | 🟡 **a stock Ubuntu 6.8 arm64 kernel cold-boots to an interactive shell on HVF, 2026-08-03** — `chm create --kernel --initramfs`, no snapshot and no KVM host anywhere in the path; guest timekeeping measured at 3.00 s per 3 s. Found four more instances of the bug class plus the OS-lock trap. Remaining: rootfs, cold virtio (disk + net), SMP cold boot. |
 
 ### V6 · The app tells the whole truth
 
@@ -746,6 +746,102 @@ implements the Linux/PSCI protocol (`PC` = entry, `x0` = FDT, EL1h/DAIF), the
 kernel that actually boots is wiring, not a port: load an arm64 `Image` into
 guest RAM, write the tree at `FDT_START`, construct virtio devices cold rather
 than from captured state, and add the `create` verb.
+
+#### The wiring, and what booting a real kernel found (#101, 2026-08-03)
+
+`chm create --kernel <Image> --initramfs <cpio.gz>` boots a **stock Ubuntu
+6.8.0-31-generic arm64 kernel** on Hypervisor.framework to an interactive shell.
+No snapshot, no KVM host, no capture — the kernel came off `ports.ubuntu.com`.
+
+```
+uname -a   : Linux (none) 6.8.0-31-generic ... aarch64 GNU/Linux
+clocksource: arch_sys_counter
+ 11:  95  GICv3  27 Level   arch_timer
+ 13:   0  GICv3  33 Edge    uart-pl011
+uptime delta over a 3s sleep: 0.09 -> 3.09
+```
+
+That last line is the one worth reading twice: 3.00 s of guest time for 3 s of
+wall clock, from a guest reading Apple's own `CNTFRQ_EL0` with no rate
+correction in the path at all.
+
+##### Four more instances of the bug class, in one run
+
+This is the strongest instance yet, and it has a single root cause worth stating
+plainly:
+
+> **The userspace GIC and the PSCI dispatch had only ever served a guest that
+> had already discovered them.** A rehydrated guest probed its interrupt
+> controller and its firmware on a KVM host *before* it was captured, and never
+> re-probes on resume. So every register that exists purely to be *discovered*
+> was free to be wrong — and all of it was.
+
+| # | Register / call | Wrong answer | Right answer | What it cost |
+| --- | --- | --- | --- | --- |
+| 11 | `PSCI_VERSION` (0x84000000) | 0 (catch-all) → reads as v0.0 | `0x0001_0000` (v1.0) | `Conflicting PSCI version detected`; PSCI disabled outright, so `CPU_ON` became unreachable however correctly it was implemented |
+| 12 | `GICD_PIDR2` @ 0xFFE8 | 0 | `0x30` | `no distributor detected, giving up` → and the architected timer hangs off the GIC, so `sched_clock: 64 bits at 1000 Hz` — the jiffies fallback |
+| 13 | `GICR_TYPER` affinity / `Last`, `GICR_PIDR2` | cpu 0 and `Last` on *every* redistributor | per-CPU affinity; `Last` only on the final frame | latent: `gic_iterate_rdists` stops at the first `Last`, so secondary cores find no redistributor |
+| 14 | `GICD_ICFGR` / `GICR_ICFGR` **read** | 0 (write stored, read unhandled) | the stored config | `gic_configure_irq` **verifies its own write** and returns -EINVAL; no `request_irq` for the PL011, so no tty. printk still worked — its console path is polled — so the guest ran perfectly and had nowhere to write |
+
+Instance 14 is the sharpest: a fully working Linux system, with an init process
+executing and a shell running, producing **not one byte** of userspace output.
+The failure was a register that had only ever been written to, in a model whose
+guests had always configured their interrupts somewhere else.
+
+A fifth was not a discovery register but the same shape of gap. Linux's
+`clear_os_lock()` writes `OSDLR_EL1` and `OSLAR_EL1` on every CPU during
+`debug_monitors_init`. Hypervisor.framework implements neither, so both trap —
+and the vCPU died on the first one, ~30 ms in, with a fully booted kernel.
+`handle_debug_sysreg_trap` handles them **by name**, and deliberately not with a
+blanket "ignore unknown MSR": each register is enumerated, and only the write
+that requests the state we actually provide is accepted. A guest that asks to
+*set* the OS lock still gets a hard error naming the register, because silently
+swallowing a system-register write is the most expensive lie a hypervisor can
+tell — the guest believes it changed the machine, the machine did not change,
+and the divergence surfaces arbitrarily far away.
+
+##### How the cold path is built
+
+- **vm-memory owns the RAM.** `GuestMemoryMmap::from_ranges` allocates it, so
+  `linux-loader`'s PE loader and `arch`'s `create_fdt` / `write_fdt_to_memory`
+  work **unmodified** — no adapter, no raw-pointer juggling. `GuestRam` was
+  deliberately *not* extended: it is snapshot-file-specific (`map_file` only),
+  and a cold boot has different ownership.
+- **Cold boot uses the userspace GIC**, not Apple's managed one, for two
+  guest-facing reasons: `hv_gic_create` fixes a non-canonical MMIO layout the
+  tree would then have to agree with, and the managed GIC cannot deliver LPIs to
+  a non-nested EL1 guest — so future virtio-pci would hit the known wall.
+- **No clock correction.** `VtimerClock::new(0, 0, host_counter_hz())`. A cold
+  guest reads Apple's own `CNTFRQ_EL0`, so there is nothing to correct and the
+  V5.5 stepper never runs. The measured 3.00 s above is that, working.
+- **The initramfs goes at the top of RAM**, page-aligned down, not just after the
+  kernel: `image_size` covers BSS that is not in the file, so "just after the
+  file" is *inside* the kernel's own memory.
+- **`read_arm64_header` detects gzip and says `gunzip`.** A distro `vmlinuz` on
+  arm64 is a gzip stream, and `linux-loader`'s `InvalidImageMagicNumber` sends
+  you hunting a corrupt download instead.
+- **`scripts/hvf/mkinitramfs.py`** writes the newc archive directly, because
+  macOS `cpio` cannot create device nodes without root — and an initramfs with
+  no `/dev/console` gives init no stdout at all, which looks exactly like a
+  silent hang. (It is also, independently, how instance 14 was found.)
+
+##### What is verified, and by what
+
+| Claim | Evidence |
+| --- | --- |
+| A stock kernel cold-boots to userspace | `Run /init as init process` → BusyBox `ash` prompt |
+| The GIC delivers | `arch_timer` 95 interrupts taken on GICv3 PPI 27 |
+| Guest timekeeping is right | 3 s sleep measured as 3.00 s of guest uptime |
+| The IRQ trigger config takes | `Setting trigger mode ... failed` count: 1 → **0** |
+| The discovery registers | 5 unit tests in `softgic.rs` |
+| The OS-lock and PSCI paths | 2 bare-metal guests in `hvf_boot.rs`, on real HVF |
+| The image builder | 10 tests in `coldboot.rs` against a synthetic `Image` |
+
+##### Still not done
+
+No rootfs, no cold virtio (disk or net), and SMP cold boot is unwired — PSCI
+`CPU_ON` returns `NOT_SUPPORTED` **by design**, so a kernel that asks logs a
+failed secondary rather than hanging. Those are the remainder of #101.
 
 ---
 
