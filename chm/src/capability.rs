@@ -233,11 +233,12 @@ pub fn build_report(hvf: HvfEvidence) -> Vec<Capability> {
     out.push(Capability::new(
         "cold-boot",
         "Cold boot from an image",
-        Support::No,
-        Evidence::Documented,
-        "This build resumes captured state. Creating a VM from a disk image with \
-         no snapshot is not implemented (#101), so there is no kernel-loading or \
-         firmware path here.",
+        Support::Yes,
+        Evidence::Built,
+        "`chm cold` boots a stock arm64 Linux kernel with no capture: FDT and boot \
+         layout from the upstream `arch` crate, a userspace GICv3 built from \
+         scratch, virtio-mmio disk and net, and PSCI CPU_ON onto up to 4 vCPUs. \
+         Measured on Ubuntu 6.8.0-31 to an interactive shell.",
     ));
 
     out.push(Capability::new(
@@ -250,14 +251,17 @@ pub fn build_report(hvf: HvfEvidence) -> Vec<Capability> {
     ));
 
     out.push(Capability::new(
-        "managed-gic-vtimer",
-        "Managed-GIC virtual timer anchoring",
-        Support::Degraded,
+        "managed-gic",
+        "Apple managed-GIC runtime path",
+        Support::No,
         Evidence::Documented,
-        "The userspace-GIC path shares one VtimerClock across vCPUs. The managed \
-         (HVF-native) GIC path still anchors per-vCPU, so an SMP guest on that \
-         path can see vCPUs disagree about time. Known, unfixed, and the reason \
-         the userspace GIC is the default.",
+        "Retired. Apple's `hv_gic_*` GIC cannot deliver LPIs (its List Registers \
+         are EL2/nested-only and it exposes no PROPBASER/PENDBASER or ITS), so it \
+         could never run a stock cloud-hypervisor capture, and `hv_gic_create` \
+         rejects the redistributor-below-distributor layout Linux expects, so it \
+         could never cold-boot either. Every capture now runs on the userspace \
+         GICv3. The hardware measurements are kept as tests in \
+         `hypervisor/tests/hvf_boot.rs`.",
     ));
 
     out.push(Capability::new(
@@ -1073,10 +1077,22 @@ mod tests {
         // These are claims a human made. Grading them as anything stronger would
         // let a stale sentence borrow the credibility of a probe.
         let caps = build_report(HvfEvidence::GuestRunning);
-        for id in ["cold-boot", "gicv2m", "managed-gic-vtimer", "its-lpi-restore"] {
+        for id in ["gicv2m", "managed-gic", "its-lpi-restore"] {
             let c = caps.iter().find(|c| c.id == id).expect(id);
             assert_eq!(c.evidence, Evidence::Documented, "{id} claimed too much");
         }
+    }
+
+    #[test]
+    fn cold_boot_is_a_yes_but_only_claims_the_build() {
+        // Cold boot shipped, so reporting `No` is a live lie. But nothing probes
+        // it while building the report, and `Observed` means "already happening"
+        // — so the honest grade is `Built`: the path is in this binary, and the
+        // report says nothing about whether it ran on this machine.
+        let caps = build_report(HvfEvidence::GuestRunning);
+        let c = caps.iter().find(|c| c.id == "cold-boot").expect("cold-boot");
+        assert_eq!(c.support, Support::Yes);
+        assert_eq!(c.evidence, Evidence::Built);
     }
 
     #[test]
