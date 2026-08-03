@@ -25,6 +25,7 @@
 //! building a second one that does not.
 
 use std::io::Write;
+use std::sync::mpsc;
 use std::error::Error;
 use std::io;
 use std::path::PathBuf;
@@ -46,6 +47,7 @@ use hypervisor::hvf::devices::MmioBus;
 use hypervisor::hvf::devices::Pl011;
 use hypervisor::hvf::host_counter_hz;
 use hypervisor::hvf::rehydrate;
+use hypervisor::hvf::UsgicCpuHandle;
 
 use hypervisor::hvf::HvfHypervisor;
 use hypervisor::hvf::UsgicSpiRouter;
@@ -60,6 +62,10 @@ use hypervisor::hvf::virtio::net::{NetDevice, NetKick};
 use crate::coldboot;
 use crate::coldboot::ColdBootConfig;
 use crate::coldboot::VirtioKind;
+use crate::imp::apply_psci_cpu_on_state;
+use crate::imp::CpuPowerSlot;
+use crate::imp::wait_for_cpu_on_request;
+use crate::imp::PsciCoordinator;
 use crate::imp::PL011_BASE;
 use crate::imp::PL011_SIZE;
 
@@ -94,14 +100,15 @@ impl MsiSink for ColdSpiSink {
 /// device tree advertises. Held together by a test.
 const COLD_NR_IRQS: u32 = 256;
 
-/// Minimal `VmOps` for a cold guest: an MMIO bus and nothing else.
+/// `VmOps` for a cold guest: an MMIO bus and the PSCI power coordinator.
 ///
-/// PSCI `CPU_ON` returns "not supported" until SMP cold boot is wired, which is
-/// the honest answer — the device tree says `enable-method = "psci"`, and a
-/// kernel that asks and is told no logs a failed secondary rather than hanging
-/// waiting for a core that will never come up.
+/// The device tree says `enable-method = "psci"`, so `CPU_ON` is the only way
+/// the kernel can start a secondary. The coordinator is shared with the vCPU
+/// threads: this call runs on whichever vCPU made the SMC, and the target's own
+/// thread is parked on the matching condition variable.
 struct ColdVmOps {
     bus: Arc<MmioBus>,
+    psci: Arc<PsciCoordinator>,
 }
 
 impl VmOps for ColdVmOps {
@@ -123,12 +130,11 @@ impl VmOps for ColdVmOps {
     }
     fn psci_vcpu_on(
         &self,
-        _target_mpidr: u64,
-        _entry: u64,
-        _context: u64,
+        target_mpidr: u64,
+        entry: u64,
+        context: u64,
     ) -> Result<i64, hypervisor::HypervisorVmError> {
-        // PSCI_NOT_SUPPORTED. See the struct docs.
-        Ok(-1)
+        Ok(self.psci.cpu_on(target_mpidr, entry, context))
     }
 }
 
@@ -327,7 +333,13 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         .filter(|(p, _)| p.kind == VirtioKind::Net)
         .map(|(_, d)| d.clone())
         .collect();
-    let vm_ops: Arc<dyn VmOps> = Arc::new(ColdVmOps { bus });
+    // vCPU 0 is running because the boot protocol started it there; every
+    // secondary waits for the kernel to ask by PSCI `CPU_ON`.
+    let psci = PsciCoordinator::cold(usize::from(args.cfg.vcpus).max(1));
+    let vm_ops: Arc<dyn VmOps> = Arc::new(ColdVmOps {
+        bus,
+        psci: psci.clone(),
+    });
 
     // A cold guest reads the host's own counter frequency, so there is no rate
     // to synthesize and no stepper to run: an unscaled clock, anchored now.
@@ -362,96 +374,168 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
             .map_err(|e| format!("spawning the console thread: {e}"))?
     };
 
+    // The net service thread must not touch a device before its injector is
+    // installed, so it waits on this.
+    let ready = Arc::new((Mutex::new(false), Condvar::new()));
+
     let vm = prepared.vm.clone();
     let seed = prepared.seed();
     let deadline = Instant::now() + Duration::from_secs(args.max_seconds);
+    let vcpus = usize::from(args.cfg.vcpus).max(1);
 
-    // The vCPU's GIC handle only exists once the vCPU does, and the vCPU can
-    // only be created on the thread that will run it. So the device injectors
-    // are installed inside that thread, before its first `run()`: a device that
-    // completed a request before its injector was live would set the ISR bit
-    // and drop the interrupt, and the guest would wait on it forever.
-    let ready = Arc::new((Mutex::new(false), Condvar::new()));
-
-    // The guest runs on its own thread because HVF binds a vCPU to the thread
-    // that created it, and the deadline has to be enforced from outside it.
+    // Each vCPU thread reports its GIC handle here, then waits on `go_rx` for
+    // the completed cross-vCPU table. Two things need every vCPU to exist
+    // first, and neither can be done from inside one vCPU's thread:
+    //
+    //  - SGI delivery. Linux IPIs secondaries to bring them up, so a table
+    //    missing a core means that core never sees its wake-up.
+    //  - Device injectors. A device that completed a request before its
+    //    injector was live would set the ISR bit and drop the interrupt, and
+    //    the guest would wait on it forever.
+    let (setup_tx, setup_rx) = mpsc::channel::<Result<(usize, UsgicCpuHandle), String>>();
+    let mut go_txs = Vec::with_capacity(vcpus);
     let outcome: Arc<Mutex<Option<Result<String, String>>>> = Arc::new(Mutex::new(None));
-    let vcpu_thread = {
+    let mut vcpu_threads = Vec::with_capacity(vcpus);
+
+    for id in 0..vcpus {
+        let (go_tx, go_rx) = mpsc::channel::<Arc<Vec<UsgicCpuHandle>>>();
+        go_txs.push(go_tx);
+        let vm = vm.clone();
+        let seed = seed.clone();
+        let vm_ops = vm_ops.clone();
+        let clock = clock.clone();
         let running = running.clone();
         let outcome = outcome.clone();
-        let entry = image.entry.0;
-        let fdt = image.fdt.0;
-        let devices = devices.clone();
-        let spi_seed = prepared.seed();
-        let ready = ready.clone();
-        thread::Builder::new()
-            .name("cold-vcpu0".into())
-            .spawn(move || {
-                let mut vcpu = match rehydrate::create_cold_usgic_vcpu(
-                    &vm,
-                    &seed,
-                    0,
-                    &vm_ops,
-                    &clock,
-                    Some((entry, fdt)),
-                ) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        *outcome.lock().unwrap() = Some(Err(format!("creating vCPU 0: {e}")));
-                        running.store(false, Ordering::Release);
-                        signal_ready(&ready);
+        let setup_tx = setup_tx.clone();
+        let slot = psci.slot(id);
+        // Only the boot CPU gets an entry point and a device tree. A secondary
+        // keeps HVF's reset state until `CPU_ON` names an address for it.
+        let boot = (id == 0).then_some((image.entry.0, image.fdt.0));
+        vcpu_threads.push(
+            thread::Builder::new()
+                .name(format!("cold-vcpu{id}"))
+                .spawn(move || {
+                    let mut vcpu = match rehydrate::create_cold_usgic_vcpu(
+                        &vm, &seed, id, &vm_ops, &clock, boot,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            let _ = setup_tx.send(Err(format!("creating vCPU {id}: {e}")));
+                            return;
+                        }
+                    };
+                    let Some(handle) = rehydrate::usgic_cpu_handle(&mut vcpu) else {
+                        let _ = setup_tx.send(Err(format!("vCPU {id} is not an HVF vCPU")));
+                        return;
+                    };
+                    if setup_tx.send(Ok((id, handle))).is_err() {
                         return;
                     }
-                };
-                if let Some(handle) = rehydrate::usgic_cpu_handle(&mut vcpu) {
-                    let router = Arc::new(spi_seed.spi_router(Arc::new(vec![handle])));
-                    let sink: Arc<dyn MsiSink> = Arc::new(ColdSpiSink { router });
-                    for (place, dev) in &devices {
-                        // One wired interrupt per device, so the vector table
-                        // has a single entry and every queue signals vector 0.
-                        dev.set_injector(Box::new(MsiSpiInjector::new(
-                            dev.name().to_string(),
-                            vec![place.intid],
-                            sink.clone(),
-                        )));
+                    drop(setup_tx);
+                    // A dropped sender means the orchestrator gave up on setup.
+                    let Ok(table) = go_rx.recv() else { return };
+                    rehydrate::usgic_set_cpu_table(&mut vcpu, table);
+
+                    if id != 0 {
+                        // Park until the kernel asks for this core. The entry
+                        // point and context arrive with the request, and both
+                        // must be in the register file before the first run().
+                        let Some((entry, context)) = wait_for_cpu_on_request(&slot, &running)
+                        else {
+                            return;
+                        };
+                        if let Err(e) = apply_psci_cpu_on_state(vcpu.as_mut(), entry, context) {
+                            *outcome.lock().unwrap() = Some(Err(format!("vCPU {id}: {e}")));
+                            running.store(false, Ordering::Release);
+                            return;
+                        }
                     }
-                }
-                signal_ready(&ready);
-                while running.load(Ordering::Acquire) {
-                    match vcpu.run() {
-                        Ok(VmExit::Ignore) => {}
-                        Ok(VmExit::Shutdown | VmExit::Reset) => {
-                            *outcome.lock().unwrap() = Some(Ok("guest powered off".into()));
-                            running.store(false, Ordering::Release);
-                            break;
-                        }
-                        Ok(other) => {
-                            *outcome.lock().unwrap() =
-                                Some(Err(format!("unexpected vCPU exit: {other:?}")));
-                            running.store(false, Ordering::Release);
-                            break;
-                        }
-                        Err(e) => {
-                            // The full source chain, not just the outermost
-                            // display: `HypervisorCpuError::RunVcpu` renders as
-                            // a bare "Failed to run vcpu", and the whole
-                            // diagnosis (the HVF status code, the ESR, the
-                            // faulting IPA) lives in the wrapped cause.
-                            let mut msg = format!("vCPU run: {e}");
-                            let mut src = Error::source(&e);
-                            while let Some(cause) = src {
-                                msg.push_str(&format!(": {cause}"));
-                                src = cause.source();
+
+                    while running.load(Ordering::Acquire) {
+                        match vcpu.run() {
+                            Ok(VmExit::Ignore) => {}
+                            Ok(VmExit::Shutdown | VmExit::Reset) => {
+                                *outcome.lock().unwrap() = Some(Ok("guest powered off".into()));
+                                running.store(false, Ordering::Release);
+                                break;
                             }
-                            *outcome.lock().unwrap() = Some(Err(msg));
-                            running.store(false, Ordering::Release);
-                            break;
+                            Ok(other) => {
+                                *outcome.lock().unwrap() =
+                                    Some(Err(format!("vCPU {id} unexpected exit: {other:?}")));
+                                running.store(false, Ordering::Release);
+                                break;
+                            }
+                            Err(e) => {
+                                // The full source chain, not just the outermost
+                                // display: `HypervisorCpuError::RunVcpu` renders
+                                // as a bare "Failed to run vcpu", and the whole
+                                // diagnosis (the HVF status code, the ESR, the
+                                // faulting IPA) lives in the wrapped cause.
+                                let mut msg = format!("vCPU {id} run: {e}");
+                                let mut src = Error::source(&e);
+                                while let Some(cause) = src {
+                                    msg.push_str(&format!(": {cause}"));
+                                    src = cause.source();
+                                }
+                                *outcome.lock().unwrap() = Some(Err(msg));
+                                running.store(false, Ordering::Release);
+                                break;
+                            }
                         }
                     }
+                    // A secondary that stops must be marked off, or the kernel
+                    // sees ALREADY_ON if it retries.
+                    psci_mark_offline(&slot);
+                })
+                .map_err(|e| format!("spawning vCPU thread {id}: {e}"))?,
+        );
+    }
+    drop(setup_tx);
+
+    // Collect every vCPU's handle, in id order: the SGI table is indexed by
+    // vCPU id, and the channel does not promise arrival order.
+    let mut handles: Vec<Option<UsgicCpuHandle>> = (0..vcpus).map(|_| None).collect();
+    for _ in 0..vcpus {
+        match setup_rx.recv() {
+            Ok(Ok((id, h))) => handles[id] = Some(h),
+            Ok(Err(e)) => {
+                running.store(false, Ordering::Release);
+                drop(go_txs);
+                for t in vcpu_threads {
+                    let _ = t.join();
                 }
-            })
-            .map_err(|e| format!("spawning the vCPU thread: {e}"))?
-    };
+                return Err(e);
+            }
+            Err(_) => {
+                running.store(false, Ordering::Release);
+                drop(go_txs);
+                for t in vcpu_threads {
+                    let _ = t.join();
+                }
+                return Err("a vCPU thread exited before reporting in".into());
+            }
+        }
+    }
+    let cpu_table: Arc<Vec<UsgicCpuHandle>> =
+        Arc::new(handles.into_iter().map(Option::unwrap).collect());
+
+    // Now every redistributor exists, so an SPI can be routed to the core its
+    // `GICD_IROUTER` affinity names rather than always to the boot CPU.
+    let router = Arc::new(seed.spi_router(cpu_table.clone()));
+    let sink: Arc<dyn MsiSink> = Arc::new(ColdSpiSink { router });
+    for (place, dev) in &devices {
+        // One wired interrupt per device, so the vector table has a single
+        // entry and every queue signals vector 0.
+        dev.set_injector(Box::new(MsiSpiInjector::new(
+            dev.name().to_string(),
+            vec![place.intid],
+            sink.clone(),
+        )));
+    }
+    signal_ready(&ready);
+    for go_tx in &go_txs {
+        let _ = go_tx.send(cpu_table.clone());
+    }
 
     // The NAT lives on its own thread: a guest transmit only enqueues the frame
     // and wakes it, so the vCPU returns to the guest from its MMIO exit instead
@@ -487,7 +571,12 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     let timed_out = running.load(Ordering::Acquire);
     running.store(false, Ordering::Release);
 
-    let _ = vcpu_thread.join();
+    // Release any secondary still parked waiting for a CPU_ON that will not
+    // come, or the join below blocks until its 100 ms poll expires.
+    psci.wake_all();
+    for t in vcpu_threads {
+        let _ = t.join();
+    }
     let _ = console.join();
     if let Some(t) = net_thread {
         let _ = t.join();
@@ -517,6 +606,16 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
 /// Release everyone waiting on the vCPU thread's setup, whether it succeeded or
 /// not: a failed vCPU still has to unblock the threads that would otherwise
 /// wait out the whole deadline for it.
+/// Mark a vCPU powered off so a later `CPU_ON` is accepted rather than being
+/// told `ALREADY_ON` for a core that is not running.
+fn psci_mark_offline(slot: &CpuPowerSlot) {
+    let (lock, cv) = &**slot;
+    let mut st = lock.lock().unwrap();
+    st.online = false;
+    st.cpu_on = None;
+    cv.notify_all();
+}
+
 fn signal_ready(ready: &Arc<(Mutex<bool>, Condvar)>) {
     let (lock, cv) = &**ready;
     *lock.lock().unwrap() = true;

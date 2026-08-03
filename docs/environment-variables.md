@@ -31,6 +31,7 @@ stderr, so `2> trace.log` separates it from guest console output.
 | `CHM_TRACE_ABORT` | Data/instruction aborts with the faulting IPA. | The guest touched an address the device model does not decode. Almost always a missing or misplaced MMIO region. |
 | `CHM_TRACE_HVC` | Hypercalls (PSCI: `CPU_ON`, `CPU_OFF`, `SYSTEM_OFF`, …). | SMP will not come up, or the guest will not shut down. |
 | `CHM_TRACE_MMIO` | Every virtio-PCI MMIO access — register, offset, value. | A device is being configured wrongly, or not at all. Verbose. |
+| `CHM_TRACE_REDIST` | Every software-GIC redistributor access — which core, which frame, which offset. | A secondary core hangs during GIC discovery. Frames other than the running core's are normal: `gic_iterate_rdists` walks them all. |
 | `CHM_TRACE_NOTIFY` | Virtqueue kicks from the guest. | The guest submitted work but nothing happened — this tells you whether it kicked. |
 | `CHM_TRACE_DRAIN` | The device-side drain of a virtqueue. | You saw the kick (above) but the request was not serviced. |
 | `CHM_TRACE_MSI` | MSI-X writes and their translation to interrupts. | Completions are not reaching the guest. |
