@@ -52,6 +52,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use arch::DeviceType;
+use hypervisor::hvf::virtio::mmio::VIRTIO_MMIO_SIZE;
 use arch::NumaNodes;
 use arch::aarch64::fdt::DeviceInfoForFdt;
 use arch::aarch64::fdt::create_fdt;
@@ -107,6 +108,55 @@ pub fn pl011_size() -> u64 {
     PL011_SIZE
 }
 
+/// Base of the first `virtio-mmio` window.
+///
+/// `MEM_32BIT_DEVICES_START` is the 512 MiB hole upstream already reserves for
+/// device MMIO below RAM, so a window here collides with nothing the kernel is
+/// told about — and, unlike a PCI BAR, its address is ours to pick because the
+/// device tree names it.
+const VIRTIO_MMIO_BASE: u64 = layout::MEM_32BIT_DEVICES_START.0;
+
+/// `INTID` of the first virtio device. PL011 holds 33; SPIs count up from
+/// `IRQ_BASE` (32), so 34 is the next free one.
+const VIRTIO_IRQ_BASE: u32 = PL011_IRQ + 1;
+
+/// The most virtio devices a cold guest can have, bounding both the MMIO
+/// windows and the SPIs they consume out of `COLD_NR_IRQS`.
+const MAX_VIRTIO_DEVICES: usize = 8;
+
+/// What kind of device sits in a `virtio-mmio` window.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum VirtioKind {
+    /// `virtio-blk`, backed by a raw disk image.
+    Block,
+    /// `virtio-net`, backed by the userspace NAT.
+    Net,
+}
+
+/// Where a virtio device was placed, so the runner can build the matching
+/// device and register it on the MMIO bus at exactly the address the guest was
+/// told to look.
+///
+/// The device tree and the bus are two independent statements about the same
+/// machine, and a cold guest believes the tree. Returning the placement rather
+/// than having both sides recompute it from constants is what keeps them from
+/// drifting apart silently.
+#[derive(Clone, Debug)]
+pub struct VirtioPlacement {
+    /// Which device this is.
+    pub kind: VirtioKind,
+    /// Zero-based index within its kind (disk 0, disk 1, ...).
+    pub index: usize,
+    /// Guest-physical base of the MMIO window.
+    pub base: u64,
+    /// Size of the window.
+    pub size: u64,
+    /// GIC `INTID` the device asserts (absolute, not SPI-relative).
+    pub intid: u32,
+    /// Backing file, for a block device.
+    pub path: Option<PathBuf>,
+}
+
 /// A device as the FDT writer wants to see it.
 #[derive(Clone, Debug)]
 struct FdtDevice {
@@ -142,6 +192,11 @@ pub struct ColdBootConfig {
     pub vcpus: u8,
     /// Guest RAM in MiB.
     pub memory_mib: u64,
+    /// Raw disk images to attach as `virtio-blk` devices, in order. The first
+    /// becomes `/dev/vda`.
+    pub disks: Vec<PathBuf>,
+    /// Attach a `virtio-net` NIC backed by the userspace NAT.
+    pub net: bool,
 }
 
 impl Default for ColdBootConfig {
@@ -152,6 +207,8 @@ impl Default for ColdBootConfig {
             cmdline: default_cmdline(),
             vcpus: 1,
             memory_mib: 1024,
+            disks: Vec::new(),
+            net: false,
         }
     }
 }
@@ -165,6 +222,24 @@ impl Default for ColdBootConfig {
 /// if the kernel panics before it opens the console properly.
 pub fn default_cmdline() -> String {
     "console=ttyAMA0 earlycon=pl011,0x9000000 reboot=k panic=1".to_string()
+}
+
+/// The `root=` a cold guest needs when its only filesystem is a disk.
+///
+/// A kernel with no initramfs and no `root=` reaches `prepare_namespace` with
+/// nothing to mount and panics. The first `--disk` is `/dev/vda` by
+/// construction — [`place_virtio`] emits disks before the NIC and Linux probes
+/// `virtio_mmio` nodes in address order — so `root=/dev/vda` is not a guess.
+///
+/// Returns `None` when an initramfs was given (it *is* the root filesystem, and
+/// forcing a pivot would break the common case of a self-contained initramfs)
+/// or when there is no disk to point at.
+pub fn implied_root_args(cfg: &ColdBootConfig) -> Option<&'static str> {
+    if cfg.initramfs.is_none() && !cfg.disks.is_empty() {
+        Some("root=/dev/vda rw")
+    } else {
+        None
+    }
 }
 
 /// A guest image, built and resident in host memory, ready to be mapped.
@@ -188,6 +263,9 @@ pub struct ColdGuestImage {
     pub kernel_file_size: u64,
     /// Where the initramfs landed, if there is one: `(guest address, bytes)`.
     pub initramfs_placed: Option<(u64, u64)>,
+    /// Every virtio device described in the tree, with the window and `INTID`
+    /// the guest will use to reach it.
+    pub virtio: Vec<VirtioPlacement>,
 }
 
 /// Reports the physical layout rather than the memory: `GuestMemoryMmap` is not
@@ -257,7 +335,69 @@ impl ColdGuestImage {
             layout::LEGACY_SERIAL_MAPPED_IO_START.0 + PL011_SIZE,
             PL011_IRQ
         );
+        for d in &self.virtio {
+            let _ = write!(
+                s,
+                "\n  virtio-{:<4} {:#012x}..{:#012x}  (SPI {})",
+                d.kind.tag(),
+                d.base,
+                d.base + d.size,
+                d.intid
+            );
+        }
         s
+    }
+}
+
+/// Assign an MMIO window and an `INTID` to every virtio device the config asks
+/// for, in a fixed order: disks first, then the NIC.
+///
+/// The order is what makes `root=/dev/vda` mean anything — Linux names virtio
+/// block devices in probe order, and it probes `virtio_mmio` nodes in address
+/// order.
+fn place_virtio(cfg: &ColdBootConfig) -> Result<Vec<VirtioPlacement>, String> {
+    let count = cfg.disks.len() + usize::from(cfg.net);
+    if count > MAX_VIRTIO_DEVICES {
+        return Err(format!(
+            "{count} virtio devices requested but at most {MAX_VIRTIO_DEVICES} fit \
+             the reserved MMIO window and SPI range"
+        ));
+    }
+    let mut out = Vec::with_capacity(count);
+    for (i, path) in cfg.disks.iter().enumerate() {
+        if !path.is_file() {
+            return Err(format!("disk image {} is not a file", path.display()));
+        }
+        out.push(VirtioPlacement {
+            kind: VirtioKind::Block,
+            index: i,
+            base: VIRTIO_MMIO_BASE + (i as u64) * VIRTIO_MMIO_SIZE,
+            size: VIRTIO_MMIO_SIZE,
+            intid: VIRTIO_IRQ_BASE + i as u32,
+            path: Some(path.clone()),
+        });
+    }
+    if cfg.net {
+        let i = cfg.disks.len();
+        out.push(VirtioPlacement {
+            kind: VirtioKind::Net,
+            index: i,
+            base: VIRTIO_MMIO_BASE + (i as u64) * VIRTIO_MMIO_SIZE,
+            size: VIRTIO_MMIO_SIZE,
+            intid: VIRTIO_IRQ_BASE + i as u32,
+            path: None,
+        });
+    }
+    Ok(out)
+}
+
+impl VirtioKind {
+    /// Short name used in the device tree node label and in diagnostics.
+    fn tag(self) -> &'static str {
+        match self {
+            VirtioKind::Block => "blk",
+            VirtioKind::Net => "net",
+        }
     }
 }
 
@@ -413,6 +553,25 @@ pub fn build(cfg: &ColdBootConfig) -> Result<ColdGuestImage, String> {
         },
     );
 
+    let virtio = place_virtio(cfg)?;
+    for dev in &virtio {
+        // `create_virtio_node` writes `dev_info.irq()` into the tree verbatim,
+        // where `create_serial_node` subtracts `IRQ_BASE` first. So the FDT
+        // wants the SPI-*relative* number here, while `intid` stays absolute
+        // because that is what the interrupt controller is asked for.
+        device_info.insert(
+            (
+                DeviceType::Virtio(dev.index as u32),
+                format!("virtio-{}-{}", dev.kind.tag(), dev.index),
+            ),
+            FdtDevice {
+                addr: dev.base,
+                irq: dev.intid - layout::IRQ_BASE,
+                len: dev.size,
+            },
+        );
+    }
+
     // MPIDR_EL1 affinity for each vCPU. Bit 31 (`MPIDR_EL1.U`... actually the
     // RES1 bit) is set on every real arm64 CPU and Linux checks for it, so the
     // tree must carry it: the `reg` property of each `/cpus/cpu@N` node is
@@ -457,6 +616,7 @@ pub fn build(cfg: &ColdBootConfig) -> Result<ColdGuestImage, String> {
         kernel_image_size: image_size,
         kernel_file_size,
         initramfs_placed,
+        virtio,
     })
 }
 
@@ -588,9 +748,20 @@ mod tests {
     /// (the kernel's in-memory footprint, BSS included) followed by that many
     /// bytes of payload. Deterministic, so these tests do not depend on a real
     /// kernel being downloaded to this machine.
+    /// Write a synthetic kernel with a valid arm64 header.
+    ///
+    /// The path is unique per call. Three tests ask for the same `image_size`,
+    /// and `fs::write` truncates before it writes — so a shared path lets one
+    /// test read a zero-length header out from under another. That is a race
+    /// the test harness creates, not one the code under test has.
     fn synthetic_kernel(image_size: u64) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut p = std::env::temp_dir();
-        p.push(format!("chm-coldboot-synth-{image_size:#x}.Image"));
+        p.push(format!(
+            "chm-coldboot-synth-{image_size:#x}-{}-{n}.Image",
+            std::process::id()
+        ));
         let mut img = vec![0u8; image_size as usize];
         // text_offset at 0x08, image_size at 0x10, flags at 0x18 (LE, 4K, 2MB),
         // magic at 0x38. Matches Documentation/arch/arm64/booting.rst.
@@ -666,5 +837,108 @@ mod tests {
             "error must name the file and the fix: {e}"
         );
         let _ = std::fs::remove_file(&initrd);
+    }
+
+    /// Create `n` empty files to stand in for disk images.
+    fn fake_disks(dir: &Path, n: usize) -> Vec<PathBuf> {
+        (0..n)
+            .map(|i| {
+                let p = dir.join(format!("d{i}.img"));
+                File::create(&p).unwrap().write_all(&[0_u8; 512]).unwrap();
+                p
+            })
+            .collect()
+    }
+
+    #[test]
+    fn disks_are_placed_before_the_nic_so_the_first_disk_is_vda() {
+        let d = tmpdir("order");
+        let cfg = ColdBootConfig {
+            disks: fake_disks(&d, 2),
+            net: true,
+            ..Default::default()
+        };
+        let p = place_virtio(&cfg).unwrap();
+        assert_eq!(p.len(), 3);
+        // Linux probes virtio_mmio nodes in address order and names blocks in
+        // probe order, so a NIC placed first would rename /dev/vda to /dev/vdb.
+        assert_eq!(p[0].kind, VirtioKind::Block);
+        assert_eq!(p[1].kind, VirtioKind::Block);
+        assert_eq!(p[2].kind, VirtioKind::Net);
+        assert!(p[0].base < p[1].base && p[1].base < p[2].base);
+    }
+
+    #[test]
+    fn placements_are_consecutive_and_do_not_overlap() {
+        let d = tmpdir("layout");
+        let cfg = ColdBootConfig {
+            disks: fake_disks(&d, 3),
+            net: true,
+            ..Default::default()
+        };
+        let p = place_virtio(&cfg).unwrap();
+        for (i, e) in p.iter().enumerate() {
+            assert_eq!(e.base, VIRTIO_MMIO_BASE + i as u64 * VIRTIO_MMIO_SIZE);
+            assert_eq!(e.size, VIRTIO_MMIO_SIZE);
+            // The FDT and the MMIO bus are handed the same numbers; an INTID
+            // collision here is silent and only shows up as a wedged guest.
+            assert_eq!(e.intid, VIRTIO_IRQ_BASE + i as u32);
+        }
+        assert!(
+            VIRTIO_IRQ_BASE > PL011_IRQ,
+            "virtio SPIs must not collide with the PL011"
+        );
+        let last = p.last().unwrap();
+        assert!(
+            last.base + last.size <= super::layout::MEM_32BIT_DEVICES_START.0
+                + super::layout::MEM_32BIT_DEVICES_SIZE,
+            "virtio windows must stay inside the 32-bit device hole"
+        );
+    }
+
+    #[test]
+    fn too_many_virtio_devices_is_refused_rather_than_silently_truncated() {
+        let d = tmpdir("toomany");
+        let cfg = ColdBootConfig {
+            disks: fake_disks(&d, MAX_VIRTIO_DEVICES),
+            net: true,
+            ..Default::default()
+        };
+        let e = place_virtio(&cfg).unwrap_err();
+        assert!(
+            e.contains(&MAX_VIRTIO_DEVICES.to_string()),
+            "error must say the limit: {e}"
+        );
+    }
+
+    #[test]
+    fn a_missing_disk_image_is_refused_before_the_guest_starts() {
+        let cfg = ColdBootConfig {
+            disks: vec![PathBuf::from("/nonexistent/nope.img")],
+            ..Default::default()
+        };
+        let e = place_virtio(&cfg).unwrap_err();
+        assert!(e.contains("nope.img"), "error must name the file: {e}");
+    }
+
+    #[test]
+    fn root_is_implied_only_when_a_disk_is_the_only_filesystem() {
+        let d = tmpdir("root");
+        let disks = fake_disks(&d, 1);
+        // Disk, no initramfs: the kernel has nothing to mount without root=.
+        let with_disk = ColdBootConfig {
+            disks: disks.clone(),
+            ..Default::default()
+        };
+        assert_eq!(implied_root_args(&with_disk), Some("root=/dev/vda rw"));
+        // An initramfs IS the root filesystem; forcing a pivot would break it.
+        let with_both = ColdBootConfig {
+            disks,
+            initramfs: Some(d.join("initrd")),
+            ..Default::default()
+        };
+        assert_eq!(implied_root_args(&with_both), None);
+        // Nothing to point root= at.
+        assert_eq!(implied_root_args(&ColdBootConfig::default()), None);
     }
 }
