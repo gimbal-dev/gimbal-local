@@ -903,6 +903,9 @@ pub struct UsgicSeed {
     /// The VM-global software distributor, installed into every vCPU so a
     /// reprogram on any core is visible to all and SPIs route by affinity.
     shared_dist: Arc<Mutex<Distributor>>,
+    /// One redistributor frame per vCPU, shared by every core so the boot CPU
+    /// can walk the whole region during GIC discovery.
+    shared_redists: Arc<Vec<Mutex<crate::hvf::softgic::Redistributor>>>,
     /// How many vCPUs the VM has, so each redistributor can say whether it is
     /// the last in the region. `gic_iterate_rdists` stops walking at the first
     /// one that claims to be.
@@ -968,6 +971,11 @@ pub fn prepare_usgic_vm(
     // The VM-global distributor, sized once and shared by every vCPU, so a
     // reprogram on any core is visible to all and SPIs route by affinity.
     let shared_dist = Arc::new(Mutex::new(Distributor::new(snap.num_irq)));
+    let shared_redists = Arc::new(
+        (0..snap.vcpus.len())
+            .map(|_| Mutex::new(crate::hvf::softgic::Redistributor::default()))
+            .collect::<Vec<_>>(),
+    );
 
     Ok(UsgicPrepared {
         guest_mem,
@@ -978,6 +986,7 @@ pub fn prepare_usgic_vm(
             gicr_region_base,
             dist_pairs: Arc::new(dist_pairs),
             shared_dist,
+            shared_redists,
             vcpu_count,
         },
     })
@@ -1016,6 +1025,7 @@ pub fn restore_usgic_vcpu(
         // bases, then seed. Every vCPU shares the one distributor, so a GICD
         // reprogram on any core is visible to all and SPIs route by affinity.
         concrete.usgic_install_shared_dist(seed.shared_dist.clone());
+        concrete.usgic_install_shared_redists(seed.shared_redists.clone(), id);
         concrete.usgic_set_gic_bases(seed.gicd_base, gicr_base);
         // Set on the rehydrate path too. A restored guest normally never
         // re-probes, which is why these registers could be wrong for so long
@@ -1140,6 +1150,11 @@ pub unsafe fn prepare_cold_usgic_vm(
             gicr_region_base,
             dist_pairs: Arc::new(Vec::new()),
             shared_dist: Arc::new(Mutex::new(Distributor::new(num_irq))),
+            shared_redists: Arc::new(
+                (0..vcpu_count as usize)
+                    .map(|_| Mutex::new(crate::hvf::softgic::Redistributor::default()))
+                    .collect::<Vec<_>>(),
+            ),
             vcpu_count,
         },
     })
@@ -1176,6 +1191,7 @@ pub fn create_cold_usgic_vcpu(
             .ok_or_else(|| RehydrateError::Translate("vCPU is not an HVF vCPU".into()))?;
         concrete.set_usgic_enabled(true);
         concrete.usgic_install_shared_dist(seed.shared_dist.clone());
+        concrete.usgic_install_shared_redists(seed.shared_redists.clone(), id);
         concrete.usgic_set_gic_bases(seed.gicd_base, gicr_base);
         // The guest is about to discover this GIC for the first time, so the
         // redistributor has to be able to identify itself.
@@ -1200,6 +1216,13 @@ pub fn create_cold_usgic_vcpu(
         concrete
             .set_mpidr_affinity(id as u32)
             .map_err(|e| RehydrateError::Hv(anyhow!("MPIDR for parked vCPU {id}: {e}")))?;
+        // PSCI: a core entered via CPU_ON starts at the highest implemented
+        // non-secure EL with interrupts masked. HVF resets a fresh vCPU to
+        // EL0, so without this the secondary's very first instruction fetch
+        // aborts from a lower EL (EC=0x20) instead of running kernel code.
+        concrete
+            .set_psci_entry_pstate()
+            .map_err(|e| RehydrateError::Hv(anyhow!("PSTATE for parked vCPU {id}: {e}")))?;
     }
 
     {

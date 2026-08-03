@@ -572,6 +572,83 @@ impl Vm for HvfVm {
 /// This is the delivery half that the existing user-space ITS translator
 /// ([`crate::hvf::virtio::its`]) has been missing: the ITS resolves a virtio
 /// completion to an LPI INTID; this interface hands that INTID to the guest.
+/// A 32-bit MMIO register model — the shape both the software GIC's
+/// distributor and its redistributor already have.
+trait Reg32 {
+    fn read32(&self, offset: u64) -> u32;
+    fn write32(&mut self, offset: u64, value: u32);
+}
+
+impl Reg32 for crate::hvf::softgic::Distributor {
+    fn read32(&self, offset: u64) -> u32 {
+        self.read(offset)
+    }
+    fn write32(&mut self, offset: u64, value: u32) {
+        self.write(offset, value);
+    }
+}
+
+impl Reg32 for crate::hvf::softgic::Redistributor {
+    fn read32(&self, offset: u64) -> u32 {
+        self.read(offset)
+    }
+    fn write32(&mut self, offset: u64, value: u32) {
+        self.write(offset, value);
+    }
+}
+
+/// Bridge a guest access of any width onto a 32-bit register model.
+///
+/// A 64-bit access is split into its two word halves, low first — which is
+/// both what the architecture defines for the doubleword registers and what
+/// the models already implement (`GICR_TYPER` at `+0x8`/`+0xC`,
+/// `GICR_PROPBASER` at `+0x70`/`+0x74`). Narrower accesses go straight
+/// through: the models ignore offsets they do not know, and a sub-word access
+/// to a GIC register is not something Linux does.
+///
+/// Returns the value for a read, or 0 for a write.
+fn access_32bit_model(
+    model: &mut impl Reg32,
+    off: u64,
+    is_write: bool,
+    write_val: u64,
+    access: usize,
+) -> u64 {
+    match (is_write, access) {
+        (true, 8) => {
+            model.write32(off, write_val as u32);
+            model.write32(off + 4, (write_val >> 32) as u32);
+            0
+        }
+        (true, _) => {
+            model.write32(off, write_val as u32);
+            0
+        }
+        (false, 8) => u64::from(model.read32(off)) | (u64::from(model.read32(off + 4)) << 32),
+        (false, _) => u64::from(model.read32(off)),
+    }
+}
+
+/// The VM's redistributor frames, one per vCPU, shared by every core.
+///
+/// A newtype only so `Default` can produce **one** frame rather than none:
+/// `UserGic` derives `Default`, and an empty vector would make a single-vCPU
+/// guest index out of bounds on its first GICR access.
+struct Redists(Arc<Vec<Mutex<crate::hvf::softgic::Redistributor>>>);
+
+impl Default for Redists {
+    fn default() -> Self {
+        Self(Arc::new(vec![Mutex::new(Default::default())]))
+    }
+}
+
+impl std::ops::Deref for Redists {
+    type Target = Vec<Mutex<crate::hvf::softgic::Redistributor>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 #[derive(Default)]
 struct UserGic {
     /// Whether the userspace CPU interface is active for this vCPU. Off unless a
@@ -600,8 +677,22 @@ struct UserGic {
     /// when the guest hits the GICD MMIO frame. On the single-vCPU path this is
     /// simply that vCPU's own distributor.
     dist: Arc<Mutex<crate::hvf::softgic::Distributor>>,
-    /// This vCPU's redistributor model (SGI/PPI frame + LPI control registers).
-    redist: crate::hvf::softgic::Redistributor,
+    /// Every vCPU's redistributor model (SGI/PPI frame + LPI control
+    /// registers), indexed by vCPU id and shared by all cores.
+    ///
+    /// Shared rather than owned because a redistributor frame is *not* private
+    /// to its core on real hardware, and Linux relies on that: the boot CPU's
+    /// `gic_iterate_rdists` walks every frame in the region reading
+    /// `GICR_TYPER` until it finds `Last`. A core that decoded only its own
+    /// frame would fault the boot CPU on the second one. A rehydrated guest
+    /// discovered its GIC on the KVM host before capture, which is why this
+    /// only became load-bearing once something cold-booted.
+    ///
+    /// Defaults to a single frame so the single-vCPU and restore paths are
+    /// unchanged.
+    redists: Redists,
+    /// Which frame in `redists` belongs to this vCPU.
+    redist_index: usize,
     /// MMIO base of the distributor frame (`0` = not wired; MMIO falls through to
     /// the device bus). Set on resume from the snapshot's GIC config.
     gicd_base: u64,
@@ -703,6 +794,32 @@ fn sgi_targets_core(sgi: u64, self_id: usize, cand_id: usize) -> bool {
 }
 
 impl UserGic {
+    /// This vCPU's own redistributor frame.
+    fn my_redist(&self) -> std::sync::MutexGuard<'_, crate::hvf::softgic::Redistributor> {
+        self.redists[self.redist_index].lock().unwrap()
+    }
+
+    /// Decode a guest-physical address inside the redistributor *region* into
+    /// `(frame index, byte offset within that frame)`.
+    ///
+    /// The region is contiguous and frame `k` sits at `region + k * 128 KiB`,
+    /// so this vCPU's own base minus its own index recovers the region base.
+    /// Every core decodes the whole region, not just its own frame: see the
+    /// `redists` field docs.
+    fn redist_frame(&self, ipa: u64) -> Option<(usize, u64)> {
+        const FRAME: u64 = 0x2_0000;
+        if self.gicr_base == 0 {
+            return None;
+        }
+        let region = self.gicr_base.checked_sub(self.redist_index as u64 * FRAME)?;
+        let span = self.redists.len() as u64 * FRAME;
+        if ipa < region || ipa >= region + span {
+            return None;
+        }
+        let off = ipa - region;
+        Some(((off / FRAME) as usize, off % FRAME))
+    }
+
     /// Queue an INTID (SPI, PPI, or LPI) for delivery. Priority ordering is a
     /// later refinement; today the pending set is drained FIFO. Deduplicated: an
     /// INTID already pending or currently active is not re-queued, so a source
@@ -787,6 +904,105 @@ mod availability_tests {
         let msg = super::hv_return_str(super::HV_DENIED);
         assert!(msg.contains("com.apple.security.hypervisor"), "{msg}");
         assert!(msg.contains("codesign"), "{msg}");
+    }
+}
+
+#[cfg(test)]
+mod usgic_redist_tests {
+    use super::{Redists, UserGic, access_32bit_model};
+    use crate::hvf::softgic::Redistributor;
+    use std::sync::{Arc, Mutex};
+
+    const FRAME: u64 = 0x2_0000;
+    const REGION: u64 = 0x0800_0000;
+
+    fn gic_with(vcpus: usize, index: usize) -> UserGic {
+        let mut g = UserGic::default();
+        g.redists = Redists(Arc::new(
+            (0..vcpus).map(|_| Mutex::new(Redistributor::default())).collect(),
+        ));
+        g.redist_index = index;
+        g.gicr_base = REGION + index as u64 * FRAME;
+        g
+    }
+
+    /// The bug this whole path exists for: `gic_iterate_rdists` runs on the
+    /// boot CPU and reads `GICR_TYPER` out of *every* frame in the region. A
+    /// core that decodes only its own frame data-aborts on the second one.
+    #[test]
+    fn every_core_decodes_every_frame() {
+        for index in 0..4 {
+            let g = gic_with(4, index);
+            for frame in 0..4u64 {
+                assert_eq!(
+                    g.redist_frame(REGION + frame * FRAME + 0x8),
+                    Some((frame as usize, 0x8)),
+                    "cpu{index} could not decode frame {frame}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn an_address_past_the_last_frame_is_not_ours() {
+        let g = gic_with(2, 0);
+        assert_eq!(g.redist_frame(REGION + 2 * FRAME), None);
+    }
+
+    #[test]
+    fn an_address_below_the_region_is_not_ours() {
+        let g = gic_with(2, 1);
+        assert_eq!(g.redist_frame(REGION - 4), None);
+    }
+
+    /// The SGI frame sits at +0x10000 inside a frame, so the offset must come
+    /// back frame-relative rather than region-relative.
+    #[test]
+    fn the_sgi_frame_offset_is_frame_relative() {
+        let g = gic_with(2, 0);
+        assert_eq!(
+            g.redist_frame(REGION + FRAME + 0x1_0100),
+            Some((1, 0x1_0100))
+        );
+    }
+
+    /// Before `usgic_set_gic_bases`, nothing is mapped; a zero base must not
+    /// be read as "the region starts at 0" and swallow low IPAs.
+    #[test]
+    fn an_unset_base_decodes_nothing() {
+        let mut g = gic_with(2, 0);
+        g.gicr_base = 0;
+        assert_eq!(g.redist_frame(0x8), None);
+    }
+
+    /// A 64-bit read must combine both word halves. `GICR_TYPER`'s upper half
+    /// is the affinity Linux matches against `MPIDR_EL1`: fold it onto the low
+    /// word and every frame claims affinity 0, so only the boot CPU finds
+    /// itself and every secondary hangs in `gic_populate_rdist`.
+    #[test]
+    fn a_doubleword_read_of_typer_carries_the_affinity() {
+        let mut r = Redistributor::default();
+        r.set_identity(3, true);
+        let v = access_32bit_model(&mut r, 0x8, false, 0, 8);
+        assert_eq!(v >> 32, 3, "affinity must be in the upper word");
+        assert_eq!(v & 0x1f, 0b1_0001, "PLPIS and Last in the lower word");
+    }
+
+    #[test]
+    fn a_word_read_sees_only_the_low_half() {
+        let mut r = Redistributor::default();
+        r.set_identity(3, true);
+        assert_eq!(access_32bit_model(&mut r, 0x8, false, 0, 4) >> 32, 0);
+    }
+
+    /// `GICR_PROPBASER` is written as one doubleword; splitting it must land
+    /// both halves, not just the low one.
+    #[test]
+    fn a_doubleword_write_lands_both_halves() {
+        let mut r = Redistributor::default();
+        let val = 0xdead_beef_1234_5678u64;
+        assert_eq!(access_32bit_model(&mut r, 0x70, true, val, 8), 0);
+        assert_eq!(access_32bit_model(&mut r, 0x70, false, 0, 8), val);
     }
 }
 
@@ -1986,7 +2202,7 @@ impl HvfVcpu {
             let enabled = if intid >= 8192 {
                 true
             } else if intid < 32 {
-                g.redist.is_ppi_enabled(intid)
+                g.my_redist().is_ppi_enabled(intid)
             } else {
                 // SPI: latch pending + read enable in the shared distributor.
                 g.dist.lock().unwrap().assert_spi(intid)
@@ -2017,7 +2233,7 @@ impl HvfVcpu {
     /// host before it was captured, which is why this was never needed until
     /// something cold-booted. See `softgic::Redistributor::for_cpu`.
     pub fn usgic_set_redist_identity(&self, cpu_id: u32, last: bool) {
-        self.usgic.lock().unwrap().redist.set_identity(cpu_id, last);
+        self.usgic.lock().unwrap().my_redist().set_identity(cpu_id, last);
     }
 
     /// Install the VM-global distributor shared by every vCPU (so a reprogram on
@@ -2025,6 +2241,28 @@ impl HvfVcpu {
     /// path this is that vCPU's own freshly-sized distributor.
     pub fn usgic_install_shared_dist(&self, dist: Arc<Mutex<crate::hvf::softgic::Distributor>>) {
         self.usgic.lock().unwrap().dist = dist;
+    }
+
+    /// Put this vCPU into the state PSCI defines for a core entered via
+    /// `CPU_ON`: the highest implemented non-secure EL, interrupts masked.
+    pub fn set_psci_entry_pstate(&self) -> CpuResult<()> {
+        self.set_reg(HV_REG_CPSR, PSTATE_EL1H_DAIF)
+    }
+
+    /// Install the VM's redistributor frames — one per vCPU, shared by every
+    /// core — and tell this vCPU which frame is its own.
+    ///
+    /// Needed only where a guest *discovers* its GIC. `gic_iterate_rdists`
+    /// runs on the boot CPU and reads `GICR_TYPER` from every frame in the
+    /// region, so each core has to be able to decode the whole region.
+    pub fn usgic_install_shared_redists(
+        &self,
+        redists: Arc<Vec<Mutex<crate::hvf::softgic::Redistributor>>>,
+        index: usize,
+    ) {
+        let mut g = self.usgic.lock().unwrap();
+        g.redists = Redists(redists);
+        g.redist_index = index;
     }
 
     /// A clone of the shared distributor handle, for the SPI router (which reads
@@ -2040,7 +2278,7 @@ impl HvfVcpu {
     pub fn usgic_seed_gic(&self, dist_regs: &[(u32, u64)], redist_regs: &[(u32, u64)]) {
         let mut g = self.usgic.lock().unwrap();
         g.dist.lock().unwrap().seed_from_kvm(dist_regs);
-        g.redist.seed_from_kvm(redist_regs);
+        g.my_redist().seed_from_kvm(redist_regs);
     }
 
     /// Seed the userspace CPU-interface bookkeeping (PMR, BPR1, CTLR, SRE,
@@ -2066,7 +2304,15 @@ impl HvfVcpu {
     /// Service a GICD/GICR MMIO access via the software GIC. Returns `None` if
     /// `ipa` is outside both frames (the caller falls through to the device
     /// bus); `Some(read_value)` when handled (0 for writes).
-    fn usgic_mmio(&self, ipa: u64, is_write: bool, write_val: u32) -> Option<u64> {
+    ///
+    /// `access` is the access width in bytes. The GIC's register models are
+    /// 32-bit, but several architectural registers are 64-bit and Linux
+    /// touches them as one doubleword — `GICR_TYPER` (whose upper half holds
+    /// the affinity a core matches against its own `MPIDR_EL1`),
+    /// `GICR_PROPBASER`/`PENDBASER`, and `GICD_IROUTER`. Folding those onto
+    /// the low word alone reports affinity 0 for every redistributor, so only
+    /// the boot CPU can ever find its own frame.
+    fn usgic_mmio(&self, ipa: u64, is_write: bool, write_val: u64, access: usize) -> Option<u64> {
         let mut g = self.usgic.lock().unwrap();
         if g.gicd_base != 0 && ipa >= g.gicd_base && ipa < g.gicd_base + 0x1_0000 {
             let off = ipa - g.gicd_base;
@@ -2075,20 +2321,29 @@ impl HvfVcpu {
             // one shared model, so it is visible to every core and to the SPI
             // router.
             let mut d = g.dist.lock().unwrap();
-            if is_write {
-                d.write(off, write_val);
-                Some(0)
-            } else {
-                Some(d.read(off) as u64)
+            Some(access_32bit_model(
+                &mut *d,
+                off,
+                is_write,
+                write_val,
+                access,
+            ))
+        } else if let Some((frame, off)) = g.redist_frame(ipa) {
+            if std::env::var_os("CHM_TRACE_REDIST").is_some() {
+                eprintln!(
+                    "[redist] cpu{} frame={frame} off={off:#x} write={is_write}",
+                    g.redist_index
+                );
             }
-        } else if g.gicr_base != 0 && ipa >= g.gicr_base && ipa < g.gicr_base + 0x2_0000 {
-            let off = ipa - g.gicr_base;
-            if is_write {
-                g.redist.write(off, write_val);
-                Some(0)
-            } else {
-                Some(g.redist.read(off) as u64)
-            }
+            // Any core may touch any frame — see the `redists` field docs.
+            let mut r = g.redists[frame].lock().unwrap();
+            Some(access_32bit_model(
+                &mut *r,
+                off,
+                is_write,
+                write_val,
+                access,
+            ))
         } else {
             None
         }
@@ -2108,7 +2363,7 @@ impl HvfVcpu {
             // PPIs gate on the redistributor's per-vCPU enable; SPIs on the
             // shared distributor (which also latches the pending bit).
             let enabled = if intid < 32 {
-                g.redist.is_ppi_enabled(intid)
+                g.my_redist().is_ppi_enabled(intid)
             } else {
                 g.dist.lock().unwrap().assert_spi(intid)
             };
@@ -2417,7 +2672,7 @@ impl HvfVcpu {
         ];
         let usgic = crate::hvf::checkpoint::UsgicCheckpoint {
             dist: g.dist.lock().unwrap().clone(),
-            redist: g.redist.clone(),
+            redist: g.my_redist().clone(),
             pending: g.pending.clone(),
             active: g.active,
         };
@@ -2438,7 +2693,7 @@ impl HvfVcpu {
     pub fn usgic_restore_softgic(&self, cp: &crate::hvf::checkpoint::UsgicCheckpoint) {
         let mut g = self.usgic.lock().unwrap();
         *g.dist.lock().unwrap() = cp.dist.clone();
-        g.redist = cp.redist.clone();
+        *g.my_redist() = cp.redist.clone();
         g.pending = cp.pending.clone();
         g.active = cp.active;
     }
@@ -2542,11 +2797,11 @@ impl HvfVcpu {
         // here as unmapped-IPA data aborts.
         if self.usgic_enabled() {
             let write_val = if is_write && srt != 31 {
-                self.get_reg(srt)? as u32
+                self.get_reg(srt)?
             } else {
                 0
             };
-            if let Some(read_val) = self.usgic_mmio(ipa, is_write, write_val) {
+            if let Some(read_val) = self.usgic_mmio(ipa, is_write, write_val, access) {
                 if !is_write && srt != 31 {
                     self.set_reg(srt, read_val)?;
                 }
