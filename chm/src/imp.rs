@@ -120,16 +120,16 @@ pub(crate) fn build_vm_ops(state_json: &str) -> (Arc<Pl011>, Arc<MmioBus>) {
 }
 
 #[derive(Default)]
-struct CpuPowerState {
-    online: bool,
-    cpu_on: Option<(u64, u64)>,
+pub(crate) struct CpuPowerState {
+    pub(crate) online: bool,
+    pub(crate) cpu_on: Option<(u64, u64)>,
 }
 
-type CpuPowerSlot = Arc<(Mutex<CpuPowerState>, Condvar)>;
+pub(crate) type CpuPowerSlot = Arc<(Mutex<CpuPowerState>, Condvar)>;
 type VmOpsResult<T> = Result<T, HypervisorVmError>;
 
 #[derive(Default)]
-struct PsciCoordinator {
+pub(crate) struct PsciCoordinator {
     slots: Vec<CpuPowerSlot>,
 }
 
@@ -148,11 +148,36 @@ impl PsciCoordinator {
         Arc::new(Self { slots })
     }
 
-    fn slot(&self, id: usize) -> CpuPowerSlot {
+    /// Power state for a guest that was never captured: vCPU 0 is running
+    /// because the boot protocol started it there, and every secondary is off
+    /// until the kernel asks for it by `CPU_ON`.
+    ///
+    /// The mirror of [`from_snapshot`], which reads each core's `mp_state`
+    /// out of the capture instead. A cold guest has no such record, and
+    /// starting a secondary before the kernel asks would run it from HVF's
+    /// reset state with no stack and no page tables.
+    ///
+    /// [`from_snapshot`]: Self::from_snapshot
+    pub(crate) fn cold(vcpus: usize) -> Arc<Self> {
+        let slots = (0..vcpus)
+            .map(|id| {
+                Arc::new((
+                    Mutex::new(CpuPowerState {
+                        online: id == 0,
+                        cpu_on: None,
+                    }),
+                    Condvar::new(),
+                ))
+            })
+            .collect();
+        Arc::new(Self { slots })
+    }
+
+    pub(crate) fn slot(&self, id: usize) -> CpuPowerSlot {
         self.slots[id].clone()
     }
 
-    fn wake_all(&self) {
+    pub(crate) fn wake_all(&self) {
         for slot in &self.slots {
             slot.1.notify_all();
         }
@@ -166,7 +191,7 @@ impl PsciCoordinator {
         (aff0 | (aff1 << 8) | (aff2 << 16) | (aff3 << 24)) as usize
     }
 
-    fn cpu_on(&self, target_mpidr: u64, entry: u64, context: u64) -> i64 {
+    pub(crate) fn cpu_on(&self, target_mpidr: u64, entry: u64, context: u64) -> i64 {
         let target = Self::mpidr_to_vcpu_id(target_mpidr);
         let Some(slot) = self.slots.get(target) else {
             return PSCI_INVALID_PARAMS;
@@ -176,6 +201,11 @@ impl PsciCoordinator {
         if st.online {
             return PSCI_ALREADY_ON;
         }
+        // Defence in depth. `online` and `cpu_on` are set together below, so
+        // a pending request always reads as already-on and this arm should be
+        // unreachable; it is here so a future change that decouples the two
+        // fails closed with the architectural error rather than silently
+        // overwriting an entry point the target may already be running from.
         if st.cpu_on.is_some() {
             return PSCI_ON_PENDING;
         }
@@ -2514,7 +2544,10 @@ fn spawn_run_watchdog(
         .expect("spawn run watchdog")
 }
 
-fn wait_for_cpu_on_request(slot: &CpuPowerSlot, running: &AtomicBool) -> Option<(u64, u64)> {
+pub(crate) fn wait_for_cpu_on_request(
+    slot: &CpuPowerSlot,
+    running: &AtomicBool,
+) -> Option<(u64, u64)> {
     let (lock, cv) = &**slot;
     let mut st = lock.lock().unwrap();
     loop {
@@ -2534,7 +2567,11 @@ fn wait_for_cpu_on_request(slot: &CpuPowerSlot, running: &AtomicBool) -> Option<
     }
 }
 
-fn apply_psci_cpu_on_state(vcpu: &mut dyn Vcpu, entry: u64, context: u64) -> Result<(), String> {
+pub(crate) fn apply_psci_cpu_on_state(
+    vcpu: &mut dyn Vcpu,
+    entry: u64,
+    context: u64,
+) -> Result<(), String> {
     let mut regs = vcpu
         .get_regs()
         .map_err(|e| format!("read regs for CPU_ON: {e}"))?;
@@ -3300,6 +3337,57 @@ fn banner(dir: &Path, mem_ranges: &Path, num_vcpus: u32, total_ram: u64, backend
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cold guest has no captured `mp_state`: the boot protocol started
+    /// vCPU 0 and nothing else. Bringing a secondary up before the kernel asks
+    /// would run it from HVF's reset state with no stack and no page tables.
+    #[test]
+    fn a_cold_coordinator_starts_only_the_boot_cpu() {
+        let psci = PsciCoordinator::cold(4);
+        assert!(psci.slots[0].0.lock().unwrap().online);
+        for id in 1..4 {
+            assert!(!psci.slots[id].0.lock().unwrap().online, "cpu{id}");
+        }
+    }
+
+    #[test]
+    fn cpu_on_brings_a_parked_core_up_once() {
+        let psci = PsciCoordinator::cold(2);
+        assert_eq!(psci.cpu_on(1, 0x4200_0000, 7), PSCI_SUCCESS);
+        let st = psci.slots[1].0.lock().unwrap();
+        assert!(st.online);
+        assert_eq!(st.cpu_on, Some((0x4200_0000, 7)));
+    }
+
+    /// Linux retries `CPU_ON` on some paths; the second call must be refused
+    /// rather than overwrite an entry point the target may already be running
+    /// from. Because the coordinator commits a core to `online` at the moment
+    /// it accepts the request, that refusal is `ALREADY_ON` — there is no
+    /// window in which the request is visible but the core is not yet up.
+    #[test]
+    fn cpu_on_refuses_a_core_that_is_already_on() {
+        let psci = PsciCoordinator::cold(2);
+        assert_eq!(psci.cpu_on(1, 0x4200_0000, 0), PSCI_SUCCESS);
+        assert_eq!(psci.cpu_on(1, 0x4300_0000, 0), PSCI_ALREADY_ON);
+        assert_eq!(psci.slots[1].0.lock().unwrap().cpu_on, Some((0x4200_0000, 0)));
+        // vCPU 0 was never off.
+        assert_eq!(psci.cpu_on(0, 0x4300_0000, 0), PSCI_ALREADY_ON);
+    }
+
+    #[test]
+    fn cpu_on_refuses_an_mpidr_with_no_vcpu_behind_it() {
+        let psci = PsciCoordinator::cold(2);
+        assert_eq!(psci.cpu_on(9, 0x4200_0000, 0), PSCI_INVALID_PARAMS);
+    }
+
+    /// The device tree gives each core an `MPIDR` built from affinity fields,
+    /// so the mapping back to a vCPU index has to unpack all four.
+    #[test]
+    fn mpidr_unpacks_every_affinity_level() {
+        assert_eq!(PsciCoordinator::mpidr_to_vcpu_id(0x0000_0000_0000_0003), 3);
+        assert_eq!(PsciCoordinator::mpidr_to_vcpu_id(0x0000_0000_0000_0201), 0x201);
+        assert_eq!(PsciCoordinator::mpidr_to_vcpu_id(0x0000_0001_0000_0000), 1 << 24);
+    }
 
     /// The clock block is a JSON *string* nested under `snapshot_data.state`, so
     /// it has to be parsed twice. Getting that wrong reads as "no clock block"
