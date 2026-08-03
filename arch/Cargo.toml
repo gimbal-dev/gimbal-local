@@ -8,6 +8,7 @@ version = "0.1.0"
 [features]
 default = []
 fw_cfg = []
+hvf = ["hypervisor/hvf", "hypervisor/kvm-snapshot"]
 kvm = ["hypervisor/kvm"]
 sev_snp = []
 tdx = []
