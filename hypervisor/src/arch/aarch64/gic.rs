@@ -24,6 +24,18 @@ pub enum Error {
     /// Error while getting device attributes for the GIC.
     #[error("Failed getting device attributes for the GIC")]
     GetDeviceAttribute(#[source] HypervisorDeviceError),
+    /// A `Vgic` implementation was asked for something it structurally cannot
+    /// provide — typically save/restore on a type that only describes an
+    /// address map.
+    ///
+    /// Carries its own message rather than wrapping another error, because the
+    /// existing variants render a fixed string at the display boundary and a
+    /// caller would be told a GIC failed to be created when none was being
+    /// created. Whoever lands here needs to know *why* the operation is not
+    /// available and where to go instead, and that only survives if the
+    /// explanation is the error's own text.
+    #[error("{0}")]
+    Unsupported(String),
 }
 pub type Result<T> = result::Result<T, Error>;
 

@@ -53,6 +53,11 @@ pub mod translate;
 pub mod sysreg_audit;
 
 pub mod softgic;
+
+/// The address map a cold-booted guest is told about, for device-tree
+/// generation. Not needed to rehydrate — a capture brings its own tree.
+pub mod coldgic;
+
 #[cfg(feature = "kvm-snapshot")]
 pub mod virtio;
 
