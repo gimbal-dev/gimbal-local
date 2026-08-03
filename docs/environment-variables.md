@@ -58,6 +58,7 @@ known-good path, not for normal operation.
 | `CHM_DEBUG_VTIMER=1` | One line per accepted offset step: host tick, curve target, old and new offset, and how far the guest's counter jumped. | Checking that the correction is stepping as expected. 50 lines/s at the default period — far lighter than it once was, when it sat on the guest-entry path. |
 | `CHM_STRICT_CNTFRQ=1` | Refuse to run on a frequency mismatch instead of warning. | KVM's posture. We warn by default because a dilated guest is still useful; this opts into strictness. |
 | `CHM_STRICT_AARCH32=1` | Refuse a snapshot whose guest believes it can run 32-bit binaries. | See [`cpu-feature-deltas.md`](cpu-feature-deltas.md) — such a guest wedges its vCPU if it ever execs one. Warn-only by default. |
+| `CHM_STRICT_ICACHE=1` | Refuse a snapshot whose guest kernel elided `ic ivau`. | See [`cpu-feature-deltas.md`](cpu-feature-deltas.md) — a capture from `CTR_EL0.DIC = 1` hardware runs JITs that intermittently execute stale code (955/1000 measured). Warn-only by default; a cold-booted guest is immune. |
 | `CHM_EAGER_RAM=1` | Populate guest RAM eagerly rather than mapping the snapshot file. | Ruling out a lazy-mapping interaction. Slower to start. |
 | `CHM_NO_RAM_WILLNEED=1` | Skip the `madvise(MADV_WILLNEED)` prefault. | Measuring what the prefault is actually buying. |
 | `CHM_FULL_BARRIER=1` | Opt back into the full media barrier on virtio-blk flush. | Comparing durability posture against throughput. |

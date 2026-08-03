@@ -193,7 +193,7 @@ audit.
 
 ---
 
-## Finding 2 — `CTR_EL0.DIC`: one bit, latent 🟡
+## Finding 2 — `CTR_EL0.DIC`: one bit, and it breaks every JIT 🔴
 
 `CTR_EL0` is refused by HVF, so the guest observes Apple's value. Reading it
 required a three-instruction guest at EL1: macOS traps `mrs ctr_el0` from EL0
@@ -219,17 +219,67 @@ and **patched `ic ivau` out of `caches_clean_inval_pou`**. On Apple, where
 (module load, BPF JIT, ftrace, kprobes, static keys) could fetch stale
 instructions.
 
-**Stressed, and it did not fire.** In a rehydrated guest: `modprobe dummy` /
-`rmmod` cycled three times, jump-label patching via
+**Stressed kernel-side, and it did not fire.** In a rehydrated guest:
+`modprobe dummy` / `rmmod` cycled three times, jump-label patching via
 `/sys/kernel/tracing/events/sched/sched_switch/enable`, and 126 lines of ftrace
 output captured — all clean, no fault, no `Oops`, guest healthy afterwards.
 
-So this is recorded as a latent unsoundness rather than an active bug. Note that
-guest **userspace** is not exposed at all: because `MIDR_EL1` is restored
-faithfully, the guest applies Neoverse-N1 erratum 1542419, which traps EL0
-`CTR_EL0` reads and hides `DIC` — so userspace JITs issue `ic ivau` correctly.
-(That erratum handling is also why an in-guest EL0 read returns `0x9444c00a`
-rather than the raw `0x9444c004`.)
+That made it look latent. **It is not.** The elision was stressed from the wrong
+side: the exposed caller is not module load, it is `__sync_icache_dcache()`,
+which `caches_clean_inval_pou()` backs and which runs whenever **userspace**
+makes a page executable. That is the JIT path.
+
+### Measured 2026-08-03 — it bites userspace JITs
+
+Guest userspace does read the register correctly, exactly as predicted below: an
+in-guest EL0 read returns `0x9444c00a`, `DIC = 0`, because `MIDR_EL1` is
+restored faithfully so the guest applies Neoverse-N1 erratum 1542419, traps EL0
+`CTR_EL0`, and hides `DIC`. **Userspace being told the truth is not enough**,
+because part of the maintenance is the kernel's job.
+
+A four-way probe in a rehydrated guest, executing freshly written code and
+checking whether the value returned is the one just written:
+
+| probe | stale executions |
+| --- | --- |
+| same page, rewritten, no maintenance | 1997 / 2000 |
+| same page, rewritten, explicit `ic ivau` | **0 / 2000** |
+| **`mmap(RW)` → write → `mprotect(RX)` → call** | **955 / 1000** |
+| same, plus explicit `ic ivau` | **0 / 1000** |
+
+Row 3 is what every JIT does, and it is precisely the case
+`__sync_icache_dcache()` exists to make safe; on a sound kernel it is 0. Rows 2
+and 4 show the hardware and the EL0 maintenance instruction both work — only the
+kernel's elided copy is wrong.
+
+The user-visible symptom, on Node 22.23.2:
+
+| command | result |
+| --- | --- |
+| `node --version` | `v22.23.2` |
+| hot loop, 8 M iterations (TurboFan) | correct |
+| 200 × `new Function` | correct |
+| `npm --version` | **`Illegal instruction (core dumped)`, 2/15 runs** |
+| `npm --version`, pinned with `taskset -c 0` | **10/15 runs** |
+| `npm --version` under `node --jitless` | 0/15 |
+
+Pinning making it **worse** is the confirmation: a cross-vCPU coherency problem
+would improve when the work stays on one core. Staying on one core instead
+maximises the chance that core's I-cache still holds the *stale* line, which is
+the signature of missing invalidation rather than missing broadcast.
+
+**Upgraded from latent to confirmed.** `chm` now warns at load, and
+`CHM_STRICT_ICACHE=1` refuses (`icache_dic_guard`). Nothing can be repaired at
+rehydrate time — the NOPs are baked into the kernel text inside the snapshot.
+Two things do fix it properly:
+
+- **Cold boot.** A guest whose kernel boots here reads this Mac's own
+  `CTR_EL0`, sees `DIC = 0`, and keeps its `ic ivau`. Immune by construction.
+- **A capture host with `DIC = 0`.** Graviton2 is Neoverse-N1, which reports 1;
+  this is a property of the capture host, not of the workload.
+
+Non-JIT workloads are unaffected, which is why every acceptance test to date
+passed: nothing in them generated code at runtime.
 
 ---
 
@@ -280,7 +330,7 @@ uses comes from `CTR_EL0` (Finding 2), which matches.
 | # | Register | Verdict |
 | --- | --- | --- |
 | 1 | `ID_AA64PFR0_EL1.EL0` | 🔴 **Real bug.** 32-bit exec permanently wedges the vCPU. Warned at load; `CHM_STRICT_AARCH32=1` refuses. |
-| 2 | `CTR_EL0.DIC` | 🟡 Latent unsoundness in kernel code patching. Stressed without fault. Userspace unaffected. |
+| 2 | `CTR_EL0.DIC` | 🔴 The guest kernel elided `ic ivau`, so JITs in the guest execute stale code (955/1000 measured). Warned at load; `CHM_STRICT_ICACHE=1` refuses. Cold boot is immune. |
 | 3 | `DCZID_EL0` | ✅ Identical. Hazard closed by measurement. |
 | 4 | AArch32 ID block (20 regs) | ✅ Refused, harmless. |
 | 5 | `REVIDR`/`CLIDR`/`CCSIDR` | ✅ Cosmetic. |
