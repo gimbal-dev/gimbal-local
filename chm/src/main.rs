@@ -64,6 +64,11 @@ mod audit;
 /// `chm sysregs` — which captured CPU registers this Mac can reproduce (V1.4).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod posture;
+
+/// `chm capabilities` — what this build can and cannot do, and how each claim
+/// was reached (V6.5).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod capability;
 mod sysregs;
 
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
