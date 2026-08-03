@@ -62,6 +62,8 @@ use hypervisor::hvf::virtio::net::{NetDevice, NetKick};
 use crate::coldboot;
 use crate::coldboot::ColdBootConfig;
 use crate::coldboot::VirtioKind;
+use crate::console;
+use crate::console::RawConsole;
 use crate::imp::apply_psci_cpu_on_state;
 use crate::imp::CpuPowerSlot;
 use crate::imp::wait_for_cpu_on_request;
@@ -173,7 +175,8 @@ fn usage() -> String {
      \x20 --net               Attach a virtio-net NIC on the userspace NAT.\n\
      \x20 --egress-allow <h:p>  Permit egress to host:port. Repeatable.\n\
      \x20                     Without any, the NIC is up but reaches nothing.\n\
-     \x20 --seconds <n>       Stop after n seconds (default 30).\n\
+     \x20 --seconds <n>       Stop after n seconds (default 30). 0 runs until\n\
+     \x20                     the guest powers off or you press Ctrl-A x.\n\
      \x20 --dry-run           Build and describe the guest image; do not run it.\n"
         .to_string()
 }
@@ -185,6 +188,7 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     let mut kernel: Option<PathBuf> = None;
     let mut egress_allow: Vec<String> = Vec::new();
     let mut cmdline_explicit = false;
+    let mut cmdline_extra: Vec<String> = Vec::new();
 
     let mut i = 0;
     while i < raw.len() {
@@ -203,6 +207,13 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
             "--cmdline" => {
                 cfg.cmdline = value("--cmdline")?;
                 cmdline_explicit = true;
+            }
+            // Append rather than replace, so one extra kernel argument does not
+            // cost you the auto-detected `root=`. Without this the only way to
+            // add (say) a `systemd.mask=` was to hand-write the whole command
+            // line, and then you own working out the root partition yourself.
+            "--cmdline-extra" => {
+                cmdline_extra.push(value("--cmdline-extra")?);
             }
             "--cpus" => {
                 cfg.vcpus = value("--cpus")?
@@ -236,9 +247,10 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     // Only when the caller did not write a command line themselves: an explicit
     // `--cmdline` is the caller saying they know what the kernel needs, and
     // appending to it could contradict a `root=` they chose deliberately.
-    if !cmdline_explicit
-        && let Some(extra) = coldboot::implied_root_args(&cfg)
-    {
+    if !cmdline_explicit && let Some(extra) = coldboot::implied_root_args(&cfg) {
+        cfg.cmdline = format!("{} {extra}", cfg.cmdline);
+    }
+    for extra in &cmdline_extra {
         cfg.cmdline = format!("{} {extra}", cfg.cmdline);
     }
     Ok(CreateArgs {
@@ -380,7 +392,11 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
 
     let vm = prepared.vm.clone();
     let seed = prepared.seed();
-    let deadline = Instant::now() + Duration::from_secs(args.max_seconds);
+    // `--seconds 0` means "no deadline": an interactive session ends when the
+    // guest powers off or the operator asks (Ctrl-A x, or a terminating signal),
+    // not when a stopwatch the operator never set runs out.
+    let deadline =
+        (args.max_seconds > 0).then(|| Instant::now() + Duration::from_secs(args.max_seconds));
     let vcpus = usize::from(args.cfg.vcpus).max(1);
 
     // Each vCPU thread reports its GIC handle here, then waits on `go_rx` for
@@ -392,7 +408,15 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     //  - Device injectors. A device that completed a request before its
     //    injector was live would set the ISR bit and drop the interrupt, and
     //    the guest would wait on it forever.
-    let (setup_tx, setup_rx) = mpsc::channel::<Result<(usize, UsgicCpuHandle), String>>();
+    // The exit signal comes back with the GIC handle because it can only be
+    // taken from the vCPU, on the vCPU's own thread, but must be *called* from
+    // the orchestrator: a guest that spins without trapping (a kernel panic
+    // reboot loop is the case that found this) never returns from `hv_vcpu_run`,
+    // so the run loop never re-reads `running` and the join below would wait for
+    // a guest that is never coming back. `hv_vcpus_exit` is what makes
+    // `--seconds` a promise rather than a hope.
+    type CpuReport = (usize, UsgicCpuHandle, Option<Arc<dyn Fn() + Send + Sync>>);
+    let (setup_tx, setup_rx) = mpsc::channel::<Result<CpuReport, String>>();
     let mut go_txs = Vec::with_capacity(vcpus);
     let outcome: Arc<Mutex<Option<Result<String, String>>>> = Arc::new(Mutex::new(None));
     let mut vcpu_threads = Vec::with_capacity(vcpus);
@@ -428,7 +452,8 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                         let _ = setup_tx.send(Err(format!("vCPU {id} is not an HVF vCPU")));
                         return;
                     };
-                    if setup_tx.send(Ok((id, handle))).is_err() {
+                    let exit = vcpu.exit_signal();
+                    if setup_tx.send(Ok((id, handle, exit))).is_err() {
                         return;
                     }
                     drop(setup_tx);
@@ -495,9 +520,13 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     // Collect every vCPU's handle, in id order: the SGI table is indexed by
     // vCPU id, and the channel does not promise arrival order.
     let mut handles: Vec<Option<UsgicCpuHandle>> = (0..vcpus).map(|_| None).collect();
+    let mut exits: Vec<Option<Arc<dyn Fn() + Send + Sync>>> = (0..vcpus).map(|_| None).collect();
     for _ in 0..vcpus {
         match setup_rx.recv() {
-            Ok(Ok((id, h))) => handles[id] = Some(h),
+            Ok(Ok((id, h, exit))) => {
+                handles[id] = Some(h);
+                exits[id] = exit;
+            }
             Ok(Err(e)) => {
                 running.store(false, Ordering::Release);
                 drop(go_txs);
@@ -537,6 +566,38 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         let _ = go_tx.send(cpu_table.clone());
     }
 
+    // Console input. Until now a cold guest could only be watched: the UART
+    // drained to stdout and nothing ever reached its receive FIFO, so a shell on
+    // `ttyAMA0` was unreachable and the guest could not be asked to do anything.
+    //
+    // The PL011's INTID is passed explicitly rather than read from the
+    // environment, because a cold guest's device tree is one *we* wrote:
+    // `CHM_SERIAL_SPI` describes a captured VMM's device order and would aim a
+    // cold guest's keystrokes at an interrupt no device owns. The SPI router
+    // already wakes the vCPU it delivers to, so no separate wake is needed.
+    //
+    // `RawConsole::enable` is a no-op when stdin is not a TTY, so a piped or
+    // redirected run gets the input pump without anyone touching terminal modes.
+    let raw_console = RawConsole::enable();
+    console::install_signal_handlers(raw_console.handle());
+    console::spawn_stdin_pump(
+        uart.clone(),
+        sink.clone(),
+        raw_console.handle(),
+        None,
+        coldboot::PL011_IRQ,
+    );
+    // Restores level-triggered receive semantics: a getty that unmasks RXIM
+    // after input was already queued would otherwise wait for a keystroke that
+    // has, from the typist's point of view, already been sent.
+    let serial_reassert = console::spawn_serial_reassert(
+        uart.clone(),
+        sink.clone(),
+        None,
+        running.clone(),
+        coldboot::PL011_IRQ,
+    );
+
     // The NAT lives on its own thread: a guest transmit only enqueues the frame
     // and wakes it, so the vCPU returns to the guest from its MMIO exit instead
     // of running a TCP stack inside it.
@@ -565,19 +626,32 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         )
     };
 
-    while running.load(Ordering::Acquire) && Instant::now() < deadline {
+    while running.load(Ordering::Acquire)
+        && deadline.is_none_or(|d| Instant::now() < d)
+        && !console::shutdown_requested()
+    {
         thread::sleep(Duration::from_millis(50));
     }
-    let timed_out = running.load(Ordering::Acquire);
+    // Only a deadline that actually expired counts as a timeout; an operator
+    // ending the session is a normal exit, not a run that overran.
+    let timed_out = running.load(Ordering::Acquire) && !console::shutdown_requested();
     running.store(false, Ordering::Release);
 
     // Release any secondary still parked waiting for a CPU_ON that will not
     // come, or the join below blocks until its 100 ms poll expires.
     psci.wake_all();
+    // And force any vCPU still inside `hv_vcpu_run` back out, so it re-reads
+    // `running` and leaves. Without this a guest executing without trapping
+    // holds the join open for as long as it keeps doing so, which is forever
+    // for a panic reboot loop.
+    for exit in exits.iter().flatten() {
+        exit();
+    }
     for t in vcpu_threads {
         let _ = t.join();
     }
     let _ = console.join();
+    let _ = serial_reassert.join();
     if let Some(t) = net_thread {
         let _ = t.join();
     }
@@ -601,7 +675,6 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         None => Ok(ExitCode::SUCCESS),
     }
 }
-
 
 /// Release everyone waiting on the vCPU thread's setup, whether it succeeded or
 /// not: a failed vCPU still has to unblock the threads that would otherwise
