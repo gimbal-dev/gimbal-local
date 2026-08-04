@@ -66,7 +66,7 @@ known-good path, not for normal operation.
 | `CHM_DISABLE_RUN_WATCHDOG=1` | Disable the run watchdog. | Long single-step debugging sessions the watchdog would otherwise cut short. |
 | `CHM_FORCE_RESUME_ADVANCE_S=<n>` | Force the resume-time guest counter jump to `n` seconds instead of the real elapsed time. | Attributing a resume-time stall. The jump is normally a function of how long the checkpoint sat on disk, so waiting cannot separate "the jump was large" from "a lot of time passed"; this varies one and holds the other. |
 | `CHM_ALLOW_OVERLAY_DRIFT=1` | Resume even though the disk overlays changed after the checkpoint's RAM was captured. | Deliberately pairing a remembered filesystem with a different one. Expect the guest to wedge — see below. |
-| `CHM_MAX_RESUMABLE_REVISIONS=<n>` | How many checkpoint revisions stay resumable before older ones are pruned. | Each revision costs a full RAM image; this bounds the store. |
+| `CHM_MAX_RESUMABLE_REVISIONS=<n>` | How many checkpoint revisions stay resumable before older ones are pruned. | Each revision costs a full RAM image; this bounds the store. Pinned revisions (`chm revisions <dir> pin <id>`) sit outside this budget, so pinning one does not shorten the window of recent history. |
 
 ### Why overlay drift is refused rather than warned about
 
