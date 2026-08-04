@@ -36,7 +36,7 @@ after reading what Cloudflare shipped in
 | **G4** | **Network controls** | ✅ **done, with gaps** | Default-deny-able egress allow-list, userspace NAT, reserved-address guard (I10), per-NIC fail-closed, egress audit trail (V6.3). Gaps are G17/G20 below. |
 | **G5** | **Off-box credentials** | ✅ **done** | Injected at the network edge; guest never holds one (V5.2, I12). In-app rule builder with no field that can hold a token (V8.5). |
 | **G6** | **Create local images — from vanilla *or from containers*** | 🟡 **half** | Vanilla: done (cold boot, BYO). **Containers: nothing.** No OCI/Docker→rootfs path exists anywhere in the tree. |
-| **G7** | **A consistent CLI with all features** | 🟡 **partial** | **25** subcommands (`exec` is new in V9.2 and *is* in the help); the app drives **19** of them. Still **7 absent from `chm --help`** — including `create`, the flagship cold-boot path. The app is ahead of the CLI's own discoverability. |
+| **G7** | **A consistent CLI with all features** | ✅ **done** | **24** subcommands, **all 24 now in `chm --help`** (V9.4), grouped by what they need — six require a control plane, which a local-only install has to be told. Every one honours its own `--help`, checked rather than claimed. A guard test reads the dispatch table from source and fails if a future command is added without a help entry. The app drives **19** of the 24; the rest are diagnostic or control-plane. |
 | **G8** | **Snapshot management** | 🟡 **partial** | Have: lineage, fork, rollback, bounded growth. Missing: **delete, garbage-collect, disk-usage reporting, rename, export/import.** Nothing reclaims a snapshot you no longer want. |
 
 ### Goals we already held, stated explicitly
@@ -167,16 +167,16 @@ Reverse chronological, all merged and hardware-verified:
 
 | # | Milestone | Merged | Serves |
 | --- | --- | --- | --- |
-| 1 | **V8.7 · Proxy rules imply egress allowance** — naming a host in an injection rule makes it reachable, scoped to its own ports and only within one authority (#145) | 08-04 | **G4**, G5 |
-| 2 | **V9.2 · `chm exec`** — run a command in a sandbox and exit with *its* status; a transport failure is never reportable as success (#161) | 08-04 | **G16**, G7 |
-| 3 | **V8.4 + credential builder** — settings persist; a rule builder with no field that can hold a token; `chm` is the authority on whether a rule is valid (#147) | 08-04 | G5, G9 |
-| 4 | **V8.3 · Bring-your-own images** — an image directory with typed refusals; the symlink rule found by using it (#146) | 08-03 | **G1** |
-| 5 | **V8.2 · Local-only mode** — stops the app *reaching* for a control plane, not just hiding it (#146) | 08-03 | G14 boundary |
-| 6 | **V8.1 · Cold boot from the app** — the app's most basic capability stops depending on infrastructure the user may not have (#146) | 08-03 | **G1** |
-| 7 | **V7.1 · A coding agent works inside the sandbox** — Copilot CLI installed, authenticated, wrote and ran JS, holding no credential (#141) | 08-03 | **G3**, G5 |
-| 8 | **Icache-elision warning** — a capture whose kernel elided `ic ivau` is named rather than mysteriously SIGILL-ing (#140) | 08-03 | G9 |
-| 9 | **Overlay drift refusal** — refuse to resume a checkpoint whose disk moved on under it (#139) | 08-03 | **G2**, G8 |
-| 10 | **Retire the managed GIC** — one interrupt backend; retiring it exposed three real defects it had been hiding (#138) | 08-03 | G1 |
+| 1 | **V9.4 · CLI completeness** — all 24 subcommands in `chm --help`, grouped by what they need, with a guard test that reads the dispatch table from source (#151) | 08-04 | **G7** |
+| 2 | **V8.7 · Proxy rules imply egress allowance** — naming a host in an injection rule makes it reachable, scoped to its own ports and only within one authority (#145) | 08-04 | **G4**, G5 |
+| 3 | **V9.2 · `chm exec`** — run a command in a sandbox and exit with *its* status; a transport failure is never reportable as success (#161) | 08-04 | **G16**, G7 |
+| 4 | **V8.4 + credential builder** — settings persist; a rule builder with no field that can hold a token; `chm` is the authority on whether a rule is valid (#147) | 08-04 | G5, G9 |
+| 5 | **V8.3 · Bring-your-own images** — an image directory with typed refusals; the symlink rule found by using it (#146) | 08-03 | **G1** |
+| 6 | **V8.2 · Local-only mode** — stops the app *reaching* for a control plane, not just hiding it (#146) | 08-03 | G14 boundary |
+| 7 | **V8.1 · Cold boot from the app** — the app's most basic capability stops depending on infrastructure the user may not have (#146) | 08-03 | **G1** |
+| 8 | **V7.1 · A coding agent works inside the sandbox** — Copilot CLI installed, authenticated, wrote and ran JS, holding no credential (#141) | 08-03 | **G3**, G5 |
+| 9 | **Icache-elision warning** — a capture whose kernel elided `ic ivau` is named rather than mysteriously SIGILL-ing (#140) | 08-03 | G9 |
+| 10 | **Overlay drift refusal** — refuse to resume a checkpoint whose disk moved on under it (#139) | 08-03 | **G2**, G8 |
 
 ### What is outstanding, against the local ship
 
@@ -187,7 +187,6 @@ it is the track [`living-workspaces.md`](living-workspaces.md) creates.
 | | Milestone | Goal | Why now | Size |
 | --- | --- | --- | --- | --- |
 | **V8.6** (#144) | **A build someone else can run** — signed `.app` that finds its own `chm`, and an honest statement of what it needs | G10 | Nothing else on this list matters if the answer to *"can I have it?"* is *"clone the repo and re-sign the binary"*. **The one true blocker.** | M |
-| **V9.4 ★** (#151) | **CLI completeness** — the 7 subcommands missing from `chm --help`, `create` first | **G7** | The app drives 19 of 24 commands; the CLI does not document 7 of its own. Nearly free. | S |
 | **V9.5 ★** (#152) | **Snapshot lifecycle** — delete, GC, disk usage, rename, **and retention roots** | **G8** | Nothing reclaims a snapshot, and nothing protects one either. **Promoted:** retention roots are now a prerequisite for V9.1, not a tidy-up after it. | M |
 | **V9.1 ★** (#148) | **Continuous snapshots (compute)** — checkpoint on a cadence and on meaningful events, browsable timeline, restore any point | **G2** | The MVP-sized, forward-compatible half. **Moved down** and made dependent on V9.5: without retention roots this produces a five-deep timeline that deletes its own history. | M |
 | **V9.3 ★** (#150) | **The sandbox spec** — one declarative document: image, sizing, egress, credentials, env, entrypoint, lifetime | **G15** | Makes a sandbox reproducible and diffable, removes the app's duplicate flag assembly, and is the unit the control plane will want. | L |

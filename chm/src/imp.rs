@@ -1089,31 +1089,54 @@ enum Parsed {
 fn usage() -> String {
     "chm — Gimbal Local (Cloud Hypervisor on Apple Silicon)\n\
      \n\
-     Rehydrate a Cloud Hypervisor arm64 snapshot onto Hypervisor.framework and\n\
-     resume it locally, streaming the guest serial console to stdout.\n\
+     Run Linux guests on Hypervisor.framework: cold-boot a kernel with no\n\
+     snapshot, or rehydrate a Cloud Hypervisor arm64 snapshot and resume it\n\
+     locally. Either way the guest serial console streams to stdout.\n\
      \n\
      USAGE:\n    \
-         chm run <SNAPSHOT_DIR> [OPTIONS]\n    \
-         chm restore <SNAPSHOT_DIR> [OPTIONS]   (alias for run)\n    \
-         chm resume <SNAPSHOT_DIR> [OPTIONS]    (restore a saved checkpoint)\n    \
-         chm fork <SRC_DIR> <DST_DIR>           (branch a saved revision)\n    \
-         chm workspace <IMAGE_DIR> <WS_DIR>     (isolated sandbox workspace)\n    \
-         chm revisions <SNAPSHOT_DIR> [--json]  (list the lineage)\n    \
-         chm rollback <SNAPSHOT_DIR> <REV_ID>   (roll back to a revision)\n    \
-         chm connect <SNAPSHOT_DIR> [OPTIONS]   (interactive session)\n    \
-         chm push <CHECKPOINT_DIR> --branch N   (commit a revision to the plane)\n    \
-         chm pull --branch N --to DIR           (rehydrate a branch head)\n    \
-         chm state-cdn reconstruct [OPTIONS]    (pull memory from the state CDN)\n    \
-         chm policy show --sandbox ID           (show a sandbox's bound policy)\n    \
-         chm firewall set <WORKSPACE_DIR> ...   (author a local egress policy)\n    \
-     chm posture <WORKSPACE_DIR> [--json]   (which security controls are on)\n    \
-     chm ctl posture [DIR]                  (the daemon's own posture)\n    \
-     chm proxy show [WORKSPACE_DIR]         (credential injection for egress)\n    \
-     chm sysregs <SNAPSHOT_DIR> [--all]     (CPU registers this Mac reproduces)\n    \
-         chm cloud <COMMAND> aws [OPTIONS]      (BYO cloud helpers)\n    \
-         chm serve <LIBRARY_DIR> [OPTIONS]      (background daemon)\n    \
-         chm ctl <COMMAND> [ARG] [--socket P]   (talk to a daemon)\n    \
-         chm exec [OPTIONS] -- <CMD> [ARG...]   (run a command in the guest)\n\
+         chm <COMMAND> [OPTIONS]\n\
+     \n\
+     RUN A GUEST\n    \
+         chm create --kernel <Image> [OPTIONS] (cold boot, no snapshot needed)\n    \
+         chm run <SNAPSHOT_DIR> [OPTIONS]      (rehydrate a snapshot)\n    \
+         chm restore <SNAPSHOT_DIR> [OPTIONS]  (alias for run)\n    \
+         chm resume <SNAPSHOT_DIR> [OPTIONS]   (restore a saved checkpoint)\n    \
+         chm connect <SNAPSHOT_DIR> [OPTIONS]  (interactive session)\n    \
+         chm exec [OPTIONS] -- <CMD> [ARG...]  (run a command in the guest)\n\
+     \n\
+     SNAPSHOTS AND LINEAGE\n    \
+         chm workspace <IMAGE_DIR> <WS_DIR>    (isolated sandbox workspace)\n    \
+         chm fork <SRC_DIR> <DST_DIR>          (branch a saved revision)\n    \
+         chm revisions <SNAPSHOT_DIR> [--json] (list the lineage)\n    \
+         chm rollback <SNAPSHOT_DIR> <REV_ID>  (roll back to a revision)\n    \
+         chm manifest <COMMAND> [OPTIONS]      (sign / verify a manifest)\n\
+     \n\
+     SECURITY AND EVIDENCE\n    \
+         chm firewall set <WORKSPACE_DIR> ...  (author a local egress policy)\n    \
+         chm proxy show [WORKSPACE_DIR]        (credential injection for egress)\n    \
+         chm limits <COMMAND> [OPTIONS]        (bound CPU, memory and disk)\n    \
+         chm audit show <WORKSPACE_DIR>        (the append-only session trail)\n    \
+         chm posture <WORKSPACE_DIR> [--json]  (which security controls are on)\n    \
+         chm capabilities [SNAPSHOT_DIR]       (what this build can do, and why)\n    \
+         chm sysregs <SNAPSHOT_DIR> [--all]    (CPU registers this Mac reproduces)\n\
+     \n\
+     DAEMON\n    \
+         chm serve <LIBRARY_DIR> [OPTIONS]     (background daemon)\n    \
+         chm ctl <COMMAND> [ARG] [--socket P]  (talk to a daemon)\n    \
+         chm ctl posture [DIR]                 (the daemon's own posture)\n\
+     \n\
+     YOUR OWN CLOUD (your AWS account, no control plane)\n    \
+         chm cloud <COMMAND> aws [OPTIONS]     (init/preflight/pull/push/capture)\n\
+     \n\
+     NEEDS A CONTROL PLANE\n    \
+         chm push <CHECKPOINT_DIR> --branch N  (commit a revision to the plane)\n    \
+         chm pull --branch N --to DIR          (rehydrate a branch head)\n    \
+         chm branches [--json] [--owner WHO]   (list + drive revision branches)\n    \
+         chm runner <COMMAND> [OPTIONS]        (drive local runs through gctl)\n    \
+         chm policy show --sandbox ID          (a sandbox's bound governance)\n    \
+         chm state-cdn reconstruct [OPTIONS]   (pull memory from the state CDN)\n\
+     \n\
+     Every command takes `--help` of its own.\n\
      \n\
      ARGS:\n    \
          <SNAPSHOT_DIR>    Directory holding `state.json` and\n                      \
@@ -2777,6 +2800,72 @@ fn banner(dir: &Path, mem_ranges: &Path, num_vcpus: u32, total_ram: u64, backend
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `--help` is the only place a user can discover what `chm` does, and it
+    /// had drifted: seven dispatched subcommands were absent from it, including
+    /// `create` — the whole cold-boot path. Listing them once fixes today; this
+    /// test fixes the class, by reading the dispatch table out of this file's
+    /// own source and requiring every arm to be reachable from the help.
+    ///
+    /// If this fails because a new `Some("...")` was added for something that
+    /// is *not* a subcommand, that is still worth a look: the dispatch match is
+    /// the only place that shape is meant to appear.
+    #[test]
+    fn every_dispatched_subcommand_appears_in_the_help() {
+        let src = include_str!("imp.rs");
+        let help = usage();
+
+        let mut dispatched: Vec<&str> = src
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("Some(\""))
+            .filter_map(|r| r.split('"').next())
+            .collect();
+        dispatched.sort_unstable();
+        dispatched.dedup();
+
+        assert!(
+            dispatched.len() > 20,
+            "extraction found only {} subcommands — the dispatch match moved \
+             and this guard is no longer reading it",
+            dispatched.len()
+        );
+
+        let missing: Vec<&str> = dispatched
+            .iter()
+            .copied()
+            .filter(|c| !help.contains(&format!("chm {c} ")))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "dispatched but absent from `chm --help`: {missing:?}"
+        );
+    }
+
+    /// The header is the first thing a reader sees, so it must not describe
+    /// half the product. Cold boot is a first-class entry point, not a footnote
+    /// to snapshot rehydration.
+    #[test]
+    fn the_help_header_covers_both_entry_points() {
+        let help = usage();
+        let header = help.split("USAGE:").next().expect("header");
+        assert!(header.contains("cold-boot"), "header omits cold boot: {header}");
+        assert!(header.contains("snapshot"), "header omits snapshots: {header}");
+    }
+
+    /// A local-only install cannot use these, and V8.2 ships exactly that mode.
+    /// Grouping them is the difference between "this is broken" and "this needs
+    /// something you have not set up".
+    #[test]
+    fn control_plane_commands_are_grouped_as_such() {
+        let help = usage();
+        let start = help.find("NEEDS A CONTROL PLANE").expect("group heading");
+        let group = &help[start..];
+        for c in ["chm push ", "chm pull ", "chm branches ", "chm runner ", "chm policy "] {
+            assert!(group.contains(c), "{c} is not under the control-plane heading");
+        }
+        // `create` is the local cold-boot path and must not be down there.
+        assert!(!group.contains("chm create "), "create listed as control-plane");
+    }
 
     /// A cold guest has no captured `mp_state`: the boot protocol started
     /// vCPU 0 and nothing else. Bringing a secondary up before the kernel asks
