@@ -4,7 +4,7 @@
 
 import Foundation
 
-struct AppSettings {
+struct AppSettings: Equatable {
     var chmPath: String
     var libraryPath: String
     /// Directory holding bring-your-own images: a kernel plus optional

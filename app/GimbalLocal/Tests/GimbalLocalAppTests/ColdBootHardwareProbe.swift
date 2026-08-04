@@ -29,3 +29,22 @@ final class ColdBootHardwareProbe: XCTestCase {
         }
     }
 }
+
+/// Scans a real directory with the app's own discovery code. Skipped unless
+/// `GIMBAL_PROBE_DIR` names one, so it never runs in the normal gate.
+final class LocalImageScanProbe: XCTestCase {
+    func testScanRealDirectory() throws {
+        guard let root = ProcessInfo.processInfo.environment["GIMBAL_PROBE_DIR"] else {
+            throw XCTSkip("set GIMBAL_PROBE_DIR to scan a real image directory")
+        }
+        let entries = LocalImageLibrary.scan(root: root)
+        print("PROBE_SCAN root=\(root) entries=\(entries.count)")
+        for entry in entries {
+            if let rejection = entry.rejection {
+                print("PROBE_SCAN   refused \(entry.name): \(rejection.reason)")
+            } else if let image = entry.image {
+                print("PROBE_SCAN   accepted \(entry.name) kernel=\(image.kernelPath) disks=\(image.diskPaths.count)")
+            }
+        }
+    }
+}

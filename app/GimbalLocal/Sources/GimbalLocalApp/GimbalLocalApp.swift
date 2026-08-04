@@ -21,6 +21,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 struct GimbalLocalApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
     @StateObject private var model = AppModel()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         Window("Gimbal Local", id: "main") {
@@ -30,6 +31,15 @@ struct GimbalLocalApp: App {
                 .task {
                     await model.bootstrap()
                 }
+        }
+        .onChange(of: scenePhase) { _, phase in
+            // Coming back from Finder is exactly when a newly-added image should
+            // be there. The scan is one directory listing, so doing it on every
+            // activation is cheaper than making the user find a Refresh button
+            // to explain why the folder they just filled looks empty.
+            if phase == .active {
+                model.refreshLocalImages()
+            }
         }
         .commands {
             CommandMenu("Gimbal") {

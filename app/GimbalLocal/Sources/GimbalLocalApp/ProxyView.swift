@@ -43,7 +43,11 @@ struct ProxyPage: View {
                     ProxyCaCard()
                     ProxyCheckCard()
                 } else {
-                    ProxyNotConfigured(config: model.proxyConfig)
+                    ProxyNotConfigured(
+                        config: model.proxyConfig,
+                        chmPath: model.settings.chmPath,
+                        onWritten: { Task { await model.refreshProxy() } }
+                    )
                 }
             }
             .padding(28)
@@ -105,7 +109,7 @@ private struct ProxyRulesCard: View {
                 )
             }
 
-            Text(
+            Text.authored(
                 "The app never sees a credential value: `chm proxy show` does not read one, "
                     + "and an `exec` source is never run."
                     + (config.isFromDaemon
@@ -347,7 +351,7 @@ private struct ProxyCheckCard: View {
                 if model.isCheckingProxy { ProgressView().controlSize(.small) }
             }
 
-            Text(
+            Text.authored(
                 "Pick a path whose answer depends on the credential — `/user` on "
                     + "api.github.com answers 200 authenticated and 401 not. Against a path "
                     + "that answers the same either way this test cannot prove anything, and "
@@ -478,6 +482,10 @@ private struct ProxyNotConfigured: View {
     /// Nil when `chm` itself could not be reached — which is a different
     /// thing from "no rules", and must not be rendered as reassurance.
     let config: ProxyConfiguration?
+    let chmPath: String
+    var onWritten: (() -> Void)?
+
+    @State private var showingBuilder = false
 
     private var hasAnswer: Bool { config != nil }
 
@@ -509,38 +517,112 @@ private struct ProxyNotConfigured: View {
     }
 
     var body: some View {
-        VStack(spacing: 14) {
-            Image(systemName: hasAnswer ? "key.slash.fill" : "questionmark.circle.fill")
-                .font(.system(size: 50))
-                .foregroundStyle(hasAnswer ? Theme.cyan : Theme.orange)
-            Text(headline)
-                .font(.title2.weight(.bold))
-            Text(detail)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 460)
+        ScrollView {
+            VStack(spacing: 14) {
+                Image(systemName: hasAnswer ? "key.slash.fill" : "questionmark.circle.fill")
+                    .font(.system(size: 50))
+                    .foregroundStyle(hasAnswer ? Theme.cyan : Theme.orange)
+                Text(headline)
+                    .font(.title2.weight(.bold))
+                Text(detail)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 460)
 
-            if hasAnswer {
-                // Naming the directory is the whole value of this line: rules
-                // dropped in the library root are read by nothing, because a
-                // guest's workspace is its own folder.
-                VStack(spacing: 4) {
-                    if let dir = config?.scopeDir {
-                        Text("Rules would be read from \(dir)/proxy-rules.json")
+                if hasAnswer {
+                    howItWorks
+                        .padding(.top, 6)
+
+                    Button {
+                        showingBuilder = true
+                    } label: {
+                        Label("Set up a credential rule", systemImage: "wand.and.stars")
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+
+                    // Naming the directory is the whole value of this line: rules
+                    // dropped in the library root are read by nothing, because a
+                    // guest's workspace is its own folder.
+                    VStack(spacing: 4) {
+                        if let dir = config?.scopeDir {
+                            Text("Rules would be read from \(dir)/proxy-rules.json")
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                                .multilineTextAlignment(.center)
+                                .textSelection(.enabled)
+                        }
+                        Text("Put `proxy-rules.json` there, or set CHM_PROXY_RULES.")
                             .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .multilineTextAlignment(.center)
+                            .foregroundStyle(.tertiary)
                             .textSelection(.enabled)
                     }
-                    Text("Put `proxy-rules.json` there, or set CHM_PROXY_RULES.")
-                        .font(.system(.caption, design: .monospaced))
-                        .foregroundStyle(.tertiary)
-                        .textSelection(.enabled)
+                    .frame(maxWidth: 620)
                 }
-                .frame(maxWidth: 620)
             }
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 28)
         }
         .frame(maxWidth: .infinity, minHeight: 320)
+        .sheet(isPresented: $showingBuilder) {
+            CredentialRuleBuilder(
+                scopeDir: config?.scopeDir,
+                chmPath: chmPath,
+                onWritten: onWritten
+            )
+        }
+    }
+
+    /// The gap this closes is specific. The old empty state said *put a file
+    /// there* without ever saying **what goes in it**, so the reader's next
+    /// move was to guess a schema — and the obvious guess is a field holding
+    /// the token, which is the one shape this design exists to prevent. Three
+    /// lines is enough to make the right shape the obvious one.
+    private var howItWorks: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("How it works")
+                .font(.callout.weight(.semibold))
+            step(
+                "1",
+                "The sandbox makes an ordinary request",
+                "It has no token, and needs no special client. It just calls api.github.com."
+            )
+            step(
+                "2",
+                "chm is already the whole network",
+                "Every packet crosses it, so it is the one place a header can be added without "
+                    + "the guest being involved."
+            )
+            step(
+                "3",
+                "The rule names a source, never a secret",
+                "`\"exec\": \"gh auth token\"` or `\"env\": \"GH_TOKEN\"` — resolved on this Mac, "
+                    + "as the request leaves. The file itself is not sensitive."
+            )
+        }
+        .padding(14)
+        .frame(maxWidth: 560, alignment: .leading)
+        .background(
+            RoundedRectangle(cornerRadius: 10)
+                .fill(Color.secondary.opacity(0.07))
+        )
+    }
+
+    private func step(_ number: String, _ title: String, _ body: String) -> some View {
+        HStack(alignment: .top, spacing: 10) {
+            Text(number)
+                .font(.caption.weight(.bold))
+                .foregroundStyle(Theme.cyan)
+                .frame(width: 18, height: 18)
+                .background(Circle().fill(Theme.cyan.opacity(0.15)))
+            VStack(alignment: .leading, spacing: 2) {
+                Text(title).font(.caption.weight(.semibold))
+                Text.authored(body)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 }

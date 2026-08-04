@@ -70,8 +70,21 @@ pub(crate) enum HostPattern {
     Ip(IpAddr),
 }
 
+/// Which list a host pattern came from. Only affects the wording of a
+/// rejection: both lists refuse the same patterns, but for opposite reasons,
+/// and a message naming the wrong list sends the reader to the wrong line.
+#[derive(Clone, Copy)]
+enum PatternUse {
+    Injection,
+    Passthrough,
+}
+
 impl HostPattern {
     fn parse(raw: &str) -> Result<Self, String> {
+        Self::parse_in(raw, PatternUse::Injection)
+    }
+
+    fn parse_in(raw: &str, used_for: PatternUse) -> Result<Self, String> {
         let raw = raw.trim().to_ascii_lowercase();
         if raw.is_empty() {
             return Err("empty host pattern".into());
@@ -80,10 +93,24 @@ impl HostPattern {
             // Deliberately refused. A rule that intercepts everything would put
             // the proxy in the middle of all guest TLS, which is exactly the
             // blast radius this design exists to avoid.
-            return Err(
-                "'*' is not allowed as an injection host: interception must name its destinations"
-                    .into(),
-            );
+            //
+            // The same refusal applies to `passthrough`, for a different
+            // reason: an exclusion list that excludes everything silently
+            // disables every rule above it, so a file that looks configured
+            // injects nothing. Both are refused, but saying "injection host"
+            // about a passthrough entry sends the reader to the wrong line.
+            return Err(match used_for {
+                PatternUse::Injection => {
+                    "'*' is not allowed as an injection host: interception must name its destinations"
+                        .into()
+                }
+                PatternUse::Passthrough => {
+                    "'*' is not allowed in 'passthrough': it would exclude every host and \
+                     silently disable every rule. Remove the rules you do not want, or list \
+                     the hosts to exclude."
+                        .to_string()
+                }
+            });
         }
         if let Some(rest) = raw.strip_prefix("*.") {
             if rest.is_empty() || !rest.contains('.') {
@@ -342,7 +369,10 @@ impl RuleSetDoc {
         let passthrough = self
             .passthrough
             .iter()
-            .map(|p| HostPattern::parse(p))
+            .map(|p| {
+                HostPattern::parse_in(p, PatternUse::Passthrough)
+                    .map_err(|e| format!("passthrough: {e}"))
+            })
             .collect::<Result<Vec<_>, _>>()?;
 
         Ok(RuleSet {
@@ -482,6 +512,36 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn a_wildcard_passthrough_is_refused_and_says_which_list_it_came_from() {
+        // Both lists refuse '*', but for opposite reasons: an injection
+        // wildcard would intercept all guest TLS, while a passthrough wildcard
+        // would silently disable every rule above it. A reader who gets the
+        // injection wording for a passthrough entry looks at the wrong line.
+        let err = RuleSet::parse(
+            r#"{
+              "version": 1,
+              "rules": [{"name": "gh", "hosts": ["api.github.com"], "env": "T"}],
+              "passthrough": ["*"]
+            }"#,
+        )
+        .expect_err("'*' must not be accepted as a passthrough entry");
+        assert!(err.contains("passthrough"), "{err}");
+        assert!(
+            !err.contains("injection host"),
+            "passthrough rejection must not blame injection: {err}"
+        );
+    }
+
+    #[test]
+    fn a_wildcard_injection_host_is_still_refused_as_before() {
+        let err = RuleSet::parse(
+            r#"{"version": 1, "rules": [{"name": "all", "hosts": ["*"], "env": "T"}]}"#,
+        )
+        .expect_err("'*' must not be accepted as an injection host");
+        assert!(err.contains("injection host"), "{err}");
+    }
+
     fn passthrough_overrides_a_matching_rule() {
         let rs = ruleset(
             r#"{
