@@ -248,9 +248,24 @@ private struct PathsSettingsTab: View {
                 }
                 .disabled(model.isRefreshing)
             } footer: {
-                Text("These point the app at the local runtime.")
+                Text("These point the app at the local runtime, and are remembered between launches.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
+            }
+
+            if !model.settingsNotices.isEmpty {
+                Section("Since you last used these") {
+                    ForEach(Array(model.settingsNotices.enumerated()), id: \.offset) { _, notice in
+                        Label {
+                            Text(notice.message)
+                                .font(.caption)
+                                .fixedSize(horizontal: false, vertical: true)
+                        } icon: {
+                            Image(systemName: "exclamationmark.triangle")
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                }
             }
         }
         .formStyle(.grouped)

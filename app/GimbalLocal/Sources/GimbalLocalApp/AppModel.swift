@@ -48,7 +48,30 @@ enum InteractiveLiveness {
 
 @MainActor
 final class AppModel: ObservableObject {
-    @Published var settings = AppSettings.defaults
+    /// Restored from `UserDefaults` at launch, and written back on every edit.
+    /// `didSet` rather than an explicit save call because the settings pane
+    /// binds straight to these fields -- a save the caller has to remember is a
+    /// save that eventually gets forgotten.
+    @Published var settings = AppSettings.defaults {
+        didSet {
+            guard !restoringSettings, settings != oldValue else { return }
+            SettingsStore.save(settings, environmentOverridden: settingsFromEnvironment)
+        }
+    }
+
+    /// What restoring the settings had to tell the user: a saved path that has
+    /// gone away, or one an environment variable is currently outranking.
+    @Published var settingsNotices: [SettingsStore.Notice] = []
+
+    /// Fields the environment is dictating this launch, so we do not write a
+    /// transient value over the user's own saved one.
+    private var settingsFromEnvironment: Set<SettingsField> = []
+
+    /// Set while `loadSettings` is assigning, so restoring does not immediately
+    /// write the derived defaults back. Persisting a value the user never chose
+    /// would freeze a repo path discovered on this launch into every future one.
+    private var restoringSettings = false
+
     @Published var snapshots: [SnapshotSummary] = []
     @Published var status = SandboxStatus.disconnected
     @Published var cloud = CloudOverview.offline
@@ -166,6 +189,7 @@ final class AppModel: ObservableObject {
     private let maxRecents = 8
 
     func bootstrap() async {
+        loadSettings()
         loadRecents()
         loadSandboxes()
         loadGlobalDefaults()
@@ -748,9 +772,10 @@ final class AppModel: ObservableObject {
         }
     }
 
-    /// Rescan the local image directory. Cheap, and driven by the same refresh
-    /// loop as everything else, so dropping an image into the folder makes it
-    /// appear without restarting the app.
+    /// Rescan the local image directory. One directory listing, so it runs at
+    /// launch, on every Refresh, and whenever the app comes back to the front --
+    /// which is when someone who just dropped an image in Finder comes looking
+    /// for it.
     func refreshLocalImages() {
         localImages = LocalImageLibrary.scan(root: settings.localImagesPath)
     }
@@ -1380,6 +1405,20 @@ final class AppModel: ObservableObject {
         UserDefaults.standard.set(localOnly, forKey: localOnlyDefaultsKey)
         if localOnly, selection == .cloudHome {
             selection = .sandboxesHome
+        }
+    }
+
+    /// Restore the paths the user chose, honouring the precedence in
+    /// `SettingsStore`: environment beats saved beats derived default.
+    func loadSettings() {
+        let restored = SettingsStore.load()
+        settingsFromEnvironment = restored.environmentOverridden
+        restoringSettings = true
+        settings = restored.settings
+        restoringSettings = false
+        settingsNotices = restored.notices
+        for notice in restored.notices {
+            appendLog("settings: \(notice.message)")
         }
     }
 
