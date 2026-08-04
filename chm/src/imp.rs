@@ -963,6 +963,7 @@ pub fn main() -> ExitCode {
         Some("state-cdn") => state_cdn::state_cdn_main(&raw[1..]),
         Some("serve") => serve::serve_main(&raw[1..]),
         Some("ctl") => serve::ctl_main(&raw[1..]),
+        Some("exec") => serve::exec_main(&raw[1..]),
         Some("fork") => match fork(&raw[1..]) {
             Ok(code) => code,
             Err(e) => {
@@ -1074,7 +1075,8 @@ fn usage() -> String {
      chm sysregs <SNAPSHOT_DIR> [--all]     (CPU registers this Mac reproduces)\n    \
          chm cloud <COMMAND> aws [OPTIONS]      (BYO cloud helpers)\n    \
          chm serve <LIBRARY_DIR> [OPTIONS]      (background daemon)\n    \
-         chm ctl <COMMAND> [ARG] [--socket P]   (talk to a daemon)\n\
+         chm ctl <COMMAND> [ARG] [--socket P]   (talk to a daemon)\n    \
+         chm exec [OPTIONS] -- <CMD> [ARG...]   (run a command in the guest)\n\
      \n\
      ARGS:\n    \
          <SNAPSHOT_DIR>    Directory holding `state.json` and\n                      \
@@ -1127,7 +1129,15 @@ fn usage() -> String {
          command bare) to press Enter. A resumed\n                                \
          guest is idle until it is typed at.\n    \
          chm ctl stop                Stop the running guest.\n    \
-         chm ctl shutdown            Stop the guest and exit the daemon.\n\
+         chm ctl shutdown            Stop the guest and exit the daemon.\n    \
+         chm exec [--timeout N] [--json] -- <CMD> [ARG...]\n      \
+         Run a command in the running guest and exit with ITS exit\n      \
+         status. The arguments after `--` are an argv: nothing in\n      \
+         them is interpreted as shell syntax, so ask for a shell\n      \
+         explicitly (`chm exec -- bash -lc '...'`) when you want one.\n      \
+         124 means the guest did not answer in time and 125 means\n      \
+         chm could not run it at all, so a transport failure is\n      \
+         never reported as success.\n\
      \n\
      NOTE: the binary must be code-signed with the\n      \
      `com.apple.security.hypervisor` entitlement (see scripts/build-chm.sh).\n"

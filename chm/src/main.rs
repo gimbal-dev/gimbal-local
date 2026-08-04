@@ -28,6 +28,11 @@ mod imp;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod console_filter;
 
+// Framing for `chm exec`: run a command in a running sandbox and recover its
+// exit status over the console channel (#149).
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod exec;
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod checkpoint;
 

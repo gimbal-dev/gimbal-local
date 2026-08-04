@@ -25,6 +25,7 @@ use crate::capability;
 use crate::console::ConsoleInput;
 use crate::credproxy::cli;
 use crate::console_filter::ConsoleFilter;
+use crate::exec;
 use crate::imp::{
     Loaded, Outcome, UsgicConfig, UsgicSession, aarch32_guard, cntfrq_guard, icache_dic_guard,
     load_snapshot,
@@ -544,6 +545,9 @@ fn handle_conn(stream: UnixStream, daemon: &Daemon) {
         }
         "capabilities-json" => {
             let _ = writer.write_all(capabilities_json(daemon, arg).as_bytes());
+        }
+        "exec-json" => {
+            let _ = writer.write_all(exec_json(daemon, arg).as_bytes());
         }
         "start" => {
             let resp = match start_vm(daemon, arg) {
@@ -1120,7 +1124,142 @@ fn send_input(daemon: &Daemon, arg: &str) -> Result<usize, String> {
     Ok(bytes.len())
 }
 
-/// Decode a client's console input, turning backslash escapes into raw bytes.
+/// Serialises exec requests: two commands typed into one console interleave
+/// their characters and both come back wrong. A second caller is refused rather
+/// than queued, so a stuck exec cannot silently stall a fleet of them.
+static EXEC_BUSY: AtomicBool = AtomicBool::new(false);
+
+/// Clears [`EXEC_BUSY`] however the exec ends, including an early return.
+struct ExecSlot;
+
+impl Drop for ExecSlot {
+    fn drop(&mut self) {
+        EXEC_BUSY.store(false, Ordering::Release);
+    }
+}
+
+/// Run `argv` in the running guest and report what happened.
+///
+/// `arg` is `<timeout_secs> <hex-argv…>` (see [`exec::encode_argv`]). The reply
+/// is a single JSON object whose `status` field is the contract: `completed` is
+/// the *only* value that carries a meaningful `exit_code`, so a caller cannot
+/// read a transport failure as a successful command.
+fn exec_json(daemon: &Daemon, arg: &str) -> String {
+    let started = Instant::now();
+    match exec_run(daemon, arg) {
+        Ok((outcome, elapsed)) => match outcome {
+            exec::ExecOutcome::Completed { code, output } => format!(
+                "{{\"status\":\"completed\",\"exit_code\":{code},\"output\":\"{}\",\
+                 \"error\":null,\"duration_ms\":{}}}\n",
+                json_escape(&output),
+                elapsed.as_millis()
+            ),
+            exec::ExecOutcome::Pending => exec_error_json(
+                "timeout",
+                "the guest did not report completion before the timeout; \
+                 it may still be running the command, or it may not be at a shell prompt \
+                 (check with `chm ctl console`)",
+                elapsed,
+            ),
+            exec::ExecOutcome::Truncated => exec_error_json(
+                "truncated",
+                "the guest produced more console output than the daemon's ring can hold, \
+                 so the command's output was partly evicted before it could be read",
+                elapsed,
+            ),
+            exec::ExecOutcome::Overflowed => exec_error_json(
+                "overflowed",
+                "the command produced too much output to capture over the console channel; \
+                 redirect it to a file in the guest instead",
+                elapsed,
+            ),
+        },
+        Err(e) => exec_error_json("error", &e, started.elapsed()),
+    }
+}
+
+fn exec_error_json(status: &str, message: &str, elapsed: Duration) -> String {
+    format!(
+        "{{\"status\":\"{status}\",\"exit_code\":null,\"output\":\"\",\
+         \"error\":\"{}\",\"duration_ms\":{}}}\n",
+        json_escape(message),
+        elapsed.as_millis()
+    )
+}
+
+fn exec_run(daemon: &Daemon, arg: &str) -> Result<(exec::ExecOutcome, Duration), String> {
+    let (timeout_str, wire) = arg.split_once(' ').unwrap_or((arg, ""));
+    let secs: u64 = timeout_str
+        .parse()
+        .map_err(|_| "malformed exec request".to_string())?;
+    let argv = exec::decode_argv(wire)?;
+    let nonce = exec::Nonce::mint();
+    let script = exec::script(&nonce, &argv)?;
+
+    if EXEC_BUSY
+        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return Err("another exec is already running in this sandbox".to_string());
+    }
+    let _slot = ExecSlot;
+
+    // Take copies of the shared handles and drop the daemon lock before waiting:
+    // an exec can run for minutes and must not block `status`, `console` or
+    // `stop` while it does.
+    let (inner, input) = {
+        let guard = daemon.current.lock().unwrap();
+        let vm = guard.as_ref().ok_or("no VM running")?;
+        let g = vm.inner.lock().unwrap();
+        if let RunStatus::Stopped(ref why) = g.status {
+            return Err(format!("`{}` is stopped ({why})", vm.name));
+        }
+        let input =
+            g.input.clone().ok_or("this VM does not expose a console input channel")?;
+        (Arc::clone(&vm.inner), input)
+    };
+
+    // Absolute stream offset of the first byte that can belong to this exec.
+    // Everything before it is prior console traffic and is never parsed.
+    let start = {
+        let g = inner.lock().unwrap();
+        g.dropped + g.console.len()
+    };
+
+    // A carriage return is what a real terminal sends; the guest tty's ICRNL
+    // turns it into the newline that completes the line.
+    let mut bytes = script.into_bytes();
+    bytes.push(b'\r');
+    input(&bytes);
+
+    let began = Instant::now();
+    let deadline = began + Duration::from_secs(secs);
+    loop {
+        let (slice, dropped, stopped) = {
+            let g = inner.lock().unwrap();
+            (g.console.clone(), g.dropped, matches!(g.status, RunStatus::Stopped(_)))
+        };
+        // Our window opened at `start`; if eviction has passed it, the bytes we
+        // would parse are not the ones we asked for.
+        if dropped > start {
+            return Ok((exec::ExecOutcome::Truncated, began.elapsed()));
+        }
+        let since = String::from_utf8_lossy(&slice[start - dropped..]);
+        let outcome = exec::parse(&nonce, &since);
+        match outcome {
+            exec::ExecOutcome::Pending => {}
+            done => return Ok((done, began.elapsed())),
+        }
+        if stopped {
+            return Err("the guest stopped before the command completed".to_string());
+        }
+        if Instant::now() >= deadline {
+            return Ok((exec::ExecOutcome::Pending, began.elapsed()));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn decode_input(arg: &str) -> Vec<u8> {
     if arg.is_empty() {
         return vec![b'\n'];
@@ -1459,12 +1598,152 @@ fn ctl_command(rest: &[String]) -> Result<String, String> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Client (`chm exec`)
+// ---------------------------------------------------------------------------
+
+/// Exit status when the guest did not report completion in time.
+const EXEC_TIMEOUT_EXIT: u8 = 124;
+/// Exit status when `chm` itself could not obtain a verdict.
+const EXEC_FAILURE_EXIT: u8 = 125;
+
+/// Default seconds to wait for a command. Long enough for a package install,
+/// short enough that a wedged guest is not waited on forever.
+const EXEC_DEFAULT_TIMEOUT: u64 = 300;
+
+pub(crate) const EXEC_USAGE: &str = "\
+usage: chm exec [--socket PATH] [--timeout SECS] [--json] -- <command> [args...]
+
+Run a command in the sandbox `chm serve` is running and report its exit status.
+
+  --timeout SECS   give up after SECS (default 300)
+  --json           print {status, exit_code, output, error, duration_ms}
+
+The arguments after `--` are an argv, not a shell command line: nothing in them
+is interpreted as shell syntax. To use a shell, ask for one explicitly:
+
+  chm exec -- bash -lc 'make build 2>&1 | tail -20'
+
+Exit status is the guest command's own, so a failing command fails `chm exec`.
+A transport failure never reports success: 124 means the guest did not answer in
+time and 125 means chm could not run the command at all. With --json the
+`status` field is the contract, and `exit_code` is non-null only when it is
+`completed`.
+
+Output is the guest's *console* text with stdout and stderr combined, not a
+byte-exact stream: the terminal has already cooked it. For binary output, or to
+keep the two streams apart, redirect to a file in the guest and copy it out.";
+
+pub fn exec_main(raw: &[String]) -> ExitCode {
+    match exec_client(raw) {
+        Ok(code) => ExitCode::from(code),
+        Err(e) => {
+            eprintln!("chm exec: {e}");
+            ExitCode::from(EXEC_FAILURE_EXIT)
+        }
+    }
+}
+
+fn exec_client(raw: &[String]) -> Result<u8, String> {
+    let (socket, rest) = take_socket(raw)?;
+    let (timeout, json, argv) = parse_exec_args(&rest)?;
+
+    let mut stream = UnixStream::connect(&socket).map_err(|e| {
+        format!(
+            "cannot connect to daemon at {}: {e} (is `chm serve` running?)",
+            socket.display()
+        )
+    })?;
+    let request = format!("exec-json {timeout} {}\n", exec::encode_argv(&argv));
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("send command: {e}"))?;
+    stream.flush().ok();
+
+    let mut body = String::new();
+    stream
+        .read_to_string(&mut body)
+        .map_err(|e| format!("read daemon: {e}"))?;
+    let reply: serde_json::Value =
+        serde_json::from_str(body.trim()).map_err(|e| format!("daemon reply: {e} ({body})"))?;
+
+    if json {
+        println!("{}", body.trim());
+    }
+
+    let status = reply.get("status").and_then(|v| v.as_str()).unwrap_or("error");
+    if status != "completed" {
+        let msg = reply.get("error").and_then(|v| v.as_str()).unwrap_or("no detail");
+        if !json {
+            eprintln!("chm exec: {status}: {msg}");
+        }
+        return Ok(if status == "timeout" {
+            EXEC_TIMEOUT_EXIT
+        } else {
+            EXEC_FAILURE_EXIT
+        });
+    }
+
+    if !json && let Some(out) = reply.get("output").and_then(|v| v.as_str()) {
+        print!("{out}");
+        if !out.is_empty() && !out.ends_with('\n') {
+            println!();
+        }
+    }
+    // A guest exit status is 0..=255; anything else means the daemon and this
+    // client disagree about the protocol, which is a chm failure, not the
+    // command's.
+    let code = reply.get("exit_code").and_then(|v| v.as_i64());
+    match code {
+        Some(c) if (0..=255).contains(&c) => Ok(c as u8),
+        _ => Err("daemon reported completion without a usable exit status".to_string()),
+    }
+}
+
+/// Split `chm exec`'s own flags from the guest argv.
+///
+/// Everything after `--` is the command, verbatim: a guest command's own flags
+/// must never be mistaken for ours. Without a `--`, flags are consumed until the
+/// first non-flag word, which then starts the command.
+fn parse_exec_args(rest: &[String]) -> Result<(u64, bool, Vec<String>), String> {
+    let mut timeout = EXEC_DEFAULT_TIMEOUT;
+    let mut json = false;
+    let mut i = 0;
+    while i < rest.len() {
+        match rest[i].as_str() {
+            "--" => {
+                i += 1;
+                break;
+            }
+            "--json" => json = true,
+            "--timeout" => {
+                let v = rest.get(i + 1).ok_or("--timeout needs a value in seconds")?;
+                timeout = v.parse().map_err(|_| format!("--timeout: `{v}` is not a number"))?;
+                if timeout == 0 {
+                    return Err("--timeout must be at least 1 second".to_string());
+                }
+                i += 1;
+            }
+            "-h" | "--help" => return Err(EXEC_USAGE.to_string()),
+            other if other.starts_with('-') => {
+                return Err(format!("unknown option `{other}`\n\n{EXEC_USAGE}"));
+            }
+            _ => break,
+        }
+        i += 1;
+    }
+    let argv: Vec<String> = rest[i..].to_vec();
+    if argv.is_empty() {
+        return Err(format!("no command given\n\n{EXEC_USAGE}"));
+    }
+    Ok((timeout, json, argv))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::fs::symlink;
     use std::process;
-
     fn s(args: &[&str]) -> Vec<String> {
         args.iter().map(|arg| arg.to_string()).collect()
     }
@@ -1731,5 +2010,95 @@ mod tests {
             ctl_command(&s(&["capabilities", "--json"])).unwrap(),
             "capabilities-json -"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // `chm exec`
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn exec_defaults_to_a_bounded_wait_and_text_output() {
+        let (timeout, json, argv) = parse_exec_args(&s(&["uname", "-a"])).unwrap();
+        assert_eq!(timeout, EXEC_DEFAULT_TIMEOUT);
+        assert!(!json);
+        assert_eq!(argv, s(&["uname", "-a"]));
+    }
+
+    /// The guest's own flags must never be eaten by ours. `--` is the boundary,
+    /// and everything past it is data.
+    #[test]
+    fn exec_does_not_claim_the_guest_commands_flags() {
+        let (_, json, argv) =
+            parse_exec_args(&s(&["--", "ls", "--json", "--timeout", "5"])).unwrap();
+        assert!(!json, "`--json` after `--` belongs to the guest command");
+        assert_eq!(argv, s(&["ls", "--json", "--timeout", "5"]));
+    }
+
+    #[test]
+    fn exec_reads_its_own_flags_before_the_separator() {
+        let (timeout, json, argv) =
+            parse_exec_args(&s(&["--timeout", "5", "--json", "--", "true"])).unwrap();
+        assert_eq!(timeout, 5);
+        assert!(json);
+        assert_eq!(argv, s(&["true"]));
+    }
+
+    #[test]
+    fn exec_refuses_an_empty_or_nonsensical_request() {
+        assert!(parse_exec_args(&s(&[])).is_err());
+        assert!(parse_exec_args(&s(&["--json"])).is_err());
+        assert!(parse_exec_args(&s(&["--timeout"])).is_err());
+        assert!(parse_exec_args(&s(&["--timeout", "soon", "--", "true"])).is_err());
+        // A zero timeout would send the command and give up before the guest
+        // could possibly answer, reporting a timeout for work that is running.
+        assert!(parse_exec_args(&s(&["--timeout", "0", "--", "true"])).is_err());
+        assert!(parse_exec_args(&s(&["--bogus", "--", "true"])).is_err());
+    }
+
+    /// With no VM running there is nothing to run a command in, and the reply
+    /// must say so in a form no caller can mistake for a successful command.
+    #[test]
+    fn exec_without_a_running_guest_is_an_error_not_an_exit_status() {
+        let dir = std::env::temp_dir().join(format!("chm-exec-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let daemon = Daemon {
+            library: Vec::new(),
+            library_dir: dir.clone(),
+            idle_exit_secs: 0,
+            max_seconds: 0,
+            socket_path: dir.join("chm.sock"),
+            current: Mutex::new(None),
+        };
+        let out = exec_json(&daemon, &format!("30 {}", exec::encode_argv(&s(&["true"]))));
+        let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        assert_eq!(parsed["status"], "error");
+        assert!(parsed["exit_code"].is_null(), "a failure must carry no exit status");
+        assert!(
+            parsed["error"].as_str().unwrap().contains("no VM running"),
+            "{out}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A garbled request must not be answered with a plausible-looking success.
+    #[test]
+    fn exec_refuses_a_malformed_request() {
+        let dir = std::env::temp_dir().join(format!("chm-execbad-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let daemon = Daemon {
+            library: Vec::new(),
+            library_dir: dir.clone(),
+            idle_exit_secs: 0,
+            max_seconds: 0,
+            socket_path: dir.join("chm.sock"),
+            current: Mutex::new(None),
+        };
+        for req in ["", "notanumber ff", "30 zz"] {
+            let out = exec_json(&daemon, req);
+            let parsed: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+            assert_eq!(parsed["status"], "error", "{req} -> {out}");
+            assert!(parsed["exit_code"].is_null(), "{req} -> {out}");
+        }
+        let _ = fs::remove_dir_all(&dir);
     }
 }
