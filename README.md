@@ -151,6 +151,11 @@ Milestones completed (all hardware-verified on Apple Silicon):
 
 Next:
 
+- **Living Workspaces:** bake a Git-transparent, content-addressed workspace
+  plane into Gimbal Local + Cloud so source, untracked work, and safely
+  classified build artifacts fork and rehydrate with the VM, without changing
+  vanilla Cloud Hypervisor snapshots. See
+  [`docs/living-workspaces.md`](docs/living-workspaces.md).
 - **Snapshot signing trust root (M30.4):** `chm` verifies Ed25519-signed
   manifests today; the remaining half is the control plane producing + signing
   production manifests (cross-repo with `gimbal-cloud-control`).
@@ -167,6 +172,12 @@ Next:
 
 AWS setup notes for the later cloud round-trip live in
 [`docs/aws-byo-setup.md`](docs/aws-byo-setup.md).
+
+## Reports
+
+| Date | Report | Summary |
+| --- | --- | --- |
+| 2026-07-30 | [Snapshot portability and security audit](reports/snapshot-portability-security/) | Three Graviton captures resume live, but secure coding-agent readiness is blocked by provenance, image, networking, and CI gaps |
 
 ## Relationship to upstream Cloud Hypervisor
 

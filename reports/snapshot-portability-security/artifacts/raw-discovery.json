@@ -1,0 +1,2068 @@
+{
+  "target": "/Users/nebuk89/StudioProjects/copilot-worktrees/cloud-hypervisor-mac/nebuk89-potential-fortnight",
+  "repository": {
+    "remote": "https://github.com/gimbal-dev/gimbal-local.git",
+    "head": "f635e0f66eba56cfadb6bd9bdaf09b6e42c67795",
+    "branch": "nebuk89-audit-snapshot-portability"
+  },
+  "generated_at": "2026-07-30T10:59:55Z",
+  "claims": [
+    {
+      "path": "README.md",
+      "line": 129,
+      "text": "Milestones completed (all hardware-verified on Apple Silicon):"
+    },
+    {
+      "path": "README.md",
+      "line": 146,
+      "text": "| M28 | Consistent sandbox controls: userspace-NAT egress firewall (default-deny allow-list, `chm firewall`) enforced locally at DNS resolve + TCP connect. |"
+    },
+    {
+      "path": "README.md",
+      "line": 149,
+      "text": "| M31 | Network host-isolation: a reserved-address guard blocks the guest from reaching host loopback / private LAN / link-local metadata (`169.254.169.254`) regardless of policy (closing DNS rebinding), and new sandboxes default to firewall-on default-deny. |"
+    },
+    {
+      "path": "README.md",
+      "line": 154,
+      "text": "- **Snapshot signing trust root (M30.4):** `chm` verifies Ed25519-signed"
+    },
+    {
+      "path": "README.md",
+      "line": 175,
+      "text": "| 2026-07-30 | [Snapshot portability and security audit](reports/snapshot-portability-security/) | Three Graviton captures resume live, but secure coding-agent readiness is blocked by provenance, image, networking, and CI gaps |"
+    },
+    {
+      "path": "docs/networking.md",
+      "line": 24,
+      "text": "> `169.254.169.254`) — **regardless of the egress policy**, so even the allow-all"
+    },
+    {
+      "path": "docs/networking.md",
+      "line": 28,
+      "text": "> allow-all when no policy is bound, but the Gimbal Local app now defaults new"
+    },
+    {
+      "path": "docs/networking.md",
+      "line": 29,
+      "text": "> sandboxes to firewall-on **default-deny** (M31.2) — so a sandbox created through"
+    },
+    {
+      "path": "docs/networking.md",
+      "line": 49,
+      "text": "| Default posture | ⚠️ **allow-all to the public internet** when no policy is bound; default-deny only once a policy sets it |"
+    },
+    {
+      "path": "docs/networking.md",
+      "line": 126,
+      "text": "With a default-deny policy that allows only `api.github.com:443`, a guest that"
+    },
+    {
+      "path": "docs/networking.md",
+      "line": 131,
+      "text": "chm: virtio-net _net0 governed by egress policy sha256:147f… (default-deny enforced at the NAT)"
+    },
+    {
+      "path": "docs/networking.md",
+      "line": 132,
+      "text": "chm: [egress] DENY dns evil.example.com (default-deny) — sandbox policy sha256:147f…"
+    },
+    {
+      "path": "docs/networking.md",
+      "line": 133,
+      "text": "chm: [egress] DENY tcp 93.184.216.34:80 (default-deny) — sandbox policy sha256:147f…"
+    },
+    {
+      "path": "docs/networking.md",
+      "line": 143,
+      "text": "default-deny, an IP the guest never resolved through us matches no allow rule and"
+    },
+    {
+      "path": "docs/networking.md",
+      "line": 153,
+      "text": "`--net`, so their guests have no NIC."
+    },
+    {
+      "path": "docs/networking.md",
+      "line": 219,
+      "text": "`connect()`, so default-deny means the host socket is simply never opened. There"
+    },
+    {
+      "path": "docs/networking.md",
+      "line": 247,
+      "text": "  `(default-deny)` — proving that specific cloud-authored rule travelled intact,"
+    },
+    {
+      "path": "docs/networking.md",
+      "line": 255,
+      "text": "… egress-DENY  dns example.com (default-deny) policy=sha256:f857c2f0…"
+    },
+    {
+      "path": "docs/roadmap.md",
+      "line": 194,
+      "text": "| V3.3 | Signed snapshot manifest + verification, unified trust root (#36). | gctl |"
+    },
+    {
+      "path": "docs/roadmap.md",
+      "line": 201,
+      "text": "| V4.2 | Make egress allow-list, reserved-address guard and CoW isolation the **default** posture with a documented opt-out (#20). | ✅ **Done.** Audited what was actually on out of the box rather than assuming: the reserved-address guard (I10) and CoW/overlay confinement (I2/I3) were already default-on, but **resource ceilings were not** — an unconfigured workspace resolved to *unbounded*. Now resolves to a `chm` baseline (≤64 vCPU, RAM ≤ host physical, overlay ≤64 GiB, console ≤1 GiB, ≤128 NAT sockets) with `CHM_LIMITS=none` as the documented opt-out. Verified the acid test still passes under the new ceilings. Egress stays open-to-the-internet by design — §1a argues why default-deny would be the worse security outcome. |"
+    },
+    {
+      "path": "docs/roadmap.md",
+      "line": 214,
+      "text": "| **network** | `ip -br link` → **loopback only**, no routes; the capture config says `net = None` | 🔴 **blocker.** No `git clone`, no `npm install`, no API call. We *built* the userspace NAT and egress policy but have never run them against a real cloud capture |"
+    },
+    {
+      "path": "docs/roadmap.md",
+      "line": 273,
+      "text": "### M30 · Security hardening — hostile-agent readiness"
+    },
+    {
+      "path": "docs/roadmap.md",
+      "line": 328,
+      "text": "**by default** (allow-all when no policy is bound; the app firewall ships off),"
+    },
+    {
+      "path": "docs/roadmap.md",
+      "line": 339,
+      "text": "  default-deny (allow-list) mode, so a new sandbox has no public egress until"
+    },
+    {
+      "path": "docs/roadmap.md",
+      "line": 400,
+      "text": "default-deny is literally \"don't open the socket,\" and the guest has no path"
+    },
+    {
+      "path": "docs/roadmap.md",
+      "line": 409,
+      "text": "teleport proof (#52, shipped: two scripted hardware proofs — a default-deny"
+    },
+    {
+      "path": "docs/roadmap.md",
+      "line": 445,
+      "text": "  package registries under the new default-deny). This is the \"actually put an"
+    },
+    {
+      "path": "docs/macos-local-runtime.md",
+      "line": 232,
+      "text": "Works, hardware-verified on Apple Silicon: VM creation, RAM mapping, vCPU"
+    },
+    {
+      "path": "docs/network-policy-plan.md",
+      "line": 107,
+      "text": "*Verified live on `:8080`:* a default-deny + `api.github.com:443` policy bound to a"
+    },
+    {
+      "path": "docs/network-policy-plan.md",
+      "line": 135,
+      "text": "- Enforcement seam is wired but set to **allow-all** here; M28.3 threads the real"
+    },
+    {
+      "path": "docs/network-policy-plan.md",
+      "line": 144,
+      "text": "(and a default-deny policy refuses the connect) — the datapath, exercised in CI"
+    },
+    {
+      "path": "docs/network-policy-plan.md",
+      "line": 187,
+      "text": "  default-deny policy with one allowed host. The allow-listed host returns"
+    },
+    {
+      "path": "docs/network-policy-plan.md",
+      "line": 200,
+      "text": "  specific cloud-authored rule travelled, not just the default-deny stance."
+    },
+    {
+      "path": "docs/network-policy-plan.md",
+      "line": 253,
+      "text": "  default-deny egress complements the isolation invariants (no host-FS"
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 12,
+      "text": "umbrella for milestone **M30 · Security hardening (hostile-agent readiness)** and"
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 16,
+      "text": "> **being hardened** under M30, and the \"hostile-agent production ready\" bar is"
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 17,
+      "text": "> **not yet met** — this is a promising prototype with a written path to that bar,"
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 88,
+      "text": "  consume its trust root (M30.4) but do not audit its internals here."
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 124,
+      "text": "| **Signature verification** (I6) | **off** — no trust root ships | `CHM_TRUST_STORE` to turn on |"
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 128,
+      "text": "**Egress is not default-deny.** A sandbox that can reach the internet is what a"
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 143,
+      "text": "trust root is configured, but no trust root ships, because nothing signs yet —"
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 182,
+      "text": "| I6 | **Only verified, provenance-known snapshots run.** A bundle is checksum-verified **and** signature-verified against a trusted key before import or run; provenance is recorded. | Ed25519 signed-manifest verification with a `CHM_TRUST_STORE` trust root; fails closed when configured, and `CHM_REQUIRE_SIGNED` makes fail-closed the default (M31.5). | **Verification + fail-closed posture hold** (M30.4/M31.5); gctl signing pending (#36) |"
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 289,
+      "text": "verify a signed manifest and **fails closed** when a trust root is configured but"
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 315,
+      "text": "- **Fail closed:** with a trust root configured, a missing/invalid signature or"
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 316,
+      "text": "  unknown key id is refused. Without a trust root, the unsigned `checksum_tree`"
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 320,
+      "text": "  authenticated (no trust root, or an unsigned/invalid manifest) is refused"
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 331,
+      "text": "trust root, key ids + rotation."
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 509,
+      "text": "reachable **by default**: networking is allow-all when no policy is bound (the"
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 520,
+      "text": "  **independently of and before** the egress policy, so even allow-all cannot"
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 527,
+      "text": "  allow-all a real guest stack cannot reach a localhost echo server."
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 529,
+      "text": "  allow-all is a safe floor (public egress only, never the host). The app's global"
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 530,
+      "text": "  default now ships the firewall **on in default-deny (allow-list) mode**, so a"
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 536,
+      "text": "  table so claims match enforcement (allow-all default; the NAT relays via host"
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 548,
+      "text": "  authenticate (no trust root, or unsigned/invalid manifest), and the"
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 556,
+      "text": "## 4. Hardening checklist (the \"hostile-agent ready\" bar)"
+    },
+    {
+      "path": "docs/security-model.md",
+      "line": 575,
+      "text": "      default-deny allow-list applied to every NIC, fail-closed, plus NAT"
+    }
+  ],
+  "security_surfaces": [
+    {
+      "path": "chm/src/control_plane.rs",
+      "line": 1980,
+      "text": "/// The trust store configured for this host, if any: `CHM_TRUST_STORE` points at"
+    },
+    {
+      "path": "chm/src/control_plane.rs",
+      "line": 1985,
+      "text": "    match env::var(\"CHM_TRUST_STORE\") {"
+    },
+    {
+      "path": "chm/src/control_plane.rs",
+      "line": 2004,
+      "text": "/// — unless the fail-closed posture (`CHM_REQUIRE_SIGNED`, M31.5) is set, which"
+    },
+    {
+      "path": "chm/src/control_plane.rs",
+      "line": 2030,
+      "text": "                 configured (CHM_TRUST_STORE) — a bundle cannot be authenticated; \\"
+    },
+    {
+      "path": "chm/src/control_plane.rs",
+      "line": 2041,
+      "text": "        \"a trust root is configured (CHM_TRUST_STORE) but this bundle carries no \\"
+    },
+    {
+      "path": "chm/src/control_plane.rs",
+      "line": 2399,
+      "text": "        // M31.5 fail-closed default: CHM_REQUIRE_SIGNED set but nothing can verify"
+    },
+    {
+      "path": "chm/src/control_plane.rs",
+      "line": 2406,
+      "text": "        assert!(err.contains(\"CHM_REQUIRE_SIGNED\"), \"names the posture, got: {err}\");"
+    },
+    {
+      "path": "chm/src/serve.rs",
+      "line": 29,
+      "text": "use crate::console_filter::ConsoleFilter;"
+    },
+    {
+      "path": "chm/src/serve.rs",
+      "line": 215,
+      "text": "fn peer_uid(stream: &UnixStream) -> io::Result<u32> {"
+    },
+    {
+      "path": "chm/src/serve.rs",
+      "line": 474,
+      "text": "    match peer_uid(&stream) {"
+    },
+    {
+      "path": "chm/src/serve.rs",
+      "line": 902,
+      "text": "    let mut console_filter = ConsoleFilter::new();"
+    },
+    {
+      "path": "chm/src/serve.rs",
+      "line": 1122,
+      "text": "    let mut console_filter = ConsoleFilter::new();"
+    },
+    {
+      "path": "chm/src/serve.rs",
+      "line": 1362,
+      "text": "    fn peer_uid_matches_this_user_over_a_local_socket() {"
+    },
+    {
+      "path": "chm/src/serve.rs",
+      "line": 1375,
+      "text": "        assert_eq!(peer_uid(&server).unwrap(), me);"
+    },
+    {
+      "path": "chm/src/serve.rs",
+      "line": 1376,
+      "text": "        assert_eq!(peer_uid(&client).unwrap(), me);"
+    },
+    {
+      "path": "chm/src/policy.rs",
+      "line": 117,
+      "text": "/// `strict` is the M31.5 fail-closed posture (`CHM_REQUIRE_SIGNED`): when set,"
+    },
+    {
+      "path": "chm/src/policy.rs",
+      "line": 188,
+      "text": "                     to run (fail closed, CHM_REQUIRE_SIGNED)\""
+    },
+    {
+      "path": "chm/src/policy.rs",
+      "line": 194,
+      "text": "                     run under an unverifiable policy (fail closed, CHM_REQUIRE_SIGNED)\""
+    },
+    {
+      "path": "chm/src/policy.rs",
+      "line": 405,
+      "text": "        // under CHM_REQUIRE_SIGNED."
+    },
+    {
+      "path": "chm/src/console_filter.rs",
+      "line": 28,
+      "text": "pub(crate) struct ConsoleFilter {"
+    },
+    {
+      "path": "chm/src/console_filter.rs",
+      "line": 35,
+      "text": "impl ConsoleFilter {"
+    },
+    {
+      "path": "chm/src/console_filter.rs",
+      "line": 138,
+      "text": "    fn run(filter: &mut ConsoleFilter, chunks: &[&str]) -> String {"
+    },
+    {
+      "path": "chm/src/console_filter.rs",
+      "line": 149,
+      "text": "        let mut f = ConsoleFilter::new();"
+    },
+    {
+      "path": "chm/src/console_filter.rs",
+      "line": 158,
+      "text": "        let mut f = ConsoleFilter::new();"
+    },
+    {
+      "path": "chm/src/console_filter.rs",
+      "line": 165,
+      "text": "        let mut f = ConsoleFilter::new();"
+    },
+    {
+      "path": "chm/src/console_filter.rs",
+      "line": 173,
+      "text": "        let mut f = ConsoleFilter::new();"
+    },
+    {
+      "path": "chm/src/console_filter.rs",
+      "line": 182,
+      "text": "        let mut f = ConsoleFilter::new();"
+    },
+    {
+      "path": "chm/src/console_filter.rs",
+      "line": 196,
+      "text": "        let mut f = ConsoleFilter {"
+    },
+    {
+      "path": "chm/src/console_filter.rs",
+      "line": 206,
+      "text": "        let mut f = ConsoleFilter::new();"
+    },
+    {
+      "path": "chm/src/signing.rs",
+      "line": 49,
+      "text": "pub const REQUIRE_SIGNED_ENV: &str = \"CHM_REQUIRE_SIGNED\";"
+    },
+    {
+      "path": "chm/src/signing.rs",
+      "line": 67,
+      "text": "/// (e.g. `CHM_REQUIRE_SIGNED=1`) enables it; unset it to disable."
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 20,
+      "text": "use crate::console_filter::ConsoleFilter;"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 567,
+      "text": "        EgressResolution::Unrestricted => None,"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 568,
+      "text": "        EgressResolution::Policy(p) => Some(*p),"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 569,
+      "text": "        EgressResolution::FailClosed(reason) => {"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 692,
+      "text": "enum EgressResolution {"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 706,
+      "text": "/// [`EgressResolution::FailClosed`] rather than silently disabling the firewall."
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 707,
+      "text": "fn resolve_egress_policy(overlay_dir: &Path, cli_override: Option<&Path>) -> EgressResolution {"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 709,
+      "text": "        Some(p) => EgressResolution::Policy(Box::new(p)),"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 710,
+      "text": "        None => EgressResolution::FailClosed(what),"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 715,
+      "text": "            Err(e) => EgressResolution::FailClosed(format!("
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 729,
+      "text": "        Err(_) => EgressResolution::Unrestricted,"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 886,
+      "text": "    /// the egress policy. Set by `--allow-local-egress` or `CHM_ALLOW_LOCAL_EGRESS`."
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 1045,
+      "text": "         --allow-local-egress  Let the guest reach reserved / host-internal\\n                        \\"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 1122,
+      "text": "            \"--allow-local-egress\" => allow_local_egress = true,"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 1211,
+      "text": "            \"--allow-local-egress\" => allow_local_egress = true,"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 1579,
+      "text": "        EgressResolution::Unrestricted => \"unrestricted\".to_string(),"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 1580,
+      "text": "        EgressResolution::Policy(p) => p.label().to_string(),"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 1581,
+      "text": "        EgressResolution::FailClosed(_) => \"fail-closed:deny-all\".to_string(),"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 2973,
+      "text": "    let mut filter = ConsoleFilter::new();"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 3256,
+      "text": "            EgressResolution::Unrestricted => None,"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 3257,
+      "text": "            EgressResolution::Policy(p) => Some(*p),"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 3258,
+      "text": "            EgressResolution::FailClosed(r) => panic!(\"unexpected fail-closed: {r}\"),"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 3327,
+      "text": "                EgressResolution::FailClosed(_)"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 3337,
+      "text": "                EgressResolution::FailClosed(_)"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 3353,
+      "text": "            EgressResolution::Unrestricted"
+    },
+    {
+      "path": "chm/src/posture.rs",
+      "line": 197,
+      "text": "    let trust = env::var(\"CHM_TRUST_STORE\").ok().filter(|v| !v.is_empty());"
+    },
+    {
+      "path": "chm/src/posture.rs",
+      "line": 210,
+      "text": "            (None, true) => \"CHM_REQUIRE_SIGNED with no trust root — every bundle refused\".to_string(),"
+    },
+    {
+      "path": "chm/src/posture.rs",
+      "line": 211,
+      "text": "            (None, false) => \"no CHM_TRUST_STORE — bundles are checksum-verified but not \\"
+    },
+    {
+      "path": "chm/src/posture.rs",
+      "line": 229,
+      "text": "        detail: \"structural — O_NOFOLLOW opens under the bundle root, private 0700 overlay\""
+    },
+    {
+      "path": "chm/src/state_cdn.rs",
+      "line": 360,
+      "text": "fn cache_path(cache: &Path, memory_ref: &str, key: &str) -> PathBuf {"
+    },
+    {
+      "path": "chm/src/state_cdn.rs",
+      "line": 361,
+      "text": "    cache.join(sanitize(memory_ref)).join(sanitize(key))"
+    },
+    {
+      "path": "chm/src/state_cdn.rs",
+      "line": 365,
+      "text": "fn sanitize(s: &str) -> String {"
+    },
+    {
+      "path": "chm/src/state_cdn.rs",
+      "line": 373,
+      "text": "    let path = cache_path(cache, memory_ref, key);"
+    },
+    {
+      "path": "chm/src/state_cdn.rs",
+      "line": 415,
+      "text": "            match fs::read(cache_path(cache, memory_ref, key)) {"
+    },
+    {
+      "path": "chm/src/state_cdn.rs",
+      "line": 586,
+      "text": "    let cache_path = cache.as_ref().map(PathBuf::from);"
+    },
+    {
+      "path": "chm/src/state_cdn.rs",
+      "line": 593,
+      "text": "        cache_path.as_deref(),"
+    },
+    {
+      "path": "chm/src/state_cdn.rs",
+      "line": 761,
+      "text": "    fn cache_path_sanitizes_content_addresses() {"
+    },
+    {
+      "path": "chm/src/state_cdn.rs",
+      "line": 762,
+      "text": "        let p = cache_path(Path::new(\"/cache\"), \"sha256:aa/bb\", \"sha256:cc\");"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/pathsafe.rs",
+      "line": 11,
+      "text": "//! These helpers open with `O_NOFOLLOW`, so a symlink at the final path"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/pathsafe.rs",
+      "line": 12,
+      "text": "//! component fails with `ELOOP` instead of escaping the bundle. `O_NOFOLLOW`"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/pathsafe.rs",
+      "line": 27,
+      "text": "        .custom_flags(libc::O_NOFOLLOW)"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/pathsafe.rs",
+      "line": 41,
+      "text": "        .custom_flags(libc::O_NOFOLLOW)"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/nat/policy.rs",
+      "line": 159,
+      "text": "    /// own networks (M31.1). The `--allow-local-egress` opt-in sets this true."
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/nat/reserved.rs",
+      "line": 16,
+      "text": "//! (`--allow-local-egress`) lifts the guard for users who really do want"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 536,
+      "text": "            let overlay = overlay_dir.join(sanitize(&format!(\"{dev_name}-cow.raw\")));"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 555,
+      "text": "                overlay_dir.join(sanitize(&format!(\"{dev_name}-{}\", file_stem(disk_path))));"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 576,
+      "text": "/// `dev_name` is sanitized, so the candidate cannot traverse out of `disks/`."
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 585,
+      "text": "        let cand = disks.join(format!(\"{}.{ext}\", sanitize(dev_name)));"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 604,
+      "text": "/// `O_NOFOLLOW`, so a bundle-planted overlay link cannot redirect the zero"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 633,
+      "text": "fn sanitize(s: &str) -> String {"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 902,
+      "text": "    /// disk writes cannot be redirected (via O_NOFOLLOW) onto a host file."
+    }
+  ],
+  "portability_surfaces": [
+    {
+      "path": "chm/src/control_plane.rs",
+      "line": 155,
+      "text": "                 capture IS restorable here, on the userspace GICv3 — if the plane \\"
+    },
+    {
+      "path": "chm/src/control_plane.rs",
+      "line": 330,
+      "text": "/// directory for the `<SNAPSHOT_DIR>` placeholder and dropping the leading"
+    },
+    {
+      "path": "chm/src/control_plane.rs",
+      "line": 331,
+      "text": "/// `chm`. The command is authoritative; we only fill the placeholder."
+    },
+    {
+      "path": "chm/src/control_plane.rs",
+      "line": 580,
+      "text": "        // `chm resume <DIR>` rehydrates a live checkpoint (Phase 1)."
+    },
+    {
+      "path": "chm/src/control_plane.rs",
+      "line": 590,
+      "text": "        // and `chm pull` rehydrates a branch head back to a resume (Phase 4)."
+    },
+    {
+      "path": "chm/src/control_plane.rs",
+      "line": 944,
+      "text": "                 `gicv2m-message-spi` (managed GIC) and `its-lpi` (userspace GICv3) \\"
+    },
+    {
+      "path": "chm/src/control_plane.rs",
+      "line": 1034,
+      "text": "        eprintln!(\"chm runner: vanilla ITS/LPI capture — running on the userspace GICv3\");"
+    },
+    {
+      "path": "chm/src/control_plane.rs",
+      "line": 1092,
+      "text": "// it, so a session committed on one machine rehydrates on any other."
+    },
+    {
+      "path": "chm/src/control_plane.rs",
+      "line": 1565,
+      "text": "    \"chm pull — rehydrate a branch head (or revision) to a local resume (Phase 4)\\n\\"
+    },
+    {
+      "path": "chm/src/control_plane.rs",
+      "line": 1802,
+      "text": "             `gicv2m-message-spi` (managed GIC) and `its-lpi` (userspace GICv3) \\"
+    },
+    {
+      "path": "chm/src/control_plane.rs",
+      "line": 1865,
+      "text": "/// Whether a `gic_mode` needs the userspace GICv3 to be restorable here."
+    },
+    {
+      "path": "chm/src/control_plane.rs",
+      "line": 1883,
+      "text": "/// `snapshots` state tree (parsed by `hypervisor::hvf::rehydrate`). A protocol"
+    },
+    {
+      "path": "chm/src/control_plane.rs",
+      "line": 2485,
+      "text": "        // Vanilla: restorable on the userspace GICv3, which delivers LPIs."
+    },
+    {
+      "path": "chm/src/serve.rs",
+      "line": 24,
+      "text": "use hypervisor::hvf::rehydrate::{rehydrate, rehydrate_resume};"
+    },
+    {
+      "path": "chm/src/serve.rs",
+      "line": 801,
+      "text": "    // AArch32-at-EL0 check (V1.4): the capture host advertised 32-bit"
+    },
+    {
+      "path": "chm/src/serve.rs",
+      "line": 805,
+      "text": "    // A stock ITS/LPI capture routes its virtio completions as LPIs, which"
+    },
+    {
+      "path": "chm/src/serve.rs",
+      "line": 806,
+      "text": "    // Apple's managed GIC cannot deliver. The userspace GICv3 *can* deliver"
+    },
+    {
+      "path": "chm/src/serve.rs",
+      "line": 817,
+      "text": "                 as LPIs; running it on the userspace GICv3, which can deliver them.\""
+    },
+    {
+      "path": "chm/src/serve.rs",
+      "line": 855,
+      "text": "        Some(state) => rehydrate_resume(hv.as_ref(), &loaded.snap, &mem_ranges, &vm_ops, state),"
+    },
+    {
+      "path": "chm/src/serve.rs",
+      "line": 856,
+      "text": "        None => rehydrate(hv.as_ref(), &loaded.snap, &mem_ranges, &vm_ops),"
+    },
+    {
+      "path": "chm/src/serve.rs",
+      "line": 858,
+      "text": "    .map_err(|e| format!(\"rehydrate: {e}\"))?;"
+    },
+    {
+      "path": "chm/src/serve.rs",
+      "line": 1048,
+      "text": "/// Run a stock ITS/LPI capture on the **userspace GICv3** under the daemon."
+    },
+    {
+      "path": "chm/src/serve.rs",
+      "line": 1051,
+      "text": "/// of the multi-threaded vCPU orchestration, cross-vCPU SGI table, ITS/LPI"
+    },
+    {
+      "path": "chm/src/checkpoint.rs",
+      "line": 42,
+      "text": "use hypervisor::hvf::rehydrate::MemMapping;"
+    },
+    {
+      "path": "chm/src/limits.rs",
+      "line": 77,
+      "text": "    /// A rehydrated snapshot is untrusted code, so \"no configuration\" must not"
+    },
+    {
+      "path": "chm/src/limits.rs",
+      "line": 208,
+      "text": "/// rehydrated snapshot is untrusted code, so the safe posture is the default"
+    },
+    {
+      "path": "chm/src/limits.rs",
+      "line": 431,
+      "text": "    /// V4.2: configuring nothing must not mean bounding nothing. A rehydrated"
+    },
+    {
+      "path": "chm/src/credproxy/rules.rs",
+      "line": 377,
+      "text": "                // Forge tokens are conventionally presented with a placeholder"
+    },
+    {
+      "path": "chm/src/credproxy/rules.rs",
+      "line": 390,
+      "text": "                        \"{where_}: template has no '{{secret}}' placeholder, so nothing would be injected\""
+    },
+    {
+      "path": "chm/src/credproxy/rules.rs",
+      "line": 568,
+      "text": "    fn a_template_without_a_placeholder_is_rejected() {"
+    },
+    {
+      "path": "chm/src/credproxy/rules.rs",
+      "line": 573,
+      "text": "        assert!(err.contains(\"placeholder\"), \"{err}\");"
+    },
+    {
+      "path": "chm/src/credproxy/server.rs",
+      "line": 1032,
+      "text": "    fn a_placeholder_from_the_guest_is_replaced_not_appended() {"
+    },
+    {
+      "path": "chm/src/credproxy/server.rs",
+      "line": 1033,
+      "text": "        let secret = secret_file(\"placeholder\");"
+    },
+    {
+      "path": "chm/src/credproxy/server.rs",
+      "line": 1055,
+      "text": "            \"guest placeholder survived:\\n{seen}\""
+    },
+    {
+      "path": "chm/src/credproxy/server.rs",
+      "line": 1497,
+      "text": "        // Nothing secret is sent anywhere — the value is a literal placeholder."
+    },
+    {
+      "path": "chm/src/startup.rs",
+      "line": 3,
+      "text": "//! A rehydrate is a sequence of distinct phases — parse the snapshot, create the"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 37,
+      "text": "use hypervisor::hvf::rehydrate::{"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 59,
+      "text": "/// A snapshot loaded off disk and ready to rehydrate."
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 272,
+      "text": "            \"chm: warning: CHM_ALLOW_ITS_LPI set -- running an ITS/LPI capture \\"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 283,
+      "text": "/// `hv_vcpu_get_sys_reg(CNTFRQ_EL0)` returns `HV_BAD_ARGUMENT`, so we derive it"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 333,
+      "text": "/// A Linux guest reads `CNTFRQ_EL0` **once at boot**, caches it as"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 352,
+      "text": "/// Set `CHM_STRICT_CNTFRQ=1` for KVM parity (refuse instead of warn), or"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 353,
+      "text": "/// `CHM_GUEST_CNTFRQ=<Hz>` to correct the dilation outright — the offset is"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 367,
+      "text": "             CNTFRQ_EL0 differs from this Mac's {host} Hz, the guest's clock will \\"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 394,
+      "text": "         Set CHM_GUEST_CNTFRQ={captured} to correct it: chm re-programs the \\"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 400,
+      "text": "    if env::var_os(\"CHM_STRICT_CNTFRQ\").is_some() {"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 404,
+      "text": "             Refusing to start because CHM_STRICT_CNTFRQ is set (this matches the \\"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 413,
+      "text": "/// Load-time AArch32-at-EL0 guard (V1.4)."
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 416,
+      "text": "/// `1` = AArch64 only, `2` = AArch64 **and AArch32**. Unlike most identity"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 419,
+      "text": "/// **faithfully**. Apple silicon implements no AArch32 at any exception level."
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 429,
+      "text": "/// `CONFIG_COMPAT=y`): executing a 96-byte static AArch32 ELF **permanently"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 434,
+      "text": "/// so the wedge is specific to entering AArch32 state."
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 437,
+      "text": "/// `SPSR_EL1.M[4] = 1` to drop to EL0 in AArch32, and on a core with no AArch32"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 440,
+      "text": "/// Nothing can be fixed at rehydrate time, so this warns rather than refuses:"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 461,
+      "text": "         The capture host advertised AArch32 at EL0 (ID_AA64PFR0_EL1.EL0 = 2) and the \\"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 462,
+      "text": "         guest kernel latched that at boot. Apple silicon implements no AArch32 at any \\"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 540,
+      "text": "    // the logging sink; on the userspace GIC the caller passes a deliverable LPI"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 585,
+      "text": "            devmgr::BackendKind::Unsupported { virtio_type } => {"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 607,
+      "text": "                // the userspace GIC that sink delivers it (deliverable); on the"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 1017,
+      "text": "         chm pull --branch N --to DIR           (rehydrate a branch head)\\n    \\"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 1476,
+      "text": "    // AArch32-at-EL0 check (V1.4): the capture host advertised 32-bit"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 1480,
+      "text": "    // Userspace-GIC path: rehydrate an ITS/LPI-routed snapshot — the kind Apple's"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 1663,
+      "text": "/// disk/net-completion path a stock ITS/LPI snapshot needs."
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 1712,
+      "text": "/// part — multi-threaded vCPU orchestration, the cross-vCPU SGI table, ITS/LPI"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 1753,
+      "text": "/// Resume a snapshot onto the **userspace GICv3** (no managed GIC) with an"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 1754,
+      "text": "/// interactive serial console. This is the path for a stock ITS/LPI-routed"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 1765,
+      "text": "/// rehydrate. The shipping managed-GIC path is untouched."
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 1779,
+      "text": "    // GIC, so an SMP checkpoint is future work; a multi-vCPU run cold-rehydrates."
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 1808,
+      "text": "        banner(dir, &shown_ranges, loaded.num_vcpus, loaded.total_ram, \"userspace GICv3\");"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 1813,
+      "text": "                \"chm: userspace GICv3 — rehydrating a {n}-vCPU ITS/LPI snapshot, \\"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 1846,
+      "text": "    let prepared = rehydrate::prepare_usgic_vm(hv.as_ref(), &snap, &mem_ranges)"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 1901,
+      "text": "                let mut vcpu = match rehydrate::restore_usgic_vcpu("
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 1929,
+      "text": "                let handle = match rehydrate::usgic_cpu_handle(&mut vcpu) {"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 1948,
+      "text": "                rehydrate::usgic_set_cpu_table(&mut vcpu, table);"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 2062,
+      "text": "    // into vCPU 0's software GIC — so a resumed stock ITS/LPI guest's disk/net I/O"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 2076,
+      "text": "        // which paired a previous session's disk with this rehydrate's pristine"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 3102,
+      "text": "    /// A capture whose `ID_AA64PFR0_EL1.EL0` says \"AArch64 and AArch32\" is the"
+    },
+    {
+      "path": "chm/src/imp.rs",
+      "line": 3126,
+      "text": "        // The real Graviton2 value: EL0 field 2 == AArch64 *and* AArch32."
+    },
+    {
+      "path": "chm/src/posture.rs",
+      "line": 241,
+      "text": "            \"CHM_ALLOW_ITS_LPI is set — an ITS/LPI capture may be run on the \\"
+    },
+    {
+      "path": "chm/src/posture.rs",
+      "line": 245,
+      "text": "            \"ITS/LPI captures routed to the userspace GICv3\".to_string()"
+    },
+    {
+      "path": "chm/src/posture.rs",
+      "line": 249,
+      "text": "    // V1.4 — the AArch32 wedge. Not a security boundary, but it is a"
+    },
+    {
+      "path": "chm/src/posture.rs",
+      "line": 254,
+      "text": "        name: \"AArch32 refusal\","
+    },
+    {
+      "path": "chm/src/main.rs",
+      "line": 7,
+      "text": "//! A standalone Apple Silicon executable that rehydrates a Cloud Hypervisor"
+    },
+    {
+      "path": "chm/src/main.rs",
+      "line": 10,
+      "text": "//! `hvf` backend (`hypervisor::hvf::rehydrate`), wiring a faithful PL011 serial"
+    },
+    {
+      "path": "chm/src/sysregs.rs",
+      "line": 12,
+      "text": "//! That is not hypothetical. `CNTFRQ_EL0` reads 121 875 000 Hz on Graviton2 and"
+    },
+    {
+      "path": "chm/src/sysregs.rs",
+      "line": 221,
+      "text": "    // is one this Mac restores perfectly (ID_AA64PFR0_EL1's AArch32 bit)."
+    },
+    {
+      "path": "hypervisor/src/hvf/gic.rs",
+      "line": 229,
+      "text": "    /// rehydrate a KVM snapshot's distributor state field-by-field via the"
+    },
+    {
+      "path": "hypervisor/src/hvf/gic.rs",
+      "line": 311,
+      "text": "/// It holds the GIC as the shared `Arc<Mutex<dyn Vgic>>` the rehydrated VM"
+    },
+    {
+      "path": "hypervisor/src/hvf/gic.rs",
+      "line": 320,
+      "text": "    /// Wrap the rehydrated VM's GIC handle as a message-based SPI sink."
+    },
+    {
+      "path": "hypervisor/src/hvf/gic.rs",
+      "line": 495,
+      "text": "        // MSI/ITS delivery (irqfd + GSI routing) is not implemented yet, so we"
+    },
+    {
+      "path": "hypervisor/src/hvf/rehydrate.rs",
+      "line": 38,
+      "text": "//! so a rehydrated guest executes its real captured code until it touches an"
+    },
+    {
+      "path": "hypervisor/src/hvf/rehydrate.rs",
+      "line": 310,
+      "text": "            // ITS/LPI snapshot has no deliverable MSIs and is rejected by the"
+    },
+    {
+      "path": "hypervisor/src/hvf/rehydrate.rs",
+      "line": 696,
+      "text": "pub fn rehydrate("
+    },
+    {
+      "path": "hypervisor/src/hvf/rehydrate.rs",
+      "line": 702,
+      "text": "    rehydrate_inner(hv, snap, memory_ranges, vm_ops, None)"
+    },
+    {
+      "path": "hypervisor/src/hvf/rehydrate.rs",
+      "line": 709,
+      "text": "pub fn rehydrate_resume("
+    },
+    {
+      "path": "hypervisor/src/hvf/rehydrate.rs",
+      "line": 716,
+      "text": "    rehydrate_inner(hv, snap, memory_ranges, vm_ops, Some(checkpoint))"
+    },
+    {
+      "path": "hypervisor/src/hvf/rehydrate.rs",
+      "line": 719,
+      "text": "fn rehydrate_inner("
+    },
+    {
+      "path": "hypervisor/src/hvf/rehydrate.rs",
+      "line": 778,
+      "text": "/// The pieces of a **userspace-GIC** rehydrated VM (NO managed GIC). Field order"
+    },
+    {
+      "path": "hypervisor/src/hvf/rehydrate.rs",
+      "line": 793,
+      "text": "/// Rehydrate a snapshot onto a **userspace GICv3** — the path for a stock"
+    },
+    {
+      "path": "hypervisor/src/hvf/rehydrate.rs",
+      "line": 794,
+      "text": "/// ITS/LPI-routed snapshot, whose virtio completions Apple's managed GIC cannot"
+    },
+    {
+      "path": "hypervisor/src/hvf/rehydrate.rs",
+      "line": 795,
+      "text": "/// deliver. Unlike [`rehydrate`], this creates NO managed GIC: it maps RAM,"
+    },
+    {
+      "path": "hypervisor/src/hvf/rehydrate.rs",
+      "line": 805,
+      "text": "/// snapshot); the managed [`rehydrate`] path is unaffected."
+    },
+    {
+      "path": "hypervisor/src/hvf/rehydrate.rs",
+      "line": 806,
+      "text": "pub fn rehydrate_usgic("
+    },
+    {
+      "path": "hypervisor/src/hvf/rehydrate.rs",
+      "line": 833,
+      "text": "        eprintln!(\"[timing] rehydrate_usgic total {:?}\", t_start.elapsed());"
+    },
+    {
+      "path": "hypervisor/src/hvf/rehydrate.rs",
+      "line": 961,
+      "text": "/// a cold rehydrate from `snap` or (when `resume` is set) from the checkpoint."
+    },
+    {
+      "path": "hypervisor/src/hvf/rehydrate.rs",
+      "line": 1033,
+      "text": "/// The counter frequency the guest believes it has, from `CHM_GUEST_CNTFRQ`."
+    },
+    {
+      "path": "hypervisor/src/hvf/rehydrate.rs",
+      "line": 1035,
+      "text": "/// A guest caches `CNTFRQ_EL0` once at boot and never re-reads it, and Apple"
+    },
+    {
+      "path": "hypervisor/src/hvf/rehydrate.rs",
+      "line": 1046,
+      "text": "    std::env::var(\"CHM_GUEST_CNTFRQ\")"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/net.rs",
+      "line": 298,
+      "text": "    /// offloads the guest agreed to. A rehydrated guest bound its features at"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/its.rs",
+      "line": 9,
+      "text": "//! message-based SPIs — so a faithfully rehydrated ITS-wired guest needs the"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/its.rs",
+      "line": 636,
+      "text": "    /// delivered: a rehydrated guest restores but then hangs on its first"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 34,
+      "text": "    Unsupported(String),"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 42,
+      "text": "            Self::Unsupported(m) => write!(f, \"unsupported device: {m}\"),"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 67,
+      "text": "/// unrecognised type becomes [`BackendKind::Unsupported`] and is rejected at"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 84,
+      "text": "    Unsupported {"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 363,
+      "text": "        other => BackendKind::Unsupported { virtio_type: other },"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 476,
+      "text": "        BackendKind::Unsupported { virtio_type } => {"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 477,
+      "text": "            return Err(DevMgrError::Unsupported(format!("
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 718,
+      "text": "        // An unknown type (here 0x1050 -> type 0x10) is flagged Unsupported,"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 723,
+      "text": "            matches!(unk[0].backend, BackendKind::Unsupported { virtio_type: 0x10 }),"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 724,
+      "text": "            \"unknown type -> Unsupported, got {:?}\","
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 731,
+      "text": "    /// `0x1049`) device must classify as `Unsupported` — the device model only"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 742,
+      "text": "            matches!(fs[0].backend, BackendKind::Unsupported { virtio_type: 26 }),"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 743,
+      "text": "            \"virtio-fs must be Unsupported (no host FS passthrough), got {:?}\","
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 750,
+      "text": "            matches!(p9[0].backend, BackendKind::Unsupported { virtio_type: 9 }),"
+    },
+    {
+      "path": "hypervisor/src/hvf/virtio/devmgr.rs",
+      "line": 751,
+      "text": "            \"virtio-9p must be Unsupported (no host FS passthrough), got {:?}\","
+    },
+    {
+      "path": "hypervisor/src/hvf/checkpoint.rs",
+      "line": 8,
+      "text": "//! This is the symmetric *capture* half of [`super::rehydrate`]'s *restore*. The"
+    },
+    {
+      "path": "hypervisor/src/hvf/checkpoint.rs",
+      "line": 28,
+      "text": "//! [`super::rehydrate::restore_vcpu_state`]."
+    },
+    {
+      "path": "hypervisor/src/hvf/checkpoint.rs",
+      "line": 48,
+      "text": "/// skipped on apply to match [`super::rehydrate::restore_distributor`]."
+    },
+    {
+      "path": "hypervisor/src/hvf/checkpoint.rs",
+      "line": 102,
+      "text": "    /// [`super::rehydrate::Snapshot::reference_cntvct`]."
+    },
+    {
+      "path": "hypervisor/src/hvf/checkpoint.rs",
+      "line": 213,
+      "text": "/// redistributor exists). Mirrors [`super::rehydrate::restore_vcpu_state`]."
+    },
+    {
+      "path": "hypervisor/src/hvf/translate.rs",
+      "line": 472,
+      "text": "    /// rehydrated guest; the distributor/redistributor blob (the opaque `hv_gic`"
+    },
+    {
+      "path": "hypervisor/src/hvf/devices.rs",
+      "line": 3,
+      "text": "//! When a rehydrated guest ([`crate::hvf::rehydrate`]) executes, every access"
+    },
+    {
+      "path": "hypervisor/src/hvf/devices.rs",
+      "line": 37,
+      "text": "/// to characterize which device windows a rehydrated guest reaches for that the"
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 9,
+      "text": "//! (and, ultimately, rehydrated arm64 cloud snapshots) can run natively on"
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 47,
+      "text": "pub mod rehydrate;"
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 103,
+      "text": "/// denom=3, i.e. 24 MHz — the value an HVF guest sees in `CNTFRQ_EL0`."
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 147,
+      "text": "/// HVF MSI/IRQ routing entry placeholder (interrupt routing lands with hv_gic)."
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 472,
+      "text": "/// Minimal userspace GICv3 **CPU interface** (experimental, Path A / M-USGIC)."
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 492,
+      "text": "    /// [`crate::hvf::rehydrate::restore_usgic_vcpu`] does for every vCPU it"
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 876,
+      "text": "    /// Cross-thread interrupt-injection queue for the userspace GIC. A device or"
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 883,
+      "text": "    /// re-asserts the raw IRQ line. This is how a stock ITS/LPI snapshot's virtio"
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 1078,
+      "text": "    /// A Linux guest reads `CNTFRQ_EL0` once at boot and caches it as"
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 1256,
+      "text": "    /// [`crate::hvf::rehydrate::restore_usgic_vcpu`] calls it for every vCPU it"
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 1257,
+      "text": "    /// builds, which is what makes a vanilla ITS/LPI capture run; tests call it"
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 1283,
+      "text": "    /// No-op unless the userspace GIC is enabled."
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 1305,
+      "text": "    /// its handler). No-op unless the userspace GIC is enabled."
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 1338,
+      "text": "    /// paired with the user-space ITS translator it lets a stock ITS/LPI-routed"
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 1340,
+      "text": "    /// only; a no-op unless the userspace GIC is enabled."
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 1356,
+      "text": "    /// safe way to inject into the userspace GIC (the raw-line assert itself is"
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 1410,
+      "text": "    /// Drain the cross-thread injection queue into the userspace GIC, applying"
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 1415,
+      "text": "    /// No-op unless the userspace GIC is enabled."
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 1535,
+      "text": "    /// timer). Owning-thread only; a no-op unless the userspace GIC is enabled."
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 1861,
+      "text": "    /// Restore a captured software-GIC state onto this vCPU's userspace GIC,"
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 1889,
+      "text": "        // through to the device bus. A resumed stock ITS/LPI snapshot runs with"
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 2180,
+      "text": "        // Only expose the queue when the userspace GIC is actually in use — a"
+    },
+    {
+      "path": "hypervisor/src/hvf/mod.rs",
+      "line": 2202,
+      "text": "        // the userspace GIC before we sample the line — they were enqueued off"
+    },
+    {
+      "path": "hypervisor/src/hvf/sysreg_audit.rs",
+      "line": 16,
+      "text": "//! We have been bitten by exactly this once already: `CNTFRQ_EL0` is 121 875 000"
+    },
+    {
+      "path": "hypervisor/src/hvf/sysreg_audit.rs",
+      "line": 19,
+      "text": "//! by accident, months in. `CNTFRQ_EL0` is not special — it is one register in a"
+    },
+    {
+      "path": "hypervisor/src/hvf/sysreg_audit.rs",
+      "line": 48,
+      "text": "use crate::hvf::rehydrate::{RehydrateError, Snapshot};"
+    },
+    {
+      "path": "hypervisor/src/hvf/sysreg_audit.rs",
+      "line": 93,
+      "text": "                | (3, 3, 14, 0, 0) // CNTFRQ_EL0"
+    },
+    {
+      "path": "hypervisor/src/hvf/sysreg_audit.rs",
+      "line": 122,
+      "text": "                 — AArch64 and AArch32 — so the guest latched \\\"32-bit userspace \\"
+    },
+    {
+      "path": "hypervisor/src/hvf/sysreg_audit.rs",
+      "line": 124,
+      "text": "                 AArch32 at any exception level. Measured: executing a 32-bit binary \\"
+    },
+    {
+      "path": "hypervisor/src/hvf/sysreg_audit.rs",
+      "line": 146,
+      "text": "                 a rehydrated Graviton2 guest, behaviourally confirmed by a \\"
+    },
+    {
+      "path": "hypervisor/src/hvf/sysreg_audit.rs",
+      "line": 153,
+      "text": "                 see the CNTFRQ guard and docs/hvf-compatible-snapshots.md.\""
+    },
+    {
+      "path": "hypervisor/src/hvf/sysreg_audit.rs",
+      "line": 209,
+      "text": "        (3, 3, 14, 0, 0) => \"CNTFRQ_EL0\","
+    },
+    {
+      "path": "hypervisor/src/hvf/sysreg_audit.rs",
+      "line": 269,
+      "text": "        // CNTFRQ_EL0 is S3_3_C14_C0_0."
+    },
+    {
+      "path": "hypervisor/src/hvf/sysreg_audit.rs",
+      "line": 282,
+      "text": "        assert_eq!(f(0xdf00).name(), \"CNTFRQ_EL0\");"
+    },
+    {
+      "path": "hypervisor/src/hvf/sysreg_audit.rs",
+      "line": 304,
+      "text": "        // The whole ID block, cache geometry, and CNTFRQ_EL0 — the register"
+    },
+    {
+      "path": "hypervisor/src/hvf/sysreg_audit.rs",
+      "line": 308,
+      "text": "        assert!(f(0xdf00).is_identity(), \"CNTFRQ_EL0\");"
+    },
+    {
+      "path": "hypervisor/src/hvf/softgic.rs",
+      "line": 3,
+      "text": "//! When Gimbal rehydrates a stock ITS/LPI snapshot it runs with no Apple managed"
+    },
+    {
+      "path": "docs/hvf-compatible-snapshots.md",
+      "line": 27,
+      "text": "Gimbal Local runs these on a **userspace GICv3**: a software"
+    },
+    {
+      "path": "docs/hvf-compatible-snapshots.md",
+      "line": 32,
+      "text": "| capability on a vanilla ITS/LPI capture | state |"
+    },
+    {
+      "path": "docs/hvf-compatible-snapshots.md",
+      "line": 34,
+      "text": "| rehydrate + execute | ✅ hardware-proven |"
+    },
+    {
+      "path": "docs/hvf-compatible-snapshots.md",
+      "line": 49,
+      "text": "  hvf_rehydrate_stock_its_snapshot_usgic_interactive_shell"
+    },
+    {
+      "path": "docs/hvf-compatible-snapshots.md",
+      "line": 55,
+      "text": "virtio completions route as LPIs, it goes to the userspace GICv3, because that"
+    },
+    {
+      "path": "docs/hvf-compatible-snapshots.md",
+      "line": 87,
+      "text": "| `CHM_ALLOW_ITS_LPI=1` | **Forces the opposite, and is almost never what you want.** It pushes an ITS/LPI capture onto the *managed* GIC, which cannot deliver LPIs, so the guest restores and then stalls on its first disk or net I/O. It exists to reproduce that failure deliberately, and it warns. |"
+    },
+    {
+      "path": "docs/hvf-compatible-snapshots.md",
+      "line": 95,
+      "text": "host. The guest also caches its **counter frequency** (`CNTFRQ_EL0`) as"
+    },
+    {
+      "path": "docs/hvf-compatible-snapshots.md",
+      "line": 98,
+      "text": "| host | `CNTFRQ_EL0` |"
+    },
+    {
+      "path": "docs/hvf-compatible-snapshots.md",
+      "line": 114,
+      "text": "| `CHM_STRICT_CNTFRQ=1` | Refuses to start on a mismatch, matching the KVM path's `CntfrqMismatch` rejection. Use it when a wrong clock would be worse than no run at all. |"
+    },
+    {
+      "path": "docs/hvf-compatible-snapshots.md",
+      "line": 115,
+      "text": "| `CHM_GUEST_CNTFRQ=<Hz>` | **Corrects the dilation.** Tells `chm` the counter frequency the guest believes it has, so it can synthesize that rate. A Graviton2 capture is `CHM_GUEST_CNTFRQ=121875000`. Measured effect: 5.081&times; dilation &rarr; **1.000&times;**. |"
+    },
+    {
+      "path": "docs/hvf-compatible-snapshots.md",
+      "line": 117,
+      "text": "### Correcting a dilated guest — `CHM_GUEST_CNTFRQ`"
+    },
+    {
+      "path": "docs/hvf-compatible-snapshots.md",
+      "line": 132,
+      "text": "$ CHM_GUEST_CNTFRQ=121875000 chm run <snapshot>"
+    },
+    {
+      "path": "docs/hvf-compatible-snapshots.md",
+      "line": 141,
+      "text": "Before the userspace GIC, the only runnable shape was virtio completions routed"
+    },
+    {
+      "path": "docs/hvf-compatible-snapshots.md",
+      "line": 165,
+      "text": "- Apple exports `hv_gic_set_spi` and `hv_gic_send_msi`, but no public ITS/LPI API"
+    },
+    {
+      "path": "docs/hvf-compatible-snapshots.md",
+      "line": 174,
+      "text": "`GITS_*` MMIO is deliberately not implemented. It is not exercised on the resume"
+    },
+    {
+      "path": "docs/hvf-compatible-snapshots.md",
+      "line": 175,
+      "text": "path — a rehydrated guest inherits an already-programmed ITS — but a guest that"
+    },
+    {
+      "path": "docs/hvf-compatible-snapshots.md",
+      "line": 176,
+      "text": "**re-programs its ITS while running** (hotplug, a driver rebind) is untested."
+    },
+    {
+      "path": "docs/hvf-compatible-snapshots.md",
+      "line": 220,
+      "text": "  **repeatable** — you can rehydrate the same snapshot any number of times and"
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 17,
+      "text": "We were bitten by exactly this once already. `CNTFRQ_EL0` reads 121 875 000 Hz on"
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 22,
+      "text": "`CNTFRQ_EL0` is not special. It is one register in a family, and the rest had"
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 94,
+      "text": "AArch64 only, `2` = AArch64 **and AArch32**. Graviton2's value is `2`, and HVF"
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 96,
+      "text": "AArch32 at any exception level**."
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 105,
+      "text": "A 96-byte hand-assembled static AArch32 ELF (`mov r7,#1; mov r0,#42; svc #0`),"
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 106,
+      "text": "executed in a rehydrated `graviton-1` guest:"
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 117,
+      "text": "that the kernel must reject before any AArch32 state is entered:"
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 127,
+      "text": "So the wedge is specific to entering AArch32 state, not to malformed files."
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 141,
+      "text": "`SPSR_EL1.M[4] = 1` to drop to EL0 in AArch32, and on a core that implements no"
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 142,
+      "text": "AArch32 that exception return cannot be architecturally completed."
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 146,
+      "text": "**Nothing can be fixed at rehydrate time.** Rewriting `ID_AA64PFR0_EL1` after"
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 165,
+      "text": "In a rehydrated `graviton-1` guest:"
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 170,
+      "text": "| …of which AArch32 (`ELF 32-bit`) | **0** |"
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 179,
+      "text": "It is also **specific to Graviton2**. Neoverse-N1 implements AArch32 at EL0 and"
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 180,
+      "text": "Graviton2 enables it; later Neoverse cores (Graviton3/4) drop AArch32 entirely,"
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 222,
+      "text": "**Stressed, and it did not fire.** In a rehydrated guest: `modprobe dummy` /"
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 249,
+      "text": "| rehydrated guest | `0x4` | 64 B | — |"
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 259,
+      "text": "## Finding 4 — the AArch32 ID block: refused, and harmless ✅"
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 262,
+      "text": "`ID_ISAR0-6`, `ID_MMFR4/5`, `ID_PFR2` — describe **AArch32** capabilities. HVF"
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 263,
+      "text": "refuses all of them, consistently with Apple having no AArch32."
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 285,
+      "text": "| 4 | AArch32 ID block (20 regs) | ✅ Refused, harmless. |"
+    },
+    {
+      "path": "docs/cpu-feature-deltas.md",
+      "line": 287,
+      "text": "| — | `CNTFRQ_EL0` | ✅ Known; corrected at runtime (V1.2/V1.3). |"
+    }
+  ],
+  "verification_surfaces": [
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 12,
+      "text": "    runs-on: ubuntu-latest"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 70,
+      "text": "    runs-on: ubuntu-latest"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 90,
+      "text": "    runs-on: ubuntu-latest"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 113,
+      "text": "    runs-on: ubuntu-latest"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 151,
+      "text": "    runs-on: ubuntu-latest"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 167,
+      "text": "    runs-on: ubuntu-latest"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 177,
+      "text": "    runs-on: ubuntu-latest"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 190,
+      "text": "    runs-on: ubuntu-latest"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 206,
+      "text": "    runs-on: ubuntu-latest"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 215,
+      "text": "    runs-on: ubuntu-latest"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 241,
+      "text": "    runs-on: ubuntu-latest"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 265,
+      "text": "    runs-on: ubuntu-latest"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 290,
+      "text": "    runs-on: ubuntu-latest"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 301,
+      "text": "    runs-on: ubuntu-latest"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 309,
+      "text": "    runs-on: ubuntu-latest"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 459,
+      "text": "    runs-on: ubuntu-latest"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 526,
+      "text": "    runs-on: garm-jammy-16"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 571,
+      "text": "    runs-on: ${{ format('{0}-16', matrix.runner) }}"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 607,
+      "text": "    runs-on: bookworm-arm64"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 656,
+      "text": "    runs-on: vfio-nvidia"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 679,
+      "text": "    runs-on: garm-jammy-16"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 720,
+      "text": "  #   runs-on: bare-metal-9950x"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 737,
+      "text": "    runs-on: noble-sevsnp"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 766,
+      "text": "  #   runs-on: bare-metal-9950x"
+    },
+    {
+      "path": ".github/workflows/ci.yaml",
+      "line": 804,
+      "text": "    runs-on: ubuntu-latest"
+    },
+    {
+      "path": ".github/workflows/integration-metrics.yaml",
+      "line": 10,
+      "text": "    runs-on: bare-metal-9950x"
+    },
+    {
+      "path": ".github/workflows/release.yaml",
+      "line": 29,
+      "text": "    runs-on: ubuntu-latest"
+    },
+    {
+      "path": ".github/workflows/docker-image.yaml",
+      "line": 24,
+      "text": "    runs-on: ubuntu-latest"
+    },
+    {
+      "path": ".github/workflows/docker-image.yaml",
+      "line": 80,
+      "text": "    runs-on: ubuntu-latest"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2030,
+      "text": "/// `CH_SNAPSHOT_DIR` pointing at a snapshot directory laid out as"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2035,
+      "text": "fn hvf_rehydrate_real_cloud_snapshot_executes() {"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2040,
+      "text": "    let Ok(dir) = env::var(\"CH_SNAPSHOT_DIR\") else {"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2041,
+      "text": "        eprintln!(\"CH_SNAPSHOT_DIR unset; skipping real-snapshot rehydration test\");"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2136,
+      "text": "/// Gated on `CH_SNAPSHOT_DIR`; skipped (passes trivially) when unset."
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2139,
+      "text": "fn hvf_rehydrate_real_cloud_snapshot_emits_console() {"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2149,
+      "text": "    let Ok(dir) = env::var(\"CH_SNAPSHOT_DIR\") else {"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2150,
+      "text": "        eprintln!(\"CH_SNAPSHOT_DIR unset; skipping real-snapshot console test\");"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2231,
+      "text": "/// The userspace-GIC path is the whole point of M-USGIC. Point CH_SNAPSHOT_DIR"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2235,
+      "text": "///   CH_SNAPSHOT_DIR=snapshots/ch-arm-stock-its <bin> \\"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2236,
+      "text": "///     hvf_rehydrate_stock_its_snapshot_usgic_executes --exact --ignored --nocapture"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2242,
+      "text": "#[ignore = \"needs a local multi-GB stock ITS snapshot via CH_SNAPSHOT_DIR\"]"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2244,
+      "text": "fn hvf_rehydrate_stock_its_snapshot_usgic_executes() {"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2253,
+      "text": "    let Ok(dir) = env::var(\"CH_SNAPSHOT_DIR\") else {"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2254,
+      "text": "        eprintln!(\"CH_SNAPSHOT_DIR unset; skipping stock-ITS USGIC test\");"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2385,
+      "text": "///   CH_SNAPSHOT_DIR=snapshots/ch-arm-stock-its <bin> \\"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2386,
+      "text": "///     hvf_rehydrate_stock_its_snapshot_usgic_interactive_shell --exact --ignored --nocapture"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2392,
+      "text": "#[ignore = \"needs a local stock ITS snapshot with a serial getty via CH_SNAPSHOT_DIR\"]"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2394,
+      "text": "fn hvf_rehydrate_stock_its_snapshot_usgic_interactive_shell() {"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2404,
+      "text": "    let Ok(dir) = env::var(\"CH_SNAPSHOT_DIR\") else {"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2405,
+      "text": "        eprintln!(\"CH_SNAPSHOT_DIR unset; skipping stock-ITS interactive-shell test\");"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2507,
+      "text": "#[ignore = \"needs a local multi-vCPU stock ITS snapshot via CH_SNAPSHOT_SMP_DIR\"]"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2509,
+      "text": "fn hvf_rehydrate_stock_its_snapshot_usgic_smp() {"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2665,
+      "text": "/// Gated on `CH_SNAPSHOT_DIR`; skipped (passes trivially) when unset."
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2668,
+      "text": "fn hvf_rehydrate_real_cloud_snapshot_resumes_userspace() {"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2677,
+      "text": "    let Ok(dir) = env::var(\"CH_SNAPSHOT_DIR\") else {"
+    },
+    {
+      "path": "hypervisor/tests/hvf_boot.rs",
+      "line": 2678,
+      "text": "        eprintln!(\"CH_SNAPSHOT_DIR unset; skipping real-snapshot userspace test\");"
+    },
+    {
+      "path": "Makefile",
+      "line": 10,
+      "text": ".PHONY: help chm chm-run chm-serve clippy fmt test-hvf security-check"
+    },
+    {
+      "path": "Makefile",
+      "line": 20,
+      "text": "\t@echo \"  make test-hvf                 Build hvf_boot integration tests (no-run)\""
+    },
+    {
+      "path": "Makefile",
+      "line": 46,
+      "text": "test-hvf:"
+    },
+    {
+      "path": "Makefile",
+      "line": 48,
+      "text": "\t\t--test hvf_boot --no-run"
+    }
+  ],
+  "counts": {
+    "claims": 56,
+    "security_surfaces": 82,
+    "portability_surfaces": 211,
+    "verification_surfaces": 60
+  }
+}

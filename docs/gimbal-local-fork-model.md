@@ -207,3 +207,8 @@ on another Mac), fork either side.
 The boundary stays sharp: **the revision graph is durable live-compute state;
 Git stays the source of truth for code.** A revision can pin the repo SHA that
 produced it, and vice-versa — one coherent, reproducible workspace.
+
+[`living-workspaces.md`](living-workspaces.md) defines the next step: Git remains
+authoritative for source history while a host-owned workspace plane binds the
+complete file-level state (including safely classified build artifacts) to the
+same session revision.
