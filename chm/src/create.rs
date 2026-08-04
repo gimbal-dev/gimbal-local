@@ -187,7 +187,16 @@ fn usage() -> String {
      \x20                     first becomes /dev/vda.\n\
      \x20 --net               Attach a virtio-net NIC on the userspace NAT.\n\
      \x20 --egress-allow <h:p>  Permit egress to host:port. Repeatable.\n\
-     \x20                     Without any, the NIC is up but reaches nothing.\n\
+     \x20                     Without any, the NIC is up but reaches nothing\n\
+     \x20                     beyond the hosts --proxy-rules implies.\n\
+     \x20 --proxy-rules <path>  Credential-injection rules (see chm proxy).\n\
+     \x20                     The hosts they name become reachable too:\n\
+     \x20                     naming a host in a rule is the intent to reach\n\
+     \x20                     it. Each implied allowance is printed.\n\
+     \x20 --workspace <path>  Where the proxy CA and audit trail live.\n\
+     \x20                     Defaults to the --proxy-rules file's own\n\
+     \x20                     directory, because a CA is a trust root that\n\
+     \x20                     has to outlive the run.\n\
      \x20 --seconds <n>       Stop after n seconds (default 30). 0 runs until\n\
      \x20                     the guest powers off or you press Ctrl-A x.\n\
      \x20 --dry-run           Build and describe the guest image; do not run it.\n"
@@ -366,10 +375,31 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     }
     .map_err(|e| format!("preparing the cold VM: {e}"))?;
 
+    // Resolve the injection rules *before* the NIC is built: naming a host in a
+    // rule is the intent to reach it (V8.7), and the NAT's allow-list is baked
+    // into the net device at construction. Resolved once and reused below, so a
+    // rules file edited between the two reads cannot produce a policy and a
+    // proxy that disagree about which hosts exist.
+    let proxy_rules = match args.proxy_rules.as_deref() {
+        Some(rules) => credproxy::cli::resolve_rules(args.workspace.as_deref(), Some(rules))
+            .map_err(|e| format!("credential proxy: {e}"))?,
+        None => None,
+    };
+    // Both halves are the local operator's here: `--egress-allow` and
+    // `--proxy-rules` are flags on this very command line. `chm create` has no
+    // control-plane path at all.
+    let implied_egress = proxy_rules.as_ref().map_or_else(Vec::new, |r| {
+        credproxy::cli::implied_egress_for(
+            r,
+            credproxy::cli::Authority::Local,
+            "chm create --egress-allow",
+        )
+    });
+
     // virtio devices go on the bus at exactly the windows the device tree
     // named, and their guest memory is the same `GuestMemory` the VM was mapped
     // with -- the device walks the guest's rings through the host mapping.
-    let devices = build_virtio(&image, &prepared.guest_mem, args)?;
+    let devices = build_virtio(&image, &prepared.guest_mem, args, &implied_egress)?;
     for (place, dev) in &devices {
         bus.add(place.base, place.size, dev.clone());
     }
@@ -384,8 +414,8 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     // port first. `chm` is already the guest's whole network, so this is the
     // one chokepoint every outbound call crosses -- the same edge injection a
     // rehydrated guest gets, on a guest that was never captured anywhere.
-    let _proxy = match args.proxy_rules.as_deref() {
-        Some(rules) => {
+    let _proxy = match (args.proxy_rules.as_deref(), proxy_rules.as_ref()) {
+        (Some(rules), Some(resolved)) => {
             // The rules file's own directory is the default workspace: a CA is
             // a persistent trust root, so it must not land in a temp dir the
             // next run cannot find.
@@ -396,7 +426,7 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                 .ok_or_else(|| "--proxy-rules has no directory; pass --workspace".to_string())?;
             // Fail closed: rules that cannot be honoured stop the run rather
             // than booting a guest whose calls go out unsigned and unaudited.
-            match credproxy::cli::start_for_workspace(&ws, Some(rules))
+            match credproxy::cli::start_resolved(&ws, resolved)
                 .map_err(|e| format!("credential proxy: {e}"))?
             {
                 Some((proxy, decider)) => {
@@ -408,7 +438,7 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                 None => None,
             }
         }
-        None => None,
+        _ => None,
     };
 
     // vCPU 0 is running because the boot protocol started it there; every
@@ -780,6 +810,7 @@ fn build_virtio(
     image: &coldboot::ColdGuestImage,
     mem: &Arc<GuestMemory>,
     args: &CreateArgs,
+    implied_egress: &[String],
 ) -> Result<Vec<(coldboot::VirtioPlacement, Arc<VirtioMmioDevice>)>, String> {
     let mut out = Vec::new();
     for place in &image.virtio {
@@ -820,12 +851,15 @@ fn build_virtio(
             VirtioKind::Net => {
                 // Deny-all unless the caller named destinations, matching the
                 // default posture every other entry point starts from.
-                let policy = EgressPolicy::from_profile(
+                let mut policy = EgressPolicy::from_profile(
                     "deny",
                     &args.egress_allow,
                     &[],
                     "chm create --egress-allow",
                 );
+                // A credential rule's hosts are reachable by implication (V8.7),
+                // each entry carrying the attribution into its own decisions.
+                policy.allow_implied(implied_egress, "implied by --proxy-rules");
                 let responder =
                     NatResponder::new(GATEWAY_IP, GATEWAY_MAC, policy, NatLimits::default());
                 VirtioMmioDevice::new(

@@ -198,6 +198,50 @@ do not:
 - **A rules file with only `passthrough` entries** installs no hook at all — the
   data path is exactly as it was, with no per-flow work.
 
+### A rule makes its host reachable
+
+Naming a host in a rule *is* the intent to reach it, so the egress allow-list is
+widened to match and you do not have to say it twice:
+
+```console
+$ chm create --proxy-rules ./rules.json ...      # note: no --egress-allow
+chm: [proxy] egress widened for api.github.com:443 — implied by the injection
+     rules in --rules ./rules.json
+```
+
+The widening is narrow on purpose:
+
+- **Only the rule's own `host:port` pairs.** A rule on 443 does not also open 22
+  on the same name.
+- **Appended to `allow`, and deny is matched first**, so this can never overrule
+  a refusal you wrote.
+- **`passthrough` is not consulted.** It withholds the *credential*, not the
+  destination; reachability comes from the rule pattern it sits inside.
+- **IPv6 rule hosts are skipped and reported**, not emitted. The egress matcher
+  parses IPv4 literals only, so an IPv6 entry would compile to an exact-hostname
+  match that can never fire — which would look like coverage and provide none.
+- **The reserved-address guard is untouched.** Only an explicit IP-literal allow
+  lifts it, and an implied entry gets no special standing, so a rule host that
+  resolves to `127.0.0.1` is still refused.
+
+Every implied entry carries its provenance into the decision it produces, so an
+operator reading an audit trail later can tell what wrote it:
+
+```
+allow api.github.com:443 (implied by credential rule 'github')
+```
+
+**The same authority must have written both halves.** Rule sources and egress
+sources mirror each other exactly — a flag, an environment variable, or a file in
+the workspace — and the environment layer is the control plane's channel. The
+widening therefore applies only when the rules and the policy came from the same
+authority. This is what stops a `proxy-rules.json` that merely *happens* to be in
+a workspace directory from reopening a host that a governed, digest-pinned policy
+deliberately closed. It is refused in both directions: the rule is "the same
+authority wrote both halves", not "one side is trusted". A policy that could not
+be resolved at all is never widened, because that is precisely the case where we
+cannot tell what was meant to govern the run.
+
 ---
 
 ## 5. What stops the guest from stealing the credential

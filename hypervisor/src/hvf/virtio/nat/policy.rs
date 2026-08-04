@@ -97,6 +97,13 @@ struct Rule {
     port: Option<u16>,
     /// The original text, echoed back in [`Decision`] for audit.
     raw: String,
+    /// Where this entry came from, when it was not written in the policy itself.
+    ///
+    /// An entry the operator typed and an entry some other subsystem implied on
+    /// their behalf are not the same fact, and a decision that renders them
+    /// identically invites the reader to believe they authored an allowance they
+    /// never wrote. Set only by [`EgressPolicy::allow_implied`].
+    note: Option<String>,
 }
 
 impl Rule {
@@ -114,11 +121,21 @@ impl Rule {
             host: HostMatch::parse(host),
             port,
             raw: text.to_string(),
+            note: None,
         }
     }
 
     fn port_matches(&self, port: u16) -> bool {
         self.port.is_none_or(|p| p == port)
+    }
+
+    /// How this rule names itself in a [`Decision`], carrying its provenance
+    /// when it has one.
+    fn describe(&self) -> String {
+        match &self.note {
+            Some(note) => format!("{} ({note})", self.raw),
+            None => self.raw.clone(),
+        }
     }
 }
 
@@ -203,6 +220,30 @@ impl EgressPolicy {
         self.allow_local_egress = allow;
     }
 
+    /// Widen the allow-list with entries another subsystem implied, attributing
+    /// each to `source` so a later decision says where the allowance came from.
+    ///
+    /// The motivating case is the credential proxy (V8.7): naming a host in an
+    /// injection rule *is* the intent to reach it, but the rule and the
+    /// allow-list are enforced by different subsystems, so the guest was denied
+    /// by a firewall that had never been told. Fixing that by quietly merging
+    /// the hosts would trade one confusion for a worse one — an operator reading
+    /// `allow api.github.com:443` could not tell whether they wrote it — so the
+    /// provenance travels with the entry into every decision it makes.
+    ///
+    /// These are *allow* entries only. They are appended, so an explicit `deny`
+    /// still wins (deny is matched first), and the reserved-address guard
+    /// (M31.1) is untouched: an implied hostname entry that resolves into a
+    /// private range is still refused, because only an IP-literal allow lifts
+    /// that guard and an implied entry gets no special standing there.
+    pub fn allow_implied(&mut self, entries: &[String], source: &str) {
+        for entry in entries {
+            let mut rule = Rule::parse(entry);
+            rule.note = Some(source.to_string());
+            self.allow.push(rule);
+        }
+    }
+
     /// Whether reserved / host-internal egress has been explicitly opted in.
     pub fn allow_local_egress(&self) -> bool {
         self.allow_local_egress
@@ -232,12 +273,12 @@ impl EgressPolicy {
         // DNS is judged by name only; port is irrelevant, so match any port.
         if let Some(rule) = self.deny.iter().find(|r| r.host.matches_host(host)) {
             return Decision::Deny {
-                rule: format!("deny {}", rule.raw),
+                rule: format!("deny {}", rule.describe()),
             };
         }
         if let Some(rule) = self.allow.iter().find(|r| r.host.matches_host(host)) {
             return Decision::Allow {
-                rule: format!("allow {}", rule.raw),
+                rule: format!("allow {}", rule.describe()),
             };
         }
         self.default_decision()
@@ -268,7 +309,7 @@ impl EgressPolicy {
                     || host.as_deref().is_some_and(|h| rule.host.matches_host(h)))
             {
                 return Decision::Deny {
-                    rule: format!("deny {}", rule.raw),
+                    rule: format!("deny {}", rule.describe()),
                 };
             }
         }
@@ -298,7 +339,7 @@ impl EgressPolicy {
                     || host.as_deref().is_some_and(|h| rule.host.matches_host(h)))
             {
                 return Decision::Allow {
-                    rule: format!("allow {}", rule.raw),
+                    rule: format!("allow {}", rule.describe()),
                 };
             }
         }
@@ -439,5 +480,77 @@ mod tests {
         // resolved through us.
         let p = EgressPolicy::from_profile("deny", &["api.github.com:443".into()], &[], "t");
         assert!(!p.decide_connect(Ipv4Addr::new(140, 82, 112, 6), 443).is_allow());
+    }
+
+    #[test]
+    fn an_implied_allow_permits_the_flow_and_says_where_it_came_from() {
+        let mut p = EgressPolicy::from_profile("deny", &[], &[], "t");
+        assert!(!p.decide_dns("api.github.com").is_allow());
+        p.allow_implied(
+            &["api.github.com:443".into()],
+            "implied by credential rule 'github'",
+        );
+        let d = p.decide_dns("api.github.com");
+        assert!(d.is_allow());
+        // The provenance is the point: an operator reading the audit trail must
+        // be able to tell this allowance apart from one they typed.
+        assert!(
+            d.rule().contains("implied by credential rule 'github'"),
+            "{}",
+            d.rule()
+        );
+        assert!(d.rule().contains("api.github.com:443"), "{}", d.rule());
+    }
+
+    #[test]
+    fn a_written_allow_carries_no_provenance_note() {
+        let p = EgressPolicy::from_profile("deny", &["api.github.com:443".into()], &[], "t");
+        assert_eq!(p.decide_dns("api.github.com").rule(), "allow api.github.com:443");
+    }
+
+    #[test]
+    fn an_implied_allow_does_not_beat_an_explicit_deny() {
+        // Deny is matched first, so widening can never overrule a written
+        // refusal -- otherwise the proxy could quietly reopen a host the
+        // operator had closed.
+        let mut p = EgressPolicy::from_profile(
+            "allow",
+            &[],
+            &["api.github.com".into()],
+            "t",
+        );
+        p.allow_implied(&["api.github.com:443".into()], "implied");
+        let d = p.decide_dns("api.github.com");
+        assert!(!d.is_allow(), "{}", d.rule());
+    }
+
+    #[test]
+    fn an_implied_hostname_does_not_lift_the_reserved_address_guard() {
+        // The DNS-rebinding vector: a rule host that resolves into a private
+        // range must still be refused, because only an IP-literal allow lifts
+        // M31.1 and an implied entry gets no special standing.
+        let mut p = EgressPolicy::from_profile("deny", &[], &[], "t");
+        p.allow_implied(&["internal.example.com:443".into()], "implied");
+        p.record_resolution("internal.example.com", Ipv4Addr::new(127, 0, 0, 1));
+        let d = p.decide_connect(Ipv4Addr::new(127, 0, 0, 1), 443);
+        assert!(!d.is_allow(), "{}", d.rule());
+        assert_eq!(d.rule(), "reserved-address");
+    }
+
+    #[test]
+    fn an_implied_wildcard_and_port_behave_like_a_written_one() {
+        let mut p = EgressPolicy::from_profile("deny", &[], &[], "t");
+        p.allow_implied(&["*.githubusercontent.com:443".into()], "implied");
+        p.record_resolution(
+            "raw.githubusercontent.com",
+            Ipv4Addr::new(185, 199, 108, 133),
+        );
+        assert!(p
+            .decide_connect(Ipv4Addr::new(185, 199, 108, 133), 443)
+            .is_allow());
+        // The port in the entry is enforced, not decorative.
+        assert!(!p
+            .decide_connect(Ipv4Addr::new(185, 199, 108, 133), 8443)
+            .is_allow());
     }
 }
