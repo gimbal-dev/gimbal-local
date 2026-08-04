@@ -36,7 +36,7 @@ after reading what Cloudflare shipped in
 | **G4** | **Network controls** | ✅ **done, with gaps** | Default-deny-able egress allow-list, userspace NAT, reserved-address guard (I10), per-NIC fail-closed, egress audit trail (V6.3). Gaps are G17/G20 below. |
 | **G5** | **Off-box credentials** | ✅ **done** | Injected at the network edge; guest never holds one (V5.2, I12). In-app rule builder with no field that can hold a token (V8.5). |
 | **G6** | **Create local images — from vanilla *or from containers*** | 🟡 **half** | Vanilla: done (cold boot, BYO). **Containers: nothing.** No OCI/Docker→rootfs path exists anywhere in the tree. |
-| **G7** | **A consistent CLI with all features** | 🟡 **partial** | 24 subcommands; the app now drives **19** of them. But **7 are absent from `chm --help`** — including `create`, the flagship cold-boot path. The app is ahead of the CLI's own discoverability. |
+| **G7** | **A consistent CLI with all features** | 🟡 **partial** | **25** subcommands (`exec` is new in V9.2 and *is* in the help); the app drives **19** of them. Still **7 absent from `chm --help`** — including `create`, the flagship cold-boot path. The app is ahead of the CLI's own discoverability. |
 | **G8** | **Snapshot management** | 🟡 **partial** | Have: lineage, fork, rollback, bounded growth. Missing: **delete, garbage-collect, disk-usage reporting, rename, export/import.** Nothing reclaims a snapshot you no longer want. |
 
 ### Goals we already held, stated explicitly
@@ -60,7 +60,7 @@ below), and stronger on exactly this.
 | # | Goal | State | Why it is a goal |
 | --- | --- | --- | --- |
 | **G15 ★** | **A declarative sandbox spec** — one document that says what a sandbox *is*: image, sizing, egress policy, credential rules, env, entrypoint, lifetime | 🔴 | Today this is ~10 argv flags across two entry points, and the app reimplements the assembly. A spec makes a sandbox reproducible, diffable, and shareable — and is the natural unit for the control plane later. Cloudflare has this (`wrangler.jsonc` + `Container` class fields). |
-| **G16 ★** | **`exec` into a running sandbox** — run a command, get stdout/stderr/exit code | 🔴 | `chm ctl input` types characters at a console and you scrape the screen. There is **no way to run a command and learn whether it succeeded.** This is the single biggest ergonomic gap for driving an agent, and it is what every automation will want first. Cloudflare's `ctx.container.exec()` returns `{stdout, stderr, exitCode, pid, kill()}`. |
+| **G16 ★** | **`exec` into a running sandbox** — run a command, get stdout/stderr/exit code | ✅ **done, one transport limit** | V9.2 (#161): `chm exec -- <argv>` exits with the guest's own status, and a *transport* failure is never reportable as success. Arguments are an argv, never a shell line. **The one gap is the transport, not the interface:** the console carries one stream, so stdout and stderr arrive combined and output is cooked text rather than a byte-exact stream. Chosen deliberately — a vsock agent needs software inside the guest, which would exclude every BYO image. The `ExecOutcome` shape is transport-agnostic, so vsock is a swap. Cloudflare's `ctx.container.exec()` also returns `pid`/`kill()`, which we do not. |
 | **G17 ★** | **Runtime-mutable network policy** — change egress rules on a live sandbox | 🔴 | Ours is fixed at start; changing it means restarting the guest, which throws away the work. Cloudflare changes allow/deny lists on a running container without dropping connections. Directly serves G4. |
 | **G18 ★** | **Idle sleep with activity reset, and a graceful stop** | 🟡 | `--idle-exit` defaults to **10 seconds** of console silence, and `--max-seconds` is a **power cut on a writable disk**. Cloudflare's `sleepAfter` defaults to 10 minutes, resets on activity, and calls a stop hook. Ours should suspend to a checkpoint rather than kill — which is G2's mechanism, reused. |
 | **G19 ★** | **Named sizing tiers** | 🔴 | `--cpus 2 --memory 2048` is a guess every time. Named tiers make sizing a decision someone can be right about, and give the docs something to reference. |
@@ -167,16 +167,16 @@ Reverse chronological, all merged and hardware-verified:
 
 | # | Milestone | Merged | Serves |
 | --- | --- | --- | --- |
-| 1 | **V8.4 + credential builder** — settings persist; a rule builder with no field that can hold a token; `chm` is the authority on whether a rule is valid (#147) | 08-04 | G5, G9 |
-| 2 | **V8.3 · Bring-your-own images** — an image directory with typed refusals; the symlink rule found by using it (#146) | 08-03 | **G1** |
-| 3 | **V8.2 · Local-only mode** — stops the app *reaching* for a control plane, not just hiding it (#146) | 08-03 | G14 boundary |
-| 4 | **V8.1 · Cold boot from the app** — the app's most basic capability stops depending on infrastructure the user may not have (#146) | 08-03 | **G1** |
-| 5 | **V7.1 · A coding agent works inside the sandbox** — Copilot CLI installed, authenticated, wrote and ran JS, holding no credential (#141) | 08-03 | **G3**, G5 |
-| 6 | **Icache-elision warning** — a capture whose kernel elided `ic ivau` is named rather than mysteriously SIGILL-ing (#140) | 08-03 | G9 |
-| 7 | **Overlay drift refusal** — refuse to resume a checkpoint whose disk moved on under it (#139) | 08-03 | **G2**, G8 |
-| 8 | **Retire the managed GIC** — one interrupt backend; retiring it exposed three real defects it had been hiding (#138) | 08-03 | G1 |
-| 9 | **Cold boot: SMP, disk, NIC, RTC** — a cold guest gets real hardware, on more than one core (#133–#137) | 08-03 | **G1**, G6 |
-| 10 | **V6.1–V6.5 · The app tells the whole truth** — posture, credential proxy, egress audit, capability honesty, each claim carrying its evidence (#129–#132) | 07-31 | **G9**, G4, G13 |
+| 1 | **V9.2 · `chm exec`** — run a command in a sandbox and exit with *its* status; a transport failure is never reportable as success (#161) | 08-04 | **G16**, G7 |
+| 2 | **V8.4 + credential builder** — settings persist; a rule builder with no field that can hold a token; `chm` is the authority on whether a rule is valid (#147) | 08-04 | G5, G9 |
+| 3 | **V8.3 · Bring-your-own images** — an image directory with typed refusals; the symlink rule found by using it (#146) | 08-03 | **G1** |
+| 4 | **V8.2 · Local-only mode** — stops the app *reaching* for a control plane, not just hiding it (#146) | 08-03 | G14 boundary |
+| 5 | **V8.1 · Cold boot from the app** — the app's most basic capability stops depending on infrastructure the user may not have (#146) | 08-03 | **G1** |
+| 6 | **V7.1 · A coding agent works inside the sandbox** — Copilot CLI installed, authenticated, wrote and ran JS, holding no credential (#141) | 08-03 | **G3**, G5 |
+| 7 | **Icache-elision warning** — a capture whose kernel elided `ic ivau` is named rather than mysteriously SIGILL-ing (#140) | 08-03 | G9 |
+| 8 | **Overlay drift refusal** — refuse to resume a checkpoint whose disk moved on under it (#139) | 08-03 | **G2**, G8 |
+| 9 | **Retire the managed GIC** — one interrupt backend; retiring it exposed three real defects it had been hiding (#138) | 08-03 | G1 |
+| 10 | **Cold boot: SMP, disk, NIC, RTC** — a cold guest gets real hardware, on more than one core (#133–#137) | 08-03 | **G1**, G6 |
 
 ### What is outstanding, against the local ship
 
@@ -187,7 +187,6 @@ it is the track [`living-workspaces.md`](living-workspaces.md) creates.
 | | Milestone | Goal | Why now | Size |
 | --- | --- | --- | --- | --- |
 | **V8.6** (#144) | **A build someone else can run** — signed `.app` that finds its own `chm`, and an honest statement of what it needs | G10 | Nothing else on this list matters if the answer to *"can I have it?"* is *"clone the repo and re-sign the binary"*. **The one true blocker.** | M |
-| **V9.2 ★** (#149) | **`chm exec`** — run a command in a running sandbox, get stdout/stderr/exit code | **G16** | Everything that automates this product needs it, and today the only answer is to type at a console and scrape it. Cheapest large win on the list. | M |
 | **V8.7** (#145) | **Proxy rules imply egress allowance** | G4, G5 | Naming a host in an injection rule *is* the intent to reach it. Found by using V7.1 in anger. | S |
 | **V9.4 ★** (#151) | **CLI completeness** — the 7 subcommands missing from `chm --help`, `create` first | **G7** | The app drives 19 of 24 commands; the CLI does not document 7 of its own. Nearly free. | S |
 | **V9.5 ★** (#152) | **Snapshot lifecycle** — delete, GC, disk usage, rename, **and retention roots** | **G8** | Nothing reclaims a snapshot, and nothing protects one either. **Promoted:** retention roots are now a prerequisite for V9.1, not a tidy-up after it. | M |
@@ -200,7 +199,7 @@ it is the track [`living-workspaces.md`](living-workspaces.md) creates.
 | **V9.9 ★** (#155) | **Opt-in ingress** — reach a named port inside a sandbox | **G20** | An agent that starts a dev server cannot be reached. Must be per-port and opt-in or it undoes M30/M31. | M |
 | **V9.10 ★** (in #150) | **Env + entrypoint at start** | **G22** | Cheap; V9.3 needs the fields anyway. | S |
 | **V9.11 ★** (in #150) | **Named sizing tiers** | **G19** | Makes sizing a decision someone can be right about. | S |
-| **V9.12 ★** (#157) | **MCP server surface** | **G21** | Depends on V9.2 and V9.3. An MCP tool call *is* "start from a spec" + "exec and report". | L |
+| **V9.12 ★** (#157) | **MCP server surface** | **G21** | V9.2 shipped, so this now depends only on V9.3. An MCP tool call *is* "start from a spec" + "exec and report". | L |
 | **V9.13 ★** | **Session record** — what the sandbox did, not just what left it | G13, G23 | We audit egress. We do not audit the session. | M |
 | V3.x | Cloud round-trip: signed manifest, `pull → verify → run` | G14 | **Deliberately after the local ship.** Cross-repo. | — |
 
@@ -1289,10 +1288,10 @@ plainly:
 
 | # | Register / call | Wrong answer | Right answer | What it cost |
 | --- | --- | --- | --- | --- |
-| 11 | `PSCI_VERSION` (0x84000000) | 0 (catch-all) → reads as v0.0 | `0x0001_0000` (v1.0) | `Conflicting PSCI version detected`; PSCI disabled outright, so `CPU_ON` became unreachable however correctly it was implemented |
-| 12 | `GICD_PIDR2` @ 0xFFE8 | 0 | `0x30` | `no distributor detected, giving up` → and the architected timer hangs off the GIC, so `sched_clock: 64 bits at 1000 Hz` — the jiffies fallback |
-| 13 | `GICR_TYPER` affinity / `Last`, `GICR_PIDR2` | cpu 0 and `Last` on *every* redistributor | per-CPU affinity; `Last` only on the final frame | latent: `gic_iterate_rdists` stops at the first `Last`, so secondary cores find no redistributor |
-| 14 | `GICD_ICFGR` / `GICR_ICFGR` **read** | 0 (write stored, read unhandled) | the stored config | `gic_configure_irq` **verifies its own write** and returns -EINVAL; no `request_irq` for the PL011, so no tty. printk still worked — its console path is polled — so the guest ran perfectly and had nowhere to write |
+| 12 | `PSCI_VERSION` (0x84000000) | 0 (catch-all) → reads as v0.0 | `0x0001_0000` (v1.0) | `Conflicting PSCI version detected`; PSCI disabled outright, so `CPU_ON` became unreachable however correctly it was implemented |
+| 13 | `GICD_PIDR2` @ 0xFFE8 | 0 | `0x30` | `no distributor detected, giving up` → and the architected timer hangs off the GIC, so `sched_clock: 64 bits at 1000 Hz` — the jiffies fallback |
+| 14 | `GICR_TYPER` affinity / `Last`, `GICR_PIDR2` | cpu 0 and `Last` on *every* redistributor | per-CPU affinity; `Last` only on the final frame | latent: `gic_iterate_rdists` stops at the first `Last`, so secondary cores find no redistributor |
+| 15 | `GICD_ICFGR` / `GICR_ICFGR` **read** | 0 (write stored, read unhandled) | the stored config | `gic_configure_irq` **verifies its own write** and returns -EINVAL; no `request_irq` for the PL011, so no tty. printk still worked — its console path is polled — so the guest ran perfectly and had nowhere to write |
 
 Instance 14 is the sharpest: a fully working Linux system, with an init process
 executing and a shell running, producing **not one byte** of userspace output.
