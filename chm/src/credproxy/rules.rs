@@ -245,10 +245,20 @@ impl PassReason {
     }
 }
 
+/// What [`RuleSet::implied_egress_allow`] derived: entries to widen the
+/// allow-list with, and hosts it could not represent.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct ImpliedEgress {
+    /// `host:port` entries in [`EgressPolicy`] syntax.
+    pub(crate) allow: Vec<String>,
+    /// Rule hosts that produced no entry, each already annotated with its rule
+    /// name so the caller can say which rule is not covered.
+    pub(crate) skipped: Vec<String>,
+}
+
 /// The full set of injection rules for a workspace.
 #[derive(Clone, Debug, Default)]
-pub(crate) struct RuleSet {
-    pub(crate) rules: Vec<Rule>,
+pub(crate) struct RuleSet {    pub(crate) rules: Vec<Rule>,
     pub(crate) passthrough: Vec<HostPattern>,
     pub(crate) label: Option<String>,
 }
@@ -272,6 +282,52 @@ impl RuleSet {
     }
 
     /// Decides what to do with a connection to `dest`.
+    /// The egress allow-list entries these rules imply, one per host × port,
+    /// plus a list of hosts that had to be skipped.
+    ///
+    /// **Why this exists (V8.7).** Naming a host in an injection rule *is* the
+    /// intent to reach it, but interception and the firewall are enforced by
+    /// different subsystems: the NAT decides the connect before it ever consults
+    /// the interception hook, so under a default-deny policy the flow was refused
+    /// before the proxy could see it. The configuration was right and the guest
+    /// was blocked anyway.
+    ///
+    /// Entries render in exactly the syntax [`EgressPolicy`] parses: `host:port`,
+    /// `*.suffix:port`, or `ip:port`. The port is always explicit, so widening
+    /// for an injection rule on 443 does not also open 22 on the same name.
+    ///
+    /// **`passthrough` is deliberately not consulted.** It withholds the
+    /// *credential*, not the destination — the reachability is implied by the
+    /// rule pattern the entry sits inside, and a passthrough host is one the
+    /// operator expects the guest to reach without a secret attached.
+    ///
+    /// IPv6 rule hosts are returned as skips rather than entries: the egress
+    /// policy parses IPv4 literals only, so an IPv6 entry would compile to an
+    /// exact-hostname match that can never fire. Emitting one would look like
+    /// coverage and provide none.
+    pub(crate) fn implied_egress_allow(&self) -> ImpliedEgress {
+        let mut allow: Vec<String> = Vec::new();
+        let mut skipped: Vec<String> = Vec::new();
+        for rule in &self.rules {
+            for host in &rule.hosts {
+                if matches!(host, HostPattern::Ip(IpAddr::V6(_))) {
+                    let note = format!("{} (rule '{}')", host, rule.name);
+                    if !skipped.contains(&note) {
+                        skipped.push(note);
+                    }
+                    continue;
+                }
+                for port in &rule.ports {
+                    let entry = format!("{host}:{port}");
+                    if !allow.contains(&entry) {
+                        allow.push(entry);
+                    }
+                }
+            }
+        }
+        ImpliedEgress { allow, skipped }
+    }
+
     pub(crate) fn decide(&self, dest: &Destination) -> Disposition {
         if self.passthrough.iter().any(|p| p.matches(dest)) {
             return Disposition::PassThrough(PassReason::ExplicitlyExcluded);
@@ -512,7 +568,6 @@ mod tests {
     }
 
     #[test]
-    #[test]
     fn a_wildcard_passthrough_is_refused_and_says_which_list_it_came_from() {
         // Both lists refuse '*', but for opposite reasons: an injection
         // wildcard would intercept all guest TLS, while a passthrough wildcard
@@ -542,6 +597,7 @@ mod tests {
         assert!(err.contains("injection host"), "{err}");
     }
 
+    #[test]
     fn passthrough_overrides_a_matching_rule() {
         let rs = ruleset(
             r#"{
@@ -665,5 +721,105 @@ mod tests {
             err.contains("allowcleartext") || err.contains("unknown field"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn implied_egress_names_every_host_and_port_the_rules_use() {
+        let rs = ruleset(
+            r#"{"rules":[
+                 {"name":"gh","hosts":["api.github.com","*.githubusercontent.com"],
+                  "env":"T"},
+                 {"name":"reg","hosts":["registry.npmjs.org"],"ports":[443,80],
+                  "env":"T"}
+               ]}"#,
+        );
+        let implied = rs.implied_egress_allow();
+        assert_eq!(
+            implied.allow,
+            vec![
+                "api.github.com:443",
+                "*.githubusercontent.com:443",
+                "registry.npmjs.org:443",
+                "registry.npmjs.org:80",
+            ]
+        );
+        assert!(implied.skipped.is_empty());
+    }
+
+    #[test]
+    fn implied_egress_entries_parse_as_egress_rules() {
+        // The entries only help if the firewall understands them, so assert
+        // against the real policy rather than the string shape.
+        let rs = ruleset(
+            r#"{"rules":[{"name":"gh","hosts":["api.github.com","*.githubusercontent.com",
+                          "203.0.113.7"],"env":"T"}]}"#,
+        );
+        let mut policy =
+            hypervisor::hvf::virtio::nat::EgressPolicy::from_profile("deny", &[], &[], "t");
+        policy.allow_implied(&rs.implied_egress_allow().allow, "test");
+        assert!(policy.decide_dns("api.github.com").is_allow());
+        assert!(policy.decide_dns("raw.githubusercontent.com").is_allow());
+        assert!(!policy.decide_dns("evil.test").is_allow());
+        assert!(policy
+            .decide_connect("203.0.113.7".parse().unwrap(), 443)
+            .is_allow());
+    }
+
+    #[test]
+    fn a_ports_list_does_not_widen_beyond_the_ports_named() {
+        let rs = ruleset(r#"{"rules":[{"name":"gh","hosts":["api.github.com"],"env":"T"}]}"#);
+        let mut policy =
+            hypervisor::hvf::virtio::nat::EgressPolicy::from_profile("deny", &[], &[], "t");
+        policy.allow_implied(&rs.implied_egress_allow().allow, "test");
+        policy.record_resolution("api.github.com", "140.82.112.6".parse().unwrap());
+        assert!(policy
+            .decide_connect("140.82.112.6".parse().unwrap(), 443)
+            .is_allow());
+        // An injection rule on 443 must not also open SSH on the same name.
+        assert!(!policy
+            .decide_connect("140.82.112.6".parse().unwrap(), 22)
+            .is_allow());
+    }
+
+    #[test]
+    fn an_ipv6_rule_host_is_skipped_rather_than_silently_dead() {
+        // The egress policy parses IPv4 literals only, so an IPv6 entry would
+        // compile to an exact-hostname match that can never fire. Reporting a
+        // skip is honest; emitting one would look like coverage.
+        let rs = ruleset(
+            r#"{"rules":[{"name":"six","hosts":["2001:db8::1","api.github.com"],"env":"T"}]}"#,
+        );
+        let implied = rs.implied_egress_allow();
+        assert_eq!(implied.allow, vec!["api.github.com:443"]);
+        assert_eq!(implied.skipped.len(), 1);
+        assert!(implied.skipped[0].contains("2001:db8::1"), "{:?}", implied.skipped);
+        assert!(implied.skipped[0].contains("six"), "{:?}", implied.skipped);
+    }
+
+    #[test]
+    fn passthrough_hosts_are_not_treated_as_reachability_intent() {
+        // `passthrough` withholds the credential, not the destination. It must
+        // not add entries of its own -- reachability comes from the rule pattern
+        // it sits inside, and inventing one here would widen for a host no rule
+        // names.
+        let rs = ruleset(
+            r#"{"rules":[{"name":"gh","hosts":["*.github.com"],"env":"T"}],
+                "passthrough":["gist.github.com"]}"#,
+        );
+        assert_eq!(rs.implied_egress_allow().allow, vec!["*.github.com:443"]);
+    }
+
+    #[test]
+    fn no_rules_implies_no_widening() {
+        assert!(RuleSet::default().implied_egress_allow().allow.is_empty());
+    }
+
+    #[test]
+    fn a_host_named_by_two_rules_is_implied_once() {
+        let rs = ruleset(
+            r#"{"rules":[{"name":"a","hosts":["api.github.com"],"env":"T"},
+                         {"name":"b","hosts":["api.github.com"],"env":"T"}]}"#,
+        );
+        assert_eq!(rs.implied_egress_allow().allow, vec!["api.github.com:443"]);
     }
 }

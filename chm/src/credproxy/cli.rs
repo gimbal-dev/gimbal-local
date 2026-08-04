@@ -24,10 +24,26 @@ use super::nat::RuleDecider;
 use super::rules::{Destination, Disposition, RuleSet};
 use super::server::{self, ProxyConfig};
 
+/// Which authority supplied a piece of a run's configuration.
+///
+/// It matters because two subsystems now inform each other (V8.7: an injection
+/// rule widens the egress allow-list), and a widening is only legitimate when
+/// the same authority wrote both halves. A control plane hands its policy down
+/// through the environment and stakes a digest on it; a file sitting in a
+/// workspace directory must not be able to reopen a host that policy closed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Authority {
+    /// A CLI flag, or a file in the workspace — the operator at the keyboard.
+    Local,
+    /// An environment binding the runner set for a governed assignment.
+    ControlPlane,
+}
+
 /// Where a rule set came from, so `show` can say so.
 pub(crate) struct Resolved {
     pub(crate) rules: RuleSet,
     pub(crate) origin: String,
+    pub(crate) authority: Authority,
 }
 
 /// Resolve the rule set the same way every other local policy resolves:
@@ -38,27 +54,43 @@ pub(crate) fn resolve_rules(
     workspace: Option<&Path>,
     cli_override: Option<&Path>,
 ) -> Result<Option<Resolved>, String> {
-    let parse = |raw: &str, origin: String| match RuleSet::parse(raw) {
-        Ok(rules) => Ok(Some(Resolved { rules, origin })),
+    let parse = |raw: &str, origin: String, authority: Authority| match RuleSet::parse(raw) {
+        Ok(rules) => Ok(Some(Resolved {
+            rules,
+            origin,
+            authority,
+        })),
         Err(e) => Err(format!("{origin}: {e}")),
     };
     if let Some(path) = cli_override {
         let raw =
             fs::read_to_string(path).map_err(|e| format!("--rules {}: {e}", path.display()))?;
-        return parse(&raw, format!("--rules {}", path.display()));
+        return parse(
+            &raw,
+            format!("--rules {}", path.display()),
+            Authority::Local,
+        );
     }
     if let Ok(raw) = env::var("CHM_PROXY_RULES") {
         // Accept either a path or the document itself, because a launcher that
         // holds the rules in memory should not have to write them to disk.
         if let Ok(text) = fs::read_to_string(&raw) {
-            return parse(&text, format!("CHM_PROXY_RULES={raw}"));
+            return parse(
+                &text,
+                format!("CHM_PROXY_RULES={raw}"),
+                Authority::ControlPlane,
+            );
         }
-        return parse(&raw, "CHM_PROXY_RULES".to_string());
+        return parse(
+            &raw,
+            "CHM_PROXY_RULES".to_string(),
+            Authority::ControlPlane,
+        );
     }
     if let Some(ws) = workspace {
         let file = ws.join("proxy-rules.json");
         if let Ok(raw) = fs::read_to_string(&file) {
-            return parse(&raw, file.display().to_string());
+            return parse(&raw, file.display().to_string(), Authority::Local);
         }
     }
     Ok(None)
@@ -76,13 +108,19 @@ pub(crate) type StartedProxy = (server::RunningProxy, Arc<dyn InterceptDecider>)
 /// Start a proxy and build the NAT hook for it, or `None` when this run has no
 /// rules. Returns the running proxy too, so the caller can keep it alive and
 /// read its audit trail.
-pub(crate) fn start_for_workspace(
+/// Start a proxy from rules the caller already resolved, and build the NAT hook
+/// for it. Returns `None` when the rules would intercept nothing.
+///
+/// Callers resolve with [`resolve_rules`] first rather than passing a path here,
+/// because the egress allow-list has to be widened (V8.7) *before* the NIC is
+/// built, which happens before the proxy can start. Resolving twice would let a
+/// rules file edited between the two reads produce a policy and a proxy that
+/// disagree about which hosts exist, so there is deliberately no
+/// resolve-and-start convenience wrapper.
+pub(crate) fn start_resolved(
     workspace: &Path,
-    cli_override: Option<&Path>,
+    resolved: &Resolved,
 ) -> Result<Option<StartedProxy>, String> {
-    let Some(resolved) = resolve_rules(Some(workspace), cli_override)? else {
-        return Ok(None);
-    };
     if resolved.rules.intercept_patterns().is_empty() {
         eprintln!(
             "chm: [proxy] {} has no injecting rules; no traffic will be intercepted",
@@ -101,7 +139,7 @@ pub(crate) fn start_for_workspace(
         audit: AuditLog::open(workspace),
     })
     .map_err(|e| format!("start proxy: {e}"))?;
-    let decider = RuleDecider::for_proxy(resolved.rules, &proxy)
+    let decider = RuleDecider::for_proxy(resolved.rules.clone(), &proxy)
         .ok_or_else(|| "rules matched nothing to intercept".to_string())?;
     eprintln!(
         "chm: [proxy] credential injection ACTIVE for {} ({}) — CA {}",
@@ -992,6 +1030,62 @@ struct Probe {
     tls_version: String,
 }
 
+/// Decide whether a resolved rule set may widen an egress allow-list, and
+/// report the widening on stderr so it is never silent.
+///
+/// **V8.7.** Naming a host in an injection rule *is* the intent to reach it, but
+/// the NAT decides a connect before it consults the interception hook, so under
+/// a default-deny policy the flow was refused before the proxy could see it —
+/// the rules were right, the proxy was running, and the guest was blocked by a
+/// subsystem that had never been told. It fails closed, so this is a usability
+/// defect rather than a security one; the fix must not turn it into the latter.
+///
+/// Two guards keep it honest:
+///
+/// 1. **Same authority, both halves.** A control plane hands its policy down
+///    through the environment and stakes a digest on it. A `proxy-rules.json`
+///    that merely happens to be in the workspace directory must not reopen a
+///    host that policy closed, so a mismatch widens nothing and says why.
+/// 2. **Nothing is implied quietly.** Every entry is printed with the rule that
+///    implied it, and each entry carries that attribution into every decision it
+///    later makes (see `EgressPolicy::allow_implied`).
+///
+/// Returns the entries to add, which is empty whenever widening is refused.
+pub(crate) fn implied_egress_for(
+    resolved: &Resolved,
+    policy_authority: Authority,
+    policy_label: &str,
+) -> Vec<String> {
+    let implied = resolved.rules.implied_egress_allow();
+    for skipped in &implied.skipped {
+        eprintln!(
+            "chm: [proxy] {skipped} is an IPv6 literal; the egress allow-list is IPv4-only, \
+             so this host is not covered and the guest will be denied unless you allow it \
+             another way"
+        );
+    }
+    if implied.allow.is_empty() {
+        return Vec::new();
+    }
+    if resolved.authority != policy_authority {
+        eprintln!(
+            "chm: [proxy] NOT widening egress for {}: the egress policy ({policy_label}) and \
+             the injection rules ({}) come from different authorities, and a local file must \
+             not reopen a host a governed policy closed. Add {} to the policy itself.",
+            implied.allow.join(", "),
+            resolved.origin,
+            implied.allow.join(", ")
+        );
+        return Vec::new();
+    }
+    eprintln!(
+        "chm: [proxy] egress widened for {} — implied by the injection rules in {}",
+        implied.allow.join(", "),
+        resolved.origin
+    );
+    implied.allow
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1256,5 +1350,73 @@ mod tests {
         assert!(body.contains("\"disposition\":\"inject\""), "{body}");
 
         let _ = fs::remove_dir_all(&ws);
+    }
+
+    fn resolved(json: &str, authority: Authority) -> Resolved {
+        Resolved {
+            rules: RuleSet::parse(json).expect("rules should parse"),
+            origin: "test".to_string(),
+            authority,
+        }
+    }
+
+    const GH: &str = r#"{"rules":[{"name":"gh","hosts":["api.github.com"],"env":"T"}]}"#;
+
+    #[test]
+    fn a_local_rule_widens_a_local_policy() {
+        let got = implied_egress_for(
+            &resolved(GH, Authority::Local),
+            Authority::Local,
+            "workspace",
+        );
+        assert_eq!(got, vec!["api.github.com:443"]);
+    }
+
+    #[test]
+    fn a_control_plane_rule_widens_a_control_plane_policy() {
+        // The control plane issued both halves, so it already intends the guest
+        // to reach the hosts it told us to inject into.
+        let got = implied_egress_for(
+            &resolved(GH, Authority::ControlPlane),
+            Authority::ControlPlane,
+            "sha256:abc",
+        );
+        assert_eq!(got, vec!["api.github.com:443"]);
+    }
+
+    #[test]
+    fn a_local_rules_file_cannot_widen_a_governed_policy() {
+        // The one that matters. A `proxy-rules.json` that merely happens to sit
+        // in the workspace directory must not reopen a host a digest-carrying
+        // control-plane policy closed.
+        let got = implied_egress_for(
+            &resolved(GH, Authority::Local),
+            Authority::ControlPlane,
+            "sha256:abc",
+        );
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn a_governed_rules_binding_cannot_widen_a_local_policy_either() {
+        // The mirror case. The guard is "same authority wrote both halves",
+        // not "the control plane is trusted", so it refuses both directions
+        // rather than encoding a hierarchy nobody asked for.
+        let got = implied_egress_for(
+            &resolved(GH, Authority::ControlPlane),
+            Authority::Local,
+            "workspace",
+        );
+        assert!(got.is_empty(), "{got:?}");
+    }
+
+    #[test]
+    fn rules_that_imply_nothing_widen_nothing() {
+        let got = implied_egress_for(
+            &resolved(r#"{"rules":[]}"#, Authority::Local),
+            Authority::Local,
+            "workspace",
+        );
+        assert!(got.is_empty(), "{got:?}");
     }
 }

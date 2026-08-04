@@ -596,15 +596,35 @@ pub(crate) fn wire_virtio(
     // allow-list. If a policy source was specified but could not be honored, the
     // session was meant to be governed, so we fail closed with a deny-all policy
     // rather than booting wide open (M30.9).
+    let workspace = overlay_dir.parent().unwrap_or(overlay_dir);
+    // Resolved here, ahead of the device loop, because the injection rules feed
+    // the egress allow-list (V8.7) that is baked into each NIC below, and the
+    // proxy itself cannot start until those NICs exist. One read, two uses.
+    let proxy_rules = credproxy::cli::resolve_rules(Some(workspace), cli_proxy_rules)
+        .map_err(|e| format!("credential proxy: {e}"))?;
+
     let enforced_policy: Option<EgressPolicy> = match resolve_egress_policy(overlay_dir, cli_egress)
     {
         EgressResolution::Unrestricted => None,
-        EgressResolution::Policy(p) => Some(*p),
+        EgressResolution::Policy(p, authority) => {
+            let mut policy = *p;
+            // Naming a host in an injection rule is the intent to reach it. Only
+            // when the same authority wrote both halves, and never silently.
+            if let Some(resolved) = proxy_rules.as_ref() {
+                let implied =
+                    credproxy::cli::implied_egress_for(resolved, authority, policy.label());
+                policy.allow_implied(&implied, "implied by the credential rules");
+            }
+            Some(policy)
+        }
         EgressResolution::FailClosed(reason) => {
             eprintln!(
                 "chm: egress was governed but the policy could not be resolved \
                  ({reason}); failing closed — denying all egress"
             );
+            // Deliberately not widened by the injection rules: this branch exists
+            // precisely because the session was meant to be governed and we
+            // cannot tell by what, so nothing may imply an exception to it.
             Some(EgressPolicy::from_profile("deny", &[], &[], "fail-closed"))
         }
     };
@@ -681,15 +701,18 @@ pub(crate) fn wire_virtio(
     // The credential proxy, if this workspace configures one. Installed after
     // the NICs exist because the hook is per-device, and only when a rule would
     // actually inject: a run with nothing to inject keeps the plain data path.
-    let workspace = overlay_dir.parent().unwrap_or(overlay_dir);
-    let proxy = match credproxy::cli::start_for_workspace(workspace, cli_proxy_rules) {
-        Ok(Some((proxy, decider))) => {
+    let proxy = match proxy_rules
+        .as_ref()
+        .map(|r| credproxy::cli::start_resolved(workspace, r))
+        .transpose()
+    {
+        Ok(Some(Some((proxy, decider)))) => {
             for dev in &net_devices {
                 dev.set_net_intercept(Some(Arc::clone(&decider)));
             }
             Some(proxy)
         }
-        Ok(None) => None,
+        Ok(_) => None,
         // Fail closed: a rules file that cannot be honoured must stop the run
         // rather than quietly boot a guest whose calls will go out unsigned.
         Err(e) => return Err(format!("credential proxy: {e}")),
@@ -726,8 +749,8 @@ pub(crate) fn wire_virtio(
 enum EgressResolution {
     /// No policy source at all — egress is unrestricted.
     Unrestricted,
-    /// A resolved, enforceable policy.
-    Policy(Box<EgressPolicy>),
+    /// A resolved, enforceable policy, and which authority supplied it.
+    Policy(Box<EgressPolicy>, credproxy::cli::Authority),
     /// A source was specified (flag / env binding / workspace file) but failed to
     /// load or parse. The session was meant to be governed, so fail closed.
     FailClosed(String),
@@ -739,13 +762,19 @@ enum EgressResolution {
 /// with `chm firewall`. A source that is present but unreadable/malformed yields
 /// [`EgressResolution::FailClosed`] rather than silently disabling the firewall.
 fn resolve_egress_policy(overlay_dir: &Path, cli_override: Option<&Path>) -> EgressResolution {
-    let from_raw = |raw: &str, what: String| match parse_egress_policy(raw) {
-        Some(p) => EgressResolution::Policy(Box::new(p)),
-        None => EgressResolution::FailClosed(what),
+    let from_raw = |raw: &str, what: String, who: credproxy::cli::Authority| {
+        match parse_egress_policy(raw) {
+            Some(p) => EgressResolution::Policy(Box::new(p), who),
+            None => EgressResolution::FailClosed(what),
+        }
     };
     if let Some(path) = cli_override {
         return match fs::read_to_string(path) {
-            Ok(raw) => from_raw(&raw, format!("--egress-policy {} is malformed", path.display())),
+            Ok(raw) => from_raw(
+                &raw,
+                format!("--egress-policy {} is malformed", path.display()),
+                credproxy::cli::Authority::Local,
+            ),
             Err(e) => EgressResolution::FailClosed(format!(
                 "--egress-policy {} could not be read: {e}",
                 path.display()
@@ -753,12 +782,20 @@ fn resolve_egress_policy(overlay_dir: &Path, cli_override: Option<&Path>) -> Egr
         };
     }
     if let Ok(raw) = env::var("CHM_EGRESS_POLICY") {
-        return from_raw(&raw, "CHM_EGRESS_POLICY is set but malformed".to_string());
+        return from_raw(
+            &raw,
+            "CHM_EGRESS_POLICY is set but malformed".to_string(),
+            credproxy::cli::Authority::ControlPlane,
+        );
     }
     let workspace = overlay_dir.parent().unwrap_or(overlay_dir);
     let file = workspace.join("egress-policy.json");
     match fs::read_to_string(&file) {
-        Ok(raw) => from_raw(&raw, format!("{} is malformed", file.display())),
+        Ok(raw) => from_raw(
+            &raw,
+            format!("{} is malformed", file.display()),
+            credproxy::cli::Authority::Local,
+        ),
         // No workspace file: this run was never asked to be governed.
         Err(_) => EgressResolution::Unrestricted,
     }
@@ -2047,7 +2084,7 @@ pub(crate) fn run_usgic_engine(
     let audit = audit::AuditLog::open(dir);
     let egress_label = match resolve_egress_policy(&overlay_dir, cfg.egress_policy) {
         EgressResolution::Unrestricted => "unrestricted".to_string(),
-        EgressResolution::Policy(p) => p.label().to_string(),
+        EgressResolution::Policy(p, _) => p.label().to_string(),
         EgressResolution::FailClosed(_) => "fail-closed:deny-all".to_string(),
     };
     audit.session_start(
@@ -3025,7 +3062,7 @@ mod tests {
     fn resolved_policy(overlay: &Path, cli: Option<&Path>) -> Option<EgressPolicy> {
         match resolve_egress_policy(overlay, cli) {
             EgressResolution::Unrestricted => None,
-            EgressResolution::Policy(p) => Some(*p),
+            EgressResolution::Policy(p, _) => Some(*p),
             EgressResolution::FailClosed(r) => panic!("unexpected fail-closed: {r}"),
         }
     }
