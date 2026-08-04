@@ -34,6 +34,8 @@
 use std::env;
 use std::fs;
 use std::io::{Seek, SeekFrom, Write};
+use std::collections::HashSet;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -268,6 +270,9 @@ pub(crate) struct RevisionInfo {
     pub revision: Revision,
     pub resumable: bool,
     pub is_head: bool,
+    /// Where this revision's payload lives — the archive entry, or the
+    /// checkpoint dir for HEAD. Needed to size it and to read its pin marker.
+    pub dir: PathBuf,
 }
 
 /// List a snapshot's revisions oldest-first: the archived ones in the store plus
@@ -279,13 +284,14 @@ pub(crate) fn list_revisions(snapshot_dir: &Path) -> Vec<RevisionInfo> {
             let dir = entry.path();
             if let Ok(revision) = read_revision_manifest(&dir) {
                 let resumable = dir.join(MEMORY_RANGES).is_file();
-                out.push(RevisionInfo { revision, resumable, is_head: false });
+                out.push(RevisionInfo { revision, resumable, is_head: false, dir });
             }
         }
     }
     if let Ok(revision) = read_revision(snapshot_dir) {
         let resumable = memory_ranges_path(snapshot_dir).is_file();
-        out.push(RevisionInfo { revision, resumable, is_head: true });
+        let dir = checkpoint_dir(snapshot_dir);
+        out.push(RevisionInfo { revision, resumable, is_head: true, dir });
     }
     out.sort_by(|a, b| a.revision.created_at_ms.cmp(&b.revision.created_at_ms));
     out
@@ -304,6 +310,10 @@ pub(crate) struct RevisionSummary {
     pub label: Option<String>,
     pub resumable: bool,
     pub is_head: bool,
+    /// A retention root: exempt from age-based pruning.
+    pub pinned: bool,
+    /// Apparent bytes, which counts content shared with another revision.
+    pub bytes: u64,
 }
 
 /// The snapshot's revisions as serializable summaries (oldest-first).
@@ -311,6 +321,8 @@ pub(crate) fn revision_summaries(snapshot_dir: &Path) -> Vec<RevisionSummary> {
     list_revisions(snapshot_dir)
         .into_iter()
         .map(|info| RevisionSummary {
+            pinned: is_pinned_dir(&info.dir),
+            bytes: revision_bytes(&info.dir),
             id: info.revision.id,
             parent: info.revision.parent,
             base_image: info.revision.base_image,
@@ -322,6 +334,102 @@ pub(crate) fn revision_summaries(snapshot_dir: &Path) -> Vec<RevisionSummary> {
         })
         .collect()
 }
+
+/// Bytes held by one revision, counting every file under it.
+///
+/// This is the *apparent* size. It deliberately double-counts content shared
+/// with another revision, because the honest answer to "how big is this one"
+/// includes state it depends on. `snapshot_usage` gives the other half — what
+/// is actually on the disk — and the two differ exactly by the sharing.
+fn revision_bytes(dir: &Path) -> u64 {
+    fn walk(dir: &Path, seen: &mut Option<&mut HashSet<(u64, u64)>>, total: &mut u64) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                walk(&e.path(), seen, total);
+            } else if md.is_file() {
+                // A forked revision hard-links the parent's write-once RAM dump,
+                // so the same inode appears under several revisions. Counting it
+                // once per link would report disk that does not exist.
+                if let Some(set) = seen.as_deref_mut()
+                    && !set.insert((md.dev(), md.ino()))
+                {
+                    continue;
+                }
+                *total += md.len();
+            }
+        }
+    }
+    let mut total = 0;
+    walk(dir, &mut None, &mut total);
+    total
+}
+
+/// What this snapshot's lineage actually occupies on disk, with each inode
+/// counted once however many revisions link to it.
+///
+/// Reported beside the sum of the per-revision figures so the difference — the
+/// saving from sharing — is visible rather than inferred. Answering *"what is
+/// using 40 GB?"* with a number that double-counts is worse than not answering.
+pub(crate) fn snapshot_usage(snapshot_dir: &Path) -> SnapshotUsage {
+    fn walk(dir: &Path, seen: &mut HashSet<(u64, u64)>, total: &mut u64) {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let Ok(md) = e.metadata() else { continue };
+            if md.is_dir() {
+                walk(&e.path(), seen, total);
+            } else if md.is_file() && seen.insert((md.dev(), md.ino())) {
+                *total += md.len();
+            }
+        }
+    }
+    // `on_disk` must cover exactly the set `apparent` sums, or the difference
+    // between them is not the sharing and the comparison is nonsense. Measuring
+    // this against a real snapshot reported 58 GiB on disk against 50 GiB of
+    // parts — impossible for a deduplicating count, and caused by folding the
+    // live overlays in here while no revision owns them. They are real disk, so
+    // they are reported, but on their own line.
+    let mut seen = HashSet::new();
+    let mut on_disk = 0;
+    for d in [revisions_dir(snapshot_dir), checkpoint_dir(snapshot_dir)] {
+        walk(&d, &mut seen, &mut on_disk);
+    }
+    let mut live_seen = HashSet::new();
+    let mut live_overlays = 0;
+    walk(
+        &snapshot_dir.join(LIVE_OVERLAYS_DIR),
+        &mut live_seen,
+        &mut live_overlays,
+    );
+
+    let apparent = revision_summaries(snapshot_dir).iter().map(|r| r.bytes).sum();
+    SnapshotUsage {
+        on_disk,
+        apparent,
+        live_overlays,
+    }
+}
+
+/// Disk held by a snapshot's lineage, three ways.
+///
+/// `on_disk` and `apparent` cover the same revisions and differ only by shared
+/// content, so `apparent - on_disk` is exactly the saving from sharing.
+#[derive(Serialize)]
+pub(crate) struct SnapshotUsage {
+    /// Distinct bytes across every revision — each inode counted once.
+    pub on_disk: u64,
+    /// The per-revision figures summed, which counts shared content repeatedly.
+    pub apparent: u64,
+    /// The live working overlays, which belong to no revision but are still
+    /// disk this snapshot is using.
+    pub live_overlays: u64,
+}
+
 
 /// Keep the newest `max_resumable_revisions()` archived revisions fully
 /// resumable; drop older ones' RAM dumps (keeping their manifest so the lineage
@@ -346,20 +454,81 @@ fn prune_revisions_keeping(snapshot_dir: &Path, max_resumable: usize) {
             .collect(),
         Err(_) => return,
     };
-    // The live HEAD counts as one resumable revision; keep that many archived.
+    // A pinned revision is a retention root: the operator has said this point
+    // must remain resumable, so age must not reclaim it. Pins are excluded from
+    // the budget entirely rather than counted against it — counting them would
+    // mean pinning a point silently shortened the window of recent history,
+    // which is the opposite of what pinning is for.
+    let (_pinned, mut prunable): (Vec<_>, Vec<_>) =
+        archived.drain(..).partition(|(_, dir)| is_pinned_dir(dir));
+
     let keep = max_resumable.saturating_sub(1);
-    if archived.len() <= keep {
+    if prunable.len() <= keep {
         return;
     }
-    archived.sort_by(|a, b| a.0.cmp(&b.0));
-    let drop_count = archived.len() - keep;
-    for (_, dir) in archived.into_iter().take(drop_count) {
+    prunable.sort_by(|a, b| a.0.cmp(&b.0));
+    let drop_count = prunable.len() - keep;
+    for (_, dir) in prunable.into_iter().take(drop_count) {
         // Drop the heavy payload (RAM dump + captured overlays) but keep the
         // manifest, so the lineage graph survives as metadata-only.
         let _ = fs::remove_file(dir.join(MEMORY_RANGES));
         let _ = fs::remove_dir_all(dir.join(OVERLAYS_SUBDIR));
     }
 }
+
+/// A pinned revision is exempt from age-based pruning.
+///
+/// The marker is a file in the revision's own directory rather than a field in
+/// the manifest, for two reasons: pinning must not rewrite a manifest that a
+/// digest may cover, and creating or removing a file is atomic, so a pin cannot
+/// be half-applied by an interrupted write.
+const PIN_MARKER: &str = "pinned";
+
+fn is_pinned_dir(revision_dir: &Path) -> bool {
+    revision_dir.join(PIN_MARKER).is_file()
+}
+
+/// Mark a revision as a retention root. Returns whether it changed anything, so
+/// a caller can tell "pinned it" from "it was already pinned".
+pub(crate) fn pin_revision(
+    snapshot_dir: &Path,
+    rev_id: &str,
+    pinned: bool,
+) -> Result<bool, String> {
+    let dir = resolve_revision_dir(snapshot_dir, rev_id)?;
+    let marker = dir.join(PIN_MARKER);
+    let was = marker.is_file();
+    if pinned == was {
+        return Ok(false);
+    }
+    if pinned {
+        fs::write(&marker, b"retention root\n").map_err(|e| format!("pin {rev_id}: {e}"))?;
+    } else {
+        fs::remove_file(&marker).map_err(|e| format!("unpin {rev_id}: {e}"))?;
+    }
+    Ok(true)
+}
+
+/// Where a revision id lives, whether it is archived or the live HEAD.
+///
+/// `chm revisions` prints the HEAD alongside the archive, so accepting only
+/// archived ids would reject an id we had just shown — the same trap that
+/// `rollback` had to fix.
+fn resolve_revision_dir(snapshot_dir: &Path, rev_id: &str) -> Result<PathBuf, String> {
+    let archived = revisions_dir(snapshot_dir).join(rev_id);
+    if archived.join(MANIFEST).is_file() {
+        return Ok(archived);
+    }
+    let head = checkpoint_dir(snapshot_dir);
+    if read_revision_manifest(&head).is_ok_and(|r| r.id == rev_id) {
+        return Ok(head);
+    }
+    Err(format!(
+        "no revision {rev_id} in {} (see `chm revisions`)",
+        snapshot_dir.display()
+    ))
+}
+
 
 /// Roll a snapshot back to an archived revision: it becomes a new HEAD that
 /// descends from the target (append-only — history is preserved, not rewound).
@@ -1141,6 +1310,164 @@ mod tests {
         // …but only the newest 2 keep their RAM.
         assert_eq!(revs.iter().filter(|r| r.resumable).count(), 2);
         assert!(revs.last().unwrap().is_head && revs.last().unwrap().resumable);
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    /// The reason retention roots exist. Age-based pruning was the *only*
+    /// policy, so a point an operator cared about was reclaimed simply by
+    /// being old — and continuous checkpointing (V9.1) makes everything old
+    /// fast. Same setup as the test above, one pin, opposite outcome.
+    #[test]
+    fn a_pinned_revision_survives_a_prune_that_would_have_reclaimed_it() {
+        let snap = env::temp_dir().join(format!("chm-pin-{}-{}", process::id(), now_ms()));
+        let _ = fs::remove_dir_all(&snap);
+        fs::create_dir_all(&snap).unwrap();
+
+        for i in 0..4u8 {
+            write_test_checkpoint(&snap, &[b'r', b'0' + i], "connect");
+        }
+        let all = revision_summaries(&snap);
+        let oldest = all.first().unwrap().id.clone();
+        assert!(!all.first().unwrap().pinned, "nothing is pinned by default");
+
+        // Unpinned, this is exactly the revision `prune_keeps_only_the_newest`
+        // drops first.
+        assert!(
+            pin_revision(&snap, &oldest, true).unwrap(),
+            "pin changed state"
+        );
+        prune_revisions_keeping(&snap, 2);
+
+        let revs = revision_summaries(&snap);
+        let kept = revs.iter().find(|r| r.id == oldest).expect("still listed");
+        assert!(kept.resumable, "a pinned revision must keep its RAM");
+        assert!(kept.pinned);
+
+        // And the pin is *exempt* from the budget rather than counted against
+        // it: the newest two are still resumable, so pinning did not silently
+        // shorten the window of recent history.
+        assert_eq!(revs.iter().filter(|r| r.resumable).count(), 3);
+
+        // Unpinning hands it back to age.
+        assert!(pin_revision(&snap, &oldest, false).unwrap());
+        prune_revisions_keeping(&snap, 2);
+        let revs = revision_summaries(&snap);
+        assert!(!revs.iter().find(|r| r.id == oldest).unwrap().resumable);
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    /// Pinning is idempotent, and says so rather than reporting a change it did
+    /// not make. A caller that cannot tell "pinned it" from "already pinned"
+    /// cannot report honestly either.
+    #[test]
+    fn pinning_twice_reports_no_change_and_an_unknown_id_is_refused() {
+        let snap = env::temp_dir().join(format!("chm-pin2-{}-{}", process::id(), now_ms()));
+        let _ = fs::remove_dir_all(&snap);
+        fs::create_dir_all(&snap).unwrap();
+        write_test_checkpoint(&snap, b"only", "connect");
+        let id = revision_summaries(&snap).first().unwrap().id.clone();
+
+        assert!(pin_revision(&snap, &id, true).unwrap());
+        assert!(
+            !pin_revision(&snap, &id, true).unwrap(),
+            "second pin is a no-op"
+        );
+
+        // An unknown id must be refused, and the refusal must say where to look
+        // — a bare "not found" makes the operator guess the id format.
+        let err = pin_revision(&snap, "no-such-rev", true).expect_err("must refuse");
+        assert!(err.contains("no-such-rev"), "{err}");
+        assert!(err.contains("chm revisions"), "refusal must point somewhere: {err}");
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    /// HEAD lives in the checkpoint dir, not the archive, so resolving only the
+    /// archive would refuse an id `chm revisions` had just printed. `rollback`
+    /// already had to learn this; pinning must not relearn it the hard way.
+    #[test]
+    fn the_live_head_can_be_pinned_by_the_id_that_was_printed() {
+        let snap = env::temp_dir().join(format!("chm-pinhead-{}-{}", process::id(), now_ms()));
+        let _ = fs::remove_dir_all(&snap);
+        fs::create_dir_all(&snap).unwrap();
+        write_test_checkpoint(&snap, b"head", "connect");
+
+        let head = revision_summaries(&snap)
+            .into_iter()
+            .find(|r| r.is_head)
+            .expect("a HEAD");
+        assert!(pin_revision(&snap, &head.id, true).unwrap());
+        assert!(
+            revision_summaries(&snap)
+                .iter()
+                .find(|r| r.is_head)
+                .unwrap()
+                .pinned
+        );
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    /// A fork hard-links its parent's write-once RAM dump, so summing per-
+    /// revision sizes reports disk that does not exist. Both numbers are
+    /// reported precisely so that gap is visible instead of being picked
+    /// arbitrarily.
+    #[test]
+    fn usage_counts_a_shared_ram_dump_once_on_disk_and_twice_apparent() {
+        let snap = env::temp_dir().join(format!("chm-usage-{}-{}", process::id(), now_ms()));
+        let _ = fs::remove_dir_all(&snap);
+        fs::create_dir_all(&snap).unwrap();
+        write_test_checkpoint(&snap, &[b'x'; 4096], "connect");
+        write_test_checkpoint(&snap, &[b'y'; 4096], "connect");
+
+        let before = snapshot_usage(&snap);
+        assert_eq!(
+            before.on_disk, before.apparent,
+            "nothing is shared yet, so both views agree"
+        );
+
+        // Hard-link one revision's RAM into another, exactly as `fork_into` does.
+        let revs = revision_summaries(&snap);
+        let src = revisions_dir(&snap).join(&revs[0].id).join(MEMORY_RANGES);
+        let link = revisions_dir(&snap).join(&revs[0].id).join("linked-copy");
+        fs::hard_link(&src, &link).unwrap();
+
+        let after = snapshot_usage(&snap);
+        assert_eq!(
+            after.on_disk, before.on_disk,
+            "a hard link consumes no additional bytes"
+        );
+        assert!(
+            after.apparent > before.apparent,
+            "the per-revision view counts it again: {} vs {}",
+            after.apparent,
+            before.apparent
+        );
+
+        // The invariant a real measurement caught us breaking: a deduplicating
+        // count can never exceed the sum it deduplicates. It did, because live
+        // overlays were folded into `on_disk` while belonging to no revision.
+        // They are now reported separately, so the two views compare.
+        fs::create_dir_all(snap.join(LIVE_OVERLAYS_DIR)).unwrap();
+        fs::write(
+            snap.join(LIVE_OVERLAYS_DIR).join("disk0-cow.raw"),
+            [0u8; 8192],
+        )
+        .unwrap();
+        let with_live = snapshot_usage(&snap);
+        assert!(
+            with_live.on_disk <= with_live.apparent,
+            "on-disk {} must not exceed apparent {}",
+            with_live.on_disk,
+            with_live.apparent
+        );
+        assert_eq!(with_live.live_overlays, 8192, "live overlays counted apart");
+        assert_eq!(
+            with_live.on_disk, after.on_disk,
+            "live overlays must not inflate the revision figure"
+        );
 
         let _ = fs::remove_dir_all(&snap);
     }

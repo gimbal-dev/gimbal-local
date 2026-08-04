@@ -1462,28 +1462,111 @@ fn workspace(raw: &[String]) -> Result<ExitCode, String> {
 
 /// `chm revisions <SNAPSHOT_DIR> [--json]` — list a snapshot's saved revisions
 /// (its suspend/fork/rollback lineage), oldest first.
+/// Shared by the parser and its test, so the documented order and the accepted
+/// order cannot drift apart.
+const REVISIONS_USAGE: &str = "usage: chm revisions <SNAPSHOT_DIR> [--json] [--usage]\n       \
+     chm revisions <SNAPSHOT_DIR> pin   <REVISION_ID>\n       \
+     chm revisions <SNAPSHOT_DIR> unpin <REVISION_ID>\n\
+     \n\
+     List the snapshot's saved revisions (its lineage), oldest first.\n\
+     `resumable` marks revisions whose live RAM is still retained; older\n\
+     ones are pruned to metadata so the lineage graph survives.\n\
+     \n\
+     `pin` makes a revision a retention root: age-based pruning will not\n\
+     reclaim its RAM, so a point you care about stays resumable however\n\
+     many checkpoints follow it. Pins sit outside the retention budget,\n\
+     so pinning one does not shorten the window of recent history.\n\
+     \n\
+     `--usage` reports what the lineage occupies. A fork hard-links its\n\
+     parent's RAM dump, so shared content is counted once for the\n\
+     revisions total and once per revision below it; the difference is\n\
+     the saving from sharing. Live overlays belong to no revision and\n\
+     are reported on their own line.";
+
 fn revisions(raw: &[String]) -> Result<ExitCode, String> {
     let json = raw.iter().any(|a| a == "--json");
+    let usage_only = raw.iter().any(|a| a == "--usage");
     let positionals: Vec<&String> = raw.iter().filter(|a| !a.starts_with('-')).collect();
-    if raw.iter().any(|a| a == "-h" || a == "--help") || positionals.len() != 1 {
-        eprintln!(
-            "usage: chm revisions <SNAPSHOT_DIR> [--json]\n\
-             \n\
-             List the snapshot's saved revisions (its lineage), oldest first.\n\
-             `resumable` marks revisions whose live RAM is still retained; older\n\
-             ones are kept as metadata so the lineage graph survives."
-        );
-        return if positionals.len() == 1 {
+
+    // `pin` / `unpin` act on a revision inside a snapshot, so they follow the
+    // directory exactly as `chm rollback <SNAPSHOT_DIR> <REVISION_ID>` does.
+    // Every command in this CLI takes SNAPSHOT_DIR immediately after the verb;
+    // putting it second here would make the directory's position depend on
+    // whether a sub-verb was given.
+    let verb = positionals
+        .get(1)
+        .map(|s| s.as_str())
+        .filter(|s| matches!(*s, "pin" | "unpin"));
+    let expected = if verb.is_some() { 3 } else { 1 };
+
+    if raw.iter().any(|a| a == "-h" || a == "--help") || positionals.len() != expected {
+        eprintln!("{REVISIONS_USAGE}");
+        return if positionals.len() == expected {
             Ok(ExitCode::SUCCESS)
+        } else if positionals.len() > 1 {
+            Err(format!(
+                "expected `pin` or `unpin` after the directory, got `{}`",
+                positionals[1]
+            ))
         } else {
             Err("expected one directory argument".to_string())
         };
     }
+
+    if let Some(verb) = verb {
+        let dir = PathBuf::from(positionals[0]);
+        let rev = positionals[2];
+        let pin = verb == "pin";
+        let changed = checkpoint::pin_revision(&dir, rev, pin)?;
+        let state = if pin { "pinned" } else { "unpinned" };
+        if changed {
+            println!("{rev} {state}");
+        } else {
+            println!("{rev} was already {state}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
     let dir = PathBuf::from(positionals[0]);
     let summaries = checkpoint::revision_summaries(&dir);
+
+    if usage_only {
+        let usage = checkpoint::snapshot_usage(&dir);
+        if json {
+            let out = serde_json::to_string(&usage).map_err(|e| format!("serialize usage: {e}"))?;
+            println!("{out}");
+        } else {
+            println!("revisions     {}", human_bytes(usage.on_disk));
+            let shared = usage.apparent.saturating_sub(usage.on_disk);
+            if shared > 0 {
+                println!(
+                    "  of which shared {} (the parts sum to {})",
+                    human_bytes(shared),
+                    human_bytes(usage.apparent)
+                );
+            }
+            if usage.live_overlays > 0 {
+                println!(
+                    "live overlays {}  (working state, in no revision)",
+                    human_bytes(usage.live_overlays)
+                );
+            }
+            println!(
+                "total         {}",
+                human_bytes(usage.on_disk + usage.live_overlays)
+            );
+            for r in &summaries {
+                let pin = if r.pinned { " [pinned]" } else { "" };
+                let kind = if r.resumable { "" } else { "  metadata-only" };
+                println!("  {}  {:>10}{pin}{kind}", r.id, human_bytes(r.bytes));
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+
     if json {
-        let out = serde_json::to_string(&summaries)
-            .map_err(|e| format!("serialize revisions: {e}"))?;
+        let out =
+            serde_json::to_string(&summaries).map_err(|e| format!("serialize revisions: {e}"))?;
         println!("{out}");
     } else if summaries.is_empty() {
         eprintln!(
@@ -1494,14 +1577,32 @@ fn revisions(raw: &[String]) -> Result<ExitCode, String> {
         for r in &summaries {
             let head = if r.is_head { " (HEAD)" } else { "" };
             let resumable = if r.resumable { "resumable" } else { "metadata-only" };
+            let pin = if r.pinned { "  [pinned]" } else { "" };
             let parent = r.parent.as_deref().unwrap_or("—");
             println!(
-                "{}{head}  {}  parent={parent}  {resumable}",
+                "{}{head}  {}  parent={parent}  {resumable}{pin}",
                 r.id, r.origin
             );
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Bytes at a scale a person can act on. Disk-usage output exists to answer
+/// "what is using 40 GB?", and a 17-digit number does not answer it.
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut v = n as f64;
+    let mut u = 0;
+    while v >= 1024.0 && u < UNITS.len() - 1 {
+        v /= 1024.0;
+        u += 1;
+    }
+    if u == 0 {
+        format!("{n} B")
+    } else {
+        format!("{v:.1} {}", UNITS[u])
+    }
 }
 
 /// `chm rollback <SNAPSHOT_DIR> <REVISION_ID>` — roll a snapshot back to an
@@ -3310,5 +3411,63 @@ mod tests {
             assert_eq!(body.trim(), process::id().to_string());
         }
         assert!(!path.exists(), "lock file must be removed when the guard drops");
+    }
+}
+
+#[cfg(test)]
+mod revisions_args_tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// The bug this locks out was found by *using* the command, not by the unit
+    /// tests: they called `pin_revision` directly and never crossed the arg
+    /// parser, which had wanted the verb before the directory. Every other
+    /// command here — `rollback` most closely — takes SNAPSHOT_DIR immediately
+    /// after the verb, so that is the order.
+    #[test]
+    fn pin_takes_the_directory_first_like_every_other_command() {
+        let dir = std::env::temp_dir().join(format!("chm-revargs-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // Directory first is accepted: it gets far enough to reject the id on
+        // its merits rather than complaining about the shape of the command.
+        let err = revisions(&args(&[dir.to_str().unwrap(), "pin", "rev-absent"]))
+            .expect_err("an unknown revision must be refused");
+        assert!(
+            err.contains("rev-absent"),
+            "the parser should have reached revision lookup, got: {err}"
+        );
+
+        // Verb first — the order the help used to document — is refused, and
+        // the message says what to do rather than restating the usage line.
+        let err = revisions(&args(&["pin", dir.to_str().unwrap(), "rev-absent"]))
+            .expect_err("verb-first must be refused");
+        assert!(
+            err.contains("after the directory"),
+            "the error should name the correct order, got: {err}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The usage text is the only place a user learns the order, so drift
+    /// between it and the parser is the defect itself, not a cosmetic one.
+    /// Reading the same constant the parser prints makes them one thing.
+    #[test]
+    fn the_usage_text_documents_the_order_the_parser_accepts() {
+        for line in ["<SNAPSHOT_DIR> pin", "<SNAPSHOT_DIR> unpin"] {
+            assert!(
+                REVISIONS_USAGE.contains(line),
+                "help must show `{line}`, got:\n{REVISIONS_USAGE}"
+            );
+        }
+        assert!(
+            !REVISIONS_USAGE.contains("revisions pin "),
+            "help must not document verb-first, which the parser refuses"
+        );
     }
 }
