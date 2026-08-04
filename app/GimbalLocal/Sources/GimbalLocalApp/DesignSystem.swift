@@ -417,3 +417,19 @@ struct NewSandboxMenu: View {
         }
     }
 }
+
+extension Text {
+    /// Renders an **authored** string as markdown.
+    ///
+    /// SwiftUI parses markdown only for *literal* arguments, because those
+    /// resolve to `LocalizedStringKey`. A `String` built by concatenation, or
+    /// held on a model, picks the plain `Text(String)` overload instead — so
+    /// backticks written to mean "this is code" end up on screen as backticks.
+    /// That is a real defect a reader sees, and it is invisible in the source.
+    ///
+    /// Only for text we wrote. Never for text carrying user input: markdown in
+    /// a value someone typed would be *interpreted* rather than shown, so a
+    /// host like `*.example.com` would come back as emphasis with the asterisks
+    /// eaten — turning a message about their typo into a different typo.
+    static func authored(_ markdown: String) -> Text { Text(.init(markdown)) }
+}
