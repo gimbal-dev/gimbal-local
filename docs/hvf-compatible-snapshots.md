@@ -74,6 +74,11 @@ Two things worth knowing about the daemon specifically:
   console again. `chm ctl input <text>` sends the text as-is with no trailing
   newline, so finish a command with `chm ctl input '\n'` — or a bare
   `chm ctl input` — to press Enter.
+- **To run a command, use `chm exec`, not `chm ctl input`.** `input` types
+  characters; it has no notion of a command and so gives you no exit status and
+  no boundary around the output. `chm exec -- <command>` frames the command,
+  waits for it, and exits with the guest's own status. See
+  [`docs/exec.md`](exec.md).
 - **Checkpoints cover SMP.** Stop writes a checkpoint for a multi-vCPU guest as
   well as a single-vCPU one: each vCPU's state is captured on its owning thread
   (Hypervisor.framework binds a vCPU to the thread that created it) and the

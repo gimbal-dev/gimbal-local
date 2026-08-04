@@ -142,6 +142,11 @@ carrier asserted or the reopened getty hangs before printing its login prompt.
   `stop` / `shutdown` to `chm ctl` clients. It also exposes
   `chm ctl list --json` and `chm ctl status --json`, which are the first
   machine-readable app-facing state surfaces for a desktop shell.
+- `chm exec -- <command>` runs a command in the guest that daemon is running and
+  exits with **its** exit status, so a script can drive a sandbox without
+  scraping the console for a substring. Output is combined stdout+stderr; a
+  transport failure is never reported as success. See
+  [`docs/exec.md`](exec.md).
 - `chm cloud <command> aws` is the local-managed BYO AWS loop. `init` persists
   profile/region/bucket defaults locally, `preflight` checks identity/quota/
   bucket safety, `capture` can run an SSH capture command then rsync/import the
