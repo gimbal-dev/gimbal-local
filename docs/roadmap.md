@@ -20,17 +20,18 @@ for the **local standalone ship**: a product that needs no control plane. It
 supersedes ad-hoc milestone tracking as the answer to *"are we building the
 right thing?"*.
 
-Goals marked **★** are new in this baseline — either named for the first time,
-or adopted after reading what Cloudflare shipped in
+Goals marked **★** are new in this baseline — named for the first time, adopted
+after reading what Cloudflare shipped in
 [Cloudflare Computer](https://blog.cloudflare.com/cloudflare-computer/)
-(2026-08-03) and its Containers platform.
+(2026-08-03) and its Containers platform, or taken from
+[`living-workspaces.md`](living-workspaces.md) (#122).
 
 ### The ship goals
 
 | # | Goal | State | Evidence, or what is missing |
 | --- | --- | --- | --- |
 | **G1** | **Real Cloud Hypervisor locally, plus BYO images by path** — not simulated | ✅ **done** | Stock upstream, unforked, Graviton2 captures, no flags (V1.5 acid test). BYO image directories with typed refusals (V8.3). Cold boot of a stock kernel with no snapshot in the path (V5.4). |
-| **G2** | **Snapshot as changes happen — time travel** | 🟡 **half** | Have: live checkpoints incl. SMP (V5.6), fork/CoW lineage, `revisions`, `rollback`, auto-prune to 5 resumable. Missing: **nothing snapshots on its own.** Every checkpoint is a manual suspend, so there is no timeline to travel along. |
+| **G2** | **Snapshot as changes happen — time travel over a whole *session*, not just a VM** | 🟡 **half, and larger than first written** | Have: live checkpoints incl. SMP (V5.6), fork/CoW lineage, `revisions`, `rollback`, auto-prune to 5 resumable. Missing three things, not one: **nothing snapshots on its own**; **pruning has no retention roots**, so a continuous timeline would eat its own history; and a checkpoint captures *compute*, not the **workspace** — the working tree, Git state, and build artifacts the agent actually produced. [`living-workspaces.md`](living-workspaces.md) is the spec for the third. |
 | **G3** | **Runs Copilot for real, safely isolated** | ✅ **done** | V7.1: Copilot CLI installed, authenticated, wrote and ran JS, on a cold-booted guest, holding **no credential** — verified by hashing, not by trusting the agent. |
 | **G4** | **Network controls** | ✅ **done, with gaps** | Default-deny-able egress allow-list, userspace NAT, reserved-address guard (I10), per-NIC fail-closed, egress audit trail (V6.3). Gaps are G17/G20 below. |
 | **G5** | **Off-box credentials** | ✅ **done** | Injected at the network edge; guest never holds one (V5.2, I12). In-app rule builder with no field that can hold a token (V8.5). |
@@ -68,6 +69,30 @@ below), and stronger on exactly this.
 | **G22 ★** | **Env vars and entrypoint at start** | 🔴 | No way to pass configuration into a guest without baking it into the image. Cheap, and G15 needs the fields anyway. |
 | **G23 ★** | **An agent paper trail** | 🟡 | We record what *left* the sandbox (V6.3). We do not record what the agent *did* inside it. Cloudflare claims "a clear paper trail showing what the agent did" but documents no API for it — so this is a goal we would be defining, not copying. |
 
+### ★ New goals — the workspace is part of the session
+
+These come from [`living-workspaces.md`](living-workspaces.md) (2026-07-31,
+merged as #122). They are what **G2 grows into** once you accept that an agent
+session is not only vCPUs, RAM, devices and a root disk — it is also the exact
+working filesystem the agent produced.
+
+| # | Goal | State | Why it is a goal |
+| --- | --- | --- | --- |
+| **G24 ★** | **The workspace checkpoints and forks *with* the VM** — one atomic `SessionRevision = compute + workspace + Git control + policy digest` | 🔴 | Today a checkpoint captures RAM and a disk overlay. That is the VM, not the *work*. Without this, "time travel" means travelling a machine image, and a fork cannot be O(1) or lazily hydrated because it has to carry whole disks. |
+| **G25 ★** | **Git stays the interface** — normal `commit`/`checkout`/`switch`/`reset`/`merge`, with workspace revisions *bound* to Git state rather than replacing it | 🔴 | The moment an agent has to learn a bespoke workflow, the feature is a tax rather than a capability. One commit may legitimately have several workspace revisions; a commit SHA is an index, not an identity. |
+| **G26 ★** | **Complete state, classified safely** — useful build artifacts travel, unknown ignored content and secrets do not | 🔴 | `target/`, `node_modules/`, `.venv/` are the expensive state worth carrying; `.env`, sockets and keys are the state that must never leave. A snapshot feature that carries everything is a secret-exfiltration feature. Default must be *ephemeral until opted in*. |
+| **G27 ★** | **A torn session fails closed** — a workspace-bound checkpoint never resumes onto an empty or mismatched mount | 🔴 | The failure mode is silent and severe: an agent resumes, sees a plausible-looking tree that is not its own, and keeps working. Same discipline as the overlay-drift refusal we already shipped (#139), applied one level up. |
+
+### Two constraints, not goals
+
+These are **release gates**. They constrain every goal above rather than
+competing with them.
+
+| | Constraint | Where it comes from |
+| --- | --- | --- |
+| **C1** | **A vanilla Cloud Hypervisor snapshot stays vanilla.** No fields added to `state.json`, no forked binary, no Gimbal-specific virtual device required to boot an ordinary snapshot. Workspace state lives in a signed session envelope *beside* the compute snapshot. | Our own V1.5 acid test, restated by [`living-workspaces.md`](living-workspaces.md) §1. It is why G24 is additive rather than a format change — and why it cannot regress G1. |
+| **C2** | **The workspace implementation is independently built.** No SV3 crate, library, binary, service, schema, migration, wire protocol, manifest, storage format, test or repository content may be depended on, vendored, forked, linked, imported, executed, copied or adapted. No claim of read/write compatibility with an SV3 volume or checkpoint. | [`living-workspaces.md`](living-workspaces.md) §1. FUSE, copy-on-write layers, content-addressed blocks and three-way merge are **requirements to implement, not permission to reuse**. Phase 0 carries a dependency-and-provenance inspection as an exit gate. |
+
 ### What the research changed, and what it confirmed
 
 Reading the Cloudflare product against ours produced one genuine surprise, and
@@ -94,6 +119,44 @@ it went in our favour:
   description of the code today". Treat its API as a signal of direction, not a
   shipped bar.
 
+### What the Living Workspaces spec changed
+
+Reading [`living-workspaces.md`](living-workspaces.md) against the code
+**re-sized G2 and moved it**, and turned up one conflict that is real today:
+
+- **G2 was scoped as a scheduling problem. It is a data-model problem.** "Nothing
+  snapshots on its own" is true but shallow. The deeper gap is that a checkpoint
+  captures a *machine* — RAM, devices, a disk overlay — and what the agent
+  actually produced is a *workspace*: tracked source, untracked work, dependency
+  trees, compiler output, indexes, and the Git state binding them together.
+  Travelling backwards through machine images is not the feature; travelling
+  backwards through **work** is.
+- **Our pruner would eat the timeline it just created.** `prune_revisions_keeping`
+  ([`chm/src/checkpoint.rs`](../chm/src/checkpoint.rs)) sorts archived revisions
+  by `created_at_ms`, keeps the newest `CHM_MAX_RESUMABLE_REVISIONS` (default 5),
+  and deletes the RAM dump and overlays from the rest. It consults **no retention
+  root of any kind** — no pin, no reference count, no check for anything pointing
+  at that revision. Checkpointing on a cadence on top of that gives a timeline
+  five points deep whose history is metadata-only headstones. The spec names this
+  directly (§9: the keep-N reaper "may not downgrade a referenced RAM
+  checkpoint"). **Retention roots are a prerequisite for continuous snapshots,
+  not a follow-up.**
+  *Checked and not a bug today:* `fork_into` **copies** the mutable state
+  (hard-linking the write-once RAM dump, copying the overlays), so an existing
+  fork does not go stale when its parent ages out. The exposure arrives with
+  continuous checkpointing, not before.
+- **So V9.1 moves down, and that is not a reversal of the competitive argument.**
+  Snapshots still being the thing the nearest comparable product lacks entirely
+  is *why* it deserves the larger, correct version rather than the cheap one.
+  Shipping "checkpoint on a timer" first would have produced exactly the kind of
+  demo-shaped result this project has refused everywhere else: a timeline that
+  looks like time travel and is five machine images deep.
+- **C1 makes the bigger version affordable.** Because workspace state lives in an
+  outer envelope *beside* the compute snapshot rather than inside it, the
+  MVP-sized piece of G2 is **forward-compatible** — automatic checkpointing plus
+  retention roots does not have to be rebuilt when G24 lands on top of it. That
+  is what makes the split below honest rather than a way of deferring the goal.
+
 ---
 
 ## 0a. How milestones ladder into the goals
@@ -118,17 +181,18 @@ Reverse chronological, all merged and hardware-verified:
 ### What is outstanding, against the local ship
 
 Ordered by what actually blocks the word *"ship"*. **V9 is new** — it is the
-track the goal ledger creates.
+track the goal ledger creates. **V10 is new and deliberately below the line**;
+it is the track [`living-workspaces.md`](living-workspaces.md) creates.
 
 | | Milestone | Goal | Why now | Size |
 | --- | --- | --- | --- | --- |
 | **V8.6** (#144) | **A build someone else can run** — signed `.app` that finds its own `chm`, and an honest statement of what it needs | G10 | Nothing else on this list matters if the answer to *"can I have it?"* is *"clone the repo and re-sign the binary"*. **The one true blocker.** | M |
-| **V9.1 ★** (#148) | **Continuous snapshots** — checkpoint on a cadence and on meaningful events, keep a browsable timeline, restore any point | **G2** | The capability the nearest comparable product does not have at all. The primitives all exist (SMP checkpoint, lineage, prune, drift detection); what is missing is something that *decides when*. | L |
 | **V9.2 ★** (#149) | **`chm exec`** — run a command in a running sandbox, get stdout/stderr/exit code | **G16** | Everything that automates this product needs it, and today the only answer is to type at a console and scrape it. Cheapest large win on the list. | M |
 | **V8.7** (#145) | **Proxy rules imply egress allowance** | G4, G5 | Naming a host in an injection rule *is* the intent to reach it. Found by using V7.1 in anger. | S |
-| **V9.3 ★** (#150) | **The sandbox spec** — one declarative document: image, sizing, egress, credentials, env, entrypoint, lifetime | **G15** | Makes a sandbox reproducible and diffable, removes the app's duplicate flag assembly, and is the unit the control plane will want. | L |
 | **V9.4 ★** (#151) | **CLI completeness** — the 7 subcommands missing from `chm --help`, `create` first | **G7** | The app drives 19 of 24 commands; the CLI does not document 7 of its own. Nearly free. | S |
-| **V9.5 ★** (#152) | **Snapshot lifecycle** — delete, GC, disk usage, rename | **G8** | Nothing reclaims a snapshot. Disk grows monotonically until someone finds the directory. | M |
+| **V9.5 ★** (#152) | **Snapshot lifecycle** — delete, GC, disk usage, rename, **and retention roots** | **G8** | Nothing reclaims a snapshot, and nothing protects one either. **Promoted:** retention roots are now a prerequisite for V9.1, not a tidy-up after it. | M |
+| **V9.1 ★** (#148) | **Continuous snapshots (compute)** — checkpoint on a cadence and on meaningful events, browsable timeline, restore any point | **G2** | The MVP-sized, forward-compatible half. **Moved down** and made dependent on V9.5: without retention roots this produces a five-deep timeline that deletes its own history. | M |
+| **V9.3 ★** (#150) | **The sandbox spec** — one declarative document: image, sizing, egress, credentials, env, entrypoint, lifetime | **G15** | Makes a sandbox reproducible and diffable, removes the app's duplicate flag assembly, and is the unit the control plane will want. | L |
 | **V8.5** (#143) | **A first-run empty state that teaches** (image half; credentials half shipped in #147) | G9 | The discovery rejections already carry the vocabulary. | S |
 | **V9.6 ★** (#154) | **Graceful stop + idle sleep that suspends** | **G18** | `--max-seconds` is a power cut on a writable disk. Should suspend to a checkpoint — which is V9.1's mechanism, reused. | S |
 | **V9.7 ★** (#153) | **Containers → image** — build a bootable rootfs from an OCI image | **G6** | The half of "create local images" that does not exist. Turns the whole container ecosystem into sandbox images. | L |
@@ -140,11 +204,31 @@ track the goal ledger creates.
 | **V9.13 ★** | **Session record** — what the sandbox did, not just what left it | G13, G23 | We audit egress. We do not audit the session. | M |
 | V3.x | Cloud round-trip: signed manifest, `pull → verify → run` | G14 | **Deliberately after the local ship.** Cross-repo. | — |
 
-**The order is deliberate and one item is deliberately out of position.** V9.1
-(continuous snapshots) sits above the cheaper wins because the research found it
-is the capability the nearest comparable product does not have *at all* — their
-sleep is a cold stop that discards the disk. Building the contract features
-first would be competing on their ground with a later start.
+**Everything above ships the local standalone product.** The track below is
+larger than everything above it combined, and is deliberately *after* the ship.
+
+### V10 · Living Workspaces — after the local ship (#159)
+
+The phases and exit gates are specified in
+[`living-workspaces.md`](living-workspaces.md) §16. Both constraints **C1** and
+**C2** are gates on every phase, not just the first.
+
+| | Milestone | Goal | Exit gate that matters most | Size |
+| --- | --- | --- | --- | --- |
+| **V10.0 ★** (#159) | **Contract and spike** — a throwaway guest FUSE frontend talking to a minimal workspace service over the private network route | G24 | A real build runs from the mount; **and a dependency/provenance inspection proves no SV3 material is present** (C2). | L |
+| **V10.1 ★** (#159) | **Local Living Workspace** — `gimbal-workspaced`, SQLite metadata, local CAS, path classes, local fork/restore/diff | G24, G26 | O(1) fork with a byte-identical parent view; **unknown ignored secrets do not fork**; the vanilla snapshot corpus still boots (C1). | L |
+| **V10.2 ★** (#159) | **Git-transparent transactions** — Git launcher, durable control layer, bindings, atomic mount-generation swaps | **G25** | The end-to-end test uses **only normal Git commands**; `checkout` never exposes a half-switched tree. | L |
+| **V10.3 ★** (#159) | **Atomic checkpoint and local resume** — barrier, handle journal, signed session envelope, supervisor ordering | G24, **G27** | Kill/restart injected at *every* capture step; a workspace-bound resume **fails closed** when the sidecar, ref or policy is missing. | L |
+| **V10.4 ★** (#159) | **Cloud roam** — heads, leases/fences, signed manifests, capabilities, tenant encryption | G14, G12 | The same live session resumes on Apple HVF at the exact workspace revision, transferring **only the blocks it reads**. | L |
+| **V10.5 ★** (#159) | **Secure artifact reuse and merge** — producer trust, derivation records, durable untracked merge | G26, G12 | A poisoned or unsigned artifact is **never executed**; a failed merge leaves the destination unchanged. | L |
+| **V10.6 ★** (#159) | **Scale and fast paths** — batching, prefetch, block layout, compaction, optional faster transport | G24 | ≥100 crash cycles; **GC cannot collect any retained revision**; capability symmetry green on both KVM and HVF. | L |
+
+**Why this is a separate track and not the next milestone.** It needs a guest
+component (`gimbalfs`) in the image, a host sidecar, a metadata engine, a content
+store, a merge engine, and a Git integration — none of which exist. Attaching it
+to V9.1 would have made the MVP's time-travel goal depend on all of it. The split
+keeps **G2 deliverable in the local ship** while leaving **G24–G27 honest about
+their size**.
 
 ---
 
