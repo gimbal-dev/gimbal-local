@@ -7,6 +7,145 @@ down and run — or resumed *past where it left off* — on an Apple-silicon Mac
 Companion to [`macos-local-runtime.md`](macos-local-runtime.md) (the
 architecture): read that for *how* the port works, this for *where it is going*.
 
+**Start at [§0, the goal ledger](#0-the-goal-ledger--what-the-local-ship-means)**
+if you want to know what we are building toward. §1 onward is how much of it is
+true and how we got here.
+
+---
+
+## 0. The goal ledger — what the local ship means
+
+Re-baselined **2026-08-04**, after V8.4 merged. This is the definition of done
+for the **local standalone ship**: a product that needs no control plane. It
+supersedes ad-hoc milestone tracking as the answer to *"are we building the
+right thing?"*.
+
+Goals marked **★** are new in this baseline — either named for the first time,
+or adopted after reading what Cloudflare shipped in
+[Cloudflare Computer](https://blog.cloudflare.com/cloudflare-computer/)
+(2026-08-03) and its Containers platform.
+
+### The ship goals
+
+| # | Goal | State | Evidence, or what is missing |
+| --- | --- | --- | --- |
+| **G1** | **Real Cloud Hypervisor locally, plus BYO images by path** — not simulated | ✅ **done** | Stock upstream, unforked, Graviton2 captures, no flags (V1.5 acid test). BYO image directories with typed refusals (V8.3). Cold boot of a stock kernel with no snapshot in the path (V5.4). |
+| **G2** | **Snapshot as changes happen — time travel** | 🟡 **half** | Have: live checkpoints incl. SMP (V5.6), fork/CoW lineage, `revisions`, `rollback`, auto-prune to 5 resumable. Missing: **nothing snapshots on its own.** Every checkpoint is a manual suspend, so there is no timeline to travel along. |
+| **G3** | **Runs Copilot for real, safely isolated** | ✅ **done** | V7.1: Copilot CLI installed, authenticated, wrote and ran JS, on a cold-booted guest, holding **no credential** — verified by hashing, not by trusting the agent. |
+| **G4** | **Network controls** | ✅ **done, with gaps** | Default-deny-able egress allow-list, userspace NAT, reserved-address guard (I10), per-NIC fail-closed, egress audit trail (V6.3). Gaps are G17/G20 below. |
+| **G5** | **Off-box credentials** | ✅ **done** | Injected at the network edge; guest never holds one (V5.2, I12). In-app rule builder with no field that can hold a token (V8.5). |
+| **G6** | **Create local images — from vanilla *or from containers*** | 🟡 **half** | Vanilla: done (cold boot, BYO). **Containers: nothing.** No OCI/Docker→rootfs path exists anywhere in the tree. |
+| **G7** | **A consistent CLI with all features** | 🟡 **partial** | 24 subcommands; the app now drives **19** of them. But **7 are absent from `chm --help`** — including `create`, the flagship cold-boot path. The app is ahead of the CLI's own discoverability. |
+| **G8** | **Snapshot management** | 🟡 **partial** | Have: lineage, fork, rollback, bounded growth. Missing: **delete, garbage-collect, disk-usage reporting, rename, export/import.** Nothing reclaims a snapshot you no longer want. |
+
+### Goals we already held, stated explicitly
+
+| # | Goal | State | Evidence, or what is missing |
+| --- | --- | --- | --- |
+| **G9** | **Every claim carries its evidence** — the app never asserts a control it has not checked | ✅ **done** | V6.5 capability honesty; `chm posture` exits non-zero when anything is weakened; the proxy page names which process answered. |
+| **G10** | **A build someone else can actually run** | 🔴 **not started** | Everything is verified against `target/debug/chm` in a git checkout with a manual re-sign. #144 / V8.6. **This is the single hardest blocker on the word "ship".** |
+| **G11** | **Resource ceilings by default** | ✅ **done** | M30.6 + V4.2: an unconfigured workspace resolves to a real baseline, not unbounded. |
+| **G12** | **Signed provenance / trust root** | 🟡 **half** | Ed25519 signed-manifest verification and a reference signer exist on the `chm` side (M30.4). The unified trust root is cross-repo. |
+| **G13** | **Observability — what a session cost, did, and reached** | 🟡 **half** | Egress audit is real and shown (V6.3). There is **no unified per-session record** of what the sandbox did. |
+| **G14** | **Cloud round-trip** | 🟡 **half** | Cross-substrate mobility is proven. Signed-manifest contract is not. **Deliberately out of scope for the local ship** — it is the only thing gated on another team. |
+
+### ★ New goals — the sandbox contract
+
+The theme these share: **we can start a sandbox, but we cannot describe one.**
+Cloud Hypervisor's own contract is a VM config; ours is a pile of CLI flags.
+Cloudflare's product is weaker than ours on the thing we are best at (see
+below), and stronger on exactly this.
+
+| # | Goal | State | Why it is a goal |
+| --- | --- | --- | --- |
+| **G15 ★** | **A declarative sandbox spec** — one document that says what a sandbox *is*: image, sizing, egress policy, credential rules, env, entrypoint, lifetime | 🔴 | Today this is ~10 argv flags across two entry points, and the app reimplements the assembly. A spec makes a sandbox reproducible, diffable, and shareable — and is the natural unit for the control plane later. Cloudflare has this (`wrangler.jsonc` + `Container` class fields). |
+| **G16 ★** | **`exec` into a running sandbox** — run a command, get stdout/stderr/exit code | 🔴 | `chm ctl input` types characters at a console and you scrape the screen. There is **no way to run a command and learn whether it succeeded.** This is the single biggest ergonomic gap for driving an agent, and it is what every automation will want first. Cloudflare's `ctx.container.exec()` returns `{stdout, stderr, exitCode, pid, kill()}`. |
+| **G17 ★** | **Runtime-mutable network policy** — change egress rules on a live sandbox | 🔴 | Ours is fixed at start; changing it means restarting the guest, which throws away the work. Cloudflare changes allow/deny lists on a running container without dropping connections. Directly serves G4. |
+| **G18 ★** | **Idle sleep with activity reset, and a graceful stop** | 🟡 | `--idle-exit` defaults to **10 seconds** of console silence, and `--max-seconds` is a **power cut on a writable disk**. Cloudflare's `sleepAfter` defaults to 10 minutes, resets on activity, and calls a stop hook. Ours should suspend to a checkpoint rather than kill — which is G2's mechanism, reused. |
+| **G19 ★** | **Named sizing tiers** | 🔴 | `--cpus 2 --memory 2048` is a guess every time. Named tiers make sizing a decision someone can be right about, and give the docs something to reference. |
+| **G20 ★** | **Ingress — reach a service inside the sandbox** | 🔴 | The NAT is egress-only. An agent that starts a dev server on :3000 has no way to be reached. Cloudflare exposes `containerFetch`/`getTcpPort`. **Must be opt-in and per-port**, or it is a hole in the isolation we spent M30/M31 building. |
+| **G21 ★** | **MCP surface** — drive a sandbox as an MCP server | 🔴 | Not adopted from Cloudflare: their docs mention MCP **nowhere**. It is our own bet, and G15+G16 are its prerequisites — an MCP tool call is exactly "start a sandbox from a spec" plus "exec in it and tell me what happened". |
+| **G22 ★** | **Env vars and entrypoint at start** | 🔴 | No way to pass configuration into a guest without baking it into the image. Cheap, and G15 needs the fields anyway. |
+| **G23 ★** | **An agent paper trail** | 🟡 | We record what *left* the sandbox (V6.3). We do not record what the agent *did* inside it. Cloudflare claims "a clear paper trail showing what the agent did" but documents no API for it — so this is a goal we would be defining, not copying. |
+
+### What the research changed, and what it confirmed
+
+Reading the Cloudflare product against ours produced one genuine surprise, and
+it went in our favour:
+
+- **They have no VM snapshots at all.** No checkpoint, no fork, no resume. Their
+  `sleepAfter` is a **cold stop that discards the container disk**; persistence
+  is a SQLite filesystem in a Durable Object, FUSE-mounted back in. So *"sleep"*
+  there means *"stop and cold-start later"*. **G2 — snapshot-as-you-go with real
+  time travel — is not a catch-up feature. It is the thing we have that the
+  nearest comparable product does not.** That is an argument for prioritising it
+  rather than the contract work, and it reverses the instinct.
+- **Their credential design is architecturally identical to ours** — a handler
+  outside the sandbox holds the secret, the guest makes a plain request, the
+  header is attached on the way out. Independent convergence on V5.2/I12 is the
+  strongest evidence we have that the design is right.
+- **They describe container isolation as "a Linux VM"** but publish no
+  hypervisor detail, no seccomp/capability claims, and no statement of what a
+  guest can attempt. Our 12 invariants and `chm posture` are a **stronger
+  security story, stated more precisely** — G9 is a real differentiator, not
+  housekeeping.
+- **`@cloudflare/computer` is explicitly preview-only**, and its `docs/` are
+  stated by its own README to be "forward-looking — read for intent, not as
+  description of the code today". Treat its API as a signal of direction, not a
+  shipped bar.
+
+---
+
+## 0a. How milestones ladder into the goals
+
+### The last ten, and which goal each served
+
+Reverse chronological, all merged and hardware-verified:
+
+| # | Milestone | Merged | Serves |
+| --- | --- | --- | --- |
+| 1 | **V8.4 + credential builder** — settings persist; a rule builder with no field that can hold a token; `chm` is the authority on whether a rule is valid (#147) | 08-04 | G5, G9 |
+| 2 | **V8.3 · Bring-your-own images** — an image directory with typed refusals; the symlink rule found by using it (#146) | 08-03 | **G1** |
+| 3 | **V8.2 · Local-only mode** — stops the app *reaching* for a control plane, not just hiding it (#146) | 08-03 | G14 boundary |
+| 4 | **V8.1 · Cold boot from the app** — the app's most basic capability stops depending on infrastructure the user may not have (#146) | 08-03 | **G1** |
+| 5 | **V7.1 · A coding agent works inside the sandbox** — Copilot CLI installed, authenticated, wrote and ran JS, holding no credential (#141) | 08-03 | **G3**, G5 |
+| 6 | **Icache-elision warning** — a capture whose kernel elided `ic ivau` is named rather than mysteriously SIGILL-ing (#140) | 08-03 | G9 |
+| 7 | **Overlay drift refusal** — refuse to resume a checkpoint whose disk moved on under it (#139) | 08-03 | **G2**, G8 |
+| 8 | **Retire the managed GIC** — one interrupt backend; retiring it exposed three real defects it had been hiding (#138) | 08-03 | G1 |
+| 9 | **Cold boot: SMP, disk, NIC, RTC** — a cold guest gets real hardware, on more than one core (#133–#137) | 08-03 | **G1**, G6 |
+| 10 | **V6.1–V6.5 · The app tells the whole truth** — posture, credential proxy, egress audit, capability honesty, each claim carrying its evidence (#129–#132) | 07-31 | **G9**, G4, G13 |
+
+### What is outstanding, against the local ship
+
+Ordered by what actually blocks the word *"ship"*. **V9 is new** — it is the
+track the goal ledger creates.
+
+| | Milestone | Goal | Why now | Size |
+| --- | --- | --- | --- | --- |
+| **V8.6** (#144) | **A build someone else can run** — signed `.app` that finds its own `chm`, and an honest statement of what it needs | G10 | Nothing else on this list matters if the answer to *"can I have it?"* is *"clone the repo and re-sign the binary"*. **The one true blocker.** | M |
+| **V9.1 ★** (#148) | **Continuous snapshots** — checkpoint on a cadence and on meaningful events, keep a browsable timeline, restore any point | **G2** | The capability the nearest comparable product does not have at all. The primitives all exist (SMP checkpoint, lineage, prune, drift detection); what is missing is something that *decides when*. | L |
+| **V9.2 ★** (#149) | **`chm exec`** — run a command in a running sandbox, get stdout/stderr/exit code | **G16** | Everything that automates this product needs it, and today the only answer is to type at a console and scrape it. Cheapest large win on the list. | M |
+| **V8.7** (#145) | **Proxy rules imply egress allowance** | G4, G5 | Naming a host in an injection rule *is* the intent to reach it. Found by using V7.1 in anger. | S |
+| **V9.3 ★** (#150) | **The sandbox spec** — one declarative document: image, sizing, egress, credentials, env, entrypoint, lifetime | **G15** | Makes a sandbox reproducible and diffable, removes the app's duplicate flag assembly, and is the unit the control plane will want. | L |
+| **V9.4 ★** (#151) | **CLI completeness** — the 7 subcommands missing from `chm --help`, `create` first | **G7** | The app drives 19 of 24 commands; the CLI does not document 7 of its own. Nearly free. | S |
+| **V9.5 ★** (#152) | **Snapshot lifecycle** — delete, GC, disk usage, rename | **G8** | Nothing reclaims a snapshot. Disk grows monotonically until someone finds the directory. | M |
+| **V8.5** (#143) | **A first-run empty state that teaches** (image half; credentials half shipped in #147) | G9 | The discovery rejections already carry the vocabulary. | S |
+| **V9.6 ★** (#154) | **Graceful stop + idle sleep that suspends** | **G18** | `--max-seconds` is a power cut on a writable disk. Should suspend to a checkpoint — which is V9.1's mechanism, reused. | S |
+| **V9.7 ★** (#153) | **Containers → image** — build a bootable rootfs from an OCI image | **G6** | The half of "create local images" that does not exist. Turns the whole container ecosystem into sandbox images. | L |
+| **V9.8 ★** (#156) | **Runtime-mutable egress policy** | **G17** | Change what a sandbox may reach without throwing away its work. | M |
+| **V9.9 ★** (#155) | **Opt-in ingress** — reach a named port inside a sandbox | **G20** | An agent that starts a dev server cannot be reached. Must be per-port and opt-in or it undoes M30/M31. | M |
+| **V9.10 ★** (in #150) | **Env + entrypoint at start** | **G22** | Cheap; V9.3 needs the fields anyway. | S |
+| **V9.11 ★** (in #150) | **Named sizing tiers** | **G19** | Makes sizing a decision someone can be right about. | S |
+| **V9.12 ★** (#157) | **MCP server surface** | **G21** | Depends on V9.2 and V9.3. An MCP tool call *is* "start from a spec" + "exec and report". | L |
+| **V9.13 ★** | **Session record** — what the sandbox did, not just what left it | G13, G23 | We audit egress. We do not audit the session. | M |
+| V3.x | Cloud round-trip: signed manifest, `pull → verify → run` | G14 | **Deliberately after the local ship.** Cross-repo. | — |
+
+**The order is deliberate and one item is deliberately out of position.** V9.1
+(continuous snapshots) sits above the cheaper wins because the research found it
+is the capability the nearest comparable product does not have *at all* — their
+sleep is a cold stop that discards the disk. Building the contract features
+first would be competing on their ground with a later start.
+
 ---
 
 ## 1. The dream, and how much of it is true
@@ -794,12 +933,25 @@ the verified boot above used one.
 
 ### Still open in V8 — none of it blocked
 
+**V8.4 shipped 2026-08-04** (#147): `SettingsStore` persists `AppSettings`, a
+saved path is validated on load rather than trusted, and unknown keys survive a
+downgrade. The credentials half of V8.5 shipped alongside it — an empty state
+that teaches the model in three steps, and a rule builder whose `Source` type
+has **no case that carries a value**, so there is no field a token can be typed
+into. Save is gated on a real `chm` verdict, never on the app's own validation.
+
 | | Milestone | Why | Size |
 | --- | --- | --- | --- |
-| **V8.4** (#142) | **Persist `AppSettings`** | `AppSettings` is **not persisted at all** — chm path, library path, socket and control-plane URL reset to defaults on every launch, so a user who points the app at their own paths must redo it each time. Every other piece of UI state already goes through `UserDefaults`. Found while shipping V8.2. | S |
-| **V8.5** (#143) | **An empty state that teaches** | A first-run user with no snapshots and no images sees an empty list. It should say what an image *is*, where to put one, and offer the kernel/rootfs layout — the discovery rejections already carry the vocabulary. | S |
-| **V8.6** (#144) | **A build someone else can run** | Everything is verified against `target/debug/chm` in a git checkout with a re-sign step. A local MVP means a signed `.app` that finds its own `chm`, and an honest statement of what it needs (HVF entitlement, an image). | M |
+| **V8.5** (#143) | **An empty state that teaches** — *image half only* | The credentials half is done. A first-run user with no images still sees an empty list; the discovery rejections already carry the vocabulary. | S |
+| **V8.6** (#144) | **A build someone else can run** | Everything is verified against `target/debug/chm` in a git checkout with a re-sign step. A local MVP means a signed `.app` that finds its own `chm`, and an honest statement of what it needs (HVF entitlement, an image). **[§0a](#0a-how-milestones-ladder-into-the-goals) ranks this the one true blocker on the word "ship".** | M |
 | **V8.7** (#145) | **Proxy rules should imply egress allowance** | Naming a host in a credential-injection rule *is* the intent to reach it; requiring it again in `--egress-allow` fails closed but confusingly. Found by using V7.1 in anger. `create.rs:822`. | S |
+
+**V9 is the track that follows** — see
+[§0a](#0a-how-milestones-ladder-into-the-goals). It exists because the
+2026-08-04 goal re-baseline found two things V8 was never scoped to cover:
+nothing snapshots on its own (so there is no timeline to travel along), and
+there is no way to run a command in a running sandbox and learn whether it
+worked.
 
 
 ## 6. Shipped & proven — how we got here
