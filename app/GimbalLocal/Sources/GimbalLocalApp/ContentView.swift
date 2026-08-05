@@ -15,6 +15,9 @@ struct ContentView: View {
             Detail()
         }
         .tint(Theme.cyan)
+        .safeAreaInset(edge: .top, spacing: 0) {
+            SettingsNoticeBanner()
+        }
         .safeAreaInset(edge: .bottom, spacing: 0) {
             EngineStatusBar()
         }
@@ -33,6 +36,50 @@ struct ContentView: View {
 }
 
 // MARK: - Sidebar
+
+/// Settings problems, said where the user actually is.
+///
+/// These notices existed before this banner and were rendered **only inside the
+/// Settings window** — so a library path left pointing somewhere useless
+/// produced a correct, well-written explanation on a page nobody had a reason
+/// to open. The app looked empty and silent while knowing exactly what was
+/// wrong. A notice delivered nowhere is not a notice.
+///
+/// Deliberately not dismissible: every case names a real misconfiguration that
+/// stays true until someone changes a path, and a dismissed banner would just
+/// restore the old silence.
+private struct SettingsNoticeBanner: View {
+    @EnvironmentObject private var model: AppModel
+
+    var body: some View {
+        if !model.settingsNotices.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(Array(model.settingsNotices.enumerated()), id: \.offset) { _, notice in
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(Theme.orange)
+                        Text(notice.message)
+                            .font(.caption)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 8)
+                    }
+                }
+                SettingsLink {
+                    Text("Open Settings")
+                }
+                .buttonStyle(.link)
+                .font(.caption)
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(.regularMaterial)
+            .overlay(alignment: .bottom) {
+                Divider()
+            }
+        }
+    }
+}
 
 private struct Sidebar: View {
     @EnvironmentObject private var model: AppModel

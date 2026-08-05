@@ -20,13 +20,21 @@ final class SettingsStoreTests: XCTestCase {
     private func restore(
         saved: [SettingsField: String] = [:],
         environment: [String: String] = [:],
-        existing: Set<String> = []
+        existing: Set<String> = [],
+        states: [String: PathState] = [:]
     ) -> SettingsStore.Restored {
         SettingsStore.restore(
             saved: saved,
             defaults: base,
             environment: environment,
-            exists: { existing.contains($0) }
+            probe: { path in
+                if let explicit = states[path] { return explicit }
+                guard existing.contains(path) else { return .missing }
+                // A path named in `existing` is healthy for whatever wants it.
+                // Those tests are about precedence, not usability; the ones
+                // about usability pass `states` and say exactly what they mean.
+                return path.hasSuffix("/chm") ? .executableFile : .populatedDirectory
+            }
         )
     }
 
@@ -259,7 +267,7 @@ final class SettingsStoreTests: XCTestCase {
             saved: saved,
             defaults: base,
             environment: [:],
-            exists: { _ in true }
+            probe: { $0.contains("chm") ? .executableFile : .populatedDirectory }
         )
         XCTAssertEqual(restored.settings, chosen)
     }
@@ -291,7 +299,7 @@ final class SettingsStoreTests: XCTestCase {
             saved: readBack,
             defaults: base,
             environment: [:],
-            exists: { _ in true }
+            probe: { $0.contains("chm") ? .executableFile : .populatedDirectory }
         )
         XCTAssertEqual(restored.settings, chosen)
     }
@@ -362,5 +370,246 @@ final class SettingsStoreTests: XCTestCase {
         model.loadSettings()
 
         XCTAssertNil(UserDefaults.standard.string(forKey: key))
+    }
+}
+
+// MARK: - Present, and still useless
+//
+// The bug these cover, in full: a snapshot library left pointing at a directory
+// that exists and is empty passed `fileExists`, produced no notice at all, and
+// the app came up with an empty list and nothing to say. Existence was never
+// the right question.
+
+extension SettingsStoreTests {
+    func testAnEmptyLibraryIsReportedRatherThanPassingSilently() {
+        let restored = restore(
+            saved: [.libraryPath: "/volume/snapshots"],
+            states: [
+                "/volume/snapshots": .emptyDirectory,
+                base.chmPath: .executableFile,
+                base.localImagesPath: .populatedDirectory,
+            ]
+        )
+        XCTAssertEqual(
+            restored.notices,
+            [.presentButEmpty(field: .libraryPath, path: "/volume/snapshots")]
+        )
+        // Reported, not overridden: the user's choice still stands.
+        XCTAssertEqual(restored.settings.libraryPath, "/volume/snapshots")
+    }
+
+    func testAnEmptyImageFolderIsReportedToo() {
+        let restored = restore(
+            saved: [.localImagesPath: "/volume/images"],
+            states: [
+                "/volume/images": .emptyDirectory,
+                base.chmPath: .executableFile,
+                base.libraryPath: .populatedDirectory,
+            ]
+        )
+        XCTAssertEqual(
+            restored.notices,
+            [.presentButEmpty(field: .localImagesPath, path: "/volume/images")]
+        )
+    }
+
+    func testAPopulatedLibrarySaysNothing() {
+        let restored = restore(
+            saved: [.libraryPath: "/volume/snapshots"],
+            states: [
+                "/volume/snapshots": .populatedDirectory,
+                base.chmPath: .executableFile,
+                base.localImagesPath: .populatedDirectory,
+            ]
+        )
+        XCTAssertTrue(restored.notices.isEmpty, "a working library must stay silent")
+    }
+
+    /// `fileExists` answers **true** for a directory, so a `chmPath` pointing at
+    /// one used to be accepted and then fail on every spawn.
+    func testADirectoryWhereTheBinaryBelongsIsRefused() {
+        let restored = restore(
+            saved: [.chmPath: "/opt/chm-dir"],
+            states: [
+                "/opt/chm-dir": .populatedDirectory,
+                base.chmPath: .missing,
+                base.libraryPath: .populatedDirectory,
+                base.localImagesPath: .populatedDirectory,
+            ]
+        )
+        XCTAssertEqual(
+            restored.notices,
+            [.notExecutable(field: .chmPath, path: "/opt/chm-dir")]
+        )
+    }
+
+    func testANonExecutableBinaryFallsBackWhenTheDefaultCanActuallyRun() {
+        let restored = restore(
+            saved: [.chmPath: "/opt/chm.txt"],
+            states: [
+                "/opt/chm.txt": .notExecutable,
+                base.chmPath: .executableFile,
+                base.libraryPath: .populatedDirectory,
+                base.localImagesPath: .populatedDirectory,
+            ]
+        )
+        XCTAssertEqual(
+            restored.notices,
+            [.missingFallback(field: .chmPath, saved: "/opt/chm.txt", fallback: base.chmPath)]
+        )
+        XCTAssertEqual(restored.settings.chmPath, base.chmPath)
+    }
+
+    /// An empty *socket* directory is not a defect — `chm` creates the socket on
+    /// demand — so `.nothing` must genuinely opt out rather than fall through to
+    /// the directory rule.
+    func testFieldsThatRequireNothingAreNeverComplainedAbout() {
+        let restored = restore(
+            saved: [.socketPath: "/tmp/sock"],
+            states: [
+                "/tmp/sock": .emptyDirectory,
+                base.chmPath: .executableFile,
+                base.libraryPath: .populatedDirectory,
+                base.localImagesPath: .populatedDirectory,
+            ]
+        )
+        XCTAssertTrue(restored.notices.isEmpty)
+    }
+
+    /// The probe is the one impure part, and its ordering is load-bearing:
+    /// `isExecutableFile` returns true for a searchable directory, so a
+    /// directory has to be classified before that question is ever asked.
+    func testTheRealProbeTellsADirectoryFromAnExecutable() throws {
+        let fm = FileManager.default
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("gimbal-probe-\(UUID().uuidString)")
+        try fm.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(at: root) }
+
+        let emptyDir = root.appendingPathComponent("empty")
+        try fm.createDirectory(at: emptyDir, withIntermediateDirectories: true)
+
+        let fullDir = root.appendingPathComponent("full")
+        try fm.createDirectory(at: fullDir, withIntermediateDirectories: true)
+        try "x".write(to: fullDir.appendingPathComponent("thing"), atomically: true, encoding: .utf8)
+
+        let hiddenOnly = root.appendingPathComponent("hidden")
+        try fm.createDirectory(at: hiddenOnly, withIntermediateDirectories: true)
+        try "x".write(to: hiddenOnly.appendingPathComponent(".DS_Store"), atomically: true, encoding: .utf8)
+
+        let plain = root.appendingPathComponent("plain.txt")
+        try "x".write(to: plain, atomically: true, encoding: .utf8)
+
+        let runnable = root.appendingPathComponent("runnable")
+        try "#!/bin/sh\n".write(to: runnable, atomically: true, encoding: .utf8)
+        try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: runnable.path)
+
+        XCTAssertEqual(SettingsStore.probeFilesystem(emptyDir.path), .emptyDirectory)
+        XCTAssertEqual(SettingsStore.probeFilesystem(fullDir.path), .populatedDirectory)
+        XCTAssertEqual(
+            SettingsStore.probeFilesystem(hiddenOnly.path), .emptyDirectory,
+            "a stray .DS_Store is not content the user put there"
+        )
+        XCTAssertEqual(SettingsStore.probeFilesystem(plain.path), .notExecutable)
+        XCTAssertEqual(SettingsStore.probeFilesystem(runnable.path), .executableFile)
+        XCTAssertEqual(
+            SettingsStore.probeFilesystem(root.appendingPathComponent("nope").path), .missing
+        )
+    }
+}
+
+// MARK: - Why Start did nothing
+
+final class SlotContentionTests: XCTestCase {
+    func testAFreeSlotSaysNothing() {
+        XCTAssertNil(SlotContention.evaluate(holderName: nil, thisSandboxIsLive: false))
+    }
+
+    /// The running sandbox is not blocked by itself. Callers pass
+    /// `slotHolder(excluding:)`, but this must hold even if one forgets.
+    func testTheRunningSandboxIsNotBlockedByItself() {
+        XCTAssertNil(SlotContention.evaluate(holderName: "graviton-2", thisSandboxIsLive: true))
+    }
+
+    func testABlockedSandboxNamesTheHolderAndTheRemedy() throws {
+        let state = try XCTUnwrap(
+            SlotContention.evaluate(holderName: "ch-arm-stock-its", thisSandboxIsLive: false)
+        )
+        XCTAssertEqual(state.holderName, "ch-arm-stock-its")
+        XCTAssertTrue(
+            state.message.contains("ch-arm-stock-its"),
+            "a refusal that does not name the holder cannot be acted on: \(state.message)"
+        )
+        XCTAssertTrue(
+            state.message.contains("one VM per process"),
+            "the constraint is the whole explanation: \(state.message)"
+        )
+        XCTAssertEqual(state.remedyLabel, "Stop ch-arm-stock-its")
+    }
+
+    /// An empty name would render "  is running and holds…", which reads as a
+    /// bug in the app rather than a fact about it.
+    func testAnEmptyHolderNameIsTreatedAsNoHolder() {
+        XCTAssertNil(SlotContention.evaluate(holderName: "", thisSandboxIsLive: false))
+    }
+}
+
+// MARK: - A running guest survives an app restart
+
+/// Quit the app with a sandbox running, reopen it, and every row read
+/// "Stopped" while `chm ctl status` said `running` — because the app matched
+/// the daemon's VM against a variable that only remembers sandboxes started
+/// since launch. The daemon reports the name; nobody read it.
+final class DaemonRunOwnerTests: XCTestCase {
+    private let candidates: [(id: String, name: String)] = [
+        (id: "4E40B07F-7534-48F4-B519-1EE674EF8E5D", name: "graviton-2"),
+        (id: "9BEA5058-1111-2222-3333-444455556666", name: "ch-arm-stock-its"),
+    ]
+
+    func testTheDaemonsUUIDResolvesToTheSandboxThatOwnsIt() {
+        XCTAssertEqual(
+            DaemonRunOwner.match(
+                reportedName: "4E40B07F-7534-48F4-B519-1EE674EF8E5D",
+                candidates: candidates
+            ),
+            "4E40B07F-7534-48F4-B519-1EE674EF8E5D"
+        )
+    }
+
+    func testALibraryNameResolvesToo() {
+        XCTAssertEqual(
+            DaemonRunOwner.match(reportedName: "ch-arm-stock-its", candidates: candidates),
+            "9BEA5058-1111-2222-3333-444455556666"
+        )
+    }
+
+    /// A guest started outside the app is real, and claiming an unrelated row
+    /// for it would be worse than admitting we do not know whose it is.
+    func testAnUnknownGuestClaimsNobody() {
+        XCTAssertNil(DaemonRunOwner.match(reportedName: "someones-scratch-vm", candidates: candidates))
+    }
+
+    func testNothingRunningResolvesToNothing() {
+        XCTAssertNil(DaemonRunOwner.match(reportedName: nil, candidates: candidates))
+        XCTAssertNil(DaemonRunOwner.match(reportedName: "", candidates: candidates))
+    }
+
+    /// Names are user-chosen and need not be unique. Guessing would mark one
+    /// sandbox running *and* disable Start on the other, from a coin toss.
+    func testADuplicateNameResolvesToNothingRatherThanGuessing() {
+        let twins: [(id: String, name: String)] = [
+            (id: "a", name: "dev"),
+            (id: "b", name: "dev"),
+        ]
+        XCTAssertNil(DaemonRunOwner.match(reportedName: "dev", candidates: twins))
+    }
+
+    /// An id must win even when some other sandbox happens to be *named* that.
+    func testIdentityBeatsANameCollision() {
+        let tricky: [(id: String, name: String)] = [
+            (id: "sandbox-7", name: "unrelated"),
+            (id: "zzz", name: "sandbox-7"),
+        ]
+        XCTAssertEqual(DaemonRunOwner.match(reportedName: "sandbox-7", candidates: tricky), "sandbox-7")
     }
 }
