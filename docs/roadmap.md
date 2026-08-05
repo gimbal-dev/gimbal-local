@@ -43,7 +43,7 @@ after reading what Cloudflare shipped in
 
 | # | Goal | State | Evidence, or what is missing |
 | --- | --- | --- | --- |
-| **G9** | **Every claim carries its evidence** — the app never asserts a control it has not checked | ✅ **done** | V6.5 capability honesty; `chm posture` exits non-zero when anything is weakened; the proxy page names which process answered. |
+| **G9** | **Every claim carries its evidence** — the app never asserts a control it has not checked | ✅ **done** | V6.5 capability honesty; `chm posture` exits non-zero when anything is weakened; the proxy page names which process answered. The first-run empty state reports the discovery rejection's own reason and remedy rather than a generic failure (V8.5). |
 | **G10** | **A build someone else can actually run** | 🔴 **not started** | Everything is verified against `target/debug/chm` in a git checkout with a manual re-sign. #144 / V8.6. **This is the single hardest blocker on the word "ship".** |
 | **G11** | **Resource ceilings by default** | ✅ **done** | M30.6 + V4.2: an unconfigured workspace resolves to a real baseline, not unbounded. |
 | **G12** | **Signed provenance / trust root** | 🟡 **half** | Ed25519 signed-manifest verification and a reference signer exist on the `chm` side (M30.4). The unified trust root is cross-repo. |
@@ -167,16 +167,16 @@ Reverse chronological, all merged and hardware-verified:
 
 | # | Milestone | Merged | Serves |
 | --- | --- | --- | --- |
-| 1 | **V9.6 · A deadline suspends instead of cutting power** — `--max-seconds`/`--idle-exit` save a resumable checkpoint, and a latent #139 bug where a checkpoint's own teardown invalidated its own fingerprint is fixed (#172) | 08-05 | **G18**, G2 |
-| 2 | **V9.1a · Delta RAM dumps + reclaim-honest accounting** — a live snapshot rewrites only the 64 KiB chunks that changed, and usage reports what deleting a revision would actually give back (#167) | 08-05 | **G2**, G8 |
-| 3 | **V9.1 · Continuous snapshots** — checkpoint a *running* guest on a cadence; a session that ends badly keeps its work (#148) | 08-05 | **G2**, G8 |
-| 4 | **V9.5a · Retention roots + honest disk accounting** — pin a revision so age-based pruning cannot reclaim it, and report what a lineage really costs (#152, part) | 08-04 | **G8**, G2 |
-| 5 | **V9.4 · CLI completeness** — all 24 subcommands in `chm --help`, grouped by what they need, with a guard test that reads the dispatch table from source (#151) | 08-04 | **G7** |
-| 6 | **V8.7 · Proxy rules imply egress allowance** — naming a host in an injection rule makes it reachable, scoped to its own ports and only within one authority (#145) | 08-04 | **G4**, G5 |
-| 7 | **V9.2 · `chm exec`** — run a command in a sandbox and exit with *its* status; a transport failure is never reportable as success (#161) | 08-04 | **G16**, G7 |
-| 8 | **V8.4 + credential builder** — settings persist; a rule builder with no field that can hold a token; `chm` is the authority on whether a rule is valid (#147) | 08-04 | G5, G9 |
-| 9 | **V8.3 · Bring-your-own images** — an image directory with typed refusals; the symlink rule found by using it (#146) | 08-03 | **G1** |
-| 10 | **V8.2 · Local-only mode** — stops the app *reaching* for a control plane, not just hiding it (#146) | 08-03 | G14 boundary |
+| 1 | **V8.5 · A first-run empty state that teaches** — names what an image *is*, surfaces the discovery rejections up front, and removes a gate that greyed out cold boot whenever the snapshot library was empty (#175) | 08-05 | **G9**, G1 |
+| 2 | **V9.6 · A deadline suspends instead of cutting power** — `--max-seconds`/`--idle-exit` save a resumable checkpoint, and a latent #139 bug where a checkpoint's own teardown invalidated its own fingerprint is fixed (#172) | 08-05 | **G18**, G2 |
+| 3 | **V9.1a · Delta RAM dumps + reclaim-honest accounting** — a live snapshot rewrites only the 64 KiB chunks that changed, and usage reports what deleting a revision would actually give back (#167) | 08-05 | **G2**, G8 |
+| 4 | **V9.1 · Continuous snapshots** — checkpoint a *running* guest on a cadence; a session that ends badly keeps its work (#148) | 08-05 | **G2**, G8 |
+| 5 | **V9.5a · Retention roots + honest disk accounting** — pin a revision so age-based pruning cannot reclaim it, and report what a lineage really costs (#152, part) | 08-04 | **G8**, G2 |
+| 6 | **V9.4 · CLI completeness** — all 24 subcommands in `chm --help`, grouped by what they need, with a guard test that reads the dispatch table from source (#151) | 08-04 | **G7** |
+| 7 | **V8.7 · Proxy rules imply egress allowance** — naming a host in an injection rule makes it reachable, scoped to its own ports and only within one authority (#145) | 08-04 | **G4**, G5 |
+| 8 | **V9.2 · `chm exec`** — run a command in a sandbox and exit with *its* status; a transport failure is never reportable as success (#161) | 08-04 | **G16**, G7 |
+| 9 | **V8.4 + credential builder** — settings persist; a rule builder with no field that can hold a token; `chm` is the authority on whether a rule is valid (#147) | 08-04 | G5, G9 |
+| 10 | **V8.3 · Bring-your-own images** — an image directory with typed refusals; the symlink rule found by using it (#146) | 08-03 | **G1** |
 
 ### What is outstanding, against the local ship
 
@@ -189,7 +189,6 @@ it is the track [`living-workspaces.md`](living-workspaces.md) creates.
 | **V8.6** (#144) | **A build someone else can run** — signed `.app` that finds its own `chm`, and an honest statement of what it needs | G10 | Nothing else on this list matters if the answer to *"can I have it?"* is *"clone the repo and re-sign the binary"*. **The one true blocker.** | M |
 | **V9.5b ★** (#152) | **Snapshot lifecycle, the reclaim half** — delete with a reachability refusal, CAS garbage collection, rename, export/import | **G8** | Retention roots and disk accounting **shipped** (V9.5a), which is what V9.1 was waiting on — so this no longer sits ahead of it. Nothing still reclaims a snapshot you no longer want. Deletion must refuse clearly when it would strand a descendant, as overlay drift does (#139); never a silent `rm -rf`. | M |
 | **V9.3 ★** (#150) | **The sandbox spec** — one declarative document: image, sizing, egress, credentials, env, entrypoint, lifetime | **G15** | Makes a sandbox reproducible and diffable, removes the app's duplicate flag assembly, and is the unit the control plane will want. | L |
-| **V8.5** (#143) | **A first-run empty state that teaches** (image half; credentials half shipped in #147) | G9 | The discovery rejections already carry the vocabulary. | S |
 | **V9.7 ★** (#153) | **Containers → image** — build a bootable rootfs from an OCI image | **G6** | The half of "create local images" that does not exist. Turns the whole container ecosystem into sandbox images. | L |
 | **V9.8 ★** (#156) | **Runtime-mutable egress policy** | **G17** | Change what a sandbox may reach without throwing away its work. | M |
 | **V9.9 ★** (#155) | **Opt-in ingress** — reach a named port inside a sandbox | **G20** | An agent that starts a dev server cannot be reached. Must be per-port and opt-in or it undoes M30/M31. | M |
@@ -1021,9 +1020,23 @@ that teaches the model in three steps, and a rule builder whose `Source` type
 has **no case that carries a value**, so there is no field a token can be typed
 into. Save is gated on a real `chm` verdict, never on the app's own validation.
 
+**V8.5 shipped 2026-08-05** (#175), closing the image half. The empty state now
+names what an image *is* — a folder holding an uncompressed arm64 `Image` — says
+where the app is looking and how to change it, and surfaces the discovery
+rejections up front rather than after a failed launch, because
+`LocalImageLibrary` already knows the remedy.
+
+Auditing that copy found a **functional bug** behind it: "New sandbox" was
+disabled whenever the snapshot library was empty, which greyed out cold boot —
+the one path needing no snapshot, no KVM host and no control plane. The gate was
+removed rather than corrected, since the menu explains what is missing and a
+greyed-out button explains nothing. Verified against the running app, which also
+caught markdown backticks rendering literally in a menu (SwiftUI parses markdown
+out of string *literals* only) and copy pointing at a page that would not have
+shown what it promised.
+
 | | Milestone | Why | Size |
 | --- | --- | --- | --- |
-| **V8.5** (#143) | **An empty state that teaches** — *image half only* | The credentials half is done. A first-run user with no images still sees an empty list; the discovery rejections already carry the vocabulary. | S |
 | **V8.6** (#144) | **A build someone else can run** | Everything is verified against `target/debug/chm` in a git checkout with a re-sign step. A local MVP means a signed `.app` that finds its own `chm`, and an honest statement of what it needs (HVF entitlement, an image). **[§0a](#0a-how-milestones-ladder-into-the-goals) ranks this the one true blocker on the word "ship".** | M |
 | **V8.7** (#145) | **Proxy rules should imply egress allowance** | Naming a host in a credential-injection rule *is* the intent to reach it; requiring it again in `--egress-allow` fails closed but confusingly. Found by using V7.1 in anger. `create.rs:822`. | S |
 
