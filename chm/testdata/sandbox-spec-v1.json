@@ -1,0 +1,39 @@
+{
+  "specVersion": 1,
+  "name": "frozen-v1",
+  "description": "A checked-in spec covering every field this build implements. Never regenerate this to make a test pass: a failure here means the change breaks specs that already exist.",
+  "image": {
+    "kernel": "/images/ubuntu/Image",
+    "initramfs": "/images/ubuntu/initrd",
+    "cmdline": "console=ttyAMA0",
+    "disks": ["/images/ubuntu/rootfs.img"]
+  },
+  "resourceLimits": {
+    "tier": "micro",
+    "cpu": { "vcpus": 2 },
+    "memory": { "ram": "2gb" },
+    "disk": { "workspaceSize": "16gb" },
+    "timeout": { "wallClock": "30m", "idle": "10m" }
+  },
+  "networkPolicy": {
+    "enabled": true,
+    "defaultAction": "deny",
+    "egress": [
+      {
+        "action": "allow",
+        "domains": ["api.github.com"],
+        "ports": [443],
+        "description": "the agent talks to GitHub"
+      }
+    ]
+  },
+  "secrets": {
+    "rulesFile": "/workspace/proxy-rules.json",
+    "workspace": "/workspace"
+  },
+  "toolPolicy": { "capabilities": ["network"] },
+  "checkpoint": { "enabled": true, "interval": "5m" },
+  "hostRequirements": { "hypervisor": "cloud-hypervisor", "arch": "aarch64" },
+  "workspaceFolder": "/home/ubuntu/work",
+  "agentUser": "ubuntu"
+}
