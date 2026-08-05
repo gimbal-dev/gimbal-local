@@ -1325,6 +1325,61 @@ mod tests {
         );
     }
 
+    /// Mirror what `--spec` does at `expand_spec`: render the document to argv,
+    /// drop the leading `create` (we are already inside it), then append the
+    /// caller's own flags — which is the ordering that gives a flag the last
+    /// word, and the ordering a greedy `--post-boot` destroys.
+    fn spliced(json: &str, caller: &[&str]) -> Vec<String> {
+        let doc = SandboxSpec::parse(json, Path::new("t.json")).unwrap();
+        let mut argv = resolve(Some(&doc), None, &Overrides::default()).to_create_argv();
+        if argv.first().map(String::as_str) == Some("create") {
+            argv.remove(0);
+        }
+        argv.extend(caller.iter().map(|s| (*s).to_string()));
+        argv
+    }
+
+    /// The bug this milestone's own hardware run found, frozen as a test.
+    ///
+    /// `--spec` splices the spec's argv **before** the caller's flags so that a
+    /// flag wins. `--post-boot` takes everything after it as the guest's
+    /// command. Put those together and a spec with a `postBootCommand` eats
+    /// every flag the operator typed: `chm create --spec … --dry-run` handed
+    /// `--dry-run` to the guest and **booted a VM when asked to describe one**.
+    ///
+    /// So this asserts the consequence, not just the cause — the real parser
+    /// must still see a flag that follows the whole spliced expansion.
+    #[test]
+    fn a_flag_after_a_spec_expansion_still_reaches_chm() {
+        let argv = spliced(
+            r#"{"specVersion":1,"postBootCommand":["echo","hi"],"env":{"A":"1"}}"#,
+            &["--dry-run", "--kernel", "/dev/null"],
+        );
+        let a = parse(&argv).expect("a spliced argv must parse");
+        assert!(a.dry_run, "the caller's own flag was swallowed: {argv:?}");
+        assert_eq!(
+            a.postboot.post_boot.as_deref(),
+            Some(&["echo".to_string(), "hi".to_string()][..])
+        );
+        assert_eq!(a.postboot.env.get("A").map(String::as_str), Some("1"));
+    }
+
+    /// The override half: a spec says what the sandbox *is*, a flag says how
+    /// *this run* differs, so a typed `--post-boot` replaces the spec's command
+    /// rather than concatenating onto it and producing a third nobody asked for.
+    #[test]
+    fn a_typed_post_boot_replaces_the_specs_command() {
+        let argv = spliced(
+            r#"{"specVersion":1,"postBootCommand":["echo","from-spec"]}"#,
+            &["--kernel", "/dev/null", "--post-boot", "echo", "from-flag"],
+        );
+        let a = parse(&argv).expect("must parse");
+        assert_eq!(
+            a.postboot.post_boot.as_deref(),
+            Some(&["echo".to_string(), "from-flag".to_string()][..])
+        );
+    }
+
     /// A guest command is not obliged to avoid words `chm` uses as flags.
     #[test]
     fn a_guest_command_may_contain_our_own_flag_names() {

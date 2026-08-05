@@ -35,5 +35,7 @@
   "checkpoint": { "enabled": true, "interval": "5m" },
   "hostRequirements": { "hypervisor": "cloud-hypervisor", "arch": "aarch64" },
   "workspaceFolder": "/home/ubuntu/work",
-  "agentUser": "ubuntu"
+  "agentUser": "ubuntu",
+  "env": { "LANG": "C.UTF-8", "TZ": "UTC" },
+  "postBootCommand": ["/usr/bin/env", "true"]
 }

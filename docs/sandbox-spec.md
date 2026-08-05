@@ -102,7 +102,7 @@ times to find four mistakes is one people stop running.
 | `identity` | #187 | Workload identity and attestation. |
 | `observability` | #188 | Structured trace/metric export. |
 | `image.oci` | #153 | Building a bootable rootfs from an OCI image. |
-| `lifecycle` hooks | #189 | Ten in the spec (`initializeCommand`, `preBootCommand`, `onCreateCommand`, `preTaskCommand`, `postTaskCommand`, `preSnapshotCommand`, `postRestoreCommand`, `preShutdownCommand`, `waitFor`). We implement `postBootCommand` only — the one we have a channel for, via `chm exec`. |
+| `lifecycle` hooks | #189 | Ten in the spec (`initializeCommand`, `preBootCommand`, `onCreateCommand`, `preTaskCommand`, `postTaskCommand`, `preSnapshotCommand`, `postRestoreCommand`, `preShutdownCommand`, `waitFor`). We implement `postBootCommand` only — the one we have a channel for, and since V9.10 it is genuinely delivered rather than refused. |
 
 Umbrella: **#182**.
 
@@ -110,6 +110,77 @@ Umbrella: **#182**.
 `"network"` means no NIC is attached — a verifiable fact about the guest, not a
 promise about the agent. `"filesystem"` and `"subprocess"` are refused, because
 listing them would imply a control that does not exist.
+
+## `env` and `postBootCommand`: how they actually reach a guest
+
+These two shipped in V9.3 **refused**, and the refusal is the most useful thing
+this document records. They parsed, they resolved, they printed in
+`--explain` with their origin — and `chm create` had no `--env` and no
+entrypoint flag, so nothing carried either across the boundary. A spec setting
+`LANG` would have started a guest that had never heard of `LANG`, and every
+visible signal would have said it worked. V9.10 (#190) built the delivery.
+
+There is no kernel or `init` in the path. `chm create` cold-boots a **BYO**
+image, so it cannot assume a cloud-init, a writable `/etc`, or any particular
+init system. What it *can* assume is the thing it already owns: the serial
+console, and the shell sitting on it.
+
+**Readiness is proven, not pattern-matched.** Waiting for a `$` or `#` prompt
+would be guesswork on an image we did not build — both characters appear in
+kernel output, and distros print different banners. Instead `chm` sends a
+framed no-op and watches for the answer:
+
+```
+__CHM_BEGIN_<nonce>__ ; true ; echo __CHM_END_<nonce>__:$?
+```
+
+If the end marker comes back, a shell read that line and ran it. That is not
+*evidence* of a shell being ready — it **is** a shell being ready, on any image
+that has one. The probe is idempotent, carries a fresh nonce each time so a
+late answer cannot be read as the next probe succeeding, and repeats every
+500 ms until the readiness deadline (120 s by default).
+
+Then `env` is exported, then `postBootCommand` runs. That order is not
+cosmetic: reversed, the two fields would each be individually correct and
+jointly useless.
+
+### `env` is not an argv, and that is why it is not one
+
+`export` is a shell builtin. `["sh","-c","export FOO=bar"]` sets a variable in a
+subshell that then exits — **exit code 0, nothing set**. It is exactly the shape
+of failure this section exists to describe, so the assignments are evaluated by
+the console's own shell rather than handed to a new one.
+
+### The scope, stated rather than implied
+
+The console is one tty with one shell session, and `chm connect` and `chm exec`
+both attach to it. So an exported variable reaches:
+
+| Reaches | Does not reach |
+| --- | --- |
+| `postBootCommand` | a **new login** after that shell exits and a getty respawns |
+| later `chm exec` calls, and their children | processes started by systemd or any other init |
+| an operator's `chm connect` session | anything on a **resumed snapshot** whose RAM predates the export |
+
+Making it survive a getty respawn means writing to `/etc/environment` or a
+profile script, which needs a writable rootfs and a known layout — neither of
+which a BYO image owes us. Stating the limit is better than a control that
+works on the images we happened to test.
+
+### A non-zero exit fails the run
+
+If `postBootCommand` exits non-zero, `chm create` reports it and exits non-zero
+too. The guest was described as one that had run that command successfully; it
+is not that guest, and a clean shutdown afterwards does not change it. A
+delivery failure therefore outranks a tidy guest exit in the run's own status.
+
+### Validation catches what delivery would only discover later
+
+`chm spec validate` refuses an `env` key that is not a POSIX name (`my-var`
+cannot be assigned by any shell) and one that looks like a credential
+(`GITHUB_TOKEN`) — the second matters *more* now than it did in V9.3, because
+before #190 a token in a spec was inert and now it would be exported into a
+shell. Use `secrets.rulesFile`; the guest never needs to hold one.
 
 ## Precedence: what a sandbox is, versus how this run differs
 
