@@ -517,3 +517,38 @@ extension SettingsStoreTests {
         )
     }
 }
+// MARK: - Why Start did nothing
+
+final class SlotContentionTests: XCTestCase {
+    func testAFreeSlotSaysNothing() {
+        XCTAssertNil(SlotContention.evaluate(holderName: nil, thisSandboxIsLive: false))
+    }
+
+    /// The running sandbox is not blocked by itself. Callers pass
+    /// `slotHolder(excluding:)`, but this must hold even if one forgets.
+    func testTheRunningSandboxIsNotBlockedByItself() {
+        XCTAssertNil(SlotContention.evaluate(holderName: "graviton-2", thisSandboxIsLive: true))
+    }
+
+    func testABlockedSandboxNamesTheHolderAndTheRemedy() throws {
+        let state = try XCTUnwrap(
+            SlotContention.evaluate(holderName: "ch-arm-stock-its", thisSandboxIsLive: false)
+        )
+        XCTAssertEqual(state.holderName, "ch-arm-stock-its")
+        XCTAssertTrue(
+            state.message.contains("ch-arm-stock-its"),
+            "a refusal that does not name the holder cannot be acted on: \(state.message)"
+        )
+        XCTAssertTrue(
+            state.message.contains("one VM per process"),
+            "the constraint is the whole explanation: \(state.message)"
+        )
+        XCTAssertEqual(state.remedyLabel, "Stop ch-arm-stock-its")
+    }
+
+    /// An empty name would render "  is running and holds…", which reads as a
+    /// bug in the app rather than a fact about it.
+    func testAnEmptyHolderNameIsTreatedAsNoHolder() {
+        XCTAssertNil(SlotContention.evaluate(holderName: "", thisSandboxIsLive: false))
+    }
+}

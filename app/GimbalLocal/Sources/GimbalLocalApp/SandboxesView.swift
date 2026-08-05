@@ -477,6 +477,25 @@ private struct SandboxControlsCard: View {
                 FailureBanner(reason: reason)
             }
 
+            // Why Start is disabled. Without this the button was enabled, did
+            // nothing, and wrote its reason to a log the user never opens.
+            if let contention {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(Theme.orange)
+                    Text(contention.message)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
+                    if let holder = model.slotHolder(excluding: sandbox.id) {
+                        Button(contention.remedyLabel) { model.stop(holder) }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                    }
+                }
+            }
+
             HStack(spacing: 10) {
                 Button {
                     model.startSandbox(sandbox)
@@ -484,7 +503,7 @@ private struct SandboxControlsCard: View {
                     Label(sandbox.state == .starting ? "Starting…" : "Start", systemImage: "play.fill")
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(isLive)
+                .disabled(isLive || contention != nil)
 
                 Button(role: .destructive) {
                     model.stop(sandbox)
@@ -508,6 +527,16 @@ private struct SandboxControlsCard: View {
 
     private var isLive: Bool {
         sandbox.state == .running || sandbox.state == .starting
+    }
+
+    /// `nil` whenever the slot is free or this sandbox is the one using it —
+    /// so the explanation appears exactly when Start would otherwise have been
+    /// refused, and never otherwise.
+    private var contention: SlotContention.State? {
+        SlotContention.evaluate(
+            holderName: model.slotHolder(excluding: sandbox.id)?.name,
+            thisSandboxIsLive: isLive
+        )
     }
 
     private func uptime(_ sandbox: Sandbox) -> String {

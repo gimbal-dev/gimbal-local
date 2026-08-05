@@ -968,9 +968,25 @@ final class AppModel: ObservableObject {
     }
 
     /// The current slot holder from the cached registry, without re-scanning.
+    ///
+    /// A guest can be live two ways — an interactive `chm connect` subprocess
+    /// tracked by a session lock, **or** the daemon's own single VM slot — and
+    /// this used to consult only the first. So a sandbox running in the daemon
+    /// blocked Start while the app believed nothing held the slot, which is the
+    /// worst of both: refused, and unexplained.
+    ///
+    /// Deliberately the same answer the refusal in `startSandbox` uses and the
+    /// same one the UI explains, because two definitions of "who holds the
+    /// slot" would eventually disagree and the disagreement would look like a
+    /// dead button.
+    ///
+    /// Local only: a cloud sandbox running elsewhere occupies nothing here.
     func slotHolder(excluding exclude: String?) -> Sandbox? {
-        guard let id = liveLocalSessionIDs.first(where: { $0 != exclude }) else { return nil }
-        return sandbox(id: id)
+        sandboxes.first {
+            $0.id != exclude
+                && $0.location == .local
+                && ($0.state == .running || $0.state == .starting)
+        }
     }
 
     /// True if the PID recorded in `lockPath` names a live process.
