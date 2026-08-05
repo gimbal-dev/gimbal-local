@@ -2294,7 +2294,8 @@ pub(crate) fn run_usgic_engine(
     // exactly when a checkpoint is cheapest and most likely to be wanted, so
     // both signals are needed. (The vtimer stepper only needs `exits` because it
     // merely waits for `in_guest` to reach zero, which a parked vCPU satisfies.)
-    let all_wakes: Vec<Arc<dyn Fn() + Send + Sync>> = setups.iter().map(|s| s.wake.clone()).collect();
+    let all_wakes: Vec<Arc<dyn Fn() + Send + Sync>> =
+        setups.iter().map(|s| s.wake.clone()).collect();
     // Snapshot the run-progress counters alongside the exit signals, before
     // `setups` is consumed into the shared handle table below.
     let all_progress: Vec<Arc<AtomicU64>> =
@@ -2821,7 +2822,8 @@ fn spawn_live_snapshotter(s: LiveSnapshotter) -> Option<thread::JoinHandle<()>> 
 
                 // The world is stopped here, and nothing in this block may
                 // return early without releasing it.
-                let result = assemble_usgic_checkpoint(captures, num_irq, vcpus).and_then(|state| {
+                let result =
+                    assemble_usgic_checkpoint(captures, num_irq, vcpus).and_then(|state| {
                     checkpoint::write_checkpoint(
                         &dir,
                         &state,

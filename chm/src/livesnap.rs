@@ -341,10 +341,11 @@ impl Quiesce {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::atomic::AtomicUsize;
     use std::sync::{Arc, Barrier};
     use std::thread;
+
+    use super::*;
 
     /// Stand-in for a vCPU thread: loops, notices new epochs, captures itself.
     ///
@@ -451,7 +452,8 @@ mod tests {
         let g = gate.clone();
         let late = thread::spawn(move || g.arrive_and_park(0, 1, 7));
         let start = Instant::now();
-        late.join().expect("a late arrival must not park indefinitely");
+        late.join()
+            .expect("a late arrival must not park indefinitely");
         assert!(
             start.elapsed() < Duration::from_secs(2),
             "late arrival parked for {:?}",
@@ -619,7 +621,8 @@ mod tests {
         let g = q.clone();
         let t = thread::spawn(move || g.park_if_paused());
         let start = Instant::now();
-        t.join().expect("writer must not park after an abandoned pause");
+        t.join()
+            .expect("writer must not park after an abandoned pause");
         assert!(start.elapsed() < Duration::from_secs(2));
     }
 
