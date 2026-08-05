@@ -1040,9 +1040,10 @@ final class AppModel: ObservableObject {
     /// for the active local sandbox. Because the local engine runs one VM at a
     /// time, at most one sandbox is live.
     var sandboxes: [Sandbox] {
-        storedSandboxes.map { stored in
+        let active = effectiveActiveLocalSandboxID
+        return storedSandboxes.map { stored in
             let state = liveState(for: stored.id)
-            let isActive = stored.id == activeLocalSandboxID
+            let isActive = stored.id == active
             let reason: String?
             if stored.location == .remote {
                 reason = (state == .failed) ? cloudSandboxReasons[stored.id] : nil
@@ -1078,7 +1079,7 @@ final class AppModel: ObservableObject {
             return .starting
         }
         // Fall back to the daemon's status for a daemon-run active sandbox.
-        guard id == activeLocalSandboxID else {
+        guard id == effectiveActiveLocalSandboxID else {
             return .stopped
         }
         switch status.state {
@@ -1089,6 +1090,25 @@ final class AppModel: ObservableObject {
         case .idle, .disconnected, .unknown:
             return .stopped
         }
+    }
+
+    /// The sandbox the daemon is running, whether or not *this* launch of the
+    /// app is the one that started it.
+    ///
+    /// `activeLocalSandboxID` only knows about sandboxes started since the app
+    /// opened, so on its own it makes a running guest disappear from the UI the
+    /// moment you quit and reopen. The daemon's own report fills that gap and
+    /// is deliberately the *fallback*, not the override: while this process is
+    /// mid-launch it knows something the daemon has not caught up with yet.
+    var effectiveActiveLocalSandboxID: String? {
+        if let activeLocalSandboxID { return activeLocalSandboxID }
+        guard status.state == .running else { return nil }
+        return DaemonRunOwner.match(
+            reportedName: status.name,
+            candidates: storedSandboxes
+                .filter { $0.location == .local }
+                .map { (id: $0.id, name: $0.name) }
+        )
     }
 
     /// Is there already a live local sandbox occupying the single VM slot?
@@ -1562,7 +1582,13 @@ final class AppModel: ObservableObject {
         case .running:
             return EngineIndicator(
                 label: "Sandbox running",
-                detail: status.name ?? "guest active",
+                // The daemon names an app-created sandbox by its workspace UUID,
+                // which tells the user nothing. Resolve it to the name they gave
+                // it, and only fall back to the raw string for a guest this app
+                // does not own.
+                detail: effectiveActiveLocalSandboxID.flatMap { id in
+                    storedSandboxes.first { $0.id == id }?.name
+                } ?? status.name ?? "guest active",
                 symbol: "play.circle.fill",
                 tone: .active
             )

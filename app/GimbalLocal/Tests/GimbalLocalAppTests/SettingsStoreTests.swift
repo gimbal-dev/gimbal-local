@@ -517,6 +517,7 @@ extension SettingsStoreTests {
         )
     }
 }
+
 // MARK: - Why Start did nothing
 
 final class SlotContentionTests: XCTestCase {
@@ -550,5 +551,65 @@ final class SlotContentionTests: XCTestCase {
     /// bug in the app rather than a fact about it.
     func testAnEmptyHolderNameIsTreatedAsNoHolder() {
         XCTAssertNil(SlotContention.evaluate(holderName: "", thisSandboxIsLive: false))
+    }
+}
+
+// MARK: - A running guest survives an app restart
+
+/// Quit the app with a sandbox running, reopen it, and every row read
+/// "Stopped" while `chm ctl status` said `running` — because the app matched
+/// the daemon's VM against a variable that only remembers sandboxes started
+/// since launch. The daemon reports the name; nobody read it.
+final class DaemonRunOwnerTests: XCTestCase {
+    private let candidates: [(id: String, name: String)] = [
+        (id: "4E40B07F-7534-48F4-B519-1EE674EF8E5D", name: "graviton-2"),
+        (id: "9BEA5058-1111-2222-3333-444455556666", name: "ch-arm-stock-its"),
+    ]
+
+    func testTheDaemonsUUIDResolvesToTheSandboxThatOwnsIt() {
+        XCTAssertEqual(
+            DaemonRunOwner.match(
+                reportedName: "4E40B07F-7534-48F4-B519-1EE674EF8E5D",
+                candidates: candidates
+            ),
+            "4E40B07F-7534-48F4-B519-1EE674EF8E5D"
+        )
+    }
+
+    func testALibraryNameResolvesToo() {
+        XCTAssertEqual(
+            DaemonRunOwner.match(reportedName: "ch-arm-stock-its", candidates: candidates),
+            "9BEA5058-1111-2222-3333-444455556666"
+        )
+    }
+
+    /// A guest started outside the app is real, and claiming an unrelated row
+    /// for it would be worse than admitting we do not know whose it is.
+    func testAnUnknownGuestClaimsNobody() {
+        XCTAssertNil(DaemonRunOwner.match(reportedName: "someones-scratch-vm", candidates: candidates))
+    }
+
+    func testNothingRunningResolvesToNothing() {
+        XCTAssertNil(DaemonRunOwner.match(reportedName: nil, candidates: candidates))
+        XCTAssertNil(DaemonRunOwner.match(reportedName: "", candidates: candidates))
+    }
+
+    /// Names are user-chosen and need not be unique. Guessing would mark one
+    /// sandbox running *and* disable Start on the other, from a coin toss.
+    func testADuplicateNameResolvesToNothingRatherThanGuessing() {
+        let twins: [(id: String, name: String)] = [
+            (id: "a", name: "dev"),
+            (id: "b", name: "dev"),
+        ]
+        XCTAssertNil(DaemonRunOwner.match(reportedName: "dev", candidates: twins))
+    }
+
+    /// An id must win even when some other sandbox happens to be *named* that.
+    func testIdentityBeatsANameCollision() {
+        let tricky: [(id: String, name: String)] = [
+            (id: "sandbox-7", name: "unrelated"),
+            (id: "zzz", name: "sandbox-7"),
+        ]
+        XCTAssertEqual(DaemonRunOwner.match(reportedName: "sandbox-7", candidates: tricky), "sandbox-7")
     }
 }
