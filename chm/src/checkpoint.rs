@@ -1323,7 +1323,10 @@ mod tests {
         // correct image rather than propagating the error.
         let recovered = root.join("recovered");
         dump_guest_ram(&recovered, &gm, &maps, Some(&short)).unwrap();
-        assert!(fs::read(&recovered).unwrap() == want, "the fallback must be correct, not just quiet");
+        assert!(
+            fs::read(&recovered).unwrap() == want,
+            "the fallback must be correct, not just quiet"
+        );
 
         let _ = fs::remove_dir_all(&root);
     }
