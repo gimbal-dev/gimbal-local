@@ -183,6 +183,23 @@ fn read_revision_manifest(rev_dir: &Path) -> Result<Revision, String> {
     let body = fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let rev: Revision =
         serde_json::from_str(&body).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    // The envelope carries its own version, and until now nothing read it. A
+    // manifest from a *newer* chm may use fields this build does not know how to
+    // honour, and serde would silently ignore them rather than say so -- so a
+    // checkpoint could be resumed with half its meaning dropped. Say it plainly
+    // instead. Older versions are deliberately still read: compatibility with
+    // what is already on disk is the whole point of versioning it.
+    if rev.manifest_version > REVISION_MANIFEST_VERSION {
+        return Err(format!(
+            "{} was written by a newer chm (manifest version {}, this build \
+             understands {}). Resuming it here could silently drop state it \
+             depends on. Upgrade chm, or cold-boot by deleting {}.",
+            path.display(),
+            rev.manifest_version,
+            REVISION_MANIFEST_VERSION,
+            rev_dir.display()
+        ));
+    }
     if rev.state.version != CHECKPOINT_VERSION {
         return Err(format!(
             "checkpoint version {} is not the supported version {} \
@@ -258,11 +275,42 @@ pub(crate) fn write_checkpoint(
     // consistent RAM+disk pair. Without this, rollback would restore an earlier
     // RAM image while the live overlay still held later disk writes -- an
     // inconsistent pair that can corrupt the guest fs on resume (#62).
+    //
+    // Bracket the copy with a fingerprint of the *live* overlays so the capture
+    // proves its own consistency rather than assuming it. Both call sites hold
+    // the writers still -- the suspend path has joined every thread, the live
+    // path has stopped the world -- so an inequality here means a writer we do
+    // not know about moved the overlays mid-copy, and the copy is torn.
+    //
+    // Checking is what makes the claim worth anything: #179 was a checkpoint
+    // whose stored fingerprint did not describe its own overlays, and nothing
+    // noticed until the *next* resume refused it, long after the session that
+    // produced it had ended. A capture that cannot describe itself must fail
+    // here, where the moment can still be retaken, rather than becoming a trap
+    // for a later run to spring.
+    let before = overlay_fingerprint(snapshot_dir);
     snapshot_overlays(snapshot_dir, &tmp)?;
+    let after = overlay_fingerprint(snapshot_dir);
+    if before != after {
+        return Err(format!(
+            "disk overlays moved while this checkpoint was capturing them \
+             ({} file(s) before, {} after), so the captured RAM and the captured \
+             disk describe different moments. Refusing to store a checkpoint that \
+             would be refused on resume. Retry with the guest quiesced.",
+            comparable_fingerprint(&before).len(),
+            comparable_fingerprint(&after).len(),
+        ));
+    }
 
     // Record what the overlays looked like at the instant this RAM was captured.
     // Read from the live dir (not the copy) so resume compares like with like.
-    let _ = fs::write(tmp.join(OVERLAY_FINGERPRINT), overlay_fingerprint(snapshot_dir));
+    //
+    // A failure here is not cosmetic and is not swallowed: a checkpoint with no
+    // fingerprint loses the #139 drift guard entirely, so it would resume
+    // against any disk state at all, silently.
+    fs::write(tmp.join(OVERLAY_FINGERPRINT), &after).map_err(|e| {
+        format!("write {}: {e}", tmp.join(OVERLAY_FINGERPRINT).display())
+    })?;
 
     let json =
         serde_json::to_string(&revision).map_err(|e| format!("serialize revision: {e}"))?;
@@ -280,8 +328,46 @@ pub(crate) fn write_checkpoint(
     }
     fs::rename(&tmp, &dir)
         .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), dir.display()))?;
+
+    // Prove the thing we just stored would actually resume, by running the very
+    // guard resume runs (#139) against it -- rather than assuming it because we
+    // wrote both sides ourselves. Writing and reading with the same code in the
+    // same run is exactly the blind spot that let a fingerprint-format change
+    // strand every existing checkpoint, and let #179 store one that could never
+    // be resumed. The cost is one directory listing.
+    verify_checkpoint_describes_overlays(snapshot_dir)?;
     prune_revisions(snapshot_dir);
     Ok(())
+}
+
+/// Check that the checkpoint now at HEAD describes the overlays actually on
+/// disk, using the same guard a resume would apply.
+///
+/// A checkpoint is a *pair* -- a RAM image and the disk state it remembers --
+/// and the pair is only worth storing if the two halves describe the same
+/// moment. Every other check of that pairing happens on the way *in* to a
+/// resume, which means a torn capture is discovered by the next run, long after
+/// the session that produced it has ended and can no longer retake it (#179).
+///
+/// So the writer verifies its own work. This is deliberately the same call the
+/// resume path makes rather than a reimplementation of it: a second opinion
+/// written from the same understanding would agree with the first one for the
+/// same wrong reasons.
+fn verify_checkpoint_describes_overlays(snapshot_dir: &Path) -> Result<(), String> {
+    let Some(drift) = overlay_drift(snapshot_dir) else {
+        return Ok(());
+    };
+    Err(format!(
+        "the checkpoint just written does not describe the overlays on disk \
+         ({} file(s) recorded, {} live), so resuming it would be refused. \
+         Something wrote to {} while it was being captured, which means the \
+         captured RAM and the captured disk are from different moments. The \
+         files are on disk but this checkpoint is not resumable; take another \
+         with the guest quiesced.",
+        drift.recorded_files,
+        drift.live_files,
+        snapshot_dir.join(LIVE_OVERLAYS_DIR).display(),
+    ))
 }
 
 /// The revision store directory (archived past revisions) for a snapshot.
@@ -1363,6 +1449,8 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::process;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn checkpoint_paths_are_under_the_snapshot_dir() {
@@ -2431,6 +2519,186 @@ mod tests {
             "gc must not touch a readable revision"
         );
         assert!(plan_gc(&snap).is_empty(), "gc must be idempotent");
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    // ---------------------------------------------------------------------
+    // Frozen on-disk fixtures.
+    //
+    // Every other test in this file writes its input with the same code that
+    // reads it back, so the pair agrees by construction and a *format* change
+    // moves both sides at once and is invisible. That blind spot is not
+    // hypothetical: it is exactly how a change that stopped fingerprinting
+    // `.bitmap` sidecars shipped green and stranded every checkpoint already on
+    // disk, each refusing to resume with an error blaming the user's disk.
+    //
+    // The fixtures under `chm/testdata/` are real artifacts, copied verbatim
+    // off a working machine. Nothing in this build can rewrite them, so they
+    // only agree with the current code if the current code still reads what is
+    // genuinely out there. Treat a failure here as "this change breaks
+    // checkpoints that already exist", never as "the fixture is stale".
+    // ---------------------------------------------------------------------
+
+    fn fixture(name: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join(name);
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    /// A real manifest from a working 2-vCPU userspace-GIC checkpoint.
+    ///
+    /// This is the guard that fires if a field is added to `Revision` without
+    /// `#[serde(default)]`: the fixture has no such field, so it stops parsing.
+    #[test]
+    fn a_real_manifest_already_on_disk_still_parses() {
+        let rev: Revision = serde_json::from_str(&fixture("manifest-v1-usgic-smp.json"))
+            .expect("a manifest written by a shipped build must still parse");
+        assert_eq!(rev.manifest_version, REVISION_MANIFEST_VERSION);
+        assert_eq!(rev.state.version, CHECKPOINT_VERSION);
+        assert_eq!(rev.state.vcpus.len(), 2, "captured as a 2-vCPU guest");
+        assert!(!rev.id.is_empty());
+    }
+
+    /// The same envelope with an *older* state shape: no `host_realtime_ns`,
+    /// no `usgic`, no `usgic_cpus`. Those three fields were added over time and
+    /// carry `#[serde(default)]` for exactly this reason; this proves that
+    /// discipline still holds rather than trusting the attribute is still there.
+    ///
+    /// Verified by deliberate breakage, which also mapped what this can and
+    /// cannot catch: dropping `#[serde(default)]` from `usgic_cpus` (a `Vec`)
+    /// fails this test with `missing field`, while dropping it from an `Option`
+    /// changes nothing -- serde already treats a missing `Option` as `None`. So
+    /// the exposure that needs guarding is additive `Vec` and scalar fields, and
+    /// this fixture guards exactly those.
+    #[test]
+    fn a_manifest_predating_the_additive_state_fields_still_parses() {
+        let rev: Revision = serde_json::from_str(&fixture("manifest-v1-pre-smp.json"))
+            .expect("fields added since must be optional, or old checkpoints die");
+        assert!(rev.state.host_realtime_ns.is_none());
+        assert!(rev.state.usgic.is_none());
+        assert!(rev.state.usgic_cpus.is_empty());
+        assert_eq!(rev.state.vcpus.len(), 1);
+    }
+
+    /// A manifest from a *newer* chm is refused by name rather than by silently
+    /// dropping the fields this build cannot honour.
+    #[test]
+    fn a_manifest_from_a_newer_chm_is_refused_with_a_reason() {
+        let snap = env::temp_dir().join(format!("chm-newerfmt-{}-{}", process::id(), line!()));
+        let _ = fs::remove_dir_all(&snap);
+        let dir = checkpoint_dir(&snap);
+        fs::create_dir_all(&dir).unwrap();
+        let bumped = fixture("manifest-v1-usgic-smp.json").replacen(
+            &format!("\"manifest_version\":{REVISION_MANIFEST_VERSION}"),
+            &format!("\"manifest_version\":{}", REVISION_MANIFEST_VERSION + 1),
+            1,
+        );
+        fs::write(dir.join(MANIFEST), &bumped).unwrap();
+
+        let Err(err) = read_revision(&snap) else {
+            panic!("a manifest from a newer chm must be refused");
+        };
+        assert!(
+            err.contains("newer chm") && err.contains("Upgrade chm"),
+            "the refusal must name the cause and a remedy, got: {err}"
+        );
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    /// A fingerprint file written before `.bitmap` sidecars stopped being
+    /// fingerprinted must still compare equal to one computed today for the
+    /// same overlays. This is the regression that stranded every checkpoint on
+    /// the development machine, frozen as the real artifact that caused it.
+    #[test]
+    fn a_fingerprint_file_from_before_the_format_change_still_matches_today() {
+        let stored = fixture("overlay-fingerprint-pre-v9.6");
+        assert!(
+            stored.lines().any(|l| l.contains(BITMAP_SUFFIX)),
+            "the fixture must be a genuine pre-change fingerprint, or it guards nothing"
+        );
+
+        // What today's code emits for those same overlays: the same lines, minus
+        // the bitmap, in sorted order.
+        let mut today: Vec<&str> = stored
+            .lines()
+            .filter(|l| !l.split(':').next().unwrap_or(l).ends_with(BITMAP_SUFFIX))
+            .collect();
+        today.sort_unstable();
+        let today = today.join("\n");
+
+        assert_eq!(
+            comparable_fingerprint(&stored),
+            comparable_fingerprint(&today),
+            "a checkpoint already on disk must still resume"
+        );
+    }
+
+    /// A checkpoint must be able to describe its own overlays the moment it is
+    /// written.
+    ///
+    /// #179: a deadline-suspend stored a checkpoint whose fingerprint predated
+    /// its own overlays by 16 seconds. Nothing noticed at write time, because
+    /// nothing looked; the failure surfaced on the *next* resume, as a refusal
+    /// that read like the user had corrupted their own disk. By then the guest
+    /// was gone and the moment could not be retaken.
+    #[test]
+    fn a_checkpoint_that_cannot_describe_its_own_overlays_fails_at_write_time() {
+        let snap = env::temp_dir().join(format!("chm-selfcheck-{}-{}", process::id(), line!()));
+        let _ = fs::remove_dir_all(&snap);
+        let live = snap.join(LIVE_OVERLAYS_DIR);
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("_disk0-cow.raw"), b"disk").unwrap();
+        let dir = checkpoint_dir(&snap);
+        fs::create_dir_all(&dir).unwrap();
+
+        // A checkpoint that recorded the overlays as they are: it verifies.
+        fs::write(dir.join(OVERLAY_FINGERPRINT), overlay_fingerprint(&snap)).unwrap();
+        assert!(
+            verify_checkpoint_describes_overlays(&snap).is_ok(),
+            "a checkpoint whose fingerprint matches its overlays must verify"
+        );
+
+        // Now let the overlays move on, as they did in #179.
+        thread::sleep(Duration::from_millis(20));
+        fs::write(live.join("_disk0-cow.raw"), b"disk-plus-later-writes").unwrap();
+
+        let Err(err) = verify_checkpoint_describes_overlays(&snap) else {
+            panic!("a checkpoint whose overlays moved under it must not be reported as written");
+        };
+        assert!(
+            err.contains("not resumable") && err.contains("quiesced"),
+            "the failure must say what is wrong and what to do, got: {err}"
+        );
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    /// The self-check is only worth having if it is the *same* check a resume
+    /// makes. A second implementation would drift from the first and agree with
+    /// it only by luck -- which is how #178 and #179 both happened.
+    #[test]
+    fn the_write_time_check_agrees_with_the_resume_time_guard() {
+        let snap = env::temp_dir().join(format!("chm-samecheck-{}-{}", process::id(), line!()));
+        let _ = fs::remove_dir_all(&snap);
+        let live = snap.join(LIVE_OVERLAYS_DIR);
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("_disk0-cow.raw"), b"a").unwrap();
+        // A pre-V9.6 fingerprint format: a bitmap line the writer no longer emits.
+        let dir = checkpoint_dir(&snap);
+        fs::create_dir_all(&dir).unwrap();
+        let stored = format!("{}\n_disk0-cow.raw.bitmap:64:1", overlay_fingerprint(&snap));
+        fs::write(dir.join(OVERLAY_FINGERPRINT), &stored).unwrap();
+
+        assert_eq!(
+            overlay_drift(&snap).is_none(),
+            verify_checkpoint_describes_overlays(&snap).is_ok(),
+            "the writer and the reader must reach the same verdict on the same state"
+        );
+        assert!(
+            verify_checkpoint_describes_overlays(&snap).is_ok(),
+            "an older fingerprint format is not drift"
+        );
 
         let _ = fs::remove_dir_all(&snap);
     }

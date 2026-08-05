@@ -182,6 +182,32 @@ filesystem that changed underneath it — the exact mismatch the overlay drift g
 refuses. `chm rollback` restores both halves together, which is the only
 consistent way back.
 
+## A checkpoint proves it can describe its own overlays
+
+The drift guard above runs at **resume**. That is the right place to catch a
+disk that moved between sessions, but it is the wrong place to first learn that
+a checkpoint was *never* consistent — by then the guest is gone and the only
+honest answer is a refusal.
+
+So writing a checkpoint now checks itself. The overlay copy is bracketed by a
+fingerprint before and after; if those differ the copy was torn while it was
+being made, and the write fails rather than producing a revision that looks
+finished. After the checkpoint is in place, `write_checkpoint` re-runs **the
+same `overlay_drift` check resume will run** — deliberately the same function,
+not a second implementation of the same idea, because two implementations of
+one rule eventually disagree and the disagreement is invisible until it strands
+something.
+
+This matters most on this path. A cadence checkpoint fires while the guest is
+running, and a deadline suspend fires with no guest flush behind it, so neither
+has a human watching for a capture that came out wrong.
+
+The failure it exists for was seen once and never reproduced: a deadline suspend
+whose data files ended up 16 seconds newer than the fingerprint recorded beside
+them, leaving a revision that refused to resume. The cause is still unknown. The
+guard does not explain it — it makes it loud, at the moment it happens, instead
+of silent until the next resume.
+
 ## Limits
 
 - **The freeze is real and still scales with guest RAM.** There is no dirty-page
