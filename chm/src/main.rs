@@ -33,6 +33,13 @@ mod console_filter;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod exec;
 
+// Delivering a spec's `env` and `postBootCommand` into a guest that is up
+// (#190). Reuses the `exec` framing, and establishes readiness by getting an
+// answer rather than by matching a prompt string no BYO image is obliged to
+// print.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod postboot;
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod checkpoint;
 
