@@ -389,8 +389,23 @@ struct NewSandboxMenu: View {
             // on a Mac that has never talked to either.
             Section("Cold boot from a local image") {
                 let bootable = model.localImages.compactMap(\.image)
+                let refused = model.localImages.filter { $0.image == nil }
                 if bootable.isEmpty {
-                    Text("No local images — add one to \(model.settings.localImagesPath)")
+                    // Name the layout, not just the path. Somewhere to put a
+                    // thing is useless without knowing what the thing is, and
+                    // this menu is where most people first look.
+                    if refused.isEmpty {
+                        Text("No local images yet")
+                        Text(FirstRunGuidance.layoutOneLine(
+                            imagesPath: model.settings.localImagesPath
+                        ))
+                    } else {
+                        // Do not point at the Sandboxes page — it only shows
+                        // rejections in its empty state, so the pointer would be
+                        // wrong for anyone who already has a sandbox. The
+                        // reasons follow immediately below anyway.
+                        Text("No local images can boot:")
+                    }
                 } else {
                     ForEach(bootable) { image in
                         Button {
@@ -400,8 +415,9 @@ struct NewSandboxMenu: View {
                         }
                     }
                 }
-                ForEach(model.localImages.filter { $0.image == nil }, id: \.name) { entry in
-                    Text("\(entry.name) — \(entry.rejection?.reason ?? "unusable")")
+                ForEach(refused, id: \.name) { entry in
+                    Text("\(entry.name) — "
+                         + FirstRunGuidance.plain(entry.rejection?.reason ?? "unusable"))
                 }
             }
         } label: {

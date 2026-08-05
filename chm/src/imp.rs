@@ -2767,10 +2767,12 @@ struct LiveSnapshotter {
 }
 
 /// How long the whole world may stay stopped for one live checkpoint before the
-/// attempt is abandoned. Generous next to the 1.5–4.5 s a 2 GiB guest measures
-/// on this hardware, but this is a *ceiling on damage*, not a target: crossing
-/// it means something is wrong, and the honest response is a missed checkpoint
-/// rather than a torn one.
+/// attempt is abandoned. Generous next to the 0.9–2.1 s a 2 GiB guest measures
+/// on this hardware (V9.1a; it was 1.5–4.5 s when every dump was a full image),
+/// but this is a *ceiling on damage*, not a target: crossing it means something
+/// is wrong, and the honest response is a missed checkpoint rather than a torn
+/// one. Deliberately not retuned down alongside the delta work — a timeout
+/// sized to the common case turns a slow disk into a lost checkpoint.
 const LIVE_SNAPSHOT_BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Decide what happens to HEAD when a run ends without writing a fresh
