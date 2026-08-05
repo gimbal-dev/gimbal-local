@@ -133,6 +133,31 @@ pub(crate) fn clear_checkpoint(snapshot_dir: &Path) {
     let _ = fs::remove_dir_all(checkpoint_dir(snapshot_dir));
 }
 
+/// Retire the current checkpoint into the revision store rather than deleting
+/// it, and report the id it was filed under.
+///
+/// `clear_checkpoint` is the right call when HEAD was written by this run's own
+/// teardown and the run went badly: a checkpoint of a dead guest is not one the
+/// next start should silently resume. It becomes the *wrong* call once
+/// continuous snapshots are on, because HEAD is then a point captured minutes
+/// earlier from a healthy guest — and #148 exists precisely so that a session
+/// which ends badly is not a session whose work is gone.
+///
+/// Archiving satisfies both duties at once: no HEAD is left for the next start
+/// to resume blindly, and the point stays reachable through `chm revisions` /
+/// `chm rollback`, which restore its RAM *and* the overlays captured with it.
+/// That pairing is the only consistent way back — the live overlays have moved
+/// on since, so resuming this RAM against them is exactly the torn RAM/disk pair
+/// the #139 drift guard refuses.
+pub(crate) fn retire_checkpoint(snapshot_dir: &Path) -> Option<String> {
+    let id = read_revision(snapshot_dir).ok()?.id;
+    archive_head(snapshot_dir, &id);
+    // Keep the store bounded on the way out. Safe for the revision just filed:
+    // pruning keeps the newest, and nothing is newer than this.
+    prune_revisions(snapshot_dir);
+    Some(id)
+}
+
 /// Read a revision's full manifest (lineage header + hardware state).
 pub(crate) fn read_revision(snapshot_dir: &Path) -> Result<Revision, String> {
     read_revision_manifest(&checkpoint_dir(snapshot_dir))
@@ -240,7 +265,7 @@ fn revisions_dir(snapshot_dir: &Path) -> PathBuf {
     snapshot_dir.join(REVISIONS_SUBDIR)
 }
 
-fn max_resumable_revisions() -> usize {
+pub(crate) fn max_resumable_revisions() -> usize {
     env::var("CHM_MAX_RESUMABLE_REVISIONS")
         .ok()
         .and_then(|v| v.parse().ok())
@@ -1006,6 +1031,46 @@ mod tests {
         );
         // Forking a dir with no checkpoint is refused.
         assert!(fork_into(&root.join("nope"), &root.join("nope2")).is_err());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A run that ends badly must not throw away a point the cadence took while
+    /// the guest was healthy -- that failure is the whole reason #148 exists.
+    #[test]
+    fn retiring_a_head_files_it_in_the_lineage_instead_of_deleting_it() {
+        let root = std::env::temp_dir().join(format!("chm-retire-{}", process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        write_test_checkpoint(&root, b"first", "connect-auto");
+        write_test_checkpoint(&root, b"second!", "connect-auto");
+        let head = read_revision(&root).unwrap().id;
+
+        let retired = retire_checkpoint(&root).expect("HEAD exists, so it is filed");
+        assert_eq!(retired, head, "reports the id a reader can roll back to");
+        assert!(
+            read_revision(&root).is_err(),
+            "no HEAD is left for the next start to resume blindly"
+        );
+
+        let ids: Vec<_> = list_revisions(&root)
+            .into_iter()
+            .map(|r| r.revision.id)
+            .collect();
+        assert!(ids.contains(&head), "the retired point is still reachable: {ids:?}");
+        let filed = list_revisions(&root)
+            .into_iter()
+            .find(|r| r.revision.id == head)
+            .unwrap();
+        assert!(
+            filed.resumable,
+            "filed with its RAM, or `chm rollback` could not honour the advice"
+        );
+
+        // With nothing to retire the call is a no-op rather than an error, so a
+        // caller need not know whether a checkpoint was ever written.
+        assert_eq!(retire_checkpoint(&root), None);
 
         let _ = fs::remove_dir_all(&root);
     }
