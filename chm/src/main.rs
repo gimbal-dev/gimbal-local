@@ -43,6 +43,12 @@ mod postboot;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod checkpoint;
 
+// Moving a lineage between machines: the export/import bundle format (V9.5c,
+// #177). Lives beside `checkpoint` because it is a *format* question -- what a
+// revision is once it leaves this disk -- not a lifecycle one.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod bundle;
+
 // Live checkpointing: the stop-the-world rendezvous that lets a running guest
 // be captured and carry on, rather than only being captured on its way out.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

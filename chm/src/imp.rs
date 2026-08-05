@@ -14,6 +14,7 @@ use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, io, thread};
 
+use crate::bundle;
 use crate::checkpoint;
 use crate::livesnap;
 use crate::create::create_main;
@@ -1507,7 +1508,9 @@ const REVISIONS_USAGE: &str = "usage: chm revisions <SNAPSHOT_DIR> [--json] [--u
      chm revisions <SNAPSHOT_DIR> unpin  <REVISION_ID>\n       \
      chm revisions <SNAPSHOT_DIR> label  <REVISION_ID> <TEXT>|--clear\n       \
      chm revisions <SNAPSHOT_DIR> delete <REVISION_ID> [--dry-run]\n       \
-     chm revisions <SNAPSHOT_DIR> gc [--dry-run]\n\
+     chm revisions <SNAPSHOT_DIR> gc [--dry-run]\n       \
+     chm revisions <SNAPSHOT_DIR> export <REVISION_ID>|--all <BUNDLE_DIR>\n       \
+     chm revisions <SNAPSHOT_DIR> import <BUNDLE_DIR> [--dry-run] [--skip-existing]\n\
      \n\
      List the snapshot's saved revisions (its lineage), oldest first, with\n     \
      how long ago each was taken. `resumable` marks revisions whose live\n     \
@@ -1534,9 +1537,23 @@ const REVISIONS_USAGE: &str = "usage: chm revisions <SNAPSHOT_DIR> [--json] [--u
      revisions are refused.\n\
      \n\
      `gc` reclaims state no reader can reach: a staging directory left\n     \
-     by an interrupted checkpoint, and revision directories whose\n     \
-     manifest will not parse. Both hold a whole RAM dump while being\n     \
-     invisible to `chm revisions`.\n\
+     by an interrupted checkpoint or import, and revision directories\n     \
+     whose manifest will not parse. Both hold a whole RAM dump while\n     \
+     being invisible to `chm revisions`.\n\
+     \n\
+     `export` writes revisions into a portable bundle directory. Its\n     \
+     payload is content-addressed on the same 64 KiB grid the delta\n     \
+     writer uses, so a lineage whose revisions overlap exports at close\n     \
+     to the size of one of them rather than the sum of all. The bundle\n     \
+     does NOT contain the base snapshot and never rewrites it — it\n     \
+     records the base's identity so an import can refuse a mismatch.\n     \
+     `tar` the directory if you want a single file.\n\
+     \n\
+     `import` adds a bundle's revisions to this snapshot's lineage. The\n     \
+     target must be the same base snapshot the bundle came from. An\n     \
+     imported revision never becomes HEAD — use `chm rollback` to move\n     \
+     there deliberately. A revision id already present is refused;\n     \
+     --skip-existing imports the rest instead.\n\
      \n\
      `--usage` reports what the lineage occupies. A fork hard-links its\n\
      parent's RAM dump, so shared content is counted once for the\n\
@@ -1546,13 +1563,16 @@ const REVISIONS_USAGE: &str = "usage: chm revisions <SNAPSHOT_DIR> [--json] [--u
 
 /// How many positional arguments each `revisions` verb takes, including the
 /// directory and the verb itself. `None` is "not a verb".
-fn revisions_arity(verb: &str, clearing: bool) -> Option<usize> {
+fn revisions_arity(verb: &str, clearing: bool, all: bool) -> Option<usize> {
     match verb {
-        "pin" | "unpin" | "delete" => Some(3),
+        "pin" | "unpin" | "delete" | "import" => Some(3),
         "gc" => Some(2),
         // `label <ID> <TEXT>`, or `label <ID> --clear` where the flag is not a
         // positional.
         "label" => Some(if clearing { 3 } else { 4 }),
+        // `export <ID> <DIR>`, or `export --all <DIR>` where the flag is not a
+        // positional.
+        "export" => Some(if all { 3 } else { 4 }),
         _ => None,
     }
 }
@@ -1562,6 +1582,8 @@ fn revisions(raw: &[String]) -> Result<ExitCode, String> {
     let usage_only = raw.iter().any(|a| a == "--usage");
     let dry_run = raw.iter().any(|a| a == "--dry-run");
     let clearing = raw.iter().any(|a| a == "--clear");
+    let all = raw.iter().any(|a| a == "--all");
+    let skip_existing = raw.iter().any(|a| a == "--skip-existing");
     let positionals: Vec<&String> = raw.iter().filter(|a| !a.starts_with('-')).collect();
 
     // Every verb acts on a revision inside a snapshot, so they follow the
@@ -1570,7 +1592,7 @@ fn revisions(raw: &[String]) -> Result<ExitCode, String> {
     // putting it second here would make the directory's position depend on
     // whether a sub-verb was given.
     let verb = positionals.get(1).map(|s| s.as_str());
-    let arity = verb.and_then(|v| revisions_arity(v, clearing));
+    let arity = verb.and_then(|v| revisions_arity(v, clearing, all));
     let expected = arity.unwrap_or(1);
 
     if raw.iter().any(|a| a == "-h" || a == "--help") || positionals.len() != expected {
@@ -1585,7 +1607,8 @@ fn revisions(raw: &[String]) -> Result<ExitCode, String> {
             ))
         } else if positionals.len() > 1 {
             Err(format!(
-                "expected one of pin, unpin, label, delete, gc after the directory, got `{}`",
+                "expected one of pin, unpin, label, delete, gc, export, import \
+                 after the directory, got `{}`",
                 positionals[1]
             ))
         } else {
@@ -1595,7 +1618,13 @@ fn revisions(raw: &[String]) -> Result<ExitCode, String> {
 
     if let Some(verb) = verb {
         let dir = PathBuf::from(positionals[0]);
-        return revisions_verb(&dir, verb, &positionals, dry_run, clearing);
+        let opts = RevisionsOpts {
+            dry_run,
+            clearing,
+            all,
+            skip_existing,
+        };
+        return revisions_verb(&dir, verb, &positionals, &opts);
     }
 
     let dir = PathBuf::from(positionals[0]);
@@ -1680,14 +1709,23 @@ fn revisions(raw: &[String]) -> Result<ExitCode, String> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Flags shared by the `revisions` sub-verbs, so adding one does not add a
+/// positional parameter to a function four verbs already share.
+struct RevisionsOpts {
+    dry_run: bool,
+    clearing: bool,
+    all: bool,
+    skip_existing: bool,
+}
+
 /// Dispatch a `chm revisions <dir> <verb>` sub-verb.
 fn revisions_verb(
     dir: &Path,
     verb: &str,
     positionals: &[&String],
-    dry_run: bool,
-    clearing: bool,
+    opts: &RevisionsOpts,
 ) -> Result<ExitCode, String> {
+    let dry_run = opts.dry_run;
     match verb {
         "pin" | "unpin" => {
             let rev = positionals[2];
@@ -1702,7 +1740,7 @@ fn revisions_verb(
         }
         "label" => {
             let rev = positionals[2];
-            let text = if clearing { None } else { Some(positionals[3].as_str()) };
+            let text = if opts.clearing { None } else { Some(positionals[3].as_str()) };
             match checkpoint::label_revision(dir, rev, text)? {
                 Some(stored) => println!("{rev} labelled \"{stored}\""),
                 None => println!("{rev} label cleared"),
@@ -1760,6 +1798,82 @@ fn revisions_verb(
                 return Err(format!("{} item(s) could not be removed", errors.len()));
             }
         }
+        "export" => {
+            // `--all` and an explicit id are the same code path with a
+            // different id list, so a bundle written either way is identical.
+            let (ids, out) = if opts.all {
+                (Vec::new(), positionals[2])
+            } else {
+                (vec![positionals[2].to_string()], positionals[3])
+            };
+            let report = bundle::export(dir, &ids, Path::new(out.as_str()))?;
+            println!(
+                "exported {} revision(s) to {}",
+                report.revisions.len(),
+                report.bundle.display()
+            );
+            for id in &report.revisions {
+                println!("  {id}");
+            }
+            println!("  {} stored", human_bytes(report.stored));
+            let saved = report.apparent.saturating_sub(report.stored);
+            if saved > 0 {
+                println!(
+                    "  {} of their {} is shared between revisions and stored once",
+                    human_bytes(saved),
+                    human_bytes(report.apparent)
+                );
+            }
+        }
+        "import" => {
+            let src = Path::new(positionals[2].as_str());
+            if dry_run {
+                for line in bundle::describe(src)? {
+                    println!("{line}");
+                }
+            }
+            let on_collision = if opts.skip_existing {
+                bundle::OnCollision::Skip
+            } else {
+                bundle::OnCollision::Refuse
+            };
+            let report = bundle::import(src, dir, on_collision, dry_run)?;
+            let verbed = if dry_run { "would import" } else { "imported" };
+            println!(
+                "{verbed} {} revision(s) ({}) into {}",
+                report.imported.len(),
+                human_bytes(report.bytes),
+                dir.display()
+            );
+            for id in &report.imported {
+                println!("  {id}");
+            }
+            // What it cost, not what it looks like. Revisions are cloned from
+            // each other on the way in, so the apparent total is a ceiling that
+            // can exceed the real one by an order of magnitude.
+            if !dry_run && !report.imported.is_empty() {
+                println!("  {} written to disk", human_bytes(report.written));
+                let shared = report.bytes.saturating_sub(report.written);
+                if shared > 0 {
+                    println!("  {} of that is shared between them", human_bytes(shared));
+                }
+            }
+            for id in &report.skipped {
+                println!("  {id} already here, left alone");
+            }
+            // A pin is a statement about the *source* machine's retention
+            // budget, so it is reported rather than applied -- see
+            // `bundle::NOT_CARRIED`.
+            for id in &report.pinned_at_source {
+                println!("  {id} was pinned at the source; `pin` it here if you agree");
+            }
+            if !report.imported.is_empty() && !dry_run {
+                println!(
+                    "HEAD is unchanged; `chm rollback {} <REVISION_ID>` to move there",
+                    dir.display()
+                );
+            }
+        }
         _ => return Err(format!("unknown revisions verb `{verb}`")),
     }
     Ok(ExitCode::SUCCESS)
@@ -1807,7 +1921,7 @@ fn human_duration(d: Duration) -> String {
 
 /// Bytes at a scale a person can act on. Disk-usage output exists to answer
 /// "what is using 40 GB?", and a 17-digit number does not answer it.
-fn human_bytes(n: u64) -> String {
+pub(crate) fn human_bytes(n: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
     let mut v = n as f64;
     let mut u = 0;
@@ -4114,7 +4228,7 @@ mod revisions_args_tests {
     /// Reading the same constant the parser prints makes them one thing.
     #[test]
     fn the_usage_text_documents_the_order_the_parser_accepts() {
-        for verb in ["pin", "unpin", "label", "delete", "gc"] {
+        for verb in ["pin", "unpin", "label", "delete", "gc", "export", "import"] {
             assert!(
                 REVISIONS_USAGE.contains(&format!("<SNAPSHOT_DIR> {verb}")),
                 "help must show `{verb}` after the directory, got:\n{REVISIONS_USAGE}"
@@ -4124,7 +4238,7 @@ mod revisions_args_tests {
                 "help must not document verb-first, which the parser refuses"
             );
             assert!(
-                revisions_arity(verb, false).is_some(),
+                revisions_arity(verb, false, false).is_some(),
                 "`{verb}` is documented but the parser does not dispatch it"
             );
         }
