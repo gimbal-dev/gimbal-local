@@ -37,7 +37,7 @@ after reading what Cloudflare shipped in
 | **G5** | **Off-box credentials** | ✅ **done** | Injected at the network edge; guest never holds one (V5.2, I12). In-app rule builder with no field that can hold a token (V8.5). |
 | **G6** | **Create local images — from vanilla *or from containers*** | 🟡 **half** | Vanilla: done (cold boot, BYO). **Containers: nothing.** No OCI/Docker→rootfs path exists anywhere in the tree. |
 | **G7** | **A consistent CLI with all features** | ✅ **done** | **24** subcommands, **all 24 now in `chm --help`** (V9.4), grouped by what they need — six require a control plane, which a local-only install has to be told. Every one honours its own `--help`, checked rather than claimed. A guard test reads the dispatch table from source and fails if a future command is added without a help entry. The app drives **19** of the 24; the rest are diagnostic or control-plane. |
-| **G8** | **Snapshot management** | 🟡 **partial** | Have: lineage, fork, rollback, bounded growth, **retention roots (pin/unpin) and disk-usage reporting** — see [`snapshot-retention.md`](snapshot-retention.md). Missing: **delete, garbage-collect, rename, export/import.** Nothing reclaims a snapshot you no longer want. |
+| **G8** | **Snapshot management** | 🟡 **partial** | Have: lineage, fork, rollback, bounded growth, retention roots (pin/unpin), disk-usage reporting, and **delete, gc and label** — see [`snapshot-retention.md`](snapshot-retention.md). Deleting a parent is measured not to strand its descendants: a 2 vCPU guest resumed to a login shell from a revision whose parent had been deleted, and the bytes the command reports reclaiming (1.4 GiB) match what the volume gave back (1452 MiB). Missing: **export/import**, which is a portability question rather than a lifecycle one. |
 
 ### Goals we already held, stated explicitly
 
@@ -167,16 +167,16 @@ Reverse chronological, all merged and hardware-verified:
 
 | # | Milestone | Merged | Serves |
 | --- | --- | --- | --- |
-| 1 | **V8.5 · A first-run empty state that teaches** — names what an image *is*, surfaces the discovery rejections up front, and removes a gate that greyed out cold boot whenever the snapshot library was empty (#175) | 08-05 | **G9**, G1 |
-| 2 | **V9.6 · A deadline suspends instead of cutting power** — `--max-seconds`/`--idle-exit` save a resumable checkpoint, and a latent #139 bug where a checkpoint's own teardown invalidated its own fingerprint is fixed (#172) | 08-05 | **G18**, G2 |
-| 3 | **V9.1a · Delta RAM dumps + reclaim-honest accounting** — a live snapshot rewrites only the 64 KiB chunks that changed, and usage reports what deleting a revision would actually give back (#167) | 08-05 | **G2**, G8 |
-| 4 | **V9.1 · Continuous snapshots** — checkpoint a *running* guest on a cadence; a session that ends badly keeps its work (#148) | 08-05 | **G2**, G8 |
-| 5 | **V9.5a · Retention roots + honest disk accounting** — pin a revision so age-based pruning cannot reclaim it, and report what a lineage really costs (#152, part) | 08-04 | **G8**, G2 |
-| 6 | **V9.4 · CLI completeness** — all 24 subcommands in `chm --help`, grouped by what they need, with a guard test that reads the dispatch table from source (#151) | 08-04 | **G7** |
-| 7 | **V8.7 · Proxy rules imply egress allowance** — naming a host in an injection rule makes it reachable, scoped to its own ports and only within one authority (#145) | 08-04 | **G4**, G5 |
-| 8 | **V9.2 · `chm exec`** — run a command in a sandbox and exit with *its* status; a transport failure is never reportable as success (#161) | 08-04 | **G16**, G7 |
-| 9 | **V8.4 + credential builder** — settings persist; a rule builder with no field that can hold a token; `chm` is the authority on whether a rule is valid (#147) | 08-04 | G5, G9 |
-| 10 | **V8.3 · Bring-your-own images** — an image directory with typed refusals; the symlink rule found by using it (#146) | 08-03 | **G1** |
+| 1 | **V9.5b · Snapshot reclaim: delete, gc, label** — delete a revision and be told what it really gave back; collect what no reader can reach; name a point so a timeline of timestamps becomes a list of reasons. Fixes a resume regression that had made **every existing checkpoint** refuse to start (#178) | 08-06 | **G8**, G2 |
+| 2 | **V8.5 · A first-run empty state that teaches** — names what an image *is*, surfaces the discovery rejections up front, and removes a gate that greyed out cold boot whenever the snapshot library was empty (#175) | 08-05 | **G9**, G1 |
+| 3 | **V9.6 · A deadline suspends instead of cutting power** — `--max-seconds`/`--idle-exit` save a resumable checkpoint, and a latent #139 bug where a checkpoint's own teardown invalidated its own fingerprint is fixed (#172) | 08-05 | **G18**, G2 |
+| 4 | **V9.1a · Delta RAM dumps + reclaim-honest accounting** — a live snapshot rewrites only the 64 KiB chunks that changed, and usage reports what deleting a revision would actually give back (#167) | 08-05 | **G2**, G8 |
+| 5 | **V9.1 · Continuous snapshots** — checkpoint a *running* guest on a cadence; a session that ends badly keeps its work (#148) | 08-05 | **G2**, G8 |
+| 6 | **V9.5a · Retention roots + honest disk accounting** — pin a revision so age-based pruning cannot reclaim it, and report what a lineage really costs (#152, part) | 08-04 | **G8**, G2 |
+| 7 | **V9.4 · CLI completeness** — all 24 subcommands in `chm --help`, grouped by what they need, with a guard test that reads the dispatch table from source (#151) | 08-04 | **G7** |
+| 8 | **V8.7 · Proxy rules imply egress allowance** — naming a host in an injection rule makes it reachable, scoped to its own ports and only within one authority (#145) | 08-04 | **G4**, G5 |
+| 9 | **V9.2 · `chm exec`** — run a command in a sandbox and exit with *its* status; a transport failure is never reportable as success (#161) | 08-04 | **G16**, G7 |
+| 10 | **V8.4 + credential builder** — settings persist; a rule builder with no field that can hold a token; `chm` is the authority on whether a rule is valid (#147) | 08-04 | G5, G9 |
 
 ### What is outstanding, against the local ship
 
@@ -187,7 +187,7 @@ it is the track [`living-workspaces.md`](living-workspaces.md) creates.
 | | Milestone | Goal | Why now | Size |
 | --- | --- | --- | --- | --- |
 | **V8.6** (#144) | **A build someone else can run** — signed `.app` that finds its own `chm`, and an honest statement of what it needs | G10 | Nothing else on this list matters if the answer to *"can I have it?"* is *"clone the repo and re-sign the binary"*. **The one true blocker.** | M |
-| **V9.5b ★** (#152) | **Snapshot lifecycle, the reclaim half** — delete with a reachability refusal, CAS garbage collection, rename, export/import | **G8** | Retention roots and disk accounting **shipped** (V9.5a), which is what V9.1 was waiting on — so this no longer sits ahead of it. Nothing still reclaims a snapshot you no longer want. Deletion must refuse clearly when it would strand a descendant, as overlay drift does (#139); never a silent `rm -rf`. | M |
+| **V9.5c ★** (#177) | **Snapshot export / import** — move a lineage between machines | **G8** | The last piece of G8, and split out of V9.5b deliberately: delete/gc/label are *lifecycle* and shipped, while export/import is a **portability format** question — it has to answer C1 (a vanilla CH snapshot stays vanilla) and decide what an outer envelope carries, which is the same decision V10 needs. Sizing it as a lifecycle chore would have got that wrong. | M |
 | **V9.3 ★** (#150) | **The sandbox spec** — one declarative document: image, sizing, egress, credentials, env, entrypoint, lifetime | **G15** | Makes a sandbox reproducible and diffable, removes the app's duplicate flag assembly, and is the unit the control plane will want. | L |
 | **V9.7 ★** (#153) | **Containers → image** — build a bootable rootfs from an OCI image | **G6** | The half of "create local images" that does not exist. Turns the whole container ecosystem into sandbox images. | L |
 | **V9.8 ★** (#156) | **Runtime-mutable egress policy** | **G17** | Change what a sandbox may reach without throwing away its work. | M |

@@ -33,7 +33,7 @@
 
 use std::env;
 use std::fs;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{ErrorKind, Read, Seek, SeekFrom, Write};
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::mem;
@@ -376,12 +376,12 @@ pub(crate) fn revision_summaries(snapshot_dir: &Path) -> Vec<RevisionSummary> {
             pinned: is_pinned_dir(&info.dir),
             bytes: revision_bytes(&info.dir),
             frees: revision_frees(&info.dir),
+            label: label_for(&info.dir, info.revision.label),
             id: info.revision.id,
             parent: info.revision.parent,
             base_image: info.revision.base_image,
             created_at_ms: info.revision.created_at_ms,
             origin: info.revision.origin,
-            label: info.revision.label,
             resumable: info.resumable,
             is_head: info.is_head,
         })
@@ -645,6 +645,201 @@ pub(crate) fn pin_revision(
         fs::remove_file(&marker).map_err(|e| format!("unpin {rev_id}: {e}"))?;
     }
     Ok(true)
+}
+
+/// A revision's human name.
+///
+/// A sidecar file for the same two reasons as the pin marker, plus one that is
+/// decisive here: the manifest embeds the entire captured hardware state, tens
+/// of kilobytes of it. Rewriting that file to edit one string round-trips a
+/// *resumable checkpoint* through serde to change something serde never needed
+/// to see, and any asymmetry there costs the checkpoint rather than the label.
+///
+/// `Revision.label` is still read as a fallback, so a manifest carrying one is
+/// honoured — but nothing in this crate writes that field.
+const LABEL_FILE: &str = "label";
+
+/// The longest label we will store. Long enough for a sentence explaining why a
+/// point matters, short enough that `chm revisions` stays a table.
+const LABEL_MAX: usize = 120;
+
+/// A revision's label: the sidecar if present, else whatever the manifest said.
+fn label_for(revision_dir: &Path, from_manifest: Option<String>) -> Option<String> {
+    match fs::read_to_string(revision_dir.join(LABEL_FILE)) {
+        Ok(text) => {
+            let trimmed = text.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_string())
+        }
+        Err(_) => from_manifest,
+    }
+}
+
+/// Name a revision, or clear its name with `None`. Returns the label as stored.
+pub(crate) fn label_revision(
+    snapshot_dir: &Path,
+    rev_id: &str,
+    label: Option<&str>,
+) -> Result<Option<String>, String> {
+    let dir = resolve_revision_dir(snapshot_dir, rev_id)?;
+    let path = dir.join(LABEL_FILE);
+    let Some(text) = label else {
+        match fs::remove_file(&path) {
+            Ok(()) => return Ok(None),
+            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(format!("clear label on {rev_id}: {e}")),
+        }
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return Err("a label cannot be empty (pass --clear to remove one)".to_string());
+    }
+    // A label is printed in a one-line-per-revision table and echoed back in
+    // error messages, so a control character would corrupt output that a reader
+    // is using to decide what to delete. Refuse rather than silently mangle.
+    if text.chars().any(char::is_control) {
+        return Err(format!("label for {rev_id} contains a control character"));
+    }
+    if text.chars().count() > LABEL_MAX {
+        return Err(format!(
+            "label for {rev_id} is longer than {LABEL_MAX} characters"
+        ));
+    }
+    // Staged and renamed, so a label is never half-written.
+    let tmp = dir.join(format!("{LABEL_FILE}.tmp"));
+    fs::write(&tmp, format!("{text}\n")).map_err(|e| format!("label {rev_id}: {e}"))?;
+    fs::rename(&tmp, &path).map_err(|e| format!("label {rev_id}: {e}"))?;
+    Ok(Some(text.to_string()))
+}
+
+/// What deleting a revision will do, worked out before anything is removed so
+/// that `--dry-run` and the real thing cannot disagree — they run the same code.
+#[derive(Debug)]
+pub(crate) struct DeletePlan {
+    pub id: String,
+    /// Bytes this delete actually gives back: extents no other file shares.
+    /// Exact, and legitimately zero when the content is shared with a fork or
+    /// an APFS clone made elsewhere — in which case the delete is free and also
+    /// reclaims nothing, which is worth saying out loud.
+    pub frees: u64,
+    /// Whether the RAM dump was still retained (deleting a resumable revision
+    /// loses a point you could have returned to; a metadata-only one is a
+    /// headstone whose payload age already reclaimed).
+    pub resumable: bool,
+    /// Revisions recording this one as their parent.
+    ///
+    /// **They keep working.** A RAM dump is a complete image of guest memory —
+    /// `dump_guest_ram_delta` clones the parent file and overwrites the changed
+    /// chunks, so the child shares *extents* with its parent, never *dependency*
+    /// — and nothing on the restore path walks `parent` at all. So this is not a
+    /// hazard list; it is the set of manifests that will keep naming an id that
+    /// is gone, which `chm revisions` reports as `(deleted)`.
+    pub orphans: Vec<String>,
+}
+
+/// Decide what deleting `rev_id` means, and refuse if it should not happen.
+pub(crate) fn plan_delete(snapshot_dir: &Path, rev_id: &str) -> Result<DeletePlan, String> {
+    let dir = resolve_revision_dir(snapshot_dir, rev_id)?;
+    // HEAD is the state this snapshot resumes from — live state, not history.
+    // Deleting it would silently turn the next start into a cold boot.
+    if dir == checkpoint_dir(snapshot_dir) {
+        return Err(format!(
+            "revision {rev_id} is HEAD: the state this snapshot resumes from, not history. \
+             Roll back to an earlier revision (or take a newer checkpoint) to make it \
+             history first."
+        ));
+    }
+    // Named remedy rather than a `--force`. A force flag invites reflex, and the
+    // whole point of a pin is that removing it should be a separate decision.
+    if is_pinned_dir(&dir) {
+        return Err(format!(
+            "revision {rev_id} is pinned as a retention root; \
+             `chm revisions <dir> unpin {rev_id}` first"
+        ));
+    }
+    let orphans = list_revisions(snapshot_dir)
+        .into_iter()
+        .filter(|info| info.revision.parent.as_deref() == Some(rev_id))
+        .map(|info| info.revision.id)
+        .collect();
+    Ok(DeletePlan {
+        id: rev_id.to_string(),
+        frees: revision_frees(&dir),
+        resumable: dir.join(MEMORY_RANGES).is_file(),
+        orphans,
+    })
+}
+
+/// Delete an archived revision. The returned plan describes what was done.
+pub(crate) fn delete_revision(snapshot_dir: &Path, rev_id: &str) -> Result<DeletePlan, String> {
+    let plan = plan_delete(snapshot_dir, rev_id)?;
+    let dir = resolve_revision_dir(snapshot_dir, rev_id)?;
+    fs::remove_dir_all(&dir).map_err(|e| format!("delete {rev_id}: {e}"))?;
+    Ok(plan)
+}
+
+/// Something taking up disk that no reader can ever reach.
+#[derive(Debug)]
+pub(crate) struct GcItem {
+    pub path: PathBuf,
+    pub reason: &'static str,
+    pub frees: u64,
+}
+
+/// Find unreachable state in a snapshot's revision store.
+///
+/// Scoped to the snapshot deliberately. The pull cache in `control_plane` is a
+/// *shared* content-addressed store keyed by digest: collecting it from here
+/// would let one snapshot's cleanup delete blobs another is about to reuse.
+pub(crate) fn plan_gc(snapshot_dir: &Path) -> Vec<GcItem> {
+    let mut items = Vec::new();
+
+    // `write_checkpoint` stages into `<checkpoint dir>.tmp` and renames. An
+    // interrupted suspend leaves the staging dir holding a whole RAM dump, and
+    // only the *next* checkpoint of this snapshot clears it — so without this,
+    // reclaiming it means running a guest.
+    let mut staging = checkpoint_dir(snapshot_dir).into_os_string();
+    staging.push(".tmp");
+    let staging = PathBuf::from(staging);
+    if staging.is_dir() {
+        items.push(GcItem {
+            frees: revision_frees(&staging),
+            path: staging,
+            reason: "interrupted checkpoint",
+        });
+    }
+
+    // A revision directory whose manifest will not parse is skipped by
+    // `list_revisions`, so it is invisible to every reader while still holding
+    // its RAM dump. Nothing can ever resume or roll back to it.
+    if let Ok(entries) = fs::read_dir(revisions_dir(snapshot_dir)) {
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if dir.is_dir() && read_revision_manifest(&dir).is_err() {
+                items.push(GcItem {
+                    frees: revision_frees(&dir),
+                    path: dir,
+                    reason: "unreadable manifest",
+                });
+            }
+        }
+    }
+    items.sort_by(|a, b| a.path.cmp(&b.path));
+    items
+}
+
+/// Remove what `plan_gc` found. Returns the items removed and any failures,
+/// rather than stopping at the first — one undeletable directory should not
+/// keep the rest of the disk hostage.
+pub(crate) fn run_gc(snapshot_dir: &Path) -> (Vec<GcItem>, Vec<String>) {
+    let mut removed = Vec::new();
+    let mut errors = Vec::new();
+    for item in plan_gc(snapshot_dir) {
+        match fs::remove_dir_all(&item.path) {
+            Ok(()) => removed.push(item),
+            Err(e) => errors.push(format!("{}: {e}", item.path.display())),
+        }
+    }
+    (removed, errors)
 }
 
 /// Where a revision id lives, whether it is archived or the live HEAD.
@@ -2019,6 +2214,223 @@ mod tests {
             overlay_drift(&snap).is_some(),
             "a write to the CoW data file is real drift and must still be caught"
         );
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    /// The premise `delete` rests on: a revision does not depend on its parent.
+    ///
+    /// `dump_guest_ram_delta` clones the parent's dump and overwrites the chunks
+    /// that changed, so a child shares *extents* with its parent and never
+    /// *dependency* -- and nothing on the restore path walks `parent` at all.
+    /// Verified on hardware too: a 2 vCPU guest resumed to a login shell from a
+    /// revision whose parent directory had been deleted.
+    #[test]
+    fn deleting_a_parent_leaves_its_child_byte_identical() {
+        let snap = env::temp_dir().join(format!("chm-delindep-{}-{}", process::id(), now_ms()));
+        let _ = fs::remove_dir_all(&snap);
+        fs::create_dir_all(&snap).unwrap();
+        write_test_checkpoint(&snap, b"first", "connect");
+        write_test_checkpoint(&snap, b"second", "connect");
+        write_test_checkpoint(&snap, b"third", "connect");
+
+        let all = revision_summaries(&snap);
+        let parent = &all[1];
+        let child = all
+            .iter()
+            .find(|r| r.parent.as_deref() == Some(parent.id.as_str()))
+            .expect("a child of the middle revision");
+        let child_dir = resolve_revision_dir(&snap, &child.id).unwrap();
+        let before = fs::read(child_dir.join(MEMORY_RANGES)).unwrap();
+
+        let plan = delete_revision(&snap, &parent.id).unwrap();
+        assert_eq!(plan.orphans, vec![child.id.clone()]);
+
+        assert_eq!(
+            fs::read(child_dir.join(MEMORY_RANGES)).unwrap(),
+            before,
+            "deleting a parent must not touch a single byte of its child"
+        );
+        // And the child is still a first-class revision, not a casualty.
+        assert!(
+            revision_summaries(&snap).iter().any(|r| r.id == child.id && r.resumable),
+            "the child must remain resumable"
+        );
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    /// HEAD is the state the snapshot resumes from -- live state, not history.
+    /// Deleting it would turn the next start into a silent cold boot. A pinned
+    /// revision is refused too, naming `unpin` rather than offering `--force`:
+    /// the point of a pin is that removing it is a separate decision.
+    #[test]
+    fn delete_refuses_head_and_pinned_revisions() {
+        let snap = env::temp_dir().join(format!("chm-delrefuse-{}-{}", process::id(), now_ms()));
+        let _ = fs::remove_dir_all(&snap);
+        fs::create_dir_all(&snap).unwrap();
+        write_test_checkpoint(&snap, b"one", "connect");
+        write_test_checkpoint(&snap, b"twoo", "connect");
+
+        let all = revision_summaries(&snap);
+        let head = all.iter().find(|r| r.is_head).expect("a HEAD");
+        let err = plan_delete(&snap, &head.id).expect_err("HEAD must be refused");
+        assert!(err.contains("HEAD"), "{err}");
+        assert!(err.contains("Roll back"), "the refusal must name a remedy: {err}");
+
+        let older = all.iter().find(|r| !r.is_head).expect("an archived revision");
+        pin_revision(&snap, &older.id, true).unwrap();
+        let err = plan_delete(&snap, &older.id).expect_err("a pin must be refused");
+        assert!(err.contains("unpin"), "the refusal must name `unpin`: {err}");
+
+        // Unpinning is the documented way through, and it must actually work.
+        pin_revision(&snap, &older.id, false).unwrap();
+        assert!(delete_revision(&snap, &older.id).is_ok());
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    /// `--dry-run` and the real thing run the same planner, so what a dry run
+    /// promises is what a real one does -- and a dry run must leave the disk
+    /// exactly as it found it.
+    #[test]
+    fn a_dry_run_delete_reports_the_same_plan_and_removes_nothing() {
+        let snap = env::temp_dir().join(format!("chm-deldry-{}-{}", process::id(), now_ms()));
+        let _ = fs::remove_dir_all(&snap);
+        fs::create_dir_all(&snap).unwrap();
+        write_test_checkpoint(&snap, b"aaaa", "connect");
+        write_test_checkpoint(&snap, b"bbbbb", "connect");
+
+        let target = revision_summaries(&snap)
+            .into_iter()
+            .find(|r| !r.is_head)
+            .expect("an archived revision");
+        let dir = resolve_revision_dir(&snap, &target.id).unwrap();
+
+        let planned = plan_delete(&snap, &target.id).unwrap();
+        assert!(dir.is_dir(), "a dry run must not remove anything");
+
+        let done = delete_revision(&snap, &target.id).unwrap();
+        assert!(!dir.exists(), "the real delete must remove the directory");
+        assert_eq!(planned.id, done.id);
+        assert_eq!(planned.frees, done.frees, "the dry run must not overpromise");
+        assert_eq!(planned.orphans, done.orphans);
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    /// A label is a sidecar file rather than a manifest field, because the
+    /// manifest embeds the whole captured hardware state: rewriting it to edit
+    /// one string round-trips a resumable checkpoint through serde to change
+    /// something serde never needed to see.
+    #[test]
+    fn a_label_names_a_revision_without_touching_its_manifest() {
+        let snap = env::temp_dir().join(format!("chm-label-{}-{}", process::id(), now_ms()));
+        let _ = fs::remove_dir_all(&snap);
+        fs::create_dir_all(&snap).unwrap();
+        write_test_checkpoint(&snap, b"lbl", "connect");
+        let id = revision_summaries(&snap).first().unwrap().id.clone();
+        let manifest = resolve_revision_dir(&snap, &id).unwrap().join(MANIFEST);
+        let before = fs::read(&manifest).unwrap();
+
+        label_revision(&snap, &id, Some("  before the refactor  ")).unwrap();
+        let stored = revision_summaries(&snap)
+            .into_iter()
+            .find(|r| r.id == id)
+            .unwrap()
+            .label;
+        assert_eq!(stored.as_deref(), Some("before the refactor"), "trimmed");
+        assert_eq!(
+            fs::read(&manifest).unwrap(),
+            before,
+            "labelling must not rewrite the manifest"
+        );
+
+        label_revision(&snap, &id, None).unwrap();
+        assert!(
+            revision_summaries(&snap)
+                .into_iter()
+                .find(|r| r.id == id)
+                .unwrap()
+                .label
+                .is_none()
+        );
+        // Clearing an absent label is a no-op, not an error.
+        assert!(label_revision(&snap, &id, None).is_ok());
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    /// A label is printed in a one-line-per-revision table and echoed back in
+    /// refusals, so a control character would corrupt the very output someone
+    /// is reading to decide what to delete.
+    #[test]
+    fn a_label_refuses_input_that_would_corrupt_the_listing() {
+        let snap = env::temp_dir().join(format!("chm-labelbad-{}-{}", process::id(), now_ms()));
+        let _ = fs::remove_dir_all(&snap);
+        fs::create_dir_all(&snap).unwrap();
+        write_test_checkpoint(&snap, b"bad", "connect");
+        let id = revision_summaries(&snap).first().unwrap().id.clone();
+
+        for bad in ["", "   ", "two\nlines", "a\tb"] {
+            assert!(
+                label_revision(&snap, &id, Some(bad)).is_err(),
+                "must refuse {bad:?}"
+            );
+        }
+        let long = "x".repeat(LABEL_MAX + 1);
+        assert!(label_revision(&snap, &id, Some(&long)).is_err(), "too long");
+        assert!(label_revision(&snap, &id, Some(&"y".repeat(LABEL_MAX))).is_ok());
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    /// Both things `gc` collects hold a whole RAM dump while being invisible to
+    /// `chm revisions` -- so without it, reclaiming them means knowing about
+    /// them, and nothing ever tells you.
+    #[test]
+    fn gc_collects_what_no_reader_can_reach_and_nothing_else() {
+        let snap = env::temp_dir().join(format!("chm-gc-{}-{}", process::id(), now_ms()));
+        let _ = fs::remove_dir_all(&snap);
+        fs::create_dir_all(&snap).unwrap();
+        write_test_checkpoint(&snap, b"keep me", "connect");
+        write_test_checkpoint(&snap, b"keep me too", "connect");
+        let before = revision_summaries(&snap).len();
+
+        assert!(
+            plan_gc(&snap).is_empty(),
+            "a healthy store collects nothing"
+        );
+
+        // An interrupted suspend: `write_checkpoint` stages here and renames.
+        let mut staging = checkpoint_dir(&snap).into_os_string();
+        staging.push(".tmp");
+        let staging = PathBuf::from(staging);
+        fs::create_dir_all(&staging).unwrap();
+        fs::write(staging.join(MEMORY_RANGES), vec![7u8; 4096]).unwrap();
+
+        // A revision whose manifest will not parse: `list_revisions` skips it,
+        // so it is unreachable while still holding its dump.
+        let broken = revisions_dir(&snap).join("rev-broken-0000");
+        fs::create_dir_all(&broken).unwrap();
+        fs::write(broken.join(MANIFEST), b"{ truncated").unwrap();
+        fs::write(broken.join(MEMORY_RANGES), vec![9u8; 8192]).unwrap();
+
+        let plan = plan_gc(&snap);
+        assert_eq!(plan.len(), 2, "both must be found: {plan:?}");
+        assert!(plan.iter().any(|i| i.path == staging));
+        assert!(plan.iter().any(|i| i.path == broken));
+
+        let (removed, errors) = run_gc(&snap);
+        assert_eq!(removed.len(), 2);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!staging.exists() && !broken.exists());
+        assert_eq!(
+            revision_summaries(&snap).len(),
+            before,
+            "gc must not touch a readable revision"
+        );
+        assert!(plan_gc(&snap).is_empty(), "gc must be idempotent");
 
         let _ = fs::remove_dir_all(&snap);
     }
