@@ -55,6 +55,11 @@ const MANIFEST: &str = "checkpoint.json";
 const MEMORY_RANGES: &str = "memory-ranges";
 /// The live disk-overlay directory (CoW writes + bitmaps) at the snapshot root.
 const LIVE_OVERLAYS_DIR: &str = ".chm-overlays";
+
+/// Sidecar suffix `OverlayBackend` appends next to each CoW overlay. Must match
+/// that backend's suffix; see [`overlay_fingerprint`] for why these files are
+/// excluded from a checkpoint's overlay identity.
+const BITMAP_SUFFIX: &str = ".bitmap";
 /// A revision's captured copy of the disk overlays, stored inside the revision
 /// dir alongside `memory-ranges` so a revision is a consistent RAM+disk pair.
 const OVERLAYS_SUBDIR: &str = "overlays";
@@ -866,14 +871,31 @@ fn snapshot_overlays(snapshot_dir: &Path, rev_dir: &Path) -> Result<(), String> 
     copy_tree(&live, &rev_dir.join(OVERLAYS_SUBDIR))
 }
 
-/// A cheap identity for the live disk overlays: every file's name, length and
-/// modification time, sorted so the result is stable across directory-read
-/// order. Empty string when there are no overlays.
+/// A cheap identity for the live disk overlays: every CoW data file's name,
+/// length and modification time, sorted so the result is stable across
+/// directory-read order. Empty string when there are no overlays.
 ///
 /// Deliberately not a content hash. The overlays are multi-gigabyte, this runs
 /// on the resume path, and the question being asked is only "is this the same
 /// overlay the checkpoint was taken against", which a length/mtime pair answers
 /// for every way the overlay actually changes (a guest writing through it).
+///
+/// The `.bitmap` sidecars are deliberately excluded. A bitmap is derived
+/// bookkeeping — which chunks of the overlay have been written — and
+/// `OverlayBackend::drop` persists it *after* a checkpoint has already recorded
+/// its fingerprint. That let a checkpoint's own teardown invalidate the
+/// fingerprint it had just written, and the #139 guard would then refuse a
+/// resume whose RAM and disk were perfectly consistent. It stayed latent for as
+/// long as the guest happened to fsync last (`persist_bitmap` returns early when
+/// nothing is dirty); V9.6 made it reachable every time, because a deadline
+/// fires at an arbitrary instant with no guest flush behind it. Observed on
+/// hardware: both data overlays identical, the bitmap's mtime 24s newer.
+///
+/// Excluding it costs no detection power. A guest write goes through the CoW
+/// *data* file, changing its mtime and usually its length, so the guard still
+/// sees it. A bitmap that moved on its own has only recorded, after the fact,
+/// allocations the data file already reflects — it is strictly more accurate
+/// than the one captured, so re-attaching against it is sound.
 fn overlay_fingerprint(snapshot_dir: &Path) -> String {
     let live = snapshot_dir.join(LIVE_OVERLAYS_DIR);
     let Ok(entries) = fs::read_dir(&live) else {
@@ -886,16 +908,16 @@ fn overlay_fingerprint(snapshot_dir: &Path) -> String {
             if !meta.is_file() {
                 return None;
             }
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.ends_with(BITMAP_SUFFIX) {
+                return None;
+            }
             let mtime = meta
                 .modified()
                 .ok()
                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                 .map_or(0, |d| d.as_nanos());
-            Some(format!(
-                "{}:{}:{mtime}",
-                e.file_name().to_string_lossy(),
-                meta.len()
-            ))
+            Some(format!("{name}:{}:{mtime}", meta.len()))
         })
         .collect();
     lines.sort();
@@ -1866,6 +1888,53 @@ mod tests {
         assert_eq!(
             with_live.on_disk, after.on_disk,
             "live overlays must not inflate the revision figure"
+        );
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    /// A checkpoint's own teardown must not be able to invalidate the overlay
+    /// fingerprint it has just written.
+    ///
+    /// `OverlayBackend::drop` calls `persist_bitmap()`, which runs *after*
+    /// `write_checkpoint` recorded the fingerprint. The recorded and live
+    /// fingerprints then disagreed, and the #139 drift guard refused a resume
+    /// whose RAM and disk were consistent. It hid for as long as the guest
+    /// happened to fsync last, because `persist_bitmap` returns early when
+    /// nothing is dirty -- and a deadline (V9.6) guarantees it does not, since
+    /// it fires at an arbitrary instant with no guest flush behind it.
+    #[test]
+    fn a_bitmap_written_after_capture_does_not_look_like_guest_disk_writes() {
+        let snap = env::temp_dir().join(format!("chm-fp-{}-{}", process::id(), now_ms()));
+        let _ = fs::remove_dir_all(&snap);
+        let live = snap.join(LIVE_OVERLAYS_DIR);
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("_disk0-cow.raw"), b"guest data").unwrap();
+        fs::write(live.join("_disk0-cow.raw.bitmap"), vec![0u8; 64]).unwrap();
+
+        let at_capture = overlay_fingerprint(&snap);
+        assert!(
+            at_capture.contains("_disk0-cow.raw"),
+            "the CoW data file must still be fingerprinted"
+        );
+
+        // Teardown persists the bitmap. Change its length as well as its
+        // contents, so this cannot pass merely because mtime granularity was
+        // too coarse to notice -- a length change is caught unconditionally.
+        fs::write(live.join("_disk0-cow.raw.bitmap"), vec![1u8; 128]).unwrap();
+        assert_eq!(
+            overlay_fingerprint(&snap),
+            at_capture,
+            "persisting the bitmap sidecar is host bookkeeping, not the guest \
+             writing to disk, and must not read as overlay drift"
+        );
+
+        // The guard must still do its actual job.
+        fs::write(live.join("_disk0-cow.raw"), b"guest data, and more").unwrap();
+        assert_ne!(
+            overlay_fingerprint(&snap),
+            at_capture,
+            "a write to the CoW data file is real drift and must still be caught"
         );
 
         let _ = fs::remove_dir_all(&snap);

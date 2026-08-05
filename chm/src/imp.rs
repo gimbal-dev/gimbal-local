@@ -940,12 +940,30 @@ fn spawn_net_service(
         .map(|h| (h, waker))
 }
 
-/// Default seconds of total console silence after which `chm` stops on its own.
-/// The resumed guest currently runs until it needs a device this build does not
-/// yet model (virtio-block/net/console over PCI), at which point it goes quiet;
-/// without this it would otherwise sit parked in WFI forever. `--idle-exit 0`
-/// disables it for an open-ended session.
-const DEFAULT_IDLE_EXIT_SECS: u64 = 10;
+/// How long a guest may be silent on the console before chm suspends it.
+///
+/// This was 10 seconds, and that number was never a judgement about idleness.
+/// It dates from a build that could not yet model virtio-block/net/console over
+/// PCI: a resumed guest ran until it needed a device that did not exist, went
+/// quiet, and would have sat parked in WFI forever. Ten seconds was scaffolding
+/// to stop that hanging. The devices landed; the scaffold did not come down.
+///
+/// Ten seconds of console silence is not idleness. An agent thinking, an `npm
+/// install` resolving, a compile — all silent, all working. For comparison
+/// Cloudflare's `sleepAfter` defaults to ten minutes.
+///
+/// Ten minutes is also only defensible because expiry now *suspends* rather
+/// than kills (V9.6): being wrong about idleness costs a resume, not the work.
+///
+/// Console silence is still a proxy, and a poor one for a guest doing silent
+/// compute — measuring vCPU WFI residency instead is #171. `--idle-exit 0`
+/// disables the timeout entirely, which is what `chm connect` already does,
+/// because an interactive session has a human to judge.
+///
+/// `chm serve` shares this rather than keeping its own copy: the daemon and the
+/// CLI had separate constants with the same stale rationale, and two numbers
+/// that must agree eventually will not.
+pub(crate) const DEFAULT_IDLE_EXIT_SECS: u64 = 600;
 
 struct Args {
     snapshot_dir: PathBuf,
@@ -1156,10 +1174,12 @@ fn usage() -> String {
          `snapshot/memory-ranges` (a `ch-snapshot` directory).\n\
      \n\
      OPTIONS:\n    \
-         --max-seconds <N>   Stop after N seconds of wall-clock run time\n                        \
-         (0 = unlimited; default 0).\n    \
-         --idle-exit <N>     Stop after N seconds with no console output\n                        \
-         (0 = disabled; default 10).\n    \
+         --max-seconds <N>   Suspend after N seconds of wall-clock run time,\n                        \
+         saving a checkpoint you can resume (0 = unlimited; default 0).\n    \
+         --idle-exit <N>     Suspend after N seconds with no console output\n                        \
+         (0 = disabled; default 600). Console silence is a proxy: a\n                        \
+         guest doing silent compute looks idle. Expiry suspends\n                        \
+         rather than stops, so being wrong costs a resume.\n    \
          --quiet             Suppress the informational banner on stderr.\n    \
          --egress-policy <FILE>  Govern this run's outbound network with a local\n                        \
          egress policy (see `chm firewall`); overrides any per-workspace\n                        \
@@ -1786,6 +1806,31 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     run_usgic(args, loaded)
 }
 
+/// Did **chm** choose the moment this session ended, rather than the user or the
+/// guest?
+///
+/// A deadline or an idle window is chm stopping a guest that was still going.
+/// The user picked a *limit*, not this instant, so we owe them the state.
+/// Tearing down a writable overlay here is a power cut: measured before this
+/// existed, a guest wrote a file, ran `sync`, hit `--max-seconds`, and a later
+/// session found nothing — and the run had also cleared the resumable HEAD it
+/// started from, so the deadline destroyed more history than it created.
+///
+/// A guest power-off, a closed console and a Ctrl-C are all somebody choosing
+/// deliberately to stop *here*, and nothing is owed. That distinction is the
+/// whole rule, and it is why this is not simply "always checkpoint".
+///
+/// An `Err` is a supervisor failure, not a choice, and does not qualify: the
+/// session state is not known to be sound, so the existing clear-or-retire path
+/// still runs.
+///
+/// V9.1a is what makes this affordable. A capture is now a delta against the
+/// previous one, so suspending on a deadline costs ~1-2s and a few MiB, rather
+/// than the ~4.5s and ~3.4GB it would have cost when this was filed (#154).
+fn chm_initiated_stop(coordinator: &Result<Outcome, String>) -> bool {
+    matches!(coordinator, Ok(Outcome::MaxSeconds) | Ok(Outcome::Idle(_)))
+}
+
 pub(crate) enum Outcome {
     PoweredOff,
     MaxSeconds,
@@ -2098,9 +2143,20 @@ pub(crate) fn run_usgic_engine(
     let (capture_tx, capture_rx) = mpsc::channel::<(usize, UsgicCapture)>();
     let mut go_txs: Vec<mpsc::Sender<Arc<Vec<UsgicCpuHandle>>>> = Vec::with_capacity(n);
 
-    // Copied out of `cfg` so the per-vCPU thread closures capture plain values
-    // rather than a borrow of the caller's config, which cannot outlive it.
-    let want_checkpoint = cfg.checkpoint;
+    // Whether a vCPU sends its register file at teardown used to be gated on
+    // `--checkpoint`, decided here at spawn. But whether the result is worth
+    // keeping cannot be known until the run ends — a deadline or an idle window
+    // turns an ordinary run into a suspend (V9.6), and by then these threads
+    // have exited. The gate therefore made "suspend on a deadline" impossible to
+    // implement downstream: there was nothing left to assemble.
+    //
+    // Every vCPU now captures unconditionally and the orchestrator decides
+    // whether to keep it. That is what the comment at the send site already
+    // claimed the code did, and it is cheap for the reason given there: a
+    // capture is a register file plus this core's software-GIC state, taken on a
+    // thread that is exiting anyway. The expensive part of a checkpoint is the
+    // guest RAM dump, which happens once, on the orchestrator, and is still
+    // gated on actually wanting the checkpoint.
 
     // The live-checkpoint rendezvous. Present even when continuous snapshots are
     // off: the per-vCPU cost is one relaxed atomic load per `run()` return, and
@@ -2245,12 +2301,12 @@ pub(crate) fn run_usgic_engine(
                 // Capture unconditionally rather than checking the run outcome
                 // first: whether the checkpoint is worth keeping is the
                 // orchestrator's call, and a thread that skipped sending because
-                // it raced another vCPU's error would hang the collector.
-                if want_checkpoint {
-                    let captured = hvf_checkpoint::capture_usgic_vcpu(&mut vcpu)
-                        .map_err(|e| format!("capture: {e}"));
-                    let _ = capture_tx.send((id, captured));
-                }
+                // it raced another vCPU's error would hang the collector. The
+                // same reasoning is why this is no longer gated on
+                // `--checkpoint` either — see the note at the channel.
+                let captured = hvf_checkpoint::capture_usgic_vcpu(&mut vcpu)
+                    .map_err(|e| format!("capture: {e}"));
+                let _ = capture_tx.send((id, captured));
                 // `vcpu` (and its VM ref) drops here, on the owning thread.
             })
             .map_err(|e| format!("spawn userspace-GIC vCPU thread {id}: {e}"))?;
@@ -2536,6 +2592,8 @@ pub(crate) fn run_usgic_engine(
 
     let vcpu_outcome = outcome.lock().unwrap().take();
 
+    let chm_chose_the_moment = chm_initiated_stop(&coordinator);
+
     // Suspend capture. Every vCPU has sent its own register file + software-GIC
     // state from its owning thread and joined, so assemble them into one
     // checkpoint and dump guest RAM here — `prepared` still owns the RAM
@@ -2543,7 +2601,7 @@ pub(crate) fn run_usgic_engine(
     //
     // Only a clean external stop checkpoints. A guest power-off or a vCPU error
     // means the box is finished, so any stale checkpoint is cleared instead.
-    if cfg.checkpoint {
+    if cfg.checkpoint || chm_chose_the_moment {
         if vcpu_outcome.is_none() {
             let written = collect_usgic_checkpoint(&capture_rx, snap_num_irq, n).and_then(|state| {
                 checkpoint::write_checkpoint(
@@ -2558,10 +2616,22 @@ pub(crate) fn run_usgic_engine(
                 Ok(()) => {
                     if !cfg.quiet {
                         let cores = if n == 1 { "1 vCPU" } else { &format!("{n} vCPUs") };
-                        eprintln!(
-                            "\nchm: suspended — userspace-GIC checkpoint saved ({cores}); \
-                             resume to continue."
-                        );
+                        // A user who did not pass --checkpoint has just had one
+                        // written for them, so say why rather than leaving them
+                        // to infer it from a changed HEAD.
+                        if chm_chose_the_moment && !cfg.checkpoint {
+                            eprintln!(
+                                "\nchm: suspended rather than stopped — the time limit was \
+                                 reached while the guest was still running, so its state was \
+                                 saved ({cores}). Resume with `chm resume {}`.",
+                                dir.display()
+                            );
+                        } else {
+                            eprintln!(
+                                "\nchm: suspended — userspace-GIC checkpoint saved ({cores}); \
+                                 resume to continue."
+                            );
+                        }
                     }
                 }
                 Err(e) => {
@@ -3290,15 +3360,40 @@ fn banner(dir: &Path, mem_ranges: &Path, num_vcpus: u32, total_ram: u64, backend
 mod tests {
     use super::*;
 
-    /// `--help` is the only place a user can discover what `chm` does, and it
-    /// had drifted: seven dispatched subcommands were absent from it, including
-    /// `create` — the whole cold-boot path. Listing them once fixes today; this
-    /// test fixes the class, by reading the dispatch table out of this file's
-    /// own source and requiring every arm to be reachable from the help.
-    ///
-    /// If this fails because a new `Some("...")` was added for something that
-    /// is *not* a subcommand, that is still worth a look: the dispatch match is
-    /// the only place that shape is meant to appear.
+    #[test]
+    fn only_a_deadline_or_an_idle_window_is_chm_choosing_the_moment() {
+        // The rule this pins: chm interrupting work it was asked to time-limit
+        // owes the user a resumable point. Anyone else choosing to stop does
+        // not. Without this, the only thing standing between a deadline and a
+        // power cut is one `||` in a 600-line function.
+        assert!(chm_initiated_stop(&Ok(Outcome::MaxSeconds)));
+        assert!(chm_initiated_stop(&Ok(Outcome::Idle(600))));
+
+        // The guest decided it was finished.
+        assert!(!chm_initiated_stop(&Ok(Outcome::PoweredOff)));
+        // The user decided, via Ctrl-C or by closing the console.
+        assert!(!chm_initiated_stop(&Ok(Outcome::Interrupted)));
+        assert!(!chm_initiated_stop(&Ok(Outcome::ConsoleClosed)));
+        // A limit breach is a guest protecting the host from itself; capturing
+        // the state that was busy exceeding a limit is not a kindness.
+        assert!(!chm_initiated_stop(&Ok(Outcome::LimitExceeded("disk".into()))));
+        // Not a choice at all — the session is not known to be sound.
+        assert!(!chm_initiated_stop(&Err("supervisor failed".into())));
+    }
+
+    #[test]
+    fn the_idle_default_is_not_the_scaffold_it_used_to_be() {
+        // 10s was a workaround for a build that could not model virtio devices:
+        // the guest went quiet at the first missing device and would have hung.
+        // The devices landed years of sessions ago. A default that low kills an
+        // agent mid-`npm install`, so this asserts the scaffold is gone rather
+        // than trusting a comment to stay true.
+        assert!(
+            DEFAULT_IDLE_EXIT_SECS >= 60,
+            "an idle window under a minute measures console silence, not idleness"
+        );
+    }
+
     /// The reachable-history window is the number an operator plans around, so
     /// it must not make them do arithmetic to read it.
     #[test]
@@ -3333,6 +3428,15 @@ mod tests {
         assert_eq!(relative_age(now + 60_000), "0s ago");
     }
 
+    /// `--help` is the only place a user can discover what `chm` does, and it
+    /// had drifted: seven dispatched subcommands were absent from it, including
+    /// `create` — the whole cold-boot path. Listing them once fixes today; this
+    /// test fixes the class, by reading the dispatch table out of this file's
+    /// own source and requiring every arm to be reachable from the help.
+    ///
+    /// If this fails because a new `Some("...")` was added for something that
+    /// is *not* a subcommand, that is still worth a look: the dispatch match is
+    /// the only place that shape is meant to appear.
     #[test]
     fn every_dispatched_subcommand_appears_in_the_help() {
         let src = include_str!("imp.rs");
