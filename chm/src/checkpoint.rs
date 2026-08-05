@@ -258,11 +258,42 @@ pub(crate) fn write_checkpoint(
     // consistent RAM+disk pair. Without this, rollback would restore an earlier
     // RAM image while the live overlay still held later disk writes -- an
     // inconsistent pair that can corrupt the guest fs on resume (#62).
+    //
+    // Bracket the copy with a fingerprint of the *live* overlays so the capture
+    // proves its own consistency rather than assuming it. Both call sites hold
+    // the writers still -- the suspend path has joined every thread, the live
+    // path has stopped the world -- so an inequality here means a writer we do
+    // not know about moved the overlays mid-copy, and the copy is torn.
+    //
+    // Checking is what makes the claim worth anything: #179 was a checkpoint
+    // whose stored fingerprint did not describe its own overlays, and nothing
+    // noticed until the *next* resume refused it, long after the session that
+    // produced it had ended. A capture that cannot describe itself must fail
+    // here, where the moment can still be retaken, rather than becoming a trap
+    // for a later run to spring.
+    let before = overlay_fingerprint(snapshot_dir);
     snapshot_overlays(snapshot_dir, &tmp)?;
+    let after = overlay_fingerprint(snapshot_dir);
+    if before != after {
+        return Err(format!(
+            "disk overlays moved while this checkpoint was capturing them \
+             ({} file(s) before, {} after), so the captured RAM and the captured \
+             disk describe different moments. Refusing to store a checkpoint that \
+             would be refused on resume. Retry with the guest quiesced.",
+            comparable_fingerprint(&before).len(),
+            comparable_fingerprint(&after).len(),
+        ));
+    }
 
     // Record what the overlays looked like at the instant this RAM was captured.
     // Read from the live dir (not the copy) so resume compares like with like.
-    let _ = fs::write(tmp.join(OVERLAY_FINGERPRINT), overlay_fingerprint(snapshot_dir));
+    //
+    // A failure here is not cosmetic and is not swallowed: a checkpoint with no
+    // fingerprint loses the #139 drift guard entirely, so it would resume
+    // against any disk state at all, silently.
+    fs::write(tmp.join(OVERLAY_FINGERPRINT), &after).map_err(|e| {
+        format!("write {}: {e}", tmp.join(OVERLAY_FINGERPRINT).display())
+    })?;
 
     let json =
         serde_json::to_string(&revision).map_err(|e| format!("serialize revision: {e}"))?;
@@ -280,8 +311,46 @@ pub(crate) fn write_checkpoint(
     }
     fs::rename(&tmp, &dir)
         .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), dir.display()))?;
+
+    // Prove the thing we just stored would actually resume, by running the very
+    // guard resume runs (#139) against it -- rather than assuming it because we
+    // wrote both sides ourselves. Writing and reading with the same code in the
+    // same run is exactly the blind spot that let a fingerprint-format change
+    // strand every existing checkpoint, and let #179 store one that could never
+    // be resumed. The cost is one directory listing.
+    verify_checkpoint_describes_overlays(snapshot_dir)?;
     prune_revisions(snapshot_dir);
     Ok(())
+}
+
+/// Check that the checkpoint now at HEAD describes the overlays actually on
+/// disk, using the same guard a resume would apply.
+///
+/// A checkpoint is a *pair* -- a RAM image and the disk state it remembers --
+/// and the pair is only worth storing if the two halves describe the same
+/// moment. Every other check of that pairing happens on the way *in* to a
+/// resume, which means a torn capture is discovered by the next run, long after
+/// the session that produced it has ended and can no longer retake it (#179).
+///
+/// So the writer verifies its own work. This is deliberately the same call the
+/// resume path makes rather than a reimplementation of it: a second opinion
+/// written from the same understanding would agree with the first one for the
+/// same wrong reasons.
+fn verify_checkpoint_describes_overlays(snapshot_dir: &Path) -> Result<(), String> {
+    let Some(drift) = overlay_drift(snapshot_dir) else {
+        return Ok(());
+    };
+    Err(format!(
+        "the checkpoint just written does not describe the overlays on disk \
+         ({} file(s) recorded, {} live), so resuming it would be refused. \
+         Something wrote to {} while it was being captured, which means the \
+         captured RAM and the captured disk are from different moments. The \
+         files are on disk but this checkpoint is not resumable; take another \
+         with the guest quiesced.",
+        drift.recorded_files,
+        drift.live_files,
+        snapshot_dir.join(LIVE_OVERLAYS_DIR).display(),
+    ))
 }
 
 /// The revision store directory (archived past revisions) for a snapshot.
@@ -1363,6 +1432,8 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::process;
+    use std::thread;
+    use std::time::Duration;
 
     #[test]
     fn checkpoint_paths_are_under_the_snapshot_dir() {
@@ -2431,6 +2502,75 @@ mod tests {
             "gc must not touch a readable revision"
         );
         assert!(plan_gc(&snap).is_empty(), "gc must be idempotent");
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    /// A checkpoint must be able to describe its own overlays the moment it is
+    /// written.
+    ///
+    /// #179: a deadline-suspend stored a checkpoint whose fingerprint predated
+    /// its own overlays by 16 seconds. Nothing noticed at write time, because
+    /// nothing looked; the failure surfaced on the *next* resume, as a refusal
+    /// that read like the user had corrupted their own disk. By then the guest
+    /// was gone and the moment could not be retaken.
+    #[test]
+    fn a_checkpoint_that_cannot_describe_its_own_overlays_fails_at_write_time() {
+        let snap = env::temp_dir().join(format!("chm-selfcheck-{}-{}", process::id(), line!()));
+        let _ = fs::remove_dir_all(&snap);
+        let live = snap.join(LIVE_OVERLAYS_DIR);
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("_disk0-cow.raw"), b"disk").unwrap();
+        let dir = checkpoint_dir(&snap);
+        fs::create_dir_all(&dir).unwrap();
+
+        // A checkpoint that recorded the overlays as they are: it verifies.
+        fs::write(dir.join(OVERLAY_FINGERPRINT), overlay_fingerprint(&snap)).unwrap();
+        assert!(
+            verify_checkpoint_describes_overlays(&snap).is_ok(),
+            "a checkpoint whose fingerprint matches its overlays must verify"
+        );
+
+        // Now let the overlays move on, as they did in #179.
+        thread::sleep(Duration::from_millis(20));
+        fs::write(live.join("_disk0-cow.raw"), b"disk-plus-later-writes").unwrap();
+
+        let Err(err) = verify_checkpoint_describes_overlays(&snap) else {
+            panic!("a checkpoint whose overlays moved under it must not be reported as written");
+        };
+        assert!(
+            err.contains("not resumable") && err.contains("quiesced"),
+            "the failure must say what is wrong and what to do, got: {err}"
+        );
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    /// The self-check is only worth having if it is the *same* check a resume
+    /// makes. A second implementation would drift from the first and agree with
+    /// it only by luck -- which is how #178 and #179 both happened.
+    #[test]
+    fn the_write_time_check_agrees_with_the_resume_time_guard() {
+        let snap = env::temp_dir().join(format!("chm-samecheck-{}-{}", process::id(), line!()));
+        let _ = fs::remove_dir_all(&snap);
+        let live = snap.join(LIVE_OVERLAYS_DIR);
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("_disk0-cow.raw"), b"a").unwrap();
+        // A pre-V9.6 fingerprint format: a bitmap line the writer no longer emits.
+        let dir = checkpoint_dir(&snap);
+        fs::create_dir_all(&dir).unwrap();
+        let stored = format!("{}\n_disk0-cow.raw.bitmap:64:1", overlay_fingerprint(&snap));
+        fs::write(dir.join(OVERLAY_FINGERPRINT), &stored).unwrap();
+
+        assert_eq!(
+            overlay_drift(&snap).is_none(),
+            verify_checkpoint_describes_overlays(&snap).is_ok(),
+            "the writer and the reader must reach the same verdict on the same state"
+        );
+        assert!(
+            verify_checkpoint_describes_overlays(&snap).is_ok(),
+            "an older fingerprint format is not drift"
+        );
 
         let _ = fs::remove_dir_all(&snap);
     }
