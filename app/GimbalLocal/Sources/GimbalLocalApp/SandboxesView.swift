@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 
+import AppKit
 import SwiftUI
 
 // MARK: - Sandboxes main page
@@ -89,27 +90,72 @@ private struct WelcomeBanner: View {
 private struct SandboxesEmptyState: View {
     @EnvironmentObject private var model: AppModel
 
+    private var guidance: FirstRunGuidance.State {
+        FirstRunGuidance.evaluate(
+            hasSnapshots: !model.snapshots.isEmpty,
+            localImages: model.localImages,
+            imagesPath: model.settings.localImagesPath
+        )
+    }
+
     var body: some View {
+        let g = guidance
         VStack(spacing: 16) {
             Image(systemName: "shippingbox")
                 .font(.system(size: 52))
                 .foregroundStyle(Theme.cyan)
-            Text("No sandboxes yet")
+            Text(g.headline)
                 .font(.title2.weight(.bold))
-            Text(model.snapshots.isEmpty
-                 ? "Add snapshot images to your library, then create a sandbox from one."
-                 : "Create your first sandbox from a snapshot image to get started.")
+            Text.authored(g.detail)
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)
-                .frame(maxWidth: 420)
+                .frame(maxWidth: 460)
+            if !g.rejections.isEmpty {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(g.rejections, id: \.name) { r in
+                        HStack(alignment: .firstTextBaseline, spacing: 8) {
+                            Image(systemName: "exclamationmark.triangle.fill")
+                                .foregroundStyle(.orange)
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(r.name).font(.callout.weight(.semibold))
+                                Text.authored(r.reason)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+                .frame(maxWidth: 460, alignment: .leading)
+                .padding(12)
+                .background {
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .fill(.orange.opacity(0.08))
+                }
+            }
 
+            // Never disabled. The menu explains what is missing and where to
+            // put it, so opening it always teaches something; a greyed-out
+            // button teaches nothing. The bug this replaces gated it on the
+            // snapshot library being non-empty, which greyed out cold boot —
+            // the one path that needs no snapshot, no KVM host and no control
+            // plane. Keeping the decision out of the four call sites means it
+            // cannot come back at one of them.
             NewSandboxMenu(prominent: true)
-                .disabled(model.snapshots.isEmpty)
 
-            if model.snapshots.isEmpty {
-                Button("Browse snapshots") { model.selection = .snapshotsHome }
+            HStack(spacing: 12) {
+                if !model.snapshots.isEmpty {
+                    Button("Browse snapshots") { model.selection = .snapshotsHome }
+                        .buttonStyle(.bordered)
+                }
+                if !g.canStartSomething {
+                    Button("Open images folder") {
+                        revealImagesFolder(model.settings.localImagesPath)
+                    }
                     .buttonStyle(.bordered)
+                    SettingsLink { Text("Settings") }
+                        .buttonStyle(.bordered)
+                }
             }
         }
         .frame(maxWidth: .infinity, minHeight: 320)
@@ -123,6 +169,24 @@ private struct SandboxesEmptyState: View {
                 }
         }
     }
+}
+
+/// Open the configured images folder in Finder, creating it first if it is not
+/// there yet.
+///
+/// Creating it is the point: on a first run the folder usually does not exist,
+/// and a button that opens nothing teaches nothing. Making it means the next
+/// step ("put a folder in here") is something the user can actually see.
+private func revealImagesFolder(_ path: String) {
+    guard !path.isEmpty else { return }
+    let expanded = (path as NSString).expandingTildeInPath
+    var isDir: ObjCBool = false
+    if !FileManager.default.fileExists(atPath: expanded, isDirectory: &isDir) {
+        try? FileManager.default.createDirectory(
+            atPath: expanded, withIntermediateDirectories: true
+        )
+    }
+    NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: expanded)
 }
 
 // MARK: - Sandbox card
