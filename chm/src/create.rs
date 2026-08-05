@@ -41,6 +41,8 @@ use std::fs;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::spec::{Overrides, SandboxSpec, resolve, spec_file_for};
+
 use hypervisor::VmExit;
 use hypervisor::VmOps;
 use hypervisor::hvf::VtimerClock;
@@ -199,7 +201,12 @@ fn usage() -> String {
      \x20                     has to outlive the run.\n\
      \x20 --seconds <n>       Stop after n seconds (default 30). 0 runs until\n\
      \x20                     the guest powers off or you press Ctrl-A x.\n\
-     \x20 --dry-run           Build and describe the guest image; do not run it.\n"
+     \x20 --dry-run           Build and describe the guest image; do not run it.\n\
+     \x20 --spec <path>       A sandbox.json (or a workspace holding one) that\n\
+     \x20                     describes this sandbox. It expands to exactly the\n\
+     \x20                     flags below, which are then applied on top: the\n\
+     \x20                     spec says what the sandbox is, flags say how this\n\
+     \x20                     run differs. See `chm spec`.\n"
         .to_string()
 }
 
@@ -296,7 +303,60 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     })
 }
 
+/// Expand a `--spec` into the flags it stands for, ahead of the caller's own.
+///
+/// The spec deliberately gets **no** private route into `ColdBootConfig`. It
+/// produces the argv a person would have typed and hands it to the same parser,
+/// which is what stops it becoming a second way to configure a guest that can
+/// drift from the first. Placing the expansion *before* the caller's flags is
+/// the whole of the precedence rule: scalar options are last-wins in `parse`, so
+/// a flag beats the spec, and repeatable ones accumulate.
+fn expand_spec(raw: &[String]) -> Result<Vec<String>, String> {
+    let Some(i) = raw.iter().position(|a| a == "--spec") else {
+        return Ok(raw.to_vec());
+    };
+    let path = raw
+        .get(i + 1)
+        .ok_or_else(|| "--spec needs a path".to_string())?;
+    let path = spec_file_for(Path::new(path));
+
+    let doc = SandboxSpec::load(&path)?;
+    // Refuse before starting anything. A spec whose policy this build cannot
+    // honour must not quietly become a guest with less policy than the document
+    // it was started from.
+    let problems = doc.validate();
+    if !problems.is_empty() {
+        let mut msg = format!("{} cannot start this sandbox:", path.display());
+        for p in &problems {
+            msg.push_str("\n  - ");
+            msg.push_str(p);
+        }
+        return Err(msg);
+    }
+
+    let resolved = resolve(Some(&doc), Some(path.clone()), &Overrides::default());
+    let mut argv = resolved.to_create_argv();
+    // `to_create_argv` renders the whole command; here we are already inside it.
+    if argv.first().map(String::as_str) == Some("create") {
+        argv.remove(0);
+    }
+    eprintln!("chm create: from {} ({} flags)", path.display(), argv.len());
+
+    let mut out = argv;
+    out.extend_from_slice(&raw[..i]);
+    out.extend_from_slice(&raw[i + 2..]);
+    Ok(out)
+}
+
 pub fn create_main(raw: &[String]) -> ExitCode {
+    let raw = match expand_spec(raw) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("chm create: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let raw = &raw[..];
     let args = match parse(raw) {
         Ok(a) => a,
         Err(msg) => {

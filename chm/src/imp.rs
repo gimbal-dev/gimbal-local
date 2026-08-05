@@ -27,6 +27,7 @@ use crate::credproxy;
 use crate::firewall;
 use crate::limits;
 use crate::serve;
+use crate::spec;
 use crate::signing;
 use crate::startup;
 use crate::posture;
@@ -1033,6 +1034,7 @@ pub fn main() -> ExitCode {
         Some("serve") => serve::serve_main(&raw[1..]),
         Some("ctl") => serve::ctl_main(&raw[1..]),
         Some("exec") => serve::exec_main(&raw[1..]),
+        Some("spec") => spec::spec_main(&raw[1..]),
         Some("fork") => match fork(&raw[1..]) {
             Ok(code) => code,
             Err(e) => {
@@ -1135,6 +1137,8 @@ fn usage() -> String {
          chm resume <SNAPSHOT_DIR> [OPTIONS]   (restore a saved checkpoint)\n    \
          chm connect <SNAPSHOT_DIR> [OPTIONS]  (interactive session)\n    \
          chm exec [OPTIONS] -- <CMD> [ARG...]  (run a command in the guest)\n\
+    \
+         chm spec <COMMAND> [OPTIONS]          (describe a sandbox in a file)\n\
      \n\
      SNAPSHOTS AND LINEAGE\n    \
          chm workspace <IMAGE_DIR> <WS_DIR>    (isolated sandbox workspace)\n    \
