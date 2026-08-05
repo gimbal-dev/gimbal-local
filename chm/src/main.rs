@@ -36,6 +36,11 @@ mod exec;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod checkpoint;
 
+// Live checkpointing: the stop-the-world rendezvous that lets a running guest
+// be captured and carry on, rather than only being captured on its way out.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod livesnap;
+
 // Cold boot: build a guest from a kernel image rather than rehydrate one from
 // a capture (#101).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]

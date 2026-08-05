@@ -10,10 +10,11 @@ use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use std::{env, fs, io, thread};
 
 use crate::checkpoint;
+use crate::livesnap;
 use crate::create::create_main;
 use crate::cloud;
 use crate::console::{self, RawConsole};
@@ -865,7 +866,8 @@ fn spawn_net_service(
     running: Arc<AtomicBool>,
     exits: Arc<Mutex<Vec<ExitSignal>>>,
     audit: audit::AuditLog,
-) -> Option<thread::JoinHandle<()>> {
+    quiesce: Arc<livesnap::Quiesce>,
+) -> Option<(thread::JoinHandle<()>, Arc<NetKick>)> {
     if net_devices.is_empty() {
         return None;
     }
@@ -873,6 +875,12 @@ fn spawn_net_service(
     for dev in &net_devices {
         dev.set_net_kick(kick.clone());
     }
+    // This thread writes received frames straight into the guest's RX ring, so
+    // a live checkpoint must be able to stop it at a pass boundary. Registered
+    // here, before the thread starts, so no checkpoint can ever observe a
+    // writer that has not yet declared itself.
+    quiesce.register();
+    let waker = kick.clone();
     thread::Builder::new()
         .name("chm-net-service".into())
         .spawn(move || {
@@ -883,6 +891,10 @@ fn spawn_net_service(
             // that never opened a socket.
             let mut tally = audit::EgressTally::default();
             while running.load(Ordering::Acquire) {
+                // Pass boundary: the only point at which this thread is provably
+                // not partway through publishing a frame into guest memory, and
+                // therefore the only safe place to hold it for a RAM dump.
+                quiesce.park_if_paused();
                 let mut delivered = false;
                 for dev in &net_devices {
                     if dev.service_net() {
@@ -925,6 +937,7 @@ fn spawn_net_service(
             }
         })
         .ok()
+        .map(|h| (h, waker))
 }
 
 /// Default seconds of total console silence after which `chm` stops on its own.
@@ -1468,14 +1481,20 @@ const REVISIONS_USAGE: &str = "usage: chm revisions <SNAPSHOT_DIR> [--json] [--u
      chm revisions <SNAPSHOT_DIR> pin   <REVISION_ID>\n       \
      chm revisions <SNAPSHOT_DIR> unpin <REVISION_ID>\n\
      \n\
-     List the snapshot's saved revisions (its lineage), oldest first.\n\
-     `resumable` marks revisions whose live RAM is still retained; older\n\
-     ones are pruned to metadata so the lineage graph survives.\n\
+     List the snapshot's saved revisions (its lineage), oldest first, with\n     \
+     how long ago each was taken. `resumable` marks revisions whose live\n     \
+     RAM is still retained; older ones are pruned to metadata so the\n     \
+     lineage graph survives. An `-auto` origin marks a point the\n     \
+     continuous-snapshot cadence took rather than one you asked for.\n\
      \n\
      `pin` makes a revision a retention root: age-based pruning will not\n\
      reclaim its RAM, so a point you care about stays resumable however\n\
      many checkpoints follow it. Pins sit outside the retention budget,\n\
-     so pinning one does not shorten the window of recent history.\n\
+     so pinning one does not shorten the window of recent history. With\n     \
+     CHM_SNAPSHOT_INTERVAL_SECS set, that budget is what bounds how far\n     \
+     back you can actually travel: the reachable window is roughly the\n     \
+     interval times CHM_MAX_RESUMABLE_REVISIONS, so pin anything you\n     \
+     want to outlive it.\n\
      \n\
      `--usage` reports what the lineage occupies. A fork hard-links its\n\
      parent's RAM dump, so shared content is counted once for the\n\
@@ -1580,12 +1599,54 @@ fn revisions(raw: &[String]) -> Result<ExitCode, String> {
             let pin = if r.pinned { "  [pinned]" } else { "" };
             let parent = r.parent.as_deref().unwrap_or("—");
             println!(
-                "{}{head}  {}  parent={parent}  {resumable}{pin}",
-                r.id, r.origin
+                "{}{head}  {:>9}  {}  parent={parent}  {resumable}{pin}",
+                r.id,
+                relative_age(r.created_at_ms),
+                r.origin
             );
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// How long ago a revision was taken, for the `chm revisions` timeline.
+///
+/// The id already carries the millisecond timestamp, but reading a point in
+/// time out of a 13-digit epoch is not something a person does — and with
+/// continuous snapshots the list is no longer a handful of deliberate suspends
+/// you remember making, it is a timeline you have to navigate. "22m ago" is the
+/// column that makes "put me back to before I broke it" answerable.
+///
+/// Relative rather than absolute deliberately: the question asked of a timeline
+/// is nearly always *how far back*, and a clock time makes the reader do the
+/// subtraction. Coarse on purpose — a resolution finer than the cadence would
+/// imply a precision the cadence does not have.
+fn relative_age(created_at_ms: u64) -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_millis() as u64);
+    // A revision from the future is a clock that moved, not a negative age.
+    // Saturating keeps it merely wrong rather than absurd (u64 would wrap).
+    let secs = now.saturating_sub(created_at_ms) / 1000;
+    match secs {
+        0..=59 => format!("{secs}s ago"),
+        60..=3599 => format!("{}m ago", secs / 60),
+        3600..=86399 => format!("{}h ago", secs / 3600),
+        _ => format!("{}d ago", secs / 86400),
+    }
+}
+
+/// A duration at a scale a person plans around. Used for the reachable-history
+/// window, where "150s" invites arithmetic and "2m 30s" does not.
+fn human_duration(d: Duration) -> String {
+    let secs = d.as_secs();
+    match secs {
+        0..=59 => format!("{secs}s"),
+        60..=3599 if secs.is_multiple_of(60) => format!("{}m", secs / 60),
+        60..=3599 => format!("{}m {}s", secs / 60, secs % 60),
+        _ if secs.is_multiple_of(3600) => format!("{}h", secs / 3600),
+        _ => format!("{}h {}m", secs / 3600, (secs % 3600) / 60),
+    }
 }
 
 /// Bytes at a scale a person can act on. Disk-usage output exists to answer
@@ -2032,6 +2093,12 @@ pub(crate) fn run_usgic_engine(
     // rather than a borrow of the caller's config, which cannot outlive it.
     let want_checkpoint = cfg.checkpoint;
 
+    // The live-checkpoint rendezvous. Present even when continuous snapshots are
+    // off: the per-vCPU cost is one relaxed atomic load per `run()` return, and
+    // making it conditional would mean two versions of the run loop.
+    let gate: Arc<livesnap::CheckpointGate<UsgicCapture>> =
+        Arc::new(livesnap::CheckpointGate::new(n));
+
     let mut threads = Vec::with_capacity(n);
     for id in 0..n {
         let (go_tx, go_rx) = mpsc::channel::<Arc<Vec<UsgicCpuHandle>>>();
@@ -2047,6 +2114,7 @@ pub(crate) fn run_usgic_engine(
         let resume = resume_state.clone();
         let clock = clock.clone();
         let capture_tx = capture_tx.clone();
+        let gate = gate.clone();
 
         let t = thread::Builder::new()
             .name(format!("chm-usgic-vcpu{id}"))
@@ -2104,6 +2172,13 @@ pub(crate) fn run_usgic_engine(
                 };
                 rehydrate::usgic_set_cpu_table(&mut vcpu, table);
 
+                // Baseline for the live-checkpoint epoch, read before the
+                // snapshotter thread can exist (it is spawned only after every
+                // vCPU has been released through this gate). A vCPU that first
+                // read the epoch after a request was already in flight would
+                // start level with it and never service it.
+                let mut my_epoch = gate.epoch();
+
                 // Run the guest until a host-side stop (running=false) or a guest
                 // power-off. The run() body handles the software GIC, the self-
                 // managed vtimer, the WFI idle halt, and draining cross-thread
@@ -2127,6 +2202,25 @@ pub(crate) fn run_usgic_engine(
                             running.store(false, Ordering::Release);
                             break;
                         }
+                    }
+
+                    // Live checkpoint rendezvous. One relaxed load when nothing
+                    // is pending, which is the overwhelmingly common case.
+                    //
+                    // This sits *after* the exit is fully serviced, not before,
+                    // and that ordering is what makes disk quiescence free:
+                    // `DeviceCore::notify` drains and publishes a block request
+                    // synchronously on this thread as part of handling the trap,
+                    // so a vCPU that reaches here provably has no half-finished
+                    // request in guest memory. An unconsumed entry still sitting
+                    // in an avail ring is fine -- that is ordinary suspended
+                    // state, and the notify handler drains it on resume.
+                    let e = gate.epoch();
+                    if e != my_epoch {
+                        my_epoch = e;
+                        let captured = hvf_checkpoint::capture_usgic_vcpu(&mut vcpu)
+                            .map_err(|err| format!("capture: {err}"));
+                        gate.arrive_and_park(id, e, captured);
                     }
                 }
 
@@ -2193,6 +2287,15 @@ pub(crate) fn run_usgic_engine(
     let inject0 = setups[0].inject.clone();
     let wake0 = setups[0].wake.clone();
     let all_exits: Vec<Arc<dyn Fn() + Send + Sync>> = setups.iter().map(|s| s.exit.clone()).collect();
+    // Every vCPU's WFI wake fd. `all_exits` alone is not enough to stop the
+    // world for a live checkpoint: `hv_vcpus_exit` forces a vCPU out of
+    // `hv_vcpu_run`, but a core idling in the host-side WFI park has already
+    // left the guest and would sit there until its poll timeout. An idle VM is
+    // exactly when a checkpoint is cheapest and most likely to be wanted, so
+    // both signals are needed. (The vtimer stepper only needs `exits` because it
+    // merely waits for `in_guest` to reach zero, which a parked vCPU satisfies.)
+    let all_wakes: Vec<Arc<dyn Fn() + Send + Sync>> =
+        setups.iter().map(|s| s.wake.clone()).collect();
     // Snapshot the run-progress counters alongside the exit signals, before
     // `setups` is consumed into the shared handle table below.
     let all_progress: Vec<Arc<AtomicU64>> =
@@ -2232,6 +2335,10 @@ pub(crate) fn run_usgic_engine(
     // VMs in one process, so an accept loop left running past its VM would leak a
     // thread and hold its port for the life of the daemon.
     let mut running_proxy: Option<credproxy::server::RunningProxy> = None;
+    // Host-side writers to guest memory that a live checkpoint must hold still.
+    // Created before the device model is wired because the net service registers
+    // itself as it starts.
+    let quiesce = Arc::new(livesnap::Quiesce::new());
     let net_service = match wire_virtio(
         &bus,
         &guest_mem,
@@ -2263,7 +2370,13 @@ pub(crate) fn run_usgic_engine(
             }
             running_proxy = wired.proxy;
             let exits: Arc<Mutex<Vec<ExitSignal>>> = Arc::new(Mutex::new(all_exits.clone()));
-            spawn_net_service(wired.net_devices, running.clone(), exits, audit.clone())
+            spawn_net_service(
+                wired.net_devices,
+                running.clone(),
+                exits,
+                audit.clone(),
+                quiesce.clone(),
+            )
         }
         Err(e) => {
             eprintln!("chm: warning: virtio device model not wired: {e}");
@@ -2343,6 +2456,30 @@ pub(crate) fn run_usgic_engine(
         None
     };
 
+    // Continuous snapshots (#148): checkpoint a *running* guest on a cadence, so
+    // a session that ends badly is not a session whose work is gone. Off unless
+    // an interval is set, because a checkpoint costs a real freeze.
+    let live_taken = Arc::new(AtomicU64::new(0));
+    let live_snapshotter = spawn_live_snapshotter(LiveSnapshotter {
+        gate: gate.clone(),
+        quiesce: quiesce.clone(),
+        net_kick: net_service.as_ref().map(|(_, k)| k.clone()),
+        exits: all_exits.clone(),
+        wakes: all_wakes.clone(),
+        running: running.clone(),
+        guest_mem: guest_mem.clone(),
+        mem_mappings: mem_mappings.clone(),
+        dir: dir.to_path_buf(),
+        num_irq: snap_num_irq,
+        vcpus: n,
+        // Its own origin, so a timeline reader can tell a point the operator
+        // asked for from one the cadence took. Same vocabulary either way, so
+        // the entry point stays visible.
+        origin: format!("{}-auto", cfg.checkpoint_source),
+        quiet: cfg.quiet,
+        taken: live_taken.clone(),
+    });
+
     let coordinator = supervise(&UsgicSession {
         uart: &uart,
         running: &running,
@@ -2372,7 +2509,15 @@ pub(crate) fn run_usgic_engine(
         p.stop();
     }
     let _ = serial_reassert.join();
-    if let Some(h) = net_service {
+    // Stop the live snapshotter before the writers it holds still: it closes the
+    // gate and the latch on its way out, so a vCPU or the net service parked for
+    // a checkpoint in progress is released rather than joined-on forever.
+    if let Some(h) = live_snapshotter {
+        let _ = h.join();
+    }
+    gate.close();
+    quiesce.close();
+    if let Some((h, _)) = net_service {
         let _ = h.join();
     }
     for t in threads {
@@ -2412,12 +2557,18 @@ pub(crate) fn run_usgic_engine(
                 }
                 Err(e) => {
                     eprintln!("chm: warning: could not write checkpoint: {e}");
-                    checkpoint::clear_checkpoint(dir);
+                    retire_or_clear_head(dir, &live_taken, cfg.quiet);
                 }
             }
         } else {
-            checkpoint::clear_checkpoint(dir);
+            retire_or_clear_head(dir, &live_taken, cfg.quiet);
         }
+    } else {
+        // Nothing asked for a teardown checkpoint, but the cadence may still
+        // have left one as HEAD. Its overlays have moved on since, so leaving it
+        // there guarantees the next start meets the #139 drift guard instead of
+        // booting. File it and stand down.
+        retire_or_clear_head(dir, &live_taken, cfg.quiet);
     }
 
     let resolved = match vcpu_outcome {
@@ -2513,6 +2664,210 @@ const VTIMER_STEP_TIMEOUT: Duration = Duration::from_millis(20);
 ///
 /// Returns `None` for an unscaled clock, which never moves and so needs no
 /// thread and pays no barrier.
+/// Everything the live snapshotter needs. A struct because a dozen positional
+/// arguments is how a `guest_mem`/`mem_mappings` pair gets silently swapped.
+struct LiveSnapshotter {
+    gate: Arc<livesnap::CheckpointGate<UsgicCapture>>,
+    quiesce: Arc<livesnap::Quiesce>,
+    net_kick: Option<Arc<NetKick>>,
+    exits: Vec<Arc<dyn Fn() + Send + Sync>>,
+    wakes: Vec<Arc<dyn Fn() + Send + Sync>>,
+    running: Arc<AtomicBool>,
+    guest_mem: Arc<GuestMemory>,
+    mem_mappings: Vec<rehydrate::MemMapping>,
+    dir: PathBuf,
+    num_irq: u32,
+    vcpus: usize,
+    origin: String,
+    quiet: bool,
+    /// How many live checkpoints have landed, shared with teardown. Teardown
+    /// needs to know whether HEAD is *this run's dying breath* or a point
+    /// captured earlier from a healthy guest, because the two deserve opposite
+    /// treatment and they are indistinguishable from the directory alone.
+    taken: Arc<AtomicU64>,
+}
+
+/// How long the whole world may stay stopped for one live checkpoint before the
+/// attempt is abandoned. Generous next to the 1.5–4.5 s a 2 GiB guest measures
+/// on this hardware, but this is a *ceiling on damage*, not a target: crossing
+/// it means something is wrong, and the honest response is a missed checkpoint
+/// rather than a torn one.
+const LIVE_SNAPSHOT_BARRIER_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Decide what happens to HEAD when a run ends without writing a fresh
+/// checkpoint over it.
+///
+/// Deleting is right when HEAD is this run's own dying breath. It is wrong when
+/// the cadence put a healthy point there, so the two cases are separated by who
+/// wrote it rather than by how the run ended.
+fn retire_or_clear_head(dir: &Path, live_taken: &Arc<AtomicU64>, quiet: bool) {
+    if live_taken.load(Ordering::Acquire) == 0 {
+        checkpoint::clear_checkpoint(dir);
+        return;
+    }
+    match checkpoint::retire_checkpoint(dir) {
+        Some(id) if !quiet => eprintln!(
+            "chm: kept the last live snapshot as {id}; \
+             recover it with `chm rollback {} {id}`",
+            dir.display()
+        ),
+        _ => {}
+    }
+}
+
+/// Checkpoint a running guest on a cadence, without stopping it (#148).
+///
+/// Returns `None` unless `CHM_SNAPSHOT_INTERVAL_SECS` asks for it. Off by
+/// default deliberately: a checkpoint freezes the guest for as long as it takes
+/// to dump RAM, so turning it on is a trade the operator makes, not one we make
+/// for them.
+fn spawn_live_snapshotter(s: LiveSnapshotter) -> Option<thread::JoinHandle<()>> {
+    let interval = env::var("CHM_SNAPSHOT_INTERVAL_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .map(Duration::from_secs)?;
+
+    // Say up front how far back this actually lets you travel. The cadence is
+    // the visible knob but retention is the binding one: at 30 s and the default
+    // budget of 5, "continuous snapshots" buys two and a half minutes of
+    // history, which is not what the phrase suggests. An operator who wants more
+    // can raise the budget or pin a point, and can only make that choice if the
+    // number is in front of them rather than inferred from two env vars.
+    if !s.quiet {
+        let window = interval * u32::try_from(checkpoint::max_resumable_revisions()).unwrap_or(1);
+        eprintln!(
+            "chm: continuous snapshots every {}s; roughly the last {} \
+             stays resumable (raise CHM_MAX_RESUMABLE_REVISIONS, or pin a \
+             revision, to keep more)",
+            interval.as_secs(),
+            human_duration(window)
+        );
+    }
+
+    thread::Builder::new()
+        .name("chm-live-snapshot".into())
+        .spawn(move || {
+            let LiveSnapshotter {
+                gate,
+                quiesce,
+                net_kick,
+                exits,
+                wakes,
+                running,
+                guest_mem,
+                mem_mappings,
+                dir,
+                num_irq,
+                vcpus,
+                origin,
+                quiet,
+                taken: taken_total,
+            } = s;
+
+            // Both signals, every time. `hv_vcpus_exit` moves a vCPU that is
+            // inside the guest; the wake fd moves one parked in the host-side
+            // WFI idle halt, which has already left the guest and would
+            // otherwise sit there until its poll timeout. An idle VM is exactly
+            // when a checkpoint is cheapest, so it must not be the slow case.
+            let kick = move || {
+                for e in &exits {
+                    e();
+                }
+                for w in &wakes {
+                    w();
+                }
+            };
+            let wake_writers = move || {
+                if let Some(k) = &net_kick {
+                    k.wake();
+                }
+            };
+
+            let (mut taken, mut missed) = (0u64, 0u64);
+            let mut next = Instant::now() + interval;
+            while running.load(Ordering::Acquire) {
+                // Poll rather than sleep the whole interval so teardown is
+                // observed promptly instead of after a full period.
+                thread::sleep(Duration::from_millis(200));
+                if Instant::now() < next {
+                    continue;
+                }
+                next = Instant::now() + interval;
+
+                let started = Instant::now();
+                // Order matters: hold the host-side writers first, then the
+                // vCPUs. The other way round leaves the net service free to
+                // publish into the RX ring of a guest whose vCPUs are already
+                // parked, which is precisely the torn ring we are avoiding.
+                if let Err(e) = quiesce.pause(&wake_writers, LIVE_SNAPSHOT_BARRIER_TIMEOUT) {
+                    missed += 1;
+                    if !quiet {
+                        eprintln!("chm: live snapshot skipped (writers): {e}");
+                    }
+                    continue;
+                }
+                let captures = match gate.stop_the_world(&kick, LIVE_SNAPSHOT_BARRIER_TIMEOUT) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        quiesce.resume();
+                        missed += 1;
+                        if !quiet {
+                            eprintln!("chm: live snapshot skipped: {e}");
+                        }
+                        continue;
+                    }
+                };
+                let frozen_at = started.elapsed();
+
+                // The world is stopped here, and nothing in this block may
+                // return early without releasing it.
+                let result =
+                    assemble_usgic_checkpoint(captures, num_irq, vcpus).and_then(|state| {
+                    checkpoint::write_checkpoint(
+                        &dir,
+                        &state,
+                        &guest_mem,
+                        &mem_mappings,
+                        &origin,
+                    )
+                });
+                let froze = started.elapsed();
+                gate.release();
+                quiesce.resume();
+
+                match result {
+                    Ok(()) => {
+                        taken += 1;
+                        taken_total.store(taken, Ordering::Release);
+                        if !quiet {
+                            // Report the measured freeze, not a nominal one: the
+                            // whole cost of this feature is time the guest did
+                            // not run, and an operator choosing an interval
+                            // needs the real number.
+                            eprintln!(
+                                "chm: live snapshot {taken} written \
+                                 (froze {:.2}s, barrier {:.0}ms)",
+                                froze.as_secs_f64(),
+                                frozen_at.as_secs_f64() * 1000.0
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        missed += 1;
+                        eprintln!("chm: warning: live snapshot failed: {e}");
+                    }
+                }
+            }
+            gate.close();
+            quiesce.close();
+            if !quiet && (taken > 0 || missed > 0) {
+                eprintln!("chm: live snapshots: {taken} written, {missed} skipped");
+            }
+        })
+        .ok()
+}
+
 fn spawn_vtimer_stepper(
     clock: Arc<VtimerClock>,
     exits: Vec<ExitSignal>,
@@ -2712,21 +3067,45 @@ fn collect_usgic_checkpoint(
     num_irq: u32,
     n: usize,
 ) -> Result<CheckpointState, String> {
-    let mut slots: Vec<Option<(hvf_checkpoint::VcpuCheckpoint, hvf_checkpoint::UsgicCheckpoint)>> =
-        (0..n).map(|_| None).collect();
+    let mut slots: Vec<Option<UsgicCapture>> = (0..n).map(|_| None).collect();
     for _ in 0..n {
         let (id, res) = captured_rx
             .recv()
             .map_err(|_| "a vCPU thread exited before sending its capture".to_string())?;
-        let cp = res.map_err(|e| format!("vCPU {id}: {e}"))?;
         *slots
             .get_mut(id)
-            .ok_or_else(|| format!("captured out-of-range vCPU id {id}"))? = Some(cp);
+            .ok_or_else(|| format!("captured out-of-range vCPU id {id}"))? = Some(res);
     }
-    let (vcpus, usgic_cpus): (Vec<_>, Vec<_>) = slots
+    let ordered = slots
         .into_iter()
         .enumerate()
         .map(|(id, c)| c.ok_or_else(|| format!("missing capture for vCPU {id}")))
+        .collect::<Result<Vec<_>, String>>()?;
+    assemble_usgic_checkpoint(ordered, num_irq, n)
+}
+
+/// Turn per-vCPU captures **already in id order** into a [`CheckpointState`].
+///
+/// Split out of [`collect_usgic_checkpoint`] so the live-checkpoint path
+/// (which gets its captures from the [`livesnap::CheckpointGate`], indexed by
+/// id rather than delivered over a channel) builds byte-identical state. Two
+/// assemblers would be two chances for the resume side to meet a shape only one
+/// of them writes.
+fn assemble_usgic_checkpoint(
+    captures: Vec<UsgicCapture>,
+    num_irq: u32,
+    n: usize,
+) -> Result<CheckpointState, String> {
+    if captures.len() != n {
+        return Err(format!(
+            "checkpoint covers {} vCPU(s) but this VM has {n}",
+            captures.len()
+        ));
+    }
+    let (vcpus, usgic_cpus): (Vec<_>, Vec<_>) = captures
+        .into_iter()
+        .enumerate()
+        .map(|(id, c)| c.map_err(|e| format!("vCPU {id}: {e}")))
         .collect::<Result<Vec<_>, String>>()?
         .into_iter()
         .unzip();
@@ -2911,6 +3290,40 @@ mod tests {
     /// If this fails because a new `Some("...")` was added for something that
     /// is *not* a subcommand, that is still worth a look: the dispatch match is
     /// the only place that shape is meant to appear.
+    /// The reachable-history window is the number an operator plans around, so
+    /// it must not make them do arithmetic to read it.
+    #[test]
+    fn human_duration_reads_at_the_scales_a_cadence_produces() {
+        let d = |s: u64| human_duration(Duration::from_secs(s));
+        assert_eq!(d(45), "45s");
+        assert_eq!(d(150), "2m 30s"); // 30s cadence x default budget of 5
+        assert_eq!(d(300), "5m");
+        assert_eq!(d(3600), "1h");
+        assert_eq!(d(5400), "1h 30m");
+    }
+
+    /// The timeline column has to stay readable at every scale a session
+    /// reaches, and must not turn a clock that went backwards into an absurdity.
+    #[test]
+    fn relative_age_reads_as_a_timeline_at_every_scale() {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let ago = |secs: u64| relative_age(now - secs * 1000);
+        assert_eq!(ago(0), "0s ago");
+        assert_eq!(ago(59), "59s ago");
+        assert_eq!(ago(60), "1m ago");
+        assert_eq!(ago(3599), "59m ago");
+        assert_eq!(ago(3600), "1h ago");
+        assert_eq!(ago(86_399), "23h ago");
+        assert_eq!(ago(86_400), "1d ago");
+        // A revision stamped in the future means the host clock moved, not that
+        // time ran backwards. Saturating keeps it wrong-but-sane; subtracting
+        // would wrap u64 and print ~584 million years.
+        assert_eq!(relative_age(now + 60_000), "0s ago");
+    }
+
     #[test]
     fn every_dispatched_subcommand_appears_in_the_help() {
         let src = include_str!("imp.rs");
