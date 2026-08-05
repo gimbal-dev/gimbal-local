@@ -849,8 +849,15 @@ fn build_virtio(
                 )
             }
             VirtioKind::Net => {
-                // Deny-all unless the caller named destinations, matching the
-                // default posture every other entry point starts from.
+                // Deny-all unless the caller named destinations. This is
+                // deliberately *stricter* than the resume path, which runs
+                // unrestricted when a workspace has no policy file: a
+                // rehydrated snapshot arrives expecting the network it was
+                // captured with, but a cold guest is being described here for
+                // the first time and nobody is owed a connection they have not
+                // asked for. Measured on hardware: within 100 s of boot a stock
+                // Ubuntu rootfs reaches for ntp/changelogs/entropy.ubuntu.com
+                // and api.snapcraft.io unprompted. See `security-model.md` §1a.
                 let mut policy = EgressPolicy::from_profile(
                     "deny",
                     &args.egress_allow,
