@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 
+import AppKit
 import Foundation
 
 enum EngineTone: Equatable {
@@ -115,6 +116,13 @@ final class AppModel: ObservableObject {
     @Published var activeLocalSandboxID: String?
     @Published var startingSandboxID: String?
     @Published var interactiveSandboxID: String?
+    /// The last reason an "Open terminal" press did not produce a terminal.
+    ///
+    /// The preconditions are rendered before the click, so this exists for the
+    /// half that can only be discovered by trying — `osascript` failing, a
+    /// binary that vanished between the render and the press. Cleared at the
+    /// start of every attempt, so it never outlives the problem it describes.
+    @Published var terminalLaunchFailure: String?
     /// Authoritative set of local sandboxes with a live `chm connect` VM, derived
     /// by scanning the per-sandbox session-lock files (`reconcileSessions`). This
     /// is the source of truth for local liveness — correct across app restarts
@@ -989,6 +997,49 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Everything standing between this sandbox and an open terminal.
+    ///
+    /// Computed for the *card*, so the reasons are on screen before the button
+    /// is pressed, and computed again inside `connect` so the refusal cannot be
+    /// bypassed by a stale view. One function, so the two can never disagree
+    /// about whether the launch was going to work.
+    func terminalLaunchBlockers(for sandbox: Sandbox) -> [TerminalLaunch.Blocker] {
+        let isLive = sandbox.state == .running || sandbox.state == .starting
+        return TerminalLaunch.blockers(
+            TerminalLaunch.Preconditions(
+                slot: SlotContention.evaluate(
+                    holderName: slotHolder(excluding: sandbox.id)?.name,
+                    thisSandboxIsLive: isLive
+                ),
+                snapshotName: sandbox.snapshotName,
+                snapshotInLibrary: snapshot(named: sandbox.snapshotName) != nil,
+                chm: SettingsStore.probeFilesystem(settings.chmPath),
+                chmPath: settings.chmPath,
+                terminalAppPresent: Self.terminalAppPresent()
+            )
+        )
+    }
+
+    /// Whether macOS can find a Terminal.app to hand the session to.
+    ///
+    /// Asked of LaunchServices rather than by stat-ing `/Applications`, because
+    /// that is the same question `osascript`'s `tell application "Terminal"`
+    /// resolves — a check against a hardcoded path could pass while the launch
+    /// still fails, which is worse than not checking.
+    static func terminalAppPresent() -> Bool {
+        NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") != nil
+    }
+
+    /// Where a sandbox's state lives, and whether that is still under the
+    /// current library. `nil` for a sandbox that has never been started.
+    func workspaceLocation(for sandbox: Sandbox) -> WorkspaceLocation.State? {
+        WorkspaceLocation.evaluate(
+            workspacePath: storedSandboxes.first(where: { $0.id == sandbox.id })?.workspacePath
+                ?? sandbox.workspacePath,
+            libraryPath: settings.libraryPath
+        )
+    }
+
     /// True if the PID recorded in `lockPath` names a live process.
     private func lockOwnerAlive(_ lockPath: String) -> Bool {
         guard
@@ -1412,19 +1463,22 @@ final class AppModel: ObservableObject {
     /// work in a sandbox. `chm connect` takes over the local VM slot in its own
     /// process, so we mark the sandbox interactive here (the daemon can't report
     /// it) and keep it shown as running until the user stops it.
+    ///
+    /// Refusals go through `terminalLaunchBlockers` — the same list the card
+    /// shows — so the button and the action cannot come to disagree about
+    /// whether this was going to work. The card should already have disabled the
+    /// button; this re-check is what makes that a guarantee rather than a hope,
+    /// since the slot can be taken between a render and a click.
     func connect(to sandbox: Sandbox) {
-        guard let snapshot = snapshot(named: sandbox.snapshotName) else {
-            appendLog("cannot connect: snapshot \(sandbox.snapshotName) not in library")
-            return
-        }
-        // Single HVF slot: refuse to open a second VM while another sandbox holds
-        // a live session, which would contend on the slot (the second VM can be
-        // "alive" but non-functional). Authoritative via the session registry so
-        // this holds even for a session inherited from a previous app run (#71).
-        if let holder = liveSlotHolder(excluding: sandbox.id) {
-            appendLog(
-                "cannot connect \(sandbox.name): \(holder.name) is using the single local VM slot — stop it first"
-            )
+        terminalLaunchFailure = nil
+        let blockers = terminalLaunchBlockers(for: sandbox)
+        if let first = blockers.first {
+            for blocker in blockers {
+                appendLog("cannot open a terminal for \(sandbox.name): \(blocker.message)")
+            }
+            // The card renders the full list; this carries the leading reason to
+            // anyone who got here anyway, rather than leaving the press silent.
+            terminalLaunchFailure = first.message
             return
         }
         activeLocalSandboxID = sandbox.id
@@ -1441,12 +1495,18 @@ final class AppModel: ObservableObject {
         consoleProcess?.terminate()
         consoleProcess = nil
         Task {
+            guard let snapshot = snapshot(named: sandbox.snapshotName) else { return }
             let runPath = await ensureWorkspace(sandboxID: sandbox.id) ?? snapshot.path
             do {
                 try openInteractiveTerminal(runPath: runPath, lockPath: lockPath)
                 appendLog("opened interactive terminal for \(sandbox.name)")
             } catch {
-                appendLog("terminal connect failed: \(error.localizedDescription)")
+                // Only reachable once the preconditions passed, so this is a
+                // genuine surprise — which is exactly the kind of failure that
+                // must not end its life in a log nobody opens.
+                let detail = error.localizedDescription
+                appendLog("terminal connect failed: \(detail)")
+                terminalLaunchFailure = "The terminal could not be opened: \(detail)"
                 if interactiveSandboxID == sandbox.id {
                     clearInteractiveTracking()
                 }

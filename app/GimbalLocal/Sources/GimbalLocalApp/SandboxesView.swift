@@ -244,49 +244,68 @@ private struct LocalSandboxActions: View {
     let sandbox: Sandbox
 
     private var isLive: Bool { sandbox.state == .running || sandbox.state == .starting }
+    private var blockers: [TerminalLaunch.Blocker] { model.terminalLaunchBlockers(for: sandbox) }
 
     var body: some View {
-        HStack(spacing: 10) {
-            Button {
-                model.connect(to: sandbox)
-            } label: {
-                Label("Open terminal", systemImage: "terminal.fill")
-                    .frame(maxWidth: .infinity)
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 10) {
+                Button {
+                    model.connect(to: sandbox)
+                } label: {
+                    Label("Open terminal", systemImage: "terminal.fill")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(!blockers.isEmpty)
+
+                Menu {
+                    Button {
+                        model.startSandbox(sandbox)
+                    } label: {
+                        Label("Start", systemImage: "play.fill")
+                    }
+                    .disabled(isLive)
+
+                    Button {
+                        model.stop(sandbox)
+                    } label: {
+                        Label("Stop", systemImage: "stop.fill")
+                    }
+                    .disabled(!isLive)
+
+                    Button {
+                        model.selection = .sandbox(sandbox.id)
+                    } label: {
+                        Label("Open details", systemImage: "info.circle")
+                    }
+                    Divider()
+                    Button(role: .destructive) {
+                        model.deleteSandbox(sandbox)
+                    } label: {
+                        Label("Remove sandbox", systemImage: "trash")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+                .menuStyle(.button)
+                .buttonStyle(.bordered)
+                .fixedSize()
             }
-            .buttonStyle(.borderedProminent)
 
-            Menu {
-                Button {
-                    model.startSandbox(sandbox)
-                } label: {
-                    Label("Start", systemImage: "play.fill")
+            // A disabled button teaches nothing (the V8.5 lesson), and a row has
+            // no room for remedies — so state the leading reason here and point
+            // at the page that carries all of them.
+            if let first = blockers.first {
+                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(Theme.orange)
+                        .font(.caption2)
+                    Text(blockers.count > 1 ? "\(first.message) (+\(blockers.count - 1) more — see details)" : first.message)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
-                .disabled(isLive)
-
-                Button {
-                    model.stop(sandbox)
-                } label: {
-                    Label("Stop", systemImage: "stop.fill")
-                }
-                .disabled(!isLive)
-
-                Button {
-                    model.selection = .sandbox(sandbox.id)
-                } label: {
-                    Label("Open details", systemImage: "info.circle")
-                }
-                Divider()
-                Button(role: .destructive) {
-                    model.deleteSandbox(sandbox)
-                } label: {
-                    Label("Remove sandbox", systemImage: "trash")
-                }
-            } label: {
-                Image(systemName: "ellipsis.circle")
             }
-            .menuStyle(.button)
-            .buttonStyle(.bordered)
-            .fixedSize()
         }
     }
 }
@@ -362,6 +381,7 @@ struct SandboxDetailPage: View {
                         WorkInsideCard(sandbox: sandbox)
                         SandboxControlsCard(sandbox: sandbox)
                         ConnectivityCard(sandbox: sandbox)
+                        WorkspaceLocationCard(sandbox: sandbox)
                         RevisionHistoryCard(
                             dirPath: sandbox.workspacePath,
                             emptyHint: "Run this sandbox (Open terminal), then end the session to save its live state as a revision here — isolated from other sandboxes of the same image."
@@ -448,6 +468,27 @@ private struct WorkInsideCard: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
 
+            // Why Open terminal is disabled. Start got this in #192 and this
+            // button — the one people actually press — did not. Every blocker is
+            // listed, so clearing one cannot reveal another as a surprise.
+            ForEach(Array(blockers.enumerated()), id: \.offset) { _, blocker in
+                LaunchBlockerRow(sandbox: sandbox, blocker: blocker)
+            }
+
+            // A failure only discovered by trying: the preconditions passed and
+            // the launch still did not happen.
+            if blockers.isEmpty, let failure = model.terminalLaunchFailure {
+                HStack(alignment: .firstTextBaseline, spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(Theme.orange)
+                    Text(failure)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer(minLength: 8)
+                }
+            }
+
             Button {
                 model.connect(to: sandbox)
             } label: {
@@ -457,6 +498,83 @@ private struct WorkInsideCard: View {
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
+            .disabled(!blockers.isEmpty)
+        }
+    }
+
+    private var blockers: [TerminalLaunch.Blocker] {
+        model.terminalLaunchBlockers(for: sandbox)
+    }
+}
+
+/// One refusal, stated with its remedy — and with a button only when the app can
+/// actually perform that remedy. A button that merely restates advice would
+/// promise an action there is none of.
+private struct LaunchBlockerRow: View {
+    @EnvironmentObject private var model: AppModel
+    let sandbox: Sandbox
+    let blocker: TerminalLaunch.Blocker
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(Theme.orange)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(blocker.message)
+                    .font(.caption)
+                    .foregroundStyle(.primary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text(blocker.remedy)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            Spacer(minLength: 8)
+            if let label = blocker.remedyLabel, let holder = model.slotHolder(excluding: sandbox.id) {
+                Button(label) { model.stop(holder) }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+            }
+        }
+    }
+}
+
+/// Where this sandbox's disk and revisions actually live.
+///
+/// Shown always, not only when something is wrong: "where is my state" is a
+/// question worth being able to answer at any time, and a row that appears only
+/// on trouble teaches the layout at the worst moment.
+private struct WorkspaceLocationCard: View {
+    @EnvironmentObject private var model: AppModel
+    let sandbox: Sandbox
+
+    var body: some View {
+        if let location = model.workspaceLocation(for: sandbox) {
+            GlassCard(title: "Stored at", subtitle: "disk, overlays and revisions", systemImage: "externaldrive.fill") {
+                Text(location.path)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if location.outsideLibrary, let note = location.note, let remedy = location.remedy {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(Theme.orange)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(note)
+                                .font(.caption)
+                                .foregroundStyle(.primary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text(remedy)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 8)
+                    }
+                }
+            }
         }
     }
 }
