@@ -83,6 +83,18 @@ silence. It is also self-perpetuating: capturing at teardown writes that *hung*
 kernel over the last good checkpoint, so every later resume starts wedged. That
 is why the check refuses up front instead of warning and continuing.
 
+Because it refuses, the comparison has to be right about what constitutes a
+change. It once was not: when the fingerprint stopped covering the `.bitmap`
+sidecars — those record, after the fact, allocations the CoW data file already
+reflects, so they never carried detection power — checkpoints written *before*
+that still stored a bitmap line. Comparing one of those against a freshly
+computed fingerprint mismatched on the **format** rather than on the disk, so
+every pre-existing checkpoint refused to resume, with an error blaming the
+user's disk for a change we had made. Measured when it was found: every stored
+fingerprint on the development machine, including the working agent image. Both
+sides are now reduced to the lines that carry signal before they are compared,
+which costs no detection power precisely because those lines never had any.
+
 ## Policy and control-plane bindings
 
 These are **not** debug switches. They carry configuration, usually set by the

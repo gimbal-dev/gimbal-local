@@ -95,6 +95,100 @@ into `total` rather than folded into either.
 > revision owned them. The invariant `on_disk <= apparent` is now asserted by a
 > test.
 
+## Reclaiming: delete, gc
+
+Retention roots decide what age-based pruning *keeps*. This half is what you do
+deliberately.
+
+### `chm revisions <dir> delete <id>`
+
+Removes one revision, and reports exactly what that gave back.
+
+**Its descendants keep working, and this is the point worth understanding.** It
+is tempting to assume a revision built as a delta against its parent must
+depend on that parent — and if it did, deleting anything but the newest
+revision would have to be refused, which would make the command useless, since
+every revision except the newest has a descendant.
+
+It does not depend on it. `dump_guest_ram_delta` *clones* the parent's dump and
+overwrites only the 64 KiB chunks that changed, so a child shares **extents**
+with its parent, never **dependency**: the clone is a separate inode holding a
+logically complete image. Nothing on the restore path reads `parent` at all.
+
+Measured, rather than argued:
+
+| Check | Result |
+| --- | --- |
+| Child's RAM dump, sha256 before and after its parent was deleted | identical |
+| A 2 vCPU guest resumed from a revision whose parent was deleted | login shell, `aarch64/2/ch-snap`, live filesystem |
+| Bytes the command reported reclaiming | 1.4 GiB |
+| Bytes the volume's own free-space counter gave back | 1452 MiB |
+
+What *does* change is the graph: the descendants' manifests go on naming an id
+that is gone. They are left exactly as they were — a manifest is the record of
+what was captured, and rewriting one to say it descended from something else
+would falsify that record to tidy a display. `chm revisions` reports the
+reference for what it is:
+
+```
+rev-1785770906759-5394  1d ago  connect  parent=rev-1785770605785-40d2 (deleted)  resumable
+```
+
+**Two refusals, both naming their remedy:**
+
+- **HEAD** — the state this snapshot resumes from. It is live state, not
+  history; deleting it would silently turn the next start into a cold boot.
+  Roll back, or take a newer checkpoint, to make it history first.
+- **A pinned revision** — the remedy named is `unpin`, deliberately, rather
+  than a `--force` flag. The whole point of a pin is that removing it is a
+  separate decision, and `--force` invites reflex.
+
+`--dry-run` runs the same planner the real command runs, so what it promises is
+what a real one does.
+
+> **A reclaim of `0 B` is a real answer, not a failure.** The figure counts
+> extents no other file shares, so a revision whose content is entirely shared
+> with a fork — or with an APFS clone of the whole workspace — costs nothing
+> and returns nothing. The command says which it is rather than printing a bare
+> zero. It also means the figures are **not additive**: deleting one revision
+> can raise what the next one would reclaim, because extents that were shared
+> become private.
+
+### `chm revisions <dir> gc`
+
+Reclaims state that no reader can reach. Both classes hold a whole RAM dump
+while being invisible to `chm revisions`, so without this, reclaiming them
+means knowing they exist and nothing ever tells you:
+
+| Collected | Why it is there |
+| --- | --- |
+| `<snapshot>/.chm-checkpoint.tmp` | `write_checkpoint` stages a checkpoint here and renames it into place. An interrupted suspend leaves the staging directory behind, and only the *next* checkpoint of that snapshot clears it — so without `gc`, reclaiming it means running a guest. |
+| A revision directory whose manifest will not parse | `list_revisions` skips it, so it is unreachable by resume, rollback, prune and usage alike, while still holding its dump. |
+
+Deliberately **snapshot-scoped**. The pull cache in `control_plane` is a shared
+content-addressed store keyed by digest; collecting it from here would let one
+snapshot's cleanup delete blobs another snapshot is about to reuse.
+
+`--dry-run` lists without removing. Running it twice is a no-op.
+
+## Naming a point: `chm revisions <dir> label <id> <text>`
+
+A timeline of timestamps tells you when, never why. A label is what makes a
+point findable a month later, and it pairs with a pin: the two questions are
+*keep this* and *keep this **because***.
+
+```
+rev-1785770906759-5394  1d ago  connect  parent=…  resumable  "node installed, before the npm crash"
+```
+
+Stored as a sidecar file, for the same reasons as the pin marker plus one that
+is decisive: the manifest embeds the entire captured hardware state. Rewriting
+that file to edit one string would round-trip a **resumable checkpoint** through
+serde to change something serde never needed to see, and any asymmetry there
+costs the checkpoint rather than the label. Control characters and labels over
+120 characters are refused, because a label is echoed back into the listing
+someone is reading to decide what to delete. `--clear` removes one.
+
 ## Related
 
 - [`docs/environment-variables.md`](environment-variables.md) —

@@ -4,6 +4,7 @@
 
 //! macOS / Apple-Silicon implementation of the `chm` CLI.
 
+use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -1498,8 +1499,11 @@ fn workspace(raw: &[String]) -> Result<ExitCode, String> {
 /// Shared by the parser and its test, so the documented order and the accepted
 /// order cannot drift apart.
 const REVISIONS_USAGE: &str = "usage: chm revisions <SNAPSHOT_DIR> [--json] [--usage]\n       \
-     chm revisions <SNAPSHOT_DIR> pin   <REVISION_ID>\n       \
-     chm revisions <SNAPSHOT_DIR> unpin <REVISION_ID>\n\
+     chm revisions <SNAPSHOT_DIR> pin    <REVISION_ID>\n       \
+     chm revisions <SNAPSHOT_DIR> unpin  <REVISION_ID>\n       \
+     chm revisions <SNAPSHOT_DIR> label  <REVISION_ID> <TEXT>|--clear\n       \
+     chm revisions <SNAPSHOT_DIR> delete <REVISION_ID> [--dry-run]\n       \
+     chm revisions <SNAPSHOT_DIR> gc [--dry-run]\n\
      \n\
      List the snapshot's saved revisions (its lineage), oldest first, with\n     \
      how long ago each was taken. `resumable` marks revisions whose live\n     \
@@ -1516,35 +1520,68 @@ const REVISIONS_USAGE: &str = "usage: chm revisions <SNAPSHOT_DIR> [--json] [--u
      interval times CHM_MAX_RESUMABLE_REVISIONS, so pin anything you\n     \
      want to outlive it.\n\
      \n\
+     `label` names a revision so a timeline of timestamps becomes a list\n     \
+     of reasons. A label is what makes a point findable months later.\n\
+     \n\
+     `delete` removes one revision. Descendants keep working — a RAM\n     \
+     dump is a complete image, so a child shares extents with its parent\n     \
+     but never depends on it — and their manifests go on naming the\n     \
+     deleted id, which is reported as `(deleted)`. HEAD and pinned\n     \
+     revisions are refused.\n\
+     \n\
+     `gc` reclaims state no reader can reach: a staging directory left\n     \
+     by an interrupted checkpoint, and revision directories whose\n     \
+     manifest will not parse. Both hold a whole RAM dump while being\n     \
+     invisible to `chm revisions`.\n\
+     \n\
      `--usage` reports what the lineage occupies. A fork hard-links its\n\
      parent's RAM dump, so shared content is counted once for the\n\
      revisions total and once per revision below it; the difference is\n\
      the saving from sharing. Live overlays belong to no revision and\n\
      are reported on their own line.";
 
+/// How many positional arguments each `revisions` verb takes, including the
+/// directory and the verb itself. `None` is "not a verb".
+fn revisions_arity(verb: &str, clearing: bool) -> Option<usize> {
+    match verb {
+        "pin" | "unpin" | "delete" => Some(3),
+        "gc" => Some(2),
+        // `label <ID> <TEXT>`, or `label <ID> --clear` where the flag is not a
+        // positional.
+        "label" => Some(if clearing { 3 } else { 4 }),
+        _ => None,
+    }
+}
+
 fn revisions(raw: &[String]) -> Result<ExitCode, String> {
     let json = raw.iter().any(|a| a == "--json");
     let usage_only = raw.iter().any(|a| a == "--usage");
+    let dry_run = raw.iter().any(|a| a == "--dry-run");
+    let clearing = raw.iter().any(|a| a == "--clear");
     let positionals: Vec<&String> = raw.iter().filter(|a| !a.starts_with('-')).collect();
 
-    // `pin` / `unpin` act on a revision inside a snapshot, so they follow the
+    // Every verb acts on a revision inside a snapshot, so they follow the
     // directory exactly as `chm rollback <SNAPSHOT_DIR> <REVISION_ID>` does.
     // Every command in this CLI takes SNAPSHOT_DIR immediately after the verb;
     // putting it second here would make the directory's position depend on
     // whether a sub-verb was given.
-    let verb = positionals
-        .get(1)
-        .map(|s| s.as_str())
-        .filter(|s| matches!(*s, "pin" | "unpin"));
-    let expected = if verb.is_some() { 3 } else { 1 };
+    let verb = positionals.get(1).map(|s| s.as_str());
+    let arity = verb.and_then(|v| revisions_arity(v, clearing));
+    let expected = arity.unwrap_or(1);
 
     if raw.iter().any(|a| a == "-h" || a == "--help") || positionals.len() != expected {
         eprintln!("{REVISIONS_USAGE}");
         return if positionals.len() == expected {
             Ok(ExitCode::SUCCESS)
+        } else if let (Some(verb), Some(arity)) = (verb, arity) {
+            Err(format!(
+                "`{verb}` takes {} argument(s) after the directory, got {}",
+                arity - 2,
+                positionals.len().saturating_sub(2)
+            ))
         } else if positionals.len() > 1 {
             Err(format!(
-                "expected `pin` or `unpin` after the directory, got `{}`",
+                "expected one of pin, unpin, label, delete, gc after the directory, got `{}`",
                 positionals[1]
             ))
         } else {
@@ -1554,16 +1591,7 @@ fn revisions(raw: &[String]) -> Result<ExitCode, String> {
 
     if let Some(verb) = verb {
         let dir = PathBuf::from(positionals[0]);
-        let rev = positionals[2];
-        let pin = verb == "pin";
-        let changed = checkpoint::pin_revision(&dir, rev, pin)?;
-        let state = if pin { "pinned" } else { "unpinned" };
-        if changed {
-            println!("{rev} {state}");
-        } else {
-            println!("{rev} was already {state}");
-        }
-        return Ok(ExitCode::SUCCESS);
+        return revisions_verb(&dir, verb, &positionals, dry_run, clearing);
     }
 
     let dir = PathBuf::from(positionals[0]);
@@ -1622,18 +1650,113 @@ fn revisions(raw: &[String]) -> Result<ExitCode, String> {
             dir.display()
         );
     } else {
+        let ids: HashSet<&str> = summaries.iter().map(|r| r.id.as_str()).collect();
         for r in &summaries {
             let head = if r.is_head { " (HEAD)" } else { "" };
             let resumable = if r.resumable { "resumable" } else { "metadata-only" };
             let pin = if r.pinned { "  [pinned]" } else { "" };
-            let parent = r.parent.as_deref().unwrap_or("—");
+            // A parent that no longer resolves is not a broken record, it is the
+            // record of a deletion — and saying so is the whole reason `delete`
+            // can leave manifests alone. Silently printing the id would look
+            // like a revision the reader had somehow missed.
+            let parent = match r.parent.as_deref() {
+                Some(p) if ids.contains(p) => p.to_string(),
+                Some(p) => format!("{p} (deleted)"),
+                None => "—".to_string(),
+            };
+            let label = r.label.as_deref().map_or_else(String::new, |l| format!("  \"{l}\""));
             println!(
-                "{}{head}  {:>9}  {}  parent={parent}  {resumable}{pin}",
+                "{}{head}  {:>9}  {}  parent={parent}  {resumable}{pin}{label}",
                 r.id,
                 relative_age(r.created_at_ms),
                 r.origin
             );
         }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// Dispatch a `chm revisions <dir> <verb>` sub-verb.
+fn revisions_verb(
+    dir: &Path,
+    verb: &str,
+    positionals: &[&String],
+    dry_run: bool,
+    clearing: bool,
+) -> Result<ExitCode, String> {
+    match verb {
+        "pin" | "unpin" => {
+            let rev = positionals[2];
+            let pin = verb == "pin";
+            let changed = checkpoint::pin_revision(dir, rev, pin)?;
+            let state = if pin { "pinned" } else { "unpinned" };
+            if changed {
+                println!("{rev} {state}");
+            } else {
+                println!("{rev} was already {state}");
+            }
+        }
+        "label" => {
+            let rev = positionals[2];
+            let text = if clearing { None } else { Some(positionals[3].as_str()) };
+            match checkpoint::label_revision(dir, rev, text)? {
+                Some(stored) => println!("{rev} labelled \"{stored}\""),
+                None => println!("{rev} label cleared"),
+            }
+        }
+        "delete" => {
+            let rev = positionals[2];
+            let plan = if dry_run {
+                checkpoint::plan_delete(dir, rev)?
+            } else {
+                checkpoint::delete_revision(dir, rev)?
+            };
+            let verbed = if dry_run { "would delete" } else { "deleted" };
+            let kind = if plan.resumable { "resumable" } else { "metadata-only" };
+            println!("{verbed} {} ({kind})", plan.id);
+            // `frees` is exact but can legitimately be zero, when every extent
+            // is shared with a fork or a clone elsewhere. Reporting "0 B" with
+            // no explanation reads like a failure, so say which it is.
+            if plan.frees == 0 {
+                println!("  reclaims nothing: its content is shared with another file");
+            } else {
+                println!("  reclaims {}", human_bytes(plan.frees));
+            }
+            for id in &plan.orphans {
+                println!("  {id} still works; its recorded parent is now shown as deleted");
+            }
+        }
+        "gc" => {
+            let (items, errors) = if dry_run {
+                (checkpoint::plan_gc(dir), Vec::new())
+            } else {
+                checkpoint::run_gc(dir)
+            };
+            if items.is_empty() && errors.is_empty() {
+                println!("nothing to collect");
+            }
+            let verbed = if dry_run { "would remove" } else { "removed" };
+            let mut total = 0u64;
+            for item in &items {
+                total += item.frees;
+                println!(
+                    "{verbed} {}  ({}, {})",
+                    item.path.display(),
+                    item.reason,
+                    human_bytes(item.frees)
+                );
+            }
+            if items.len() > 1 {
+                println!("total {}", human_bytes(total));
+            }
+            if !errors.is_empty() {
+                for e in &errors {
+                    eprintln!("chm: {e}");
+                }
+                return Err(format!("{} item(s) could not be removed", errors.len()));
+            }
+        }
+        _ => return Err(format!("unknown revisions verb `{verb}`")),
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -3987,15 +4110,51 @@ mod revisions_args_tests {
     /// Reading the same constant the parser prints makes them one thing.
     #[test]
     fn the_usage_text_documents_the_order_the_parser_accepts() {
-        for line in ["<SNAPSHOT_DIR> pin", "<SNAPSHOT_DIR> unpin"] {
+        for verb in ["pin", "unpin", "label", "delete", "gc"] {
             assert!(
-                REVISIONS_USAGE.contains(line),
-                "help must show `{line}`, got:\n{REVISIONS_USAGE}"
+                REVISIONS_USAGE.contains(&format!("<SNAPSHOT_DIR> {verb}")),
+                "help must show `{verb}` after the directory, got:\n{REVISIONS_USAGE}"
+            );
+            assert!(
+                !REVISIONS_USAGE.contains(&format!("revisions {verb} ")),
+                "help must not document verb-first, which the parser refuses"
+            );
+            assert!(
+                revisions_arity(verb, false).is_some(),
+                "`{verb}` is documented but the parser does not dispatch it"
             );
         }
+    }
+
+    /// The verbs take different numbers of arguments, so one shared arity would
+    /// either reject `gc` (which takes none) or wave through a `delete` with no
+    /// revision id — and a delete that guessed its target would be the worst
+    /// possible defect in this command.
+    #[test]
+    fn each_verb_checks_its_own_arity() {
+        let dir = std::env::temp_dir().join(format!("chm-revarity-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let d = dir.to_str().unwrap();
+
+        // Too few: a delete with no id must not be interpreted as anything.
+        let err = revisions(&args(&[d, "delete"])).expect_err("delete needs an id");
+        assert!(err.contains("delete"), "{err}");
+        // Too many: `gc` takes none, so an id is a mistake worth naming.
+        let err = revisions(&args(&[d, "gc", "rev-1"])).expect_err("gc takes no id");
+        assert!(err.contains("gc"), "{err}");
+        // `label` needs its text, unless --clear says there is none.
+        assert!(revisions(&args(&[d, "label", "rev-absent"])).is_err());
+        let err = revisions(&args(&[d, "label", "rev-absent", "--clear"]))
+            .expect_err("an unknown id must still be refused");
         assert!(
-            !REVISIONS_USAGE.contains("revisions pin "),
-            "help must not document verb-first, which the parser refuses"
+            err.contains("rev-absent"),
+            "--clear should reach revision lookup, got: {err}"
         );
+        // An unknown verb names the ones that exist rather than the usage line.
+        let err = revisions(&args(&[d, "purge", "rev-1"])).expect_err("unknown verb");
+        assert!(err.contains("delete"), "the error should list real verbs: {err}");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }
