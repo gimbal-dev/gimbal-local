@@ -1555,11 +1555,16 @@ fn revisions(raw: &[String]) -> Result<ExitCode, String> {
             let out = serde_json::to_string(&usage).map_err(|e| format!("serialize usage: {e}"))?;
             println!("{out}");
         } else {
-            println!("revisions     {}", human_bytes(usage.on_disk));
+            // Revisions clone rather than copy, so the sum of their sizes is a
+            // ceiling that can exceed the real cost by orders of magnitude (a
+            // measured lineage: 110 GiB of parts over 41 MiB of disk). Lead
+            // with what deleting them gives back, which is the number anyone
+            // reading this is about to act on.
+            println!("revisions     {} to reclaim", human_bytes(usage.on_disk));
             let shared = usage.apparent.saturating_sub(usage.on_disk);
             if shared > 0 {
                 println!(
-                    "  of which shared {} (the parts sum to {})",
+                    "  {} of their {} is shared and costs nothing extra",
                     human_bytes(shared),
                     human_bytes(usage.apparent)
                 );
@@ -1577,7 +1582,11 @@ fn revisions(raw: &[String]) -> Result<ExitCode, String> {
             for r in &summaries {
                 let pin = if r.pinned { " [pinned]" } else { "" };
                 let kind = if r.resumable { "" } else { "  metadata-only" };
-                println!("  {}  {:>10}{pin}{kind}", r.id, human_bytes(r.bytes));
+                println!(
+                    "  {}  {:>10} to reclaim{pin}{kind}",
+                    r.id,
+                    human_bytes(r.frees)
+                );
             }
         }
         return Ok(ExitCode::SUCCESS);
