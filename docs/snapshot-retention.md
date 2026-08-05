@@ -1,11 +1,33 @@
 # Snapshot retention — what is kept, what is reclaimed, and what it costs
 
-Every checkpoint writes a **full RAM image**. On the images this project runs
-that is 2.8 GiB a time, so a lineage cannot keep every revision resumable and
-still fit on a laptop. `chm` bounds the store by age: the newest
-`CHM_MAX_RESUMABLE_REVISIONS` revisions (default 5) keep their RAM, and older
-ones are reduced to their manifest — the lineage graph survives, the ability to
-resume that exact point does not.
+Every resumable checkpoint carries a **complete guest-RAM image** — you can
+resume any of them without consulting its neighbours. What it *costs* is a
+different question, and since V9.1a the answer is much smaller than the size:
+each dump is written as a clone of the previous one with only the 64 KiB chunks
+that changed rewritten, so consecutive revisions share almost all their extents.
+On the images this project runs a full image is 2.8 GiB, but the **incremental**
+cost of one more revision is a measured 2–13 MiB.
+
+That changes the arithmetic, not the need for a bound. Shared extents are only
+freed when the last revision referencing them goes, so a long lineage still
+grows — and `chm revisions <dir> --usage` reports what deleting a revision would
+*actually* reclaim rather than what its parts add up to, because those two
+numbers are now very different. On a real ten-revision lineage:
+
+```
+$ chm revisions ~/agent-workspace --usage
+revisions     0 B to reclaim
+  50.0 GiB of their 50.0 GiB is shared and costs nothing extra
+```
+
+Every revision reports 10 GiB of parts and **0 B reclaimable**, because each
+one's extents are shared with its neighbours. Naive accounting would have told
+you to delete one for 10 GiB back and given you nothing.
+
+`chm` bounds the store by age: the newest `CHM_MAX_RESUMABLE_REVISIONS`
+revisions (default 5) keep their RAM, and older ones are reduced to their
+manifest — the lineage graph survives, the ability to resume that exact point
+does not.
 
 Age is the right default and the wrong rule for the one revision you care
 about. The point worth keeping is usually *not* the most recent one: it is the

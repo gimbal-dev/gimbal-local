@@ -71,7 +71,11 @@ const OVERLAY_FINGERPRINT: &str = "overlay.fingerprint";
 
 /// How many revisions keep their full (resumable) guest-RAM dump. Older
 /// revisions are pruned to manifest-only so the lineage graph survives without
-/// the store growing by a full RAM image on every suspend. Overridable via
+/// the store growing without bound. Consecutive dumps share most of their
+/// extents (V9.1a writes each as a delta against the last), so one more
+/// revision costs a measured 2-13 MiB rather than a whole RAM image -- but
+/// shared extents are only freed when the last revision using them goes, which
+/// is why this budget still exists. Overridable via
 /// `CHM_MAX_RESUMABLE_REVISIONS`.
 const DEFAULT_MAX_RESUMABLE_REVISIONS: usize = 5;
 
