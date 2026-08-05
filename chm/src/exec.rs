@@ -122,7 +122,7 @@ impl fmt::Debug for Nonce {
 /// argument without exception: the caller passes an argv, and nothing in it is
 /// ever interpreted as shell syntax (invariant I5 — explicit quoting, no
 /// implicit interpretation of caller-supplied text).
-fn shell_quote(arg: &str) -> String {
+pub(crate) fn shell_quote(arg: &str) -> String {
     let mut out = String::with_capacity(arg.len() + 2);
     out.push('\'');
     for c in arg.chars() {
@@ -134,6 +134,37 @@ fn shell_quote(arg: &str) -> String {
     }
     out.push('\'');
     out
+}
+
+/// Wrap an already-built shell fragment in the nonce framing.
+///
+/// Split out of [`script`] so that a caller which must construct a shell
+/// *fragment* rather than run an argv — [`crate::postboot`] exporting
+/// environment variables into the console's own shell, which a subshell could
+/// not do — gets the identical framing, timeout accounting and length guard,
+/// instead of a second hand-rolled protocol that would drift from [`parse`].
+///
+/// This does **not** weaken I5. The invariant is that *caller-supplied text*
+/// never becomes shell syntax, and every such value still passes through
+/// [`shell_quote`]; what varies is only the fixed syntax `chm` itself writes
+/// around it. The distinction is enforced by keeping this `pub(crate)`: no user
+/// argv reaches it except through [`script`].
+pub(crate) fn frame(nonce: &Nonce, fragment: &str) -> Result<String, String> {
+    // `%s%s` keeps the nonce and the marker word separate in the echoed text and
+    // joined only in the printed text; see the module docs.
+    let line = format!(
+        "printf '%s%s\\n' {n} '{BEGIN}'; {{ {fragment} ; }} 2>&1; __chm_rc=$?; \
+         printf '%s%s:%d\\n' {n} '{END}' \"$__chm_rc\"",
+        n = shell_quote(&nonce.0),
+    );
+    if line.len() > MAX_SCRIPT {
+        return Err(format!(
+            "command is too long for a guest terminal ({} bytes of framed input, limit {MAX_SCRIPT}); \
+             put it in a script and run that instead",
+            line.len()
+        ));
+    }
+    Ok(line)
 }
 
 /// Build the shell line that runs `argv` and frames its output.
@@ -154,22 +185,7 @@ pub(crate) fn script(nonce: &Nonce, argv: &[String]) -> Result<String, String> {
         .map(|a| shell_quote(a))
         .collect::<Vec<_>>()
         .join(" ");
-    // `%s%s` keeps the nonce and the marker word separate in the echoed text and
-    // joined only in the printed text; see the module docs.
-    let line = format!(
-        "printf '%s%s\\n' {n} '{BEGIN}'; {{ {cmd} ; }} 2>&1; __chm_rc=$?; \
-         printf '%s%s:%d\\n' {n} '{END}' \"$__chm_rc\"",
-        n = shell_quote(&nonce.0),
-        cmd = cmd,
-    );
-    if line.len() > MAX_SCRIPT {
-        return Err(format!(
-            "command is too long for a guest terminal ({} bytes of framed input, limit {MAX_SCRIPT}); \
-             put it in a script and run that instead",
-            line.len()
-        ));
-    }
-    Ok(line)
+    frame(nonce, &cmd)
 }
 
 /// Encode an argv for the daemon's line-oriented control protocol.

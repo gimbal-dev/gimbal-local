@@ -24,58 +24,37 @@
 //! `routes_completions_as_lpis`. Starting on the path that works avoids
 //! building a second one that does not.
 
-use std::io::Write;
-use std::sync::mpsc;
+use std::collections::BTreeMap;
 use std::error::Error;
-use std::io;
-use std::path::Path;
-use std::path::PathBuf;
-use std::thread;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::Arc;
-use std::sync::Mutex;
-use std::sync::atomic::AtomicBool;
-use std::sync::Condvar;
-use std::sync::atomic::Ordering;
-use std::fs;
-use std::time::Duration;
-use std::time::Instant;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::time::{Duration, Instant};
+use std::{fs, io, thread};
 
-use crate::spec::{Overrides, SandboxSpec, resolve, spec_file_for};
-
-use hypervisor::VmExit;
-use hypervisor::VmOps;
-use hypervisor::hvf::VtimerClock;
 use arch::aarch64::layout::LEGACY_RTC_MAPPED_IO_START;
-use hypervisor::hvf::devices::MmioBus;
-use hypervisor::hvf::devices::Pl011;
-use hypervisor::hvf::devices::Pl031;
-use hypervisor::hvf::host_counter_hz;
-use hypervisor::hvf::rehydrate;
-use hypervisor::hvf::UsgicCpuHandle;
-
-use hypervisor::hvf::HvfHypervisor;
-use hypervisor::hvf::UsgicSpiRouter;
-use hypervisor::hvf::virtio::GuestMemory;
+use hypervisor::hvf::devices::{MmioBus, Pl011, Pl031};
 use hypervisor::hvf::virtio::block::{BlockDevice, FileBackend};
 use hypervisor::hvf::virtio::devcore::{Backend, MsiSink, MsiSpiInjector};
-use hypervisor::hvf::virtio::features;
 use hypervisor::hvf::virtio::mmio::{self, MmioParams, VirtioMmioDevice, device_id};
 use hypervisor::hvf::virtio::nat::{EgressPolicy, NatLimits, NatResponder};
 use hypervisor::hvf::virtio::net::{NetDevice, NetKick};
+use hypervisor::hvf::virtio::{GuestMemory, features};
+use hypervisor::hvf::{
+    HvfHypervisor, UsgicCpuHandle, UsgicSpiRouter, VtimerClock, host_counter_hz, rehydrate,
+};
+use hypervisor::{VmExit, VmOps};
 
-use crate::coldboot;
-use crate::credproxy;
-use crate::coldboot::ColdBootConfig;
-use crate::coldboot::VirtioKind;
-use crate::console;
+use crate::coldboot::{ColdBootConfig, VirtioKind};
 use crate::console::RawConsole;
-use crate::imp::apply_psci_cpu_on_state;
-use crate::imp::CpuPowerSlot;
-use crate::imp::wait_for_cpu_on_request;
-use crate::imp::PsciCoordinator;
-use crate::imp::PL011_BASE;
-use crate::imp::PL011_SIZE;
+use crate::imp::{
+    CpuPowerSlot, PL011_BASE, PL011_SIZE, PsciCoordinator, apply_psci_cpu_on_state,
+    wait_for_cpu_on_request,
+};
+use crate::spec::{Overrides, SandboxSpec, resolve, spec_file_for};
+use crate::{coldboot, console, credproxy, postboot};
 
 /// The NAT gateway the guest talks to, and the MAC we hand its NIC.
 ///
@@ -120,7 +99,11 @@ struct ColdVmOps {
 }
 
 impl VmOps for ColdVmOps {
-    fn guest_mem_write(&self, gpa: u64, buf: &[u8]) -> Result<usize, hypervisor::HypervisorVmError> {
+    fn guest_mem_write(
+        &self,
+        gpa: u64,
+        buf: &[u8],
+    ) -> Result<usize, hypervisor::HypervisorVmError> {
         self.bus.guest_mem_write(gpa, buf)
     }
     fn guest_mem_read(
@@ -169,6 +152,11 @@ struct CreateArgs {
     /// is a persistent trust root, so it belongs somewhere the caller chose,
     /// never a temporary directory.
     workspace: Option<PathBuf>,
+    /// What a spec's `env` and `postBootCommand` asked to happen inside the
+    /// guest once it is up. Empty on every path that did not ask for either, so
+    /// the existing behaviour is not merely preserved but untouched — the whole
+    /// mechanism is skipped rather than run and found to have nothing to do.
+    postboot: postboot::Plan,
 }
 
 fn usage() -> String {
@@ -201,6 +189,20 @@ fn usage() -> String {
      \x20                     has to outlive the run.\n\
      \x20 --seconds <n>       Stop after n seconds (default 30). 0 runs until\n\
      \x20                     the guest powers off or you press Ctrl-A x.\n\
+     \x20 --env KEY=VALUE     Export a variable in the guest's console shell\n\
+     \x20                     once it is up. Repeatable. Reaches the post-boot\n\
+     \x20                     command, later `chm exec`s and your own session,\n\
+     \x20                     but not a fresh login after that shell exits.\n\
+     \x20                     Never put a credential here — see chm proxy.\n\
+     \x20 --post-boot <argv…> Run a command once the guest has a shell, before\n\
+     \x20                     the console is yours. Everything after it is the\n\
+     \x20                     argv, so put it last. A non-zero exit fails the\n\
+     \x20                     run: a sandbox whose setup failed is not the\n\
+     \x20                     sandbox that was asked for.\n\
+     \x20 --post-boot-arg <s> One argv element of the same command. Repeatable,\n\
+     \x20                     and not greedy, so it can be followed by other\n\
+     \x20                     flags — which is why --spec expands to this form\n\
+     \x20                     and your own --post-boot still overrides it.\n\
      \x20 --dry-run           Build and describe the guest image; do not run it.\n\
      \x20 --spec <path>       A sandbox.json (or a workspace holding one) that\n\
      \x20                     describes this sandbox. It expands to exactly the\n\
@@ -220,6 +222,8 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     let mut cmdline_extra: Vec<String> = Vec::new();
     let mut proxy_rules: Option<PathBuf> = None;
     let mut workspace: Option<PathBuf> = None;
+    let mut env: BTreeMap<String, String> = BTreeMap::new();
+    let mut post_boot: Option<Vec<String>> = None;
 
     let mut i = 0;
     while i < raw.len() {
@@ -270,6 +274,42 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
             "--disk" => cfg.disks.push(PathBuf::from(value("--disk")?)),
             "--net" => cfg.net = true,
             "--egress-allow" => egress_allow.push(value("--egress-allow")?),
+            "--env" => {
+                let (k, v) = postboot::parse_assignment(&value("--env")?)?;
+                env.insert(k, v);
+            }
+            // Everything after `--post-boot` is the command's argv, including
+            // anything that looks like one of our own flags. A command is not
+            // obliged to avoid names `chm` happens to use, and the alternative —
+            // one quoted string — would make it a shell *line*, which is exactly
+            // the ambiguity `chm exec` refuses (I5).
+            //
+            // Which is why a spec must NOT expand to this form. `--spec` splices
+            // its argv *before* the caller's flags so that a flag wins, and a
+            // greedy `--post-boot` there would eat every one of them — turning
+            // `--dry-run` into an argument to the guest's command. That is not
+            // hypothetical: it is what the first build of this milestone did,
+            // and it booted a VM instead of describing one. Machines use
+            // `--post-boot-arg`; humans keep this.
+            "--post-boot" => {
+                let rest: Vec<String> = raw[i + 1..].to_vec();
+                if rest.is_empty() {
+                    return Err("--post-boot needs a command".to_string());
+                }
+                // Replaces rather than appends: a command is a whole thing, so
+                // a flag overrides a spec's instead of concatenating onto it.
+                post_boot = Some(rest);
+                i = raw.len();
+                continue;
+            }
+            // One argv element at a time, so the flag is not greedy and can
+            // therefore be followed by others. Appends, because a whole command
+            // arrives as a run of these.
+            "--post-boot-arg" => {
+                post_boot
+                    .get_or_insert_with(Vec::new)
+                    .push(value("--post-boot-arg")?);
+            }
             "--dry-run" => dry_run = true,
             "-h" | "--help" => return Err(usage()),
             other => return Err(format!("unknown option {other}\n\n{}", usage())),
@@ -300,6 +340,7 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
         egress_allow,
         proxy_rules,
         workspace,
+        postboot: postboot::Plan { env, post_boot },
     })
 }
 
@@ -406,8 +447,7 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         return Ok(ExitCode::SUCCESS);
     }
 
-    let hv = HvfHypervisor::new()
-        .map_err(|e| format!("Hypervisor.framework unavailable: {e}"))?;
+    let hv = HvfHypervisor::new().map_err(|e| format!("Hypervisor.framework unavailable: {e}"))?;
 
     let uart = Arc::new(Pl011::new());
     let bus = Arc::new(MmioBus::new());
@@ -517,9 +557,18 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
 
     // Console: drain the UART to stdout on a helper thread so the vCPU thread
     // only ever runs the guest.
+    //
+    // When something has to be delivered into the guest (#190), that thread also
+    // *tees* what it printed into a bounded tail, because `take_output` consumes
+    // and a second reader would steal bytes from the operator's own screen. The
+    // tee is `None` on every other run, so a plain `chm create` allocates
+    // nothing and behaves exactly as before.
+    let tail: Option<Arc<ConsoleTail>> =
+        (!args.postboot.is_empty()).then(|| Arc::new(ConsoleTail::default()));
     let console = {
         let uart = uart.clone();
         let running = running.clone();
+        let tail = tail.clone();
         thread::Builder::new()
             .name("cold-console".into())
             .spawn(move || {
@@ -530,11 +579,17 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                         thread::sleep(Duration::from_millis(5));
                         continue;
                     }
+                    if let Some(t) = &tail {
+                        t.push(&bytes);
+                    }
                     let _ = out.write_all(&bytes);
                     let _ = out.flush();
                 }
                 let rest = uart.take_output();
                 if !rest.is_empty() {
+                    if let Some(t) = &tail {
+                        t.push(&rest);
+                    }
                     let _ = out.write_all(&rest);
                     let _ = out.flush();
                 }
@@ -782,6 +837,70 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         )
     };
 
+    // Deliver what the spec asked to happen inside the guest, on its own thread
+    // so the orchestrator's deadline loop keeps running: readiness can take a
+    // minute on a slow boot, and a `--seconds` promise must not become a hope
+    // because we were blocked waiting for a shell.
+    //
+    // It starts *after* the stdin pump is installed, so an operator watching the
+    // console sees the delivery happen rather than finding it already done.
+    let postboot_result: Arc<Mutex<Option<Result<postboot::Report, postboot::Failure>>>> =
+        Arc::new(Mutex::new(None));
+    let postboot_thread = match &tail {
+        None => None,
+        Some(tail) => {
+            let plan = args.postboot.clone();
+            let slot = postboot_result.clone();
+            let running_pb = running.clone();
+            let ch = GuestConsole {
+                input: console::console_input(
+                    uart.clone(),
+                    sink.clone(),
+                    None,
+                    coldboot::PL011_IRQ,
+                ),
+                tail: tail.clone(),
+                running: running.clone(),
+            };
+            Some(
+                thread::Builder::new()
+                    .name("cold-postboot".into())
+                    .spawn(move || {
+                        let r = postboot::deliver(
+                            &ch,
+                            &plan,
+                            postboot::DEFAULT_READY_TIMEOUT,
+                            postboot::DEFAULT_STEP_TIMEOUT,
+                        );
+                        let failed = r.is_err();
+                        match &r {
+                            Ok(postboot::Report::Delivered {
+                                exported,
+                                post_boot_code,
+                            }) => {
+                                if *exported > 0 {
+                                    eprintln!("\nchm create: exported {exported} variable(s)");
+                                }
+                                if let Some(c) = post_boot_code {
+                                    eprintln!("chm create: postBootCommand exited {c}");
+                                }
+                            }
+                            Ok(postboot::Report::NothingToDo) => {}
+                            Err(e) => eprintln!("\nchm create: {}", e.message()),
+                        }
+                        *slot.lock().unwrap() = Some(r);
+                        // A setup that failed leaves a guest that is not the one
+                        // the document described, so the run ends rather than
+                        // handing over a sandbox nobody asked for.
+                        if failed {
+                            running_pb.store(false, Ordering::Release);
+                        }
+                    })
+                    .map_err(|e| format!("spawning the post-boot thread: {e}"))?,
+            )
+        }
+    };
+
     while running.load(Ordering::Acquire)
         && deadline.is_none_or(|d| Instant::now() < d)
         && !console::shutdown_requested()
@@ -811,11 +930,22 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     if let Some(t) = net_thread {
         let _ = t.join();
     }
+    if let Some(t) = postboot_thread {
+        let _ = t.join();
+    }
 
     // `image` must outlive the VM: `prepared` holds the VM and unmaps guest RAM
     // on drop, and the pointer it was given belongs to `image`.
     drop(prepared);
     drop(image);
+
+    // A delivery failure outranks a clean guest exit. The guest may well have
+    // powered off tidily; the point is that it was never the guest the document
+    // described, and reporting success would be the #192 mistake in a new place
+    // — a conclusion reached and then not acted on.
+    if let Some(Err(e)) = postboot_result.lock().unwrap().take() {
+        return Err(e.message());
+    }
 
     let result = outcome.lock().unwrap().take();
     match result {
@@ -835,6 +965,70 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
 /// Release everyone waiting on the vCPU thread's setup, whether it succeeded or
 /// not: a failed vCPU still has to unblock the threads that would otherwise
 /// wait out the whole deadline for it.
+/// A bounded copy of what the console printed, so post-boot delivery can read
+/// the guest's answers without taking bytes off the operator's screen.
+///
+/// Bounded because a guest can print forever and this is a side-channel, not a
+/// log: only the recent tail can matter, since every framed step starts by
+/// noting the current length and reads forward from there. Losing older bytes is
+/// what [`exec::ExecOutcome::Truncated`] exists to report, so eviction becomes a
+/// named failure rather than a wrong answer.
+#[derive(Default)]
+struct ConsoleTail {
+    /// Text kept, oldest first.
+    buf: Mutex<String>,
+    /// How many bytes have been evicted from the front.
+    dropped: Mutex<usize>,
+}
+
+impl ConsoleTail {
+    /// Roughly the daemon's ring, and comfortably above `exec::MAX_OUTPUT`, so a
+    /// step that overflows is reported as overflow rather than as eviction.
+    const CAP: usize = 256 * 1024;
+
+    fn push(&self, bytes: &[u8]) {
+        let mut buf = self.buf.lock().unwrap();
+        buf.push_str(&String::from_utf8_lossy(bytes));
+        if buf.len() > Self::CAP {
+            // Trim on a char boundary: the tail is read as `&str`, and slicing
+            // mid-codepoint would panic on a guest that prints UTF-8.
+            let mut cut = buf.len() - Self::CAP;
+            while cut < buf.len() && !buf.is_char_boundary(cut) {
+                cut += 1;
+            }
+            *self.dropped.lock().unwrap() += cut;
+            let kept = buf.split_off(cut);
+            *buf = kept;
+        }
+    }
+
+    fn text(&self) -> String {
+        self.buf.lock().unwrap().clone()
+    }
+}
+
+/// The running cold guest, as [`postboot`] needs to see it.
+struct GuestConsole {
+    input: console::ConsoleInput,
+    tail: Arc<ConsoleTail>,
+    running: Arc<AtomicBool>,
+}
+
+impl postboot::Console for GuestConsole {
+    fn send(&self, bytes: &[u8]) {
+        // The same path a keystroke takes — push to the FIFO, raise the receive
+        // interrupt, wake a parked vCPU — rather than a second injection route
+        // that could work when typing does not, or vice versa.
+        (self.input)(bytes);
+    }
+    fn transcript(&self) -> String {
+        self.tail.text()
+    }
+    fn stopped(&self) -> bool {
+        !self.running.load(Ordering::Acquire) || console::shutdown_requested()
+    }
+}
+
 /// Mark a vCPU powered off so a later `CPU_ON` is accepted rather than being
 /// told `ALREADY_ON` for a core that is not running.
 fn psci_mark_offline(slot: &CpuPowerSlot) {
@@ -889,7 +1083,10 @@ fn build_virtio(
                     .len();
                 let nsectors = bytes / 512;
                 if nsectors == 0 {
-                    return Err(format!("disk {} is smaller than one sector", path.display()));
+                    return Err(format!(
+                        "disk {} is smaller than one sector",
+                        path.display()
+                    ));
                 }
                 let backend = FileBackend::open(path, nsectors)
                     .map_err(|e| format!("opening disk {}: {e}", path.display()))?;
@@ -966,8 +1163,17 @@ mod tests {
     #[test]
     fn options_parse_to_the_values_given() {
         let a = parse(&args(&[
-            "--kernel", "/tmp/Image", "--cpus", "4", "--memory", "2048", "--seconds", "7",
-            "--cmdline", "console=ttyAMA0 quiet", "--dry-run",
+            "--kernel",
+            "/tmp/Image",
+            "--cpus",
+            "4",
+            "--memory",
+            "2048",
+            "--seconds",
+            "7",
+            "--cmdline",
+            "console=ttyAMA0 quiet",
+            "--dry-run",
         ]))
         .unwrap();
         assert_eq!(a.cfg.kernel, PathBuf::from("/tmp/Image"));
@@ -1027,7 +1233,10 @@ mod tests {
         }
         use std::io::Read as _;
         let mut hdr = [0_u8; 64];
-        std::fs::File::open(p).unwrap().read_exact(&mut hdr).unwrap();
+        std::fs::File::open(p)
+            .unwrap()
+            .read_exact(&mut hdr)
+            .unwrap();
         assert_eq!(&hdr[0x38..0x3c], b"ARM\x64", "not an arm64 Image");
         let cfg = ColdBootConfig {
             kernel: p.to_path_buf(),
@@ -1044,7 +1253,10 @@ mod tests {
         // Accepting this would read as "egress is restricted to this host" when
         // in fact there is no NIC at all — a misleading kind of safe.
         let e = parse(&args(&[
-            "--kernel", "/tmp/Image", "--egress-allow", "api.github.com:443",
+            "--kernel",
+            "/tmp/Image",
+            "--egress-allow",
+            "api.github.com:443",
         ]))
         .unwrap_err();
         assert!(e.contains("--net"), "error must name the missing flag: {e}");
@@ -1053,7 +1265,12 @@ mod tests {
     #[test]
     fn disks_accumulate_in_order_and_net_is_off_by_default() {
         let a = parse(&args(&[
-            "--kernel", "/tmp/Image", "--disk", "/tmp/a.img", "--disk", "/tmp/b.img",
+            "--kernel",
+            "/tmp/Image",
+            "--disk",
+            "/tmp/a.img",
+            "--disk",
+            "/tmp/b.img",
         ]))
         .unwrap();
         assert_eq!(a.cfg.disks.len(), 2);
@@ -1079,8 +1296,12 @@ mod tests {
         // The caller may have chosen a different root deliberately; appending
         // a second root= would silently override it.
         let a = parse(&args(&[
-            "--kernel", "/tmp/Image", "--disk", "/tmp/a.img",
-            "--cmdline", "console=ttyAMA0 root=/dev/vda2 ro",
+            "--kernel",
+            "/tmp/Image",
+            "--disk",
+            "/tmp/a.img",
+            "--cmdline",
+            "console=ttyAMA0 root=/dev/vda2 ro",
         ]))
         .unwrap();
         assert_eq!(a.cfg.cmdline, "console=ttyAMA0 root=/dev/vda2 ro");
@@ -1089,7 +1310,12 @@ mod tests {
     #[test]
     fn an_initramfs_suppresses_the_implied_root() {
         let a = parse(&args(&[
-            "--kernel", "/tmp/Image", "--disk", "/tmp/a.img", "--initramfs", "/tmp/i.gz",
+            "--kernel",
+            "/tmp/Image",
+            "--disk",
+            "/tmp/a.img",
+            "--initramfs",
+            "/tmp/i.gz",
         ]))
         .unwrap();
         assert!(
@@ -1097,5 +1323,76 @@ mod tests {
             "an initramfs is the root fs: {:?}",
             a.cfg.cmdline
         );
+    }
+
+    /// Mirror what `--spec` does at `expand_spec`: render the document to argv,
+    /// drop the leading `create` (we are already inside it), then append the
+    /// caller's own flags — which is the ordering that gives a flag the last
+    /// word, and the ordering a greedy `--post-boot` destroys.
+    fn spliced(json: &str, caller: &[&str]) -> Vec<String> {
+        let doc = SandboxSpec::parse(json, Path::new("t.json")).unwrap();
+        let mut argv = resolve(Some(&doc), None, &Overrides::default()).to_create_argv();
+        if argv.first().map(String::as_str) == Some("create") {
+            argv.remove(0);
+        }
+        argv.extend(caller.iter().map(|s| (*s).to_string()));
+        argv
+    }
+
+    /// The bug this milestone's own hardware run found, frozen as a test.
+    ///
+    /// `--spec` splices the spec's argv **before** the caller's flags so that a
+    /// flag wins. `--post-boot` takes everything after it as the guest's
+    /// command. Put those together and a spec with a `postBootCommand` eats
+    /// every flag the operator typed: `chm create --spec … --dry-run` handed
+    /// `--dry-run` to the guest and **booted a VM when asked to describe one**.
+    ///
+    /// So this asserts the consequence, not just the cause — the real parser
+    /// must still see a flag that follows the whole spliced expansion.
+    #[test]
+    fn a_flag_after_a_spec_expansion_still_reaches_chm() {
+        let argv = spliced(
+            r#"{"specVersion":1,"postBootCommand":["echo","hi"],"env":{"A":"1"}}"#,
+            &["--dry-run", "--kernel", "/dev/null"],
+        );
+        let a = parse(&argv).expect("a spliced argv must parse");
+        assert!(a.dry_run, "the caller's own flag was swallowed: {argv:?}");
+        assert_eq!(
+            a.postboot.post_boot.as_deref(),
+            Some(&["echo".to_string(), "hi".to_string()][..])
+        );
+        assert_eq!(a.postboot.env.get("A").map(String::as_str), Some("1"));
+    }
+
+    /// The override half: a spec says what the sandbox *is*, a flag says how
+    /// *this run* differs, so a typed `--post-boot` replaces the spec's command
+    /// rather than concatenating onto it and producing a third nobody asked for.
+    #[test]
+    fn a_typed_post_boot_replaces_the_specs_command() {
+        let argv = spliced(
+            r#"{"specVersion":1,"postBootCommand":["echo","from-spec"]}"#,
+            &["--kernel", "/dev/null", "--post-boot", "echo", "from-flag"],
+        );
+        let a = parse(&argv).expect("must parse");
+        assert_eq!(
+            a.postboot.post_boot.as_deref(),
+            Some(&["echo".to_string(), "from-flag".to_string()][..])
+        );
+    }
+
+    /// A guest command is not obliged to avoid words `chm` uses as flags.
+    #[test]
+    fn a_guest_command_may_contain_our_own_flag_names() {
+        let a = parse(&[
+            "--kernel".into(),
+            "/dev/null".into(),
+            "--post-boot".into(),
+            "sh".into(),
+            "-c".into(),
+            "--dry-run --cpus 9".into(),
+        ])
+        .expect("must parse");
+        assert!(!a.dry_run);
+        assert_eq!(a.postboot.post_boot.as_ref().unwrap().len(), 3);
     }
 }

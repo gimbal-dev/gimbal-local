@@ -83,6 +83,7 @@ use std::process::ExitCode;
 use serde::{Deserialize, Serialize};
 
 use crate::imp::DEFAULT_IDLE_EXIT_SECS;
+use crate::postboot;
 
 /// The spec format version.
 ///
@@ -194,25 +195,33 @@ pub const UNIMPLEMENTED: &[(&str, u32, &str)] = &[
 /// Fields this build *understands* but cannot yet deliver into a guest.
 ///
 /// Kept separate from [`UNIMPLEMENTED`] because these are not unbuilt sections
-/// of somebody else's spec — they are our own V9.10/G22 gap, found by asking the
-/// question a spec is meant to make askable: what actually delivers this? The
-/// answer for both was "nothing": `chm create` has no `--env` and no entrypoint
-/// flag, so a document setting them would describe a guest the sandbox never
-/// becomes. Refused until #190 gives them a channel.
-const UNDELIVERED: &[(&str, u32, &str)] = &[
-    (
-        "env",
-        190,
-        "there is no channel into a cold-booted guest for environment variables \
-         yet, so these would be described and then dropped",
-    ),
-    (
-        "postBootCommand",
-        190,
-        "the `chm exec` channel exists (V9.2) but nothing sequences a command \
-         after boot yet",
-    ),
-];
+/// of somebody else's spec — they would be our own gap, found by asking the
+/// question a spec is meant to make askable: what actually delivers this?
+///
+/// **Currently empty, and deliberately kept.** `env` and `postBootCommand` lived
+/// here from V9.3 until V9.10 built their delivery (#190). The list stays
+/// because the *category* is permanent: this build will keep growing fields it
+/// can describe before it can carry, and the honest place for one is a refusal
+/// naming its issue rather than a parser that quietly drops it. Emptying the
+/// list and deleting the mechanism would mean the next such field arrives with
+/// nowhere to be declared, and the cheapest thing to do with it would be
+/// nothing.
+const UNDELIVERED: &[(&str, u32, &str)] = &[];
+
+/// Is an [`UNDELIVERED`] field actually set in this document?
+///
+/// A named function rather than an inline `false`, because the list is empty
+/// and an empty list refuses nobody: the next field we can describe but not
+/// deliver needs somewhere obvious to declare *how its presence is detected*,
+/// or it will be added to the table and quietly match nothing — a refusal
+/// mechanism that reports safety without providing it, which is the #179
+/// failure shape one layer up.
+fn undelivered_field_present(spec: &SandboxSpec, name: &str) -> bool {
+    let _ = (spec, name);
+    // No current entries: every field this build understands, it delivers.
+    // A future one adds its arm here.
+    false
+}
 
 // ---------------------------------------------------------------------------
 // The document
@@ -952,7 +961,11 @@ impl SandboxSpec {
         // A spec is meant to be committed and reviewed. A credential in `env`
         // would be committed with it, and the credential proxy exists precisely
         // so the guest -- and therefore this file -- never holds one.
-        for key in self.env.keys() {
+        //
+        // V9.10 made `env` real, which makes this refusal *more* important
+        // rather than less: until #190 a credential here was inert, and now it
+        // would be exported into a shell.
+        for (key, _) in self.env.iter() {
             let k = key.to_ascii_uppercase();
             if ["TOKEN", "SECRET", "PASSWORD", "PASSWD", "APIKEY", "API_KEY"]
                 .iter()
@@ -963,6 +976,13 @@ impl SandboxSpec {
                      guest is never meant to hold one — use `secrets.rulesFile` so it is injected \
                      at the network edge instead."
                 ));
+            }
+            // A name no shell can assign would validate here and then fail at
+            // delivery, which is the "described but never delivered" gap this
+            // milestone exists to close — so it is caught while the message can
+            // still name the file it came from.
+            if let Err(e) = postboot::validate_name(key) {
+                problems.push(e);
             }
         }
 
@@ -979,13 +999,10 @@ impl SandboxSpec {
         // become what its own document describes is the failure this module is
         // written to prevent, and it makes no difference whether the missing
         // piece is somebody else's spec section or our own unbuilt flag.
+        //
+        // Empty since V9.10 — see [`UNDELIVERED`] for why the mechanism stays.
         for (name, issue, why) in UNDELIVERED {
-            let present = match *name {
-                "env" => !self.env.is_empty(),
-                "postBootCommand" => self.post_boot_command.is_some(),
-                _ => false,
-            };
-            if present {
+            if undelivered_field_present(self, name) {
                 problems.push(format!(
                     "`{name}` is understood but not yet delivered to the guest ({why}). \
                      Refusing rather than describing a sandbox this build cannot produce \
@@ -1513,6 +1530,21 @@ impl Resolved {
         }
         if self.max_seconds.value > 0 {
             push(&mut argv, "--seconds", self.max_seconds.value.to_string());
+        }
+        for (k, v) in &self.env.value {
+            push(&mut argv, "--env", format!("{k}={v}"));
+        }
+        // `--post-boot-arg`, never `--post-boot`. This argv is spliced *before*
+        // the caller's own flags so that a flag wins, and `--post-boot` takes
+        // everything after it as the guest's command — so a spec emitting the
+        // greedy form would silently eat `--dry-run`, `--cpus 4`, and every
+        // other override, destroying the precedence rule this module exists to
+        // implement. Measured, not reasoned about: the first build of V9.10 did
+        // exactly this and booted a guest when asked to describe one.
+        if let Some(pb) = &self.post_boot_command {
+            for arg in &pb.value {
+                push(&mut argv, "--post-boot-arg", arg.clone());
+            }
         }
         argv
     }
@@ -2073,33 +2105,101 @@ mod tests {
         assert_eq!(r.idle_exit_seconds.value, 600);
         assert!(r.checkpoint.value);
         assert_eq!(r.checkpoint_interval_secs.as_ref().unwrap().value, 300);
+        // Removed from this fixture in V9.3 because the build refused them, and
+        // put back in V9.10 when it stopped. The fixture is the record of what
+        // this build can be asked for, so it has to move when that moves.
+        assert_eq!(r.env.value.get("LANG").map(String::as_str), Some("C.UTF-8"));
+        assert_eq!(
+            r.post_boot_command.as_ref().unwrap().value,
+            vec!["/usr/bin/env".to_string(), "true".to_string()]
+        );
     }
 
-    /// `env` and `postBootCommand` parse, resolve, and explain — and nothing
-    /// carries them into a guest. Until #190 gives them a channel they must be
-    /// refused, because a spec that describes a guest the sandbox never becomes
-    /// is the failure this whole module exists to prevent.
+    /// The V9.10 inversion of the V9.3 test that used to live here.
+    ///
+    /// `env` and `postBootCommand` were refused with #190 because nothing
+    /// carried them into a guest. Now something does, so the same two documents
+    /// must **start** — and, more importantly, must reach the argv, because
+    /// "accepted" and "delivered" are exactly the two things V9.3 proved could
+    /// come apart.
     #[test]
-    fn fields_we_cannot_deliver_yet_are_refused_not_quietly_dropped() {
-        for (json, needle) in [
-            (r#"{"specVersion":1,"env":{"LANG":"C.UTF-8"}}"#, "env"),
-            (
-                r#"{"specVersion":1,"postBootCommand":["/usr/bin/env","true"]}"#,
-                "postBootCommand",
-            ),
+    fn env_and_post_boot_command_are_accepted_and_reach_the_command_line() {
+        for json in [
+            r#"{"specVersion":1,"env":{"LANG":"C.UTF-8"}}"#,
+            r#"{"specVersion":1,"postBootCommand":["/usr/bin/env","true"]}"#,
         ] {
             let problems = spec_from(json).validate();
             assert!(
-                problems
-                    .iter()
-                    .any(|p| p.contains(needle) && p.contains("190")),
-                "`{needle}` must be refused with #190, got {problems:?}"
+                !problems.iter().any(|p| p.contains("190")),
+                "no longer undelivered, so #190 must not be cited: {problems:?}"
             );
         }
-        // The resolver still understands them, so #190 is a wiring job rather
-        // than a parsing one.
-        let doc = spec_from(r#"{"specVersion":1,"env":{"LANG":"C.UTF-8"}}"#);
-        let r = resolve(Some(&doc), None, &Overrides::default());
-        assert_eq!(r.env.value.get("LANG").map(String::as_str), Some("C.UTF-8"));
+
+        let doc = spec_from(
+            r#"{"specVersion":1,"env":{"LANG":"C.UTF-8","TZ":"UTC"},
+                "postBootCommand":["/usr/bin/env","true"]}"#,
+        );
+        let argv = resolve(Some(&doc), None, &Overrides::default()).to_create_argv();
+        let line = argv.join(" ");
+        // Accepting a field and then not emitting it is precisely the V9.3 gap.
+        assert!(line.contains("--env LANG=C.UTF-8"), "{line}");
+        assert!(line.contains("--env TZ=UTC"), "{line}");
+        assert!(
+            line.contains("--post-boot-arg /usr/bin/env --post-boot-arg true"),
+            "{line}"
+        );
+    }
+
+    /// The bug this milestone's own hardware run found, frozen as a test.
+    ///
+    /// `--spec` splices its argv **before** the caller's flags so that a flag
+    /// wins. `--post-boot` takes everything after it as the guest's command. Put
+    /// those two together and a spec with a `postBootCommand` silently eats
+    /// every flag the operator typed — `--dry-run` became an argument to the
+    /// guest, so asking `chm create` to *describe* a sandbox booted one instead.
+    ///
+    /// The other half of this rule — that the spliced argv still parses, and a
+    /// flag after it still reaches `chm` — lives in `create.rs`, where the
+    /// parser it has to survive is in scope.
+    #[test]
+    fn a_spec_never_emits_the_greedy_post_boot_flag() {
+        let doc = spec_from(
+            r#"{"specVersion":1,"postBootCommand":["echo","hi"],
+                "resourceLimits":{"cpu":{"vcpus":2}}}"#,
+        );
+        let argv = resolve(Some(&doc), None, &Overrides::default()).to_create_argv();
+        assert!(
+            !argv.iter().any(|a| a == "--post-boot"),
+            "the greedy form would swallow the caller's flags: {argv:?}"
+        );
+        assert_eq!(
+            argv.iter().filter(|a| *a == "--post-boot-arg").count(),
+            2,
+            "one flag per argv element: {argv:?}"
+        );
+    }
+
+    #[test]
+    fn an_env_name_no_shell_can_assign_is_refused_by_the_document() {
+        // Otherwise it would validate here and fail at delivery — the same
+        // described-but-not-delivered shape, moved one step later.
+        let problems = spec_from(r#"{"specVersion":1,"env":{"my-var":"1"}}"#).validate();
+        assert!(
+            problems.iter().any(|p| p.contains("my-var")),
+            "{problems:?}"
+        );
+    }
+
+    #[test]
+    fn a_credential_shaped_env_name_is_still_refused_now_that_env_is_real() {
+        // Delivering `env` makes this refusal matter more, not less: before
+        // #190 a token here was inert, and now it would be exported.
+        let problems = spec_from(r#"{"specVersion":1,"env":{"GITHUB_TOKEN":"ghp_x"}}"#).validate();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains("GITHUB_TOKEN") && p.contains("secrets.rulesFile")),
+            "{problems:?}"
+        );
     }
 }
