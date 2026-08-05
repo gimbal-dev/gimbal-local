@@ -27,17 +27,56 @@ actually produced, not ours.
 
 Measured on an M-series Mac against a real 2 GiB / 25 GiB-on-disk Ubuntu guest:
 
-| | freeze | of which barrier |
-| --- | --- | --- |
-| busy guest (writing + `sync` in a loop) | 2.6–4.5 s | 0.16–0.97 s |
-| idle guest | 1.5–2.3 s | 0.30–0.88 s |
+| | freeze | of which barrier | disk per snapshot |
+| --- | --- | --- | --- |
+| busy guest (writing + `sync` in a loop) | 0.9–2.1 s | 0.05–0.92 s | 2.2–12 MiB |
+| the first snapshot of a run | 2.5–2.6 s | 0.16–0.47 s | ~13 MiB |
 
 The *barrier* is the time spent getting every vCPU and host-side writer to a safe
-point. The remainder is writing the RAM image. So the freeze is dominated by
-guest size, not by vCPU count or how busy the guest is.
+point. The remainder is capturing RAM.
+
+The first snapshot of a run is the slow one because it reads the previous image
+off disk; after that the comparison runs against a page cache that is still warm.
+It writes no more than the others do.
+
+**Snapshots after the first are written as deltas**, which is what makes the
+cadence affordable. Two checkpoints seconds apart share almost all of their
+memory — measured at **99.9% identical** on a real guest, 309 changed pages out
+of 524,288 — so `chm` clones the previous image and rewrites only the 64 KiB
+chunks whose contents actually changed. Reading and comparing 2 GiB is far
+cheaper than writing it.
+
+Before this, every snapshot wrote a full RAM image: ~3.4 GB and 2.6–4.5 s each,
+which is about 13 GB per *minute* of history at a 15 s cadence. A delta is
+roughly **130× smaller** and around **half the freeze**.
 
 An idle guest is the cheaper case, which is what you want: the moments worth
 checkpointing are often the quiet ones.
+
+A delta is an optimisation, never a requirement. If anything about the previous
+image is unexpected — wrong size, unreadable, a filesystem without clone support
+— `chm` says so and writes the whole image instead:
+
+```
+chm: note: full RAM dump (parent dump is 1073741824 bytes, this guest needs 2147483648)
+```
+
+### Reading the disk figures
+
+`chm revisions <dir> --usage` reports what deleting a revision would **reclaim**,
+not the sum of its file sizes. Those are wildly different numbers once revisions
+share extents: a measured lineage showed 110 GiB of apparent parts sitting on
+41 MiB of actual disk.
+
+```
+revisions     41.0 MiB to reclaim
+  110.0 GiB of their 110.0 GiB is shared and costs nothing extra
+```
+
+The reclaim figure is a floor: an extent shared by two revisions is exclusive to
+neither, so it is counted in neither, and deleting either one alone does not free
+it. It self-corrects — once the other copy goes, the extents become exclusive to
+the survivor and start being counted.
 
 ## What "safe point" means
 
@@ -145,9 +184,14 @@ consistent way back.
 
 ## Limits
 
-- **The freeze is real and scales with guest RAM.** There is no dirty-page
-  tracking or iterative pre-copy: every checkpoint writes a full RAM image. A
-  larger guest means a longer freeze, linearly.
+- **The freeze is real and still scales with guest RAM.** There is no dirty-page
+  tracking or iterative pre-copy. Deltas remove most of the *writing*, but every
+  checkpoint still reads and compares the whole image to find what changed, so a
+  larger guest means a longer freeze, linearly. Hardware dirty-page tracking
+  would remove the comparison too; HVF exposes none.
+- **A snapshot with no previous image at all writes the whole thing.** That is
+  the very first checkpoint of a brand-new workspace, not the first of each run —
+  a resumed snapshot already has one to diff against.
 - **Retention is age-based**, plus explicit pins. There is no policy that keeps,
   say, one point per hour as history ages.
 - **The cadence is a plain timer.** It does not yet trigger on meaningful guest
