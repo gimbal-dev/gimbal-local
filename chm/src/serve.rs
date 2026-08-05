@@ -74,10 +74,11 @@ fn daemon_shutdown_requested() -> bool {
 /// bound. Late `ctl console` attachers fast-forward past anything dropped.
 const CONSOLE_CAP: usize = 256 * 1024;
 
-/// Default seconds of console silence after which a started guest is stopped.
-/// Mirrors `chm run`'s default; the resumed guest currently goes quiet at the
-/// first unmodelled device. `--idle-exit 0` keeps it running open-endedly.
-const DEFAULT_IDLE_EXIT_SECS: u64 = 10;
+// Default seconds of console silence after which a started guest is suspended.
+// Shared with `chm run` rather than duplicated — see its definition for why this
+// is ten minutes and not the ten seconds it used to be. Two independent copies
+// of the same scaffolding constant is how it stayed wrong in both places.
+use crate::imp::DEFAULT_IDLE_EXIT_SECS;
 
 /// Where the running guest's state lives, shared between the worker thread that
 /// drives the vCPU and the connection handlers that read console / status.
@@ -1343,10 +1344,14 @@ fn run_guest_usgic(
     let outcome = run_usgic_engine(&cfg, loaded, &mut |s| supervise_daemon(s, opts, inner))?;
     Ok(match outcome {
         Outcome::PoweredOff => "guest powered off".to_string(),
-        Outcome::MaxSeconds => "reached --max-seconds limit".to_string(),
-        Outcome::Idle(secs) => format!(
-            "no console output for {secs}s (likely waiting on an unmodelled device)"
-        ),
+        // The daemon always checkpoints, so a limit expiring here suspends the
+        // guest rather than cutting its power. Say so: an operator reading
+        // "reached --max-seconds limit" has no way to tell which happened, and
+        // the difference is whether their work still exists.
+        Outcome::MaxSeconds => "suspended at the --max-seconds limit".to_string(),
+        Outcome::Idle(secs) => {
+            format!("suspended after {secs}s with no console output")
+        }
         Outcome::LimitExceeded(reason) => format!("resource limit hit ({reason})"),
         Outcome::ConsoleClosed | Outcome::Interrupted => "stopped by request".to_string(),
     })
