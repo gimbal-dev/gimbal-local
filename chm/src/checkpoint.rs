@@ -183,6 +183,23 @@ fn read_revision_manifest(rev_dir: &Path) -> Result<Revision, String> {
     let body = fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
     let rev: Revision =
         serde_json::from_str(&body).map_err(|e| format!("parse {}: {e}", path.display()))?;
+    // The envelope carries its own version, and until now nothing read it. A
+    // manifest from a *newer* chm may use fields this build does not know how to
+    // honour, and serde would silently ignore them rather than say so -- so a
+    // checkpoint could be resumed with half its meaning dropped. Say it plainly
+    // instead. Older versions are deliberately still read: compatibility with
+    // what is already on disk is the whole point of versioning it.
+    if rev.manifest_version > REVISION_MANIFEST_VERSION {
+        return Err(format!(
+            "{} was written by a newer chm (manifest version {}, this build \
+             understands {}). Resuming it here could silently drop state it \
+             depends on. Upgrade chm, or cold-boot by deleting {}.",
+            path.display(),
+            rev.manifest_version,
+            REVISION_MANIFEST_VERSION,
+            rev_dir.display()
+        ));
+    }
     if rev.state.version != CHECKPOINT_VERSION {
         return Err(format!(
             "checkpoint version {} is not the supported version {} \
@@ -2504,6 +2521,117 @@ mod tests {
         assert!(plan_gc(&snap).is_empty(), "gc must be idempotent");
 
         let _ = fs::remove_dir_all(&snap);
+    }
+
+    // ---------------------------------------------------------------------
+    // Frozen on-disk fixtures.
+    //
+    // Every other test in this file writes its input with the same code that
+    // reads it back, so the pair agrees by construction and a *format* change
+    // moves both sides at once and is invisible. That blind spot is not
+    // hypothetical: it is exactly how a change that stopped fingerprinting
+    // `.bitmap` sidecars shipped green and stranded every checkpoint already on
+    // disk, each refusing to resume with an error blaming the user's disk.
+    //
+    // The fixtures under `chm/testdata/` are real artifacts, copied verbatim
+    // off a working machine. Nothing in this build can rewrite them, so they
+    // only agree with the current code if the current code still reads what is
+    // genuinely out there. Treat a failure here as "this change breaks
+    // checkpoints that already exist", never as "the fixture is stale".
+    // ---------------------------------------------------------------------
+
+    fn fixture(name: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("testdata").join(name);
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    }
+
+    /// A real manifest from a working 2-vCPU userspace-GIC checkpoint.
+    ///
+    /// This is the guard that fires if a field is added to `Revision` without
+    /// `#[serde(default)]`: the fixture has no such field, so it stops parsing.
+    #[test]
+    fn a_real_manifest_already_on_disk_still_parses() {
+        let rev: Revision = serde_json::from_str(&fixture("manifest-v1-usgic-smp.json"))
+            .expect("a manifest written by a shipped build must still parse");
+        assert_eq!(rev.manifest_version, REVISION_MANIFEST_VERSION);
+        assert_eq!(rev.state.version, CHECKPOINT_VERSION);
+        assert_eq!(rev.state.vcpus.len(), 2, "captured as a 2-vCPU guest");
+        assert!(!rev.id.is_empty());
+    }
+
+    /// The same envelope with an *older* state shape: no `host_realtime_ns`,
+    /// no `usgic`, no `usgic_cpus`. Those three fields were added over time and
+    /// carry `#[serde(default)]` for exactly this reason; this proves that
+    /// discipline still holds rather than trusting the attribute is still there.
+    ///
+    /// Verified by deliberate breakage, which also mapped what this can and
+    /// cannot catch: dropping `#[serde(default)]` from `usgic_cpus` (a `Vec`)
+    /// fails this test with `missing field`, while dropping it from an `Option`
+    /// changes nothing -- serde already treats a missing `Option` as `None`. So
+    /// the exposure that needs guarding is additive `Vec` and scalar fields, and
+    /// this fixture guards exactly those.
+    #[test]
+    fn a_manifest_predating_the_additive_state_fields_still_parses() {
+        let rev: Revision = serde_json::from_str(&fixture("manifest-v1-pre-smp.json"))
+            .expect("fields added since must be optional, or old checkpoints die");
+        assert!(rev.state.host_realtime_ns.is_none());
+        assert!(rev.state.usgic.is_none());
+        assert!(rev.state.usgic_cpus.is_empty());
+        assert_eq!(rev.state.vcpus.len(), 1);
+    }
+
+    /// A manifest from a *newer* chm is refused by name rather than by silently
+    /// dropping the fields this build cannot honour.
+    #[test]
+    fn a_manifest_from_a_newer_chm_is_refused_with_a_reason() {
+        let snap = env::temp_dir().join(format!("chm-newerfmt-{}-{}", process::id(), line!()));
+        let _ = fs::remove_dir_all(&snap);
+        let dir = checkpoint_dir(&snap);
+        fs::create_dir_all(&dir).unwrap();
+        let bumped = fixture("manifest-v1-usgic-smp.json").replacen(
+            &format!("\"manifest_version\":{REVISION_MANIFEST_VERSION}"),
+            &format!("\"manifest_version\":{}", REVISION_MANIFEST_VERSION + 1),
+            1,
+        );
+        fs::write(dir.join(MANIFEST), &bumped).unwrap();
+
+        let Err(err) = read_revision(&snap) else {
+            panic!("a manifest from a newer chm must be refused");
+        };
+        assert!(
+            err.contains("newer chm") && err.contains("Upgrade chm"),
+            "the refusal must name the cause and a remedy, got: {err}"
+        );
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    /// A fingerprint file written before `.bitmap` sidecars stopped being
+    /// fingerprinted must still compare equal to one computed today for the
+    /// same overlays. This is the regression that stranded every checkpoint on
+    /// the development machine, frozen as the real artifact that caused it.
+    #[test]
+    fn a_fingerprint_file_from_before_the_format_change_still_matches_today() {
+        let stored = fixture("overlay-fingerprint-pre-v9.6");
+        assert!(
+            stored.lines().any(|l| l.contains(BITMAP_SUFFIX)),
+            "the fixture must be a genuine pre-change fingerprint, or it guards nothing"
+        );
+
+        // What today's code emits for those same overlays: the same lines, minus
+        // the bitmap, in sorted order.
+        let mut today: Vec<&str> = stored
+            .lines()
+            .filter(|l| !l.split(':').next().unwrap_or(l).ends_with(BITMAP_SUFFIX))
+            .collect();
+        today.sort_unstable();
+        let today = today.join("\n");
+
+        assert_eq!(
+            comparable_fingerprint(&stored),
+            comparable_fingerprint(&today),
+            "a checkpoint already on disk must still resume"
+        );
     }
 
     /// A checkpoint must be able to describe its own overlays the moment it is

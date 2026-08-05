@@ -37,7 +37,7 @@ after reading what Cloudflare shipped in
 | **G5** | **Off-box credentials** | ✅ **done** | Injected at the network edge; guest never holds one (V5.2, I12). In-app rule builder with no field that can hold a token (V8.5). |
 | **G6** | **Create local images — from vanilla *or from containers*** | 🟡 **half** | Vanilla: done (cold boot, BYO). **Containers: nothing.** No OCI/Docker→rootfs path exists anywhere in the tree. |
 | **G7** | **A consistent CLI with all features** | ✅ **done** | **24** subcommands, **all 24 now in `chm --help`** (V9.4), grouped by what they need — six require a control plane, which a local-only install has to be told. Every one honours its own `--help`, checked rather than claimed. A guard test reads the dispatch table from source and fails if a future command is added without a help entry. The app drives **19** of the 24; the rest are diagnostic or control-plane. |
-| **G8** | **Snapshot management** | 🟡 **partial** | Have: lineage, fork, rollback, bounded growth, retention roots (pin/unpin), disk-usage reporting, and **delete, gc and label** — see [`snapshot-retention.md`](snapshot-retention.md). Deleting a parent is measured not to strand its descendants: a 2 vCPU guest resumed to a login shell from a revision whose parent had been deleted, and the bytes the command reports reclaiming (1.4 GiB) match what the volume gave back (1452 MiB). Missing: **export/import**, which is a portability question rather than a lifecycle one. |
+| **G8** | **Snapshot management** | 🟡 **partial** | Have: lineage, fork, rollback, bounded growth, retention roots (pin/unpin), disk-usage reporting, and **delete, gc and label** — see [`snapshot-retention.md`](snapshot-retention.md). Deleting a parent is measured not to strand its descendants: a 2 vCPU guest resumed to a login shell from a revision whose parent had been deleted, and the bytes the command reports reclaiming (1.4 GiB) match what the volume gave back (1452 MiB). A written checkpoint now re-runs the resume-time drift guard against itself, so a torn capture fails at write time rather than becoming a revision nobody can resume. Missing: **export/import**, which is a portability question rather than a lifecycle one, and **format-compatibility cover for the manifest envelope** (#180). |
 
 ### Goals we already held, stated explicitly
 
@@ -167,16 +167,16 @@ Reverse chronological, all merged and hardware-verified:
 
 | # | Milestone | Merged | Serves |
 | --- | --- | --- | --- |
-| 1 | **V9.5b · Snapshot reclaim: delete, gc, label** — delete a revision and be told what it really gave back; collect what no reader can reach; name a point so a timeline of timestamps becomes a list of reasons. Fixes a resume regression that had made **every existing checkpoint** refuse to start (#178) | 08-06 | **G8**, G2 |
-| 2 | **V8.5 · A first-run empty state that teaches** — names what an image *is*, surfaces the discovery rejections up front, and removes a gate that greyed out cold boot whenever the snapshot library was empty (#175) | 08-05 | **G9**, G1 |
-| 3 | **V9.6 · A deadline suspends instead of cutting power** — `--max-seconds`/`--idle-exit` save a resumable checkpoint, and a latent #139 bug where a checkpoint's own teardown invalidated its own fingerprint is fixed (#172) | 08-05 | **G18**, G2 |
-| 4 | **V9.1a · Delta RAM dumps + reclaim-honest accounting** — a live snapshot rewrites only the 64 KiB chunks that changed, and usage reports what deleting a revision would actually give back (#167) | 08-05 | **G2**, G8 |
-| 5 | **V9.1 · Continuous snapshots** — checkpoint a *running* guest on a cadence; a session that ends badly keeps its work (#148) | 08-05 | **G2**, G8 |
-| 6 | **V9.5a · Retention roots + honest disk accounting** — pin a revision so age-based pruning cannot reclaim it, and report what a lineage really costs (#152, part) | 08-04 | **G8**, G2 |
-| 7 | **V9.4 · CLI completeness** — all 24 subcommands in `chm --help`, grouped by what they need, with a guard test that reads the dispatch table from source (#151) | 08-04 | **G7** |
-| 8 | **V8.7 · Proxy rules imply egress allowance** — naming a host in an injection rule makes it reachable, scoped to its own ports and only within one authority (#145) | 08-04 | **G4**, G5 |
-| 9 | **V9.2 · `chm exec`** — run a command in a sandbox and exit with *its* status; a transport failure is never reportable as success (#161) | 08-04 | **G16**, G7 |
-| 10 | **V8.4 + credential builder** — settings persist; a rule builder with no field that can hold a token; `chm` is the authority on whether a rule is valid (#147) | 08-04 | G5, G9 |
+| 1 | **V9.6a · A checkpoint proves it can describe its own overlays** — `write_checkpoint` brackets the overlay copy and then re-runs *the resume-time guard* against what it just wrote, so a torn capture fails at write time instead of stranding a revision nobody can resume (#179). Plus frozen on-disk fixtures, because the format regression in #178 was green in every test by construction (#180) | 08-06 | **G9**, G2 |
+| 2 | **V9.5b · Snapshot reclaim: delete, gc, label** — delete a revision and be told what it really gave back; collect what no reader can reach; name a point so a timeline of timestamps becomes a list of reasons. Fixes a resume regression that had made **every existing checkpoint** refuse to start (#178) | 08-06 | **G8**, G2 |
+| 3 | **V8.5 · A first-run empty state that teaches** — names what an image *is*, surfaces the discovery rejections up front, and removes a gate that greyed out cold boot whenever the snapshot library was empty (#175) | 08-05 | **G9**, G1 |
+| 4 | **V9.6 · A deadline suspends instead of cutting power** — `--max-seconds`/`--idle-exit` save a resumable checkpoint, and a latent #139 bug where a checkpoint's own teardown invalidated its own fingerprint is fixed (#172) | 08-05 | **G18**, G2 |
+| 5 | **V9.1a · Delta RAM dumps + reclaim-honest accounting** — a live snapshot rewrites only the 64 KiB chunks that changed, and usage reports what deleting a revision would actually give back (#167) | 08-05 | **G2**, G8 |
+| 6 | **V9.1 · Continuous snapshots** — checkpoint a *running* guest on a cadence; a session that ends badly keeps its work (#148) | 08-05 | **G2**, G8 |
+| 7 | **V9.5a · Retention roots + honest disk accounting** — pin a revision so age-based pruning cannot reclaim it, and report what a lineage really costs (#152, part) | 08-04 | **G8**, G2 |
+| 8 | **V9.4 · CLI completeness** — all 24 subcommands in `chm --help`, grouped by what they need, with a guard test that reads the dispatch table from source (#151) | 08-04 | **G7** |
+| 9 | **V8.7 · Proxy rules imply egress allowance** — naming a host in an injection rule makes it reachable, scoped to its own ports and only within one authority (#145) | 08-04 | **G4**, G5 |
+| 10 | **V9.2 · `chm exec`** — run a command in a sandbox and exit with *its* status; a transport failure is never reportable as success (#161) | 08-04 | **G16**, G7 |
 
 ### What is outstanding, against the local ship
 
@@ -196,6 +196,7 @@ it is the track [`living-workspaces.md`](living-workspaces.md) creates.
 | **V9.11 ★** (in #150) | **Named sizing tiers** | **G19** | Makes sizing a decision someone can be right about. | S |
 | **V9.12 ★** (#157) | **MCP server surface** | **G21** | V9.2 shipped, so this now depends only on V9.3. An MCP tool call *is* "start from a spec" + "exec and report". | L |
 | **V9.13 ★** | **Session record** — what the sandbox did, not just what left it | G13, G23 | We audit egress. We do not audit the session. | M |
+| **V9.14 ★** (#180) | **Checkpoint format compatibility** — every additive field on the `Revision` envelope defaulted, a documented rule for bumping `REVISION_MANIFEST_VERSION`, and the test writer sharing the real writer | G8, G9 | #178 made **every checkpoint on the machine** refuse to resume with a green suite, because every test writes its input with the code that reads it back. Frozen fixtures now cover the state *inside* the manifest; the envelope around it still has **zero** `#[serde(default)]`. | S |
 | V3.x | Cloud round-trip: signed manifest, `pull → verify → run` | G14 | **Deliberately after the local ship.** Cross-repo. | — |
 
 **Everything above ships the local standalone product.** The track below is
