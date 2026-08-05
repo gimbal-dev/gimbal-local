@@ -759,16 +759,89 @@ final class AppModel: ObservableObject {
     /// shortcut around the daemon.
     func coldBoot(image: LocalImage, options: ColdBootTerminalCommand.Options = .init()) {
         do {
-            let command = try ColdBootTerminalCommand.shellCommand(
-                chmPath: settings.chmPath,
-                image: image,
-                options: options,
-                workdir: FileManager.default.currentDirectoryPath
-            )
+            // A spec in the image directory is what the sandbox *is*, so it wins
+            // over the app's own flag assembly. Preferring it rather than
+            // offering it as an alternative is deliberate: two ways to start the
+            // same sandbox is precisely the duplication this replaces, and the
+            // one that is written down and reviewable is the better of them.
+            let command: String
+            if SandboxSpecDocument.exists(in: image.path) {
+                command = try ColdBootTerminalCommand.specShellCommand(
+                    chmPath: settings.chmPath,
+                    specDirectory: image.path,
+                    workdir: FileManager.default.currentDirectoryPath
+                )
+                appendLog("cold boot: \(image.name) from \(SandboxSpecDocument.filename)")
+            } else {
+                command = try ColdBootTerminalCommand.shellCommand(
+                    chmPath: settings.chmPath,
+                    image: image,
+                    options: options,
+                    workdir: FileManager.default.currentDirectoryPath
+                )
+                appendLog("cold boot: \(image.name) (kernel \(image.kernelPath))")
+            }
             try openTerminal(runningShellCommand: command)
-            appendLog("cold boot: \(image.name) (kernel \(image.kernelPath))")
         } catch {
             appendLog("cold boot failed for \(image.name): \(error.localizedDescription)")
+        }
+    }
+
+    /// Write a `sandbox.json` describing `image`, then ask `chm` whether it is
+    /// any good.
+    ///
+    /// The app does not judge the spec itself — `chm spec validate` does, and
+    /// its wording is shown verbatim. That is the V8.4 credential-builder
+    /// precedent, and the reason is the same: a second validator drifts from the
+    /// first, and the drift shows up as a sandbox that started differently from
+    /// the way the UI described it.
+    @discardableResult
+    func writeSandboxSpec(
+        for image: LocalImage,
+        options: ColdBootTerminalCommand.Options = .init(),
+        overwrite: Bool = false
+    ) -> SpecValidation? {
+        do {
+            let doc = SandboxSpecDocument.describing(image: image, options: options)
+            let path = try doc.write(into: image.path, overwrite: overwrite)
+            appendLog("wrote \(path)")
+            let verdict = validateSandboxSpec(directory: image.path)
+            if let verdict, !verdict.ok {
+                for problem in verdict.problems {
+                    appendLog("spec: \(problem)")
+                }
+            }
+            refreshLocalImages()
+            return verdict
+        } catch {
+            appendLog("sandbox spec failed for \(image.name): \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// Run `chm spec validate` and report what it said.
+    ///
+    /// Returns `nil` only when `chm` could not be run at all, which is a
+    /// different thing from a spec being invalid and must not be reported as
+    /// either "fine" or "broken".
+    func validateSandboxSpec(directory: String) -> SpecValidation? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: settings.chmPath)
+        process.arguments = ["spec", "validate", directory]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = pipe
+        do {
+            try process.run()
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            process.waitUntilExit()
+            return SpecValidation.parse(
+                exitCode: process.terminationStatus,
+                output: String(decoding: data, as: UTF8.self)
+            )
+        } catch {
+            appendLog("chm spec validate could not run: \(error.localizedDescription)")
+            return nil
         }
     }
 

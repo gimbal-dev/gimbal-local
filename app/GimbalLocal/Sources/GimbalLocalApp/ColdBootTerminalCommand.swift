@@ -135,7 +135,43 @@ enum ColdBootTerminalCommand {
         }
         argv.append(contentsOf: ["--seconds", String(max(0, options.seconds))])
 
-        return [
+        return wrap(argv: argv, workdir: workdir, quote: quote)
+    }
+
+    /// Build the command that cold-boots whatever `specDirectory/sandbox.json`
+    /// describes.
+    ///
+    /// This is the de-duplication #150 asked for. `shellCommand` above knows the
+    /// name and meaning of eleven `chm create` flags, and every one of them is a
+    /// fact about `chm` that the app has to be kept in step with by hand. Here
+    /// the app knows one flag, and the sandbox's own file carries the rest — so
+    /// a flag `chm` gains, renames or changes the default of costs no change
+    /// here at all.
+    ///
+    /// The escaping surface shrinks with it: two paths to validate instead of
+    /// eleven, under the same invariant-I5 discipline.
+    static func specShellCommand(
+        chmPath: String,
+        specDirectory: String,
+        workdir: String
+    ) throws -> String {
+        for path in [chmPath, specDirectory, workdir]
+        where !InteractiveTerminalCommand.isCleanPath(path) {
+            throw BuildError.invalidPath(path)
+        }
+        let quote = InteractiveTerminalCommand.shellQuote
+        let argv = [quote(chmPath), "create", "--spec", quote(specDirectory)]
+        return wrap(argv: argv, workdir: workdir, quote: quote)
+    }
+
+    /// The shared banner/`cd`/exit wrapper both routes end in, so the session a
+    /// user sees is identical whichever produced it.
+    private static func wrap(
+        argv: [String],
+        workdir: String,
+        quote: (String) -> String
+    ) -> String {
+        [
             "cd \(quote(workdir))",
             "echo \(quote(sessionBanner))",
             "echo \(quote(usageHint))",
