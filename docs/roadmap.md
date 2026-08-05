@@ -31,7 +31,7 @@ after reading what Cloudflare shipped in
 | # | Goal | State | Evidence, or what is missing |
 | --- | --- | --- | --- |
 | **G1** | **Real Cloud Hypervisor locally, plus BYO images by path** — not simulated | ✅ **done** | Stock upstream, unforked, Graviton2 captures, no flags (V1.5 acid test). BYO image directories with typed refusals (V8.3). Cold boot of a stock kernel with no snapshot in the path (V5.4). |
-| **G2** | **Snapshot as changes happen — time travel over a whole *session*, not just a VM** | 🟡 **compute half done; workspace half is V10** | Have: **continuous snapshots of a running guest (V9.1)** — cadence-driven checkpoints with a measured 1.5–4.5 s freeze on a 2 GiB guest, a browsable timeline (`chm revisions` with ages and an `-auto` origin), rollback to any retained point, **retention roots so the timeline no longer eats its own history (V9.5a)**, and a bad exit that *keeps* its last live point instead of discarding it. Also live checkpoints incl. SMP (V5.6) and fork/CoW lineage. Missing: a checkpoint captures *compute*, not the **workspace** — the working tree, Git state and build artifacts the agent actually produced. [`living-workspaces.md`](living-workspaces.md) is the spec for that, and it is V10. Also missing: the cadence is a plain timer, not event-driven. |
+| **G2** | **Snapshot as changes happen — time travel over a whole *session*, not just a VM** | 🟡 **compute half done; workspace half is V10** | Have: **continuous snapshots of a running guest (V9.1/V9.1a)** — cadence-driven checkpoints written as deltas against the last one, so a 2 GiB guest freezes for a measured 0.9–2.1 s and a snapshot costs 2–13 MiB of disk rather than 3.4 GB; a browsable timeline (`chm revisions` with ages and an `-auto` origin), rollback to any retained point, **retention roots so the timeline no longer eats its own history (V9.5a)**, usage that reports what deleting a revision would actually reclaim, and a bad exit that *keeps* its last live point instead of discarding it. Also live checkpoints incl. SMP (V5.6) and fork/CoW lineage. Missing: a checkpoint captures *compute*, not the **workspace** — the working tree, Git state and build artifacts the agent actually produced. [`living-workspaces.md`](living-workspaces.md) is the spec for that, and it is V10. Also missing: the cadence is a plain timer, not event-driven. |
 | **G3** | **Runs Copilot for real, safely isolated** | ✅ **done** | V7.1: Copilot CLI installed, authenticated, wrote and ran JS, on a cold-booted guest, holding **no credential** — verified by hashing, not by trusting the agent. |
 | **G4** | **Network controls** | ✅ **done, with gaps** | Default-deny-able egress allow-list, userspace NAT, reserved-address guard (I10), per-NIC fail-closed, egress audit trail (V6.3). Gaps are G17/G20 below. |
 | **G5** | **Off-box credentials** | ✅ **done** | Injected at the network edge; guest never holds one (V5.2, I12). In-app rule builder with no field that can hold a token (V8.5). |
@@ -167,16 +167,16 @@ Reverse chronological, all merged and hardware-verified:
 
 | # | Milestone | Merged | Serves |
 | --- | --- | --- | --- |
-| 1 | **V9.1 · Continuous snapshots** — checkpoint a *running* guest on a cadence; a session that ends badly keeps its work (#148) | 08-05 | **G2**, G8 |
-| 2 | **V9.5a · Retention roots + honest disk accounting** — pin a revision so age-based pruning cannot reclaim it, and report what a lineage really costs (#152, part) | 08-04 | **G8**, G2 |
-| 3 | **V9.4 · CLI completeness** — all 24 subcommands in `chm --help`, grouped by what they need, with a guard test that reads the dispatch table from source (#151) | 08-04 | **G7** |
-| 4 | **V8.7 · Proxy rules imply egress allowance** — naming a host in an injection rule makes it reachable, scoped to its own ports and only within one authority (#145) | 08-04 | **G4**, G5 |
-| 5 | **V9.2 · `chm exec`** — run a command in a sandbox and exit with *its* status; a transport failure is never reportable as success (#161) | 08-04 | **G16**, G7 |
-| 6 | **V8.4 + credential builder** — settings persist; a rule builder with no field that can hold a token; `chm` is the authority on whether a rule is valid (#147) | 08-04 | G5, G9 |
-| 7 | **V8.3 · Bring-your-own images** — an image directory with typed refusals; the symlink rule found by using it (#146) | 08-03 | **G1** |
-| 8 | **V8.2 · Local-only mode** — stops the app *reaching* for a control plane, not just hiding it (#146) | 08-03 | G14 boundary |
-| 9 | **V8.1 · Cold boot from the app** — the app's most basic capability stops depending on infrastructure the user may not have (#146) | 08-03 | **G1** |
-| 10 | **V7.1 · A coding agent works inside the sandbox** — Copilot CLI installed, authenticated, wrote and ran JS, holding no credential (#141) | 08-03 | **G3**, G5 |
+| 1 | **V9.1a · Delta RAM dumps + reclaim-honest accounting** — a live snapshot rewrites only the 64 KiB chunks that changed, and usage reports what deleting a revision would actually give back (#167) | 08-05 | **G2**, G8 |
+| 2 | **V9.1 · Continuous snapshots** — checkpoint a *running* guest on a cadence; a session that ends badly keeps its work (#148) | 08-05 | **G2**, G8 |
+| 3 | **V9.5a · Retention roots + honest disk accounting** — pin a revision so age-based pruning cannot reclaim it, and report what a lineage really costs (#152, part) | 08-04 | **G8**, G2 |
+| 4 | **V9.4 · CLI completeness** — all 24 subcommands in `chm --help`, grouped by what they need, with a guard test that reads the dispatch table from source (#151) | 08-04 | **G7** |
+| 5 | **V8.7 · Proxy rules imply egress allowance** — naming a host in an injection rule makes it reachable, scoped to its own ports and only within one authority (#145) | 08-04 | **G4**, G5 |
+| 6 | **V9.2 · `chm exec`** — run a command in a sandbox and exit with *its* status; a transport failure is never reportable as success (#161) | 08-04 | **G16**, G7 |
+| 7 | **V8.4 + credential builder** — settings persist; a rule builder with no field that can hold a token; `chm` is the authority on whether a rule is valid (#147) | 08-04 | G5, G9 |
+| 8 | **V8.3 · Bring-your-own images** — an image directory with typed refusals; the symlink rule found by using it (#146) | 08-03 | **G1** |
+| 9 | **V8.2 · Local-only mode** — stops the app *reaching* for a control plane, not just hiding it (#146) | 08-03 | G14 boundary |
+| 10 | **V8.1 · Cold boot from the app** — the app's most basic capability stops depending on infrastructure the user may not have (#146) | 08-03 | **G1** |
 
 ### What is outstanding, against the local ship
 
