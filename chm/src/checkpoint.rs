@@ -51,6 +51,9 @@ use serde::{Deserialize, Serialize};
 
 const CHECKPOINT_SUBDIR: &str = ".chm-checkpoint";
 const REVISIONS_SUBDIR: &str = ".chm-revisions";
+/// Where `bundle::import` assembles a revision before renaming it into the
+/// store. See [`import_staging_dir`].
+const IMPORT_STAGING_DIR: &str = ".chm-import.tmp";
 const MANIFEST: &str = "checkpoint.json";
 const MEMORY_RANGES: &str = "memory-ranges";
 /// The live disk-overlay directory (CoW writes + bitmaps) at the snapshot root.
@@ -67,7 +70,7 @@ const OVERLAYS_SUBDIR: &str = "overlays";
 /// Sidecar recording the live overlay identity a checkpoint was taken against,
 /// so resume can tell whether the disk has moved on under it. See
 /// [`overlay_drift`].
-const OVERLAY_FINGERPRINT: &str = "overlay.fingerprint";
+pub(crate) const OVERLAY_FINGERPRINT: &str = "overlay.fingerprint";
 
 /// How many revisions keep their full (resumable) guest-RAM dump. Older
 /// revisions are pruned to manifest-only so the lineage graph survives without
@@ -373,6 +376,41 @@ fn verify_checkpoint_describes_overlays(snapshot_dir: &Path) -> Result<(), Strin
 /// The revision store directory (archived past revisions) for a snapshot.
 fn revisions_dir(snapshot_dir: &Path) -> PathBuf {
     snapshot_dir.join(REVISIONS_SUBDIR)
+}
+
+/// The revision store directory, for `bundle`'s import to place into.
+///
+/// Import writes a revision straight into the archive rather than through
+/// `write_checkpoint`, because it is placing a *finished* capture rather than
+/// taking one -- there is no guest to quiesce and no HEAD to rotate.
+pub(crate) fn revision_store_dir(snapshot_dir: &Path) -> PathBuf {
+    revisions_dir(snapshot_dir)
+}
+
+/// Where an import assembles a revision before it becomes visible.
+///
+/// Deliberately **outside** the revision store. Staging inside it would put a
+/// directory holding a valid `checkpoint.json` where `list_revisions` scans, so
+/// a half-written import would be listed as a revision whose id `rollback`
+/// could not then resolve -- the directory name and the manifest id would
+/// disagree. `plan_gc` collects this one, so an interrupted import is reclaimed
+/// by `chm revisions <dir> gc` rather than by a hand-written `rm -rf`.
+pub(crate) fn import_staging_dir(snapshot_dir: &Path) -> PathBuf {
+    snapshot_dir.join(IMPORT_STAGING_DIR)
+}
+
+/// Read the revision manifest in a directory, for `bundle` to check that an
+/// imported payload really is the revision the envelope claims.
+pub(crate) fn read_revision_manifest_at(dir: &Path) -> Result<Revision, String> {
+    read_revision_manifest(dir)
+}
+
+/// The delta writer's chunk grid, so `bundle` can assert it hashes on the same
+/// one. Exposed as a function rather than making the constant public so the
+/// coupling is a stated dependency rather than an ambient one.
+#[cfg(test)]
+pub(crate) fn delta_chunk_bytes() -> usize {
+    DELTA_CHUNK
 }
 
 pub(crate) fn max_resumable_revisions() -> usize {
@@ -894,6 +932,19 @@ pub(crate) fn plan_gc(snapshot_dir: &Path) -> Vec<GcItem> {
         });
     }
 
+    // An interrupted `import` leaves a partly reassembled revision here. It is
+    // outside the revision store on purpose (see `import_staging_dir`), which
+    // is exactly what makes it invisible to every reader -- and it can hold a
+    // whole RAM dump.
+    let staging = import_staging_dir(snapshot_dir);
+    if staging.is_dir() {
+        items.push(GcItem {
+            frees: revision_frees(&staging),
+            path: staging,
+            reason: "interrupted import",
+        });
+    }
+
     // A revision directory whose manifest will not parse is skipped by
     // `list_revisions`, so it is invisible to every reader while still holding
     // its RAM dump. Nothing can ever resume or roll back to it.
@@ -1182,8 +1233,16 @@ fn snapshot_overlays(snapshot_dir: &Path, rev_dir: &Path) -> Result<(), String> 
 /// allocations the data file already reflects — it is strictly more accurate
 /// than the one captured, so re-attaching against it is sound.
 fn overlay_fingerprint(snapshot_dir: &Path) -> String {
-    let live = snapshot_dir.join(LIVE_OVERLAYS_DIR);
-    let Ok(entries) = fs::read_dir(&live) else {
+    fingerprint_overlay_dir(&snapshot_dir.join(LIVE_OVERLAYS_DIR))
+}
+
+/// The fingerprint of one overlay directory, wherever it lives.
+///
+/// Split out from [`overlay_fingerprint`] so an import can check the overlays
+/// it just wrote against the `overlay.fingerprint` the source machine shipped
+/// beside them, rather than only discovering at resume that the two disagree.
+pub(crate) fn fingerprint_overlay_dir(live: &Path) -> String {
+    let Ok(entries) = fs::read_dir(live) else {
         return String::new();
     };
     let mut lines: Vec<String> = entries
@@ -1222,7 +1281,7 @@ fn overlay_fingerprint(snapshot_dir: &Path) -> String {
 /// Normalising both sides costs no detection power, precisely because those
 /// lines never carried any, and makes an old fingerprint comparable with a new
 /// one.
-fn comparable_fingerprint(text: &str) -> Vec<&str> {
+pub(crate) fn comparable_fingerprint(text: &str) -> Vec<&str> {
     text.lines()
         // Each line is `name:len:mtime`; split from the right so a name
         // containing a colon still resolves.
