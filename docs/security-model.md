@@ -126,19 +126,62 @@ flags, no env, no config** — the way almost every sandbox actually starts.
 
 ### Two deliberate "off"s, and why
 
-**Egress is not default-deny.** A sandbox that can reach the internet is what a
-sandbox is *for*, and a snapshot rehydrated from the cloud arrives expecting its
-network. Default-deny would mean every user's first experience is a broken
-guest, which trains people to disable the firewall wholesale — a worse outcome
-than the one it prevents.
+**Egress is not default-deny — on the resume path.** The two entry points
+genuinely differ, and a reader who learns one and assumes the other will be
+wrong:
 
-What matters is that the *dangerous* half of egress is not optional. The threat
-from a hostile guest is not that it reaches the public internet; it is that it
-reaches **your** machine and **your** LAN — `127.0.0.1`, `192.168.0.0/16`, and
-above all the cloud metadata endpoint at `169.254.169.254`. That boundary (I10)
-is on by default, is enforced below policy so no allow-list can widen it by
-accident, and survives DNS answers that resolve into those ranges. Restricting
-public egress on top of that is a policy choice, offered by `chm firewall`.
+| Entry point | No policy configured | Measured by |
+| --- | --- | --- |
+| `chm run` / `chm serve` (resume a snapshot) | **unrestricted** | `chm firewall show` → *"no policy — unrestricted egress"* |
+| `chm create` (cold boot) | **deny-all** | a cold guest with `--net` and no `--egress-allow`: DNS denied, `curl` → `000` |
+
+The split is deliberate. A snapshot rehydrated from the cloud arrives expecting
+the network it was captured with, and default-deny there would mean every
+user's first experience is a broken guest — which trains people to disable the
+firewall wholesale, a worse outcome than the one it prevents. A cold guest is
+being described for the first time, by someone who is already naming its kernel,
+disks and memory; nothing is owed a connection nobody asked for.
+
+What matters is that the *dangerous* half of egress is not optional on either.
+The threat from a hostile guest is not that it reaches the public internet; it
+is that it reaches **your** machine and **your** LAN — `127.0.0.1`,
+`192.168.0.0/16`, and above all the cloud metadata endpoint at
+`169.254.169.254`. That boundary (I10) is on by default, is enforced below
+policy so no allow-list can widen it by accident, and survives DNS answers that
+resolve into those ranges. Restricting public egress on top of that is a policy
+choice, offered by `chm firewall`.
+
+#### What a stock Ubuntu guest reaches for on its own
+
+Measured twice, independently: once from a deliberately unrestricted image-build
+session's audit trail, once from a default-deny cold boot's refusals. **None of
+these were requested by the workload.**
+
+| Host | Port | What asks for it | Notes |
+| --- | --- | --- | --- |
+| `ports.ubuntu.com` | **80** | `apt` (the arm64 archive — on arm64 this is the *only* apt host; `archive.` and `security.ubuntu.com` are x86-only and appear nowhere in the guest's sources) | Plaintext **by design** — apt's integrity comes from GPG signatures on the Release file, not TLS. Not a credential leak; it does leak *which packages you install* to anyone on the path. |
+| `esm.ubuntu.com` | 443 | `ubuntu-advantage-tools` | Subscription check. |
+| `contracts.canonical.com` | 443 | `ubuntu-advantage-tools` timer | Sends a machine identifier. |
+| `livepatch.canonical.com` | 443 | `canonical-livepatch` | Subscription; pointless without a Pro token. |
+| `motd.ubuntu.com` | 443 | `update-motd` on every login | Encodes host details in the request path. The clearest pure-telemetry entry. |
+| `changelogs.ubuntu.com` | 443 | motd / `apt-listchanges` | Benign. |
+| `api.snapcraft.io` | 443 | `snapd` | Pointless if you install no snaps. |
+| `entropy.ubuntu.com` | 443 | `pollinate`, once at first boot | Seeds the RNG from a Canonical server. |
+| `ntp.ubuntu.com` | 123 | `systemd-timesyncd` | Useful in general — but a cold guest already gets correct time from the PL031 RTC (V7.1), so it is not load-bearing here. |
+| `cdn.fwupd.org` | 443 | `fwupd-refresh` timer | A VM has no firmware to update. |
+
+**A working starting point**, if you want apt to function and nothing else to
+phone home. One host, because that is what the guest actually uses — measured
+from its own `sources.list`, not assumed from the x86 defaults. These are
+ports, so `:80` does not open `:22`:
+
+```
+chm create --net --egress-allow ports.ubuntu.com:80 ...
+```
+
+There is deliberately **no named preset** for this yet. A preset is a promise
+about what stays in it across releases, and the list above is a measurement of
+one distro at one point in time, not a contract.
 
 **Signature verification is not default-fail-closed.** `chm` verifies when a
 trust root is configured, but no trust root ships, because nothing signs yet —
