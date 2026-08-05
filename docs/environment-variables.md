@@ -67,6 +67,7 @@ known-good path, not for normal operation.
 | `CHM_FORCE_RESUME_ADVANCE_S=<n>` | Force the resume-time guest counter jump to `n` seconds instead of the real elapsed time. | Attributing a resume-time stall. The jump is normally a function of how long the checkpoint sat on disk, so waiting cannot separate "the jump was large" from "a lot of time passed"; this varies one and holds the other. |
 | `CHM_ALLOW_OVERLAY_DRIFT=1` | Resume even though the disk overlays changed after the checkpoint's RAM was captured. | Deliberately pairing a remembered filesystem with a different one. Expect the guest to wedge — see below. |
 | `CHM_MAX_RESUMABLE_REVISIONS=<n>` | How many checkpoint revisions stay resumable before older ones are pruned. | Each revision costs a full RAM image; this bounds the store. Pinned revisions (`chm revisions <dir> pin <id>`) sit outside this budget, so pinning one does not shorten the window of recent history. |
+| `CHM_SNAPSHOT_INTERVAL_SECS=<n>` | Checkpoint the *running* guest every `n` seconds, without stopping it. Off by default. | Long agent sessions, where a session that ends badly should not be a session whose work is gone. Each checkpoint freezes the guest for as long as the RAM dump takes — **measured 1.5–4.5 s for a 2 GiB guest on an M-series Mac** — so the interval is a trade you make knowingly. See `docs/continuous-snapshots.md`. |
 
 ### Why overlay drift is refused rather than warned about
 
