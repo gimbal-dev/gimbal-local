@@ -50,6 +50,11 @@ mod coldboot;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod create;
 
+// The declarative sandbox spec (V9.3, #150): describe a sandbox rather than
+// assemble one. Uses the agent-compute spec's vocabulary -- see the module docs.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod spec;
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod console;
 

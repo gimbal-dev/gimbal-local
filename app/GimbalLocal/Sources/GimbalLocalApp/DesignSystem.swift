@@ -411,13 +411,40 @@ struct NewSandboxMenu: View {
                         Button {
                             model.coldBoot(image: image)
                         } label: {
-                            Text(image.name)
+                            // Say when a spec is driving the boot. Otherwise the
+                            // same click does two different things depending on
+                            // a file the menu never mentions, and the first time
+                            // someone notices is when the guest is the wrong
+                            // size.
+                            Text(SandboxSpecDocument.exists(in: image.path)
+                                 ? "\(image.name)  ·  from \(SandboxSpecDocument.filename)"
+                                 : image.name)
                         }
                     }
                 }
                 ForEach(refused, id: \.name) { entry in
                     Text("\(entry.name) — "
                          + FirstRunGuidance.plain(entry.rejection?.reason ?? "unusable"))
+                }
+            }
+
+            // Writing the spec is a separate, explicit act. Generating one on
+            // first boot would be worse: a file that appears on its own and then
+            // silently governs every later run is the opposite of the
+            // reviewability a spec is for.
+            let undescribed = model.localImages
+                .compactMap(\.image)
+                .filter { !SandboxSpecDocument.exists(in: $0.path) }
+            if !undescribed.isEmpty {
+                Section("Describe a sandbox") {
+                    Text("Writes \(SandboxSpecDocument.filename) you can edit and commit")
+                    ForEach(undescribed) { image in
+                        Button {
+                            model.writeSandboxSpec(for: image)
+                        } label: {
+                            Text(image.name)
+                        }
+                    }
                 }
             }
         } label: {
