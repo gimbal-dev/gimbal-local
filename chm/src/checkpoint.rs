@@ -928,6 +928,27 @@ fn overlay_fingerprint(snapshot_dir: &Path) -> String {
     lines.join("\n")
 }
 
+/// A fingerprint reduced to the lines that carry detection power.
+///
+/// The `.bitmap` sidecars stopped being fingerprinted when the guard learned
+/// that a bitmap moving on its own has only recorded, after the fact,
+/// allocations the data file already reflects. But checkpoints written before
+/// that change still *store* a bitmap line, so comparing one of those against a
+/// freshly computed fingerprint mismatches on the **format** rather than on the
+/// disk — reporting drift for every checkpoint that predates the change and
+/// refusing to resume it, with an error blaming the user's disk.
+///
+/// Normalising both sides costs no detection power, precisely because those
+/// lines never carried any, and makes an old fingerprint comparable with a new
+/// one.
+fn comparable_fingerprint(text: &str) -> Vec<&str> {
+    text.lines()
+        // Each line is `name:len:mtime`; split from the right so a name
+        // containing a colon still resolves.
+        .filter(|line| !line.rsplitn(3, ':').last().unwrap_or(line).ends_with(BITMAP_SUFFIX))
+        .collect()
+}
+
 /// Whether the live disk overlays have moved on since this checkpoint's RAM was
 /// captured — i.e. whether resuming would pair a guest's remembered filesystem
 /// with a different one on disk.
@@ -950,12 +971,14 @@ pub(crate) fn overlay_drift(snapshot_dir: &Path) -> Option<OverlayDrift> {
     let recorded =
         fs::read_to_string(checkpoint_dir(snapshot_dir).join(OVERLAY_FINGERPRINT)).ok()?;
     let live = overlay_fingerprint(snapshot_dir);
+    let recorded = comparable_fingerprint(&recorded);
+    let live = comparable_fingerprint(&live);
     if recorded == live {
         return None;
     }
     Some(OverlayDrift {
-        recorded_files: recorded.lines().count(),
-        live_files: live.lines().count(),
+        recorded_files: recorded.len(),
+        live_files: live.len(),
     })
 }
 
@@ -1938,6 +1961,62 @@ mod tests {
         assert_ne!(
             overlay_fingerprint(&snap),
             at_capture,
+            "a write to the CoW data file is real drift and must still be caught"
+        );
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    /// A checkpoint written before the guard stopped fingerprinting `.bitmap`
+    /// sidecars still *stores* a bitmap line. Comparing one of those against a
+    /// freshly computed fingerprint mismatched on the format rather than on the
+    /// disk, so every checkpoint that predated the change reported drift and
+    /// refused to resume, blaming the user's disk for a change we made.
+    ///
+    /// Measured when this shipped: every stored fingerprint on the development
+    /// machine was in the older format, including the working agent image.
+    #[test]
+    fn a_fingerprint_written_before_bitmaps_were_excluded_still_compares_equal() {
+        let snap = env::temp_dir().join(format!("chm-fpcompat-{}-{}", process::id(), now_ms()));
+        let _ = fs::remove_dir_all(&snap);
+        let live = snap.join(LIVE_OVERLAYS_DIR);
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("_disk0-cow.raw"), b"data").unwrap();
+        fs::write(live.join("_disk0-cow.raw.bitmap"), b"bits").unwrap();
+        fs::create_dir_all(checkpoint_dir(&snap)).unwrap();
+
+        // Exactly the shape an older binary wrote: the live fingerprint of the
+        // moment, plus the bitmap line it used to include.
+        let live_now = overlay_fingerprint(&snap);
+        let bitmap_meta = fs::metadata(live.join("_disk0-cow.raw.bitmap")).unwrap();
+        let bitmap_mtime = bitmap_meta
+            .modified()
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let mut old_format = vec![
+            format!("_disk0-cow.raw.bitmap:{}:{bitmap_mtime}", bitmap_meta.len()),
+        ];
+        old_format.extend(live_now.lines().map(str::to_string));
+        old_format.sort();
+        fs::write(
+            checkpoint_dir(&snap).join(OVERLAY_FINGERPRINT),
+            old_format.join("\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            overlay_drift(&snap),
+            None,
+            "an unchanged disk must resume even when its fingerprint predates \
+             the bitmap exclusion"
+        );
+
+        // Loosening the comparison must not cost the guard its actual job.
+        fs::write(live.join("_disk0-cow.raw"), b"the guest wrote more").unwrap();
+        assert!(
+            overlay_drift(&snap).is_some(),
             "a write to the CoW data file is real drift and must still be caught"
         );
 
