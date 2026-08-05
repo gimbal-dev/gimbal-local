@@ -989,6 +989,16 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Where a sandbox's state lives, and whether that is still under the
+    /// current library. `nil` for a sandbox that has never been started.
+    func workspaceLocation(for sandbox: Sandbox) -> WorkspaceLocation.State? {
+        WorkspaceLocation.evaluate(
+            workspacePath: storedSandboxes.first(where: { $0.id == sandbox.id })?.workspacePath
+                ?? sandbox.workspacePath,
+            libraryPath: settings.libraryPath
+        )
+    }
+
     /// True if the PID recorded in `lockPath` names a live process.
     private func lockOwnerAlive(_ lockPath: String) -> Bool {
         guard

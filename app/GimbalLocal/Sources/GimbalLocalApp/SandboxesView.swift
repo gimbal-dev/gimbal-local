@@ -362,6 +362,7 @@ struct SandboxDetailPage: View {
                         WorkInsideCard(sandbox: sandbox)
                         SandboxControlsCard(sandbox: sandbox)
                         ConnectivityCard(sandbox: sandbox)
+                        WorkspaceLocationCard(sandbox: sandbox)
                         RevisionHistoryCard(
                             dirPath: sandbox.workspacePath,
                             emptyHint: "Run this sandbox (Open terminal), then end the session to save its live state as a revision here — isolated from other sandboxes of the same image."
@@ -860,5 +861,39 @@ struct FailureBanner: View {
             with: ""
         )
         .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+private struct WorkspaceLocationCard: View {
+    @EnvironmentObject private var model: AppModel
+    let sandbox: Sandbox
+
+    var body: some View {
+        if let location = model.workspaceLocation(for: sandbox) {
+            GlassCard(title: "Stored at", subtitle: "disk, overlays and revisions", systemImage: "externaldrive.fill") {
+                Text(location.path)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if location.outsideLibrary, let note = location.note, let remedy = location.remedy {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(Theme.orange)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(note)
+                                .font(.caption)
+                                .foregroundStyle(.primary)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text(remedy)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
+                        Spacer(minLength: 8)
+                    }
+                }
+            }
+        }
     }
 }
