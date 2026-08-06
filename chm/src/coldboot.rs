@@ -116,6 +116,104 @@ pub fn pl011_size() -> u64 {
 /// device tree names it.
 const VIRTIO_MMIO_BASE: u64 = layout::MEM_32BIT_DEVICES_START.0;
 
+/// Which virtio drivers a kernel carries *built in*.
+///
+/// Cold boot puts every device on **virtio-mmio** (`VIRTIO_MMIO_BASE`, above),
+/// and an initramfs-only guest built from a container image has no
+/// `/lib/modules` — a container rootfs never ships one. So a kernel that builds
+/// virtio as loadable modules pairs with a container image to produce a guest
+/// that boots to a shell and then has no network and no disk. `--net` is
+/// accepted, the device is placed and logged, and the guest cannot see it,
+/// which reads as broken networking rather than a missing driver.
+///
+/// A built-in driver links its `.name` string into the kernel image; a modular
+/// one carries that string in its `.ko` instead. An arm64 `Image` is
+/// uncompressed by definition -- that is why `check_kernel` insists on one --
+/// so the strings are plainly readable. Matching is NUL-delimited so a longer
+/// symbol that merely starts with the same text cannot count.
+///
+/// Measured across four kernels, three of which ship a `.config` giving ground
+/// truth:
+///
+/// | kernel | `virtio-mmio` string | `CONFIG_VIRTIO_MMIO` |
+/// | --- | --- | --- |
+/// | Alpine 6.6 `virt` | absent | `m` |
+/// | Firecracker CI 6.1 | present | `y` |
+/// | Firecracker CI 5.10 | present | `y` |
+/// | Ubuntu 6.8 `generic` | present | verified by booting: a NIC with no `modprobe` |
+///
+/// The discriminating control is inside a single binary rather than between
+/// them: Alpine's `virtio-pci` string *is* present and its `CONFIG_VIRTIO_PCI`
+/// *is* `y`, while the Firecracker kernels have neither. So this tracks
+/// per-driver configuration, not how many strings a kernel happens to hold.
+///
+/// **Absence is the only thing worth reporting, and only ever as a warning.**
+/// A kernel naming the driver certainly has it; a kernel that does not is very
+/// likely modular but is being judged by a heuristic over a binary, and
+/// refusing a boot outright on that would be a wrong answer that costs the user
+/// a working guest. A warning that is occasionally unnecessary is cheap; a
+/// refusal that is occasionally wrong is not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VirtioBuiltin {
+    /// The transport. Without it the others cannot bind, whatever they say.
+    pub mmio: bool,
+    pub net: bool,
+    pub blk: bool,
+}
+
+impl VirtioBuiltin {
+    /// Scan an uncompressed arm64 kernel `Image` for built-in virtio drivers.
+    pub fn scan(kernel: &[u8]) -> Self {
+        let has = |needle: &str| {
+            let mut pat = Vec::with_capacity(needle.len() + 2);
+            pat.push(0u8);
+            pat.extend_from_slice(needle.as_bytes());
+            pat.push(0u8);
+            kernel.windows(pat.len()).any(|w| w == pat)
+        };
+        Self {
+            mmio: has("virtio-mmio"),
+            net: has("virtio_net"),
+            blk: has("virtio_blk"),
+        }
+    }
+
+    /// The sentence to show a user, or `None` when nothing is wrong.
+    ///
+    /// The transport is reported on its own, because loading `virtio_net`
+    /// against a kernel with no `virtio_mmio` returns success and still leaves
+    /// no interface -- the driver registers onto a bus that is not there. That
+    /// is the detail that turns an hour of debugging into a minute, so it is
+    /// stated rather than left to be rediscovered.
+    pub fn warning(&self) -> Option<String> {
+        if self.mmio && self.net && self.blk {
+            return None;
+        }
+        let mut missing = Vec::new();
+        if !self.mmio {
+            missing.push("virtio_mmio (the transport itself)");
+        }
+        if !self.net {
+            missing.push("virtio_net");
+        }
+        if !self.blk {
+            missing.push("virtio_blk");
+        }
+        Some(format!(
+            "this kernel does not appear to have {} built in.\n    \
+             Cold boot puts every device on virtio-mmio, and a container rootfs \
+             ships no /lib/modules,\n    \
+             so --net and --disk will be accepted and the guest will still see \
+             no NIC and no disk.\n    \
+             An Ubuntu `generic` arm64 kernel has these built in and is known to \
+             work; Alpine's `virt` does not.\n    \
+             If you must use this kernel, supply the matching modules and load \
+             virtio_mmio *as well as* virtio_net.",
+            missing.join(", ")
+        ))
+    }
+}
+
 /// `INTID` of the first virtio device. PL011 holds 33; SPIs count up from
 /// `IRQ_BASE` (32), so 34 is the next free one.
 /// SPI for the PL031 RTC. The guest never actually takes it -- Linux's pl031
@@ -1198,5 +1296,80 @@ mod tests {
         assert_eq!(implied_root_args(&cfg).as_deref(), Some("root=/dev/vda rw"));
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ground truth, from kernels that ship their own `.config`.
+    ///
+    /// The fixtures are the smallest slices that carry the signal rather than
+    /// whole kernels: a real `Image` is 16-58 MiB and none of them belong in
+    /// git. What is reproduced faithfully is the *shape* -- NUL-delimited C
+    /// strings in a blob of unrelated bytes -- because that is what `scan`
+    /// depends on.
+    fn kernel_like(names: &[&str]) -> Vec<u8> {
+        let mut v = vec![0x5au8; 512];
+        for n in names {
+            v.push(0);
+            v.extend_from_slice(n.as_bytes());
+            v.push(0);
+            v.extend_from_slice(&[0x17; 64]);
+        }
+        v
+    }
+
+    #[test]
+    fn a_modular_kernel_is_reported_as_missing_every_driver() {
+        // Alpine 6.6 `virt`: CONFIG_VIRTIO_MMIO/NET/BLK=m, CONFIG_VIRTIO_PCI=y.
+        // Measured on the real Image: the three module strings are absent and
+        // `virtio-pci` is present, which is why the scan is per-driver rather
+        // than "does this kernel mention virtio".
+        let k = kernel_like(&["virtio-pci", "virtio", "virtio,mmio"]);
+        let v = VirtioBuiltin::scan(&k);
+        assert!(!v.mmio && !v.net && !v.blk);
+        let w = v.warning().expect("a modular kernel must warn");
+        assert!(w.contains("virtio_mmio (the transport itself)"), "{w}");
+        assert!(w.contains("virtio_net") && w.contains("virtio_blk"), "{w}");
+    }
+
+    #[test]
+    fn a_builtin_kernel_is_silent() {
+        // Firecracker CI 6.1.128 and 5.10.233: MMIO/NET/BLK all `y`, and no
+        // CONFIG_VIRTIO_PCI at all.
+        let k = kernel_like(&["virtio-mmio", "virtio_net", "virtio_blk"]);
+        let v = VirtioBuiltin::scan(&k);
+        assert!(v.mmio && v.net && v.blk);
+        assert!(
+            v.warning().is_none(),
+            "a working kernel must not be warned about"
+        );
+    }
+
+    /// The transport is the one that decides, and it fails silently: loading
+    /// `virtio_net` against a kernel with no `virtio_mmio` returns success and
+    /// still leaves no interface. A kernel carrying the device drivers but not
+    /// the bus must therefore still warn, and must name the bus.
+    #[test]
+    fn drivers_without_their_transport_still_warn() {
+        let k = kernel_like(&["virtio_net", "virtio_blk"]);
+        let v = VirtioBuiltin::scan(&k);
+        assert!(!v.mmio && v.net && v.blk);
+        let w = v.warning().expect("no transport must warn");
+        assert!(w.contains("virtio_mmio (the transport itself)"), "{w}");
+        assert!(
+            !w.contains(", virtio_net"),
+            "must not blame a driver that is present: {w}"
+        );
+    }
+
+    /// Matching is NUL-delimited, so a longer symbol beginning with the same
+    /// text is not the driver. Without this, `virtio_net_hdr` or a kernel
+    /// parameter like `virtio_net.napi_tx` -- which really is present in the
+    /// Firecracker kernels -- would be read as the driver being built in and a
+    /// broken pairing would be reported as fine.
+    #[test]
+    fn a_longer_symbol_is_not_the_driver() {
+        let k = kernel_like(&["virtio_net.napi_tx", "virtio-mmio-cmdline"]);
+        let v = VirtioBuiltin::scan(&k);
+        assert!(!v.net, "`virtio_net.napi_tx` is not `virtio_net`");
+        assert!(!v.mmio, "`virtio-mmio-cmdline` is not `virtio-mmio`");
     }
 }
