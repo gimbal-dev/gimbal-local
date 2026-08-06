@@ -37,6 +37,7 @@ use std::fmt::Write as _;
 use std::iter;
 
 use super::entry::EntryKind;
+use crate::create::{GATEWAY_IP, GUEST_IP, GUEST_PREFIX_LEN};
 
 /// `newc` magic. The other cpio variants are not read by the kernel.
 const MAGIC: &str = "070701";
@@ -303,6 +304,15 @@ pub fn write_cpio(rootfs: &Rootfs) -> Vec<u8> {
 /// can host a shell session already has a shell, and shipping a binary would
 /// mean shipping one per libc.
 pub fn default_init(entrypoint: &str, env: &[String], workdir: Option<&str>) -> String {
+    // Read from the constants `create` declares rather than restated here: a
+    // guest configured onto a different subnet from its own gateway has a NIC
+    // that is up, has an address, and reaches nothing.
+    let dotted = |v: [u8; 4]| format!("{}.{}.{}.{}", v[0], v[1], v[2], v[3]);
+    let guest_ip = dotted(GUEST_IP);
+    let gateway_ip = dotted(GATEWAY_IP);
+    let guest_prefix = GUEST_PREFIX_LEN;
+    let guest_netmask = dotted(prefix_to_netmask(GUEST_PREFIX_LEN));
+
     // The image's own environment, delivered rather than merely understood.
     //
     // This is not a nicety. `python:3.12-alpine` installs to /usr/local/bin and
@@ -372,6 +382,34 @@ mkdir -p /dev/pts && mount -t devpts devpts /dev/pts 2>/dev/null
 # Loopback, so anything binding 127.0.0.1 works without a network policy.
 ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null
 
+# The NIC, if chm attached one.
+#
+# A captured guest receives this from capture-side cloud-init. A container
+# rootfs has neither cloud-init nor a DHCP client, so without this the guest
+# holds a NIC it can see and cannot use -- which reads as broken networking
+# rather than as unconfigured.
+#
+# Tested at runtime rather than at build time, because the same image is booted
+# both with and without --net.
+if [ -e /sys/class/net/eth0 ]; then
+    if ip link set eth0 up 2>/dev/null &&
+       ip addr add {guest_ip}/{guest_prefix} dev eth0 2>/dev/null &&
+       ip route add default via {gateway_ip} 2>/dev/null; then
+        :
+    elif ifconfig eth0 {guest_ip} netmask {guest_netmask} up 2>/dev/null; then
+        route add default gw {gateway_ip} 2>/dev/null
+    else
+        # Configuring an interface needs an ioctl, and no shell builtin makes
+        # one -- so if the image ships neither tool there is nothing this init
+        # can do. Say which tools are missing rather than leaving a silent NIC.
+        echo "gimbal: eth0 is present but this image has no working 'ip' or"
+        echo "gimbal: 'ifconfig', so it cannot be configured. Use an image that"
+        echo "gimbal: has iproute2 or busybox, or configure it yourself:"
+        echo "gimbal:   <tool> addr add {guest_ip}/{guest_prefix} dev eth0"
+        echo "gimbal:   <tool> route add default via {gateway_ip}"
+    fi
+fi
+
 echo "gimbal: container rootfs up; starting {entrypoint}"
 
 # Hand over with a controlling terminal, so job control works and Ctrl-C
@@ -416,6 +454,20 @@ gimbal_start
 /// Image `Env` values are attacker-influenced content (they come out of a
 /// registry), so this is the same discipline invariant I5 applies to the app's
 /// generated commands, not a formatting nicety.
+/// `ifconfig` wants a dotted netmask where `ip` takes a prefix length. Derived
+/// rather than written out, so the two forms cannot describe different subnets.
+fn prefix_to_netmask(prefix: u8) -> [u8; 4] {
+    // Both ends are special-cased because a shift of 32 is undefined and
+    // panics in debug -- which is what the first run of this function's own
+    // test did, rather than quietly returning a wrong mask in release.
+    let bits: u32 = match prefix {
+        0 => 0,
+        p if p >= 32 => u32::MAX,
+        p => u32::MAX << (32 - u32::from(p)),
+    };
+    bits.to_be_bytes()
+}
+
 fn sh_quote(v: &str) -> String {
     format!("'{}'", v.replace('\'', r"'\''"))
 }
@@ -914,6 +966,75 @@ mod tests {
         assert!(
             guard < mounts,
             "re-entry must return before remounting what the parent mounted:\n{s}"
+        );
+    }
+
+    #[test]
+    fn the_nic_is_configured_from_the_addresses_chm_itself_uses() {
+        // A restated literal here would pass every test while putting the
+        // guest on a different subnet from its own gateway -- a NIC that is
+        // up, holds an address, and reaches nothing.
+        let s = default_init("/bin/sh", &[], None);
+        let d = |v: [u8; 4]| format!("{}.{}.{}.{}", v[0], v[1], v[2], v[3]);
+        assert!(
+            s.contains(&format!(
+                "addr add {}/{} dev eth0",
+                d(GUEST_IP),
+                GUEST_PREFIX_LEN
+            )),
+            "the guest address must be the one create declares:\n{s}"
+        );
+        assert!(
+            s.contains(&format!("route add default via {}", d(GATEWAY_IP))),
+            "the gateway must be the one create declares:\n{s}"
+        );
+    }
+
+    #[test]
+    fn the_two_netmask_forms_describe_one_subnet() {
+        // `ip` takes a prefix length and `ifconfig` a dotted mask, so the same
+        // subnet is written twice and the two could disagree silently.
+        assert_eq!(prefix_to_netmask(24), [255, 255, 255, 0]);
+        assert_eq!(prefix_to_netmask(16), [255, 255, 0, 0]);
+        assert_eq!(prefix_to_netmask(32), [255, 255, 255, 255]);
+        assert_eq!(prefix_to_netmask(0), [0, 0, 0, 0]);
+
+        let s = default_init("/bin/sh", &[], None);
+        let mask = prefix_to_netmask(GUEST_PREFIX_LEN);
+        assert!(
+            s.contains(&format!(
+                "netmask {}.{}.{}.{}",
+                mask[0], mask[1], mask[2], mask[3]
+            )),
+            "the ifconfig branch must carry the mask the prefix means:\n{s}"
+        );
+    }
+
+    #[test]
+    fn a_guest_with_no_nic_is_left_alone() {
+        // The same image is booted with and without --net, so this has to be a
+        // runtime test in the script and not a build-time decision.
+        let s = default_init("/bin/sh", &[], None);
+        assert!(
+            s.contains("if [ -e /sys/class/net/eth0 ]; then"),
+            "configuring a NIC that was never attached would print errors on \
+             every no-network boot:\n{s}"
+        );
+    }
+
+    #[test]
+    fn an_image_with_no_network_tool_is_told_which_tools_are_missing() {
+        // Configuring an interface needs an ioctl and no shell builtin makes
+        // one, so this case is unfixable from inside the init -- which makes
+        // saying so the whole of the remedy. node:22-slim is a real example.
+        let s = default_init("/bin/sh", &[], None);
+        assert!(
+            s.contains("no working 'ip' or"),
+            "a silent NIC reads as broken networking:\n{s}"
+        );
+        assert!(
+            s.contains("iproute2 or busybox"),
+            "name what the image needs, not just what it lacks:\n{s}"
         );
     }
 }
