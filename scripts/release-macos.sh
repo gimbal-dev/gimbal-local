@@ -125,6 +125,20 @@ fi
 if [[ "$publish" == "yes" ]]; then
     command -v gh >/dev/null || die "gh is not installed, and --publish needs it to create the release."
     gh auth status >/dev/null 2>&1 || die "gh is not authenticated. Run: gh auth login"
+
+    # The README tells people where to download this. If it names a different
+    # repo than the one we are about to publish to, the very first thing a
+    # downloader does -- click that link -- fails, and the artifact is perfect
+    # and unreachable. This is not hypothetical: the first release was nearly
+    # cut with README pointing at a repo that does not exist.
+    target_repo="$(gh repo view --json nameWithOwner --jq .nameWithOwner)"
+    if ! grep -q "github.com/$target_repo/releases" README.md; then
+        die "README.md does not point at $target_repo/releases, so the download
+      link people follow will not lead to this release.
+
+      Found instead:
+$(grep -n 'github.com/[^)]*/releases' README.md | sed 's/^/        /' || echo '        (no releases link at all)')"
+    fi
 fi
 
 echo "  identity        $identity"
@@ -222,13 +236,24 @@ notes="$repo_root/target/release-notes-$version.md"
 cat >"$notes" <<NOTES
 Gimbal Local $version — Cloud Hypervisor snapshots, rehydrated on Apple silicon.
 
-Requires an Apple silicon Mac (M1 or later) running macOS 14 or newer.
+A vanilla Cloud Hypervisor \`arm64\` snapshot captured on a Linux/KVM host — no
+fork, no patches, no flags — resumes on Apple Hypervisor.framework and comes
+back to a live shell. Or cold-boot a stock kernel with no snapshot at all.
 
-It does **not** require a Linux host, a KVM machine, a control plane, or an
-account anywhere. Everything runs on your Mac.
+### What you need
+
+- An Apple silicon Mac (M1 or later) running macOS 14 or newer.
+
+### What you do not need
+
+Worth saying plainly, because every comparable tool asks for at least one:
+
+- No Linux host and no KVM machine. The Mac is the hypervisor.
+- No control plane, no account, no network. Everything runs locally.
+- No Rust toolchain, no Xcode, no source checkout. \`chm\` ships inside the app.
 
 The app is signed with a Developer ID certificate and notarized by Apple, so it
-opens without a Gatekeeper warning.
+opens without a Gatekeeper warning and its ticket verifies offline.
 
 ### Install
 
@@ -241,6 +266,28 @@ opens without a Gatekeeper warning.
 \`\`\`
 /Applications/GimbalLocal.app/Contents/MacOS/chm --help
 \`\`\`
+
+### Before it can start anything
+
+The app creates \`~/gimbal-snapshots\` and \`~/gimbal-images\` on first launch,
+and both are empty — it does not ship a guest. You need one of:
+
+- a Cloud Hypervisor **arm64 snapshot** (\`state.json\` + \`snapshot/memory-ranges\`,
+  from \`ch-remote … snapshot\` on a Linux host) to rehydrate; or
+- a directory holding an uncompressed arm64 kernel \`Image\` to cold-boot; or
+- nothing but a container reference — \`chm image build alpine:3.20\` builds a
+  bootable image from Docker Hub on this Mac.
+
+### Known limits
+
+- One guest at a time. \`hv_vm_create\` is process-global on macOS.
+- A guest resumed from a snapshot inherits the capture host's CPU feature
+  view. On Graviton that means \`CTR_EL0.DIC\` disagrees with this Mac, which
+  breaks JIT-heavy workloads such as \`npm\`. Cold-booted guests are immune by
+  construction, because their kernel reads this Mac's own \`CTR_EL0\`.
+- **arm64 guests only.** A \`sandbox.json\` asking for \`x86_64\`, and an
+  amd64-only container image, are both refused by name up front. An \`x86_64\`
+  *snapshot* is not recognised as such and will fail less clearly.
 NOTES
 
 gh release create "v$version" "$zip" \

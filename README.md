@@ -43,7 +43,7 @@ chm: guest resumed — serial console follows.
 ## Install
 
 Download the latest `GimbalLocal-<version>.zip` from
-[Releases](https://github.com/nebuk89/cloud-hypervisor-mac/releases), unzip it,
+[Releases](https://github.com/gimbal-dev/gimbal-local/releases), unzip it,
 and drag **Gimbal Local.app** to `/Applications`. The app is signed with a
 Developer ID certificate and notarized by Apple, so it opens without a
 Gatekeeper warning.
