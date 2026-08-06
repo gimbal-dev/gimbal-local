@@ -15,7 +15,7 @@ authors = ["The Cloud Hypervisor Authors"]
 edition.workspace = true
 name = "gimbal-local"
 rust-version.workspace = true
-version = "0.1.0"
+version = "0.1.1"
 
 [[bin]]
 name = "chm"
