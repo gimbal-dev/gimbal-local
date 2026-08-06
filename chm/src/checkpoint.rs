@@ -84,6 +84,37 @@ const DEFAULT_MAX_RESUMABLE_REVISIONS: usize = 5;
 
 /// On-disk manifest version for the lineage header (independent of the
 /// hardware [`CheckpointState`] version).
+///
+/// # When to bump this
+///
+/// The version gate is one-directional and that is what decides the rule: a
+/// *newer* manifest is refused by name (`read_revision_manifest`), an *older*
+/// one is read. So the number exists to protect a user running an old chm
+/// against a checkpoint from a new one — nothing else. Bump it exactly when an
+/// old build reading a new manifest would be **wrong**, not merely incomplete:
+///
+/// - **Bump** when a new field changes the meaning of the fields already there,
+///   or when resuming without honouring it would produce a guest that is
+///   subtly incorrect rather than one that refuses to start. An old build
+///   ignores what it does not know, so anything it *must not* ignore has to be
+///   fenced off by the version.
+/// - **Bump** when an existing field changes units, encoding, or semantics —
+///   the old build will parse it happily and mean something different by it.
+/// - **Do not bump** for a purely additive field that an old build can safely
+///   ignore. Bumping locks that build out of every checkpoint written after
+///   the change, for no gain. Give the field `#[serde(default)]` instead, and
+///   let the frozen fixtures in `chm/testdata/` prove old manifests still
+///   parse.
+/// - **Do not bump** for a field an old build never sees because it lives in
+///   [`CheckpointState`] — that has its own `CHECKPOINT_VERSION`, checked
+///   separately and by exact equality rather than by ordering.
+///
+/// A bump is a compatibility break for *readers*, so it is the expensive
+/// option; `#[serde(default)]` is the cheap one and should be the default
+/// answer. #180 is the record of getting this wrong in the other direction:
+/// the envelope carries no `#[serde(default)]` at all, so any field added here
+/// without one brings down every checkpoint already on disk — which is what
+/// `a_real_manifest_already_on_disk_still_parses` exists to catch.
 const REVISION_MANIFEST_VERSION: u32 = 1;
 
 /// A committed revision: the lineage header plus the captured hardware state.
@@ -253,6 +284,40 @@ pub(crate) fn write_checkpoint(
         state: state.clone(),
     };
 
+    commit_checkpoint(snapshot_dir, &revision, |dest, parent_dump| {
+        // Write against the previous HEAD's dump where there is one. Two
+        // checkpoints seconds apart share almost all of their RAM -- measured at
+        // 99.9% identical on a real guest -- so re-writing the whole image is
+        // wasted freeze *and* wasted disk.
+        //
+        // The returned shared-bytes count is a delta metric, not a result the
+        // caller acts on -- the original `?;` discarded it too.
+        dump_guest_ram(dest, guest_mem, mem_mappings, parent_dump).map(|_shared| ())
+    })
+}
+
+/// Stage a checkpoint directory, swap it into place as the new HEAD, and prove
+/// the result would resume.
+///
+/// This function *is* the on-disk shape of a checkpoint: which files a
+/// checkpoint directory contains, the order they are staged in, and how the
+/// swap happens. Everything about a checkpoint except the RAM image itself is
+/// decided here, and `dump_ram` is the single injected difference -- it
+/// receives the destination path and the previous HEAD's dump to delta against,
+/// if there is one.
+///
+/// **It is shared with the test writer on purpose.** #180: every checkpoint
+/// test used to build its input with a hand-written mirror of this code, so a
+/// change to the real writer's output shape moved only one of the two and every
+/// test stayed green while real checkpoints broke. That is not hypothetical --
+/// it is how #178 stranded every checkpoint on the machine with a full green
+/// suite. A mirror agrees with the original right up until the moment the
+/// agreement is the thing under test.
+fn commit_checkpoint(
+    snapshot_dir: &Path,
+    revision: &Revision,
+    dump_ram: impl FnOnce(&Path, Option<&Path>) -> Result<(), String>,
+) -> Result<(), String> {
     let dir = checkpoint_dir(snapshot_dir);
     let mut tmp = dir.clone().into_os_string();
     tmp.push(".tmp");
@@ -261,18 +326,10 @@ pub(crate) fn write_checkpoint(
     let _ = fs::remove_dir_all(&tmp);
     fs::create_dir_all(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
 
-    // Write against the previous HEAD's dump where there is one. Two
-    // checkpoints seconds apart share almost all of their RAM -- measured at
-    // 99.9% identical on a real guest -- so re-writing the whole image is
-    // wasted freeze *and* wasted disk.
+    // Read the parent dump from the *live* dir before anything archives it.
     let parent_dump = dir.join(MEMORY_RANGES);
     let parent_dump = parent_dump.is_file().then_some(parent_dump);
-    dump_guest_ram(
-        &tmp.join(MEMORY_RANGES),
-        guest_mem,
-        mem_mappings,
-        parent_dump.as_deref(),
-    )?;
+    dump_ram(&tmp.join(MEMORY_RANGES), parent_dump.as_deref())?;
 
     // Capture the disk overlays alongside the RAM dump so this revision is a
     // consistent RAM+disk pair. Without this, rollback would restore an earlier
@@ -311,12 +368,10 @@ pub(crate) fn write_checkpoint(
     // A failure here is not cosmetic and is not swallowed: a checkpoint with no
     // fingerprint loses the #139 drift guard entirely, so it would resume
     // against any disk state at all, silently.
-    fs::write(tmp.join(OVERLAY_FINGERPRINT), &after).map_err(|e| {
-        format!("write {}: {e}", tmp.join(OVERLAY_FINGERPRINT).display())
-    })?;
+    fs::write(tmp.join(OVERLAY_FINGERPRINT), &after)
+        .map_err(|e| format!("write {}: {e}", tmp.join(OVERLAY_FINGERPRINT).display()))?;
 
-    let json =
-        serde_json::to_string(&revision).map_err(|e| format!("serialize revision: {e}"))?;
+    let json = serde_json::to_string(&revision).map_err(|e| format!("serialize revision: {e}"))?;
     fs::write(tmp.join(MANIFEST), json.as_bytes())
         .map_err(|e| format!("write {}: {e}", tmp.join(MANIFEST).display()))?;
 
@@ -1763,21 +1818,23 @@ mod tests {
     }
 
     /// Write a checkpoint with a given RAM marker + origin into `snapshot_dir`.
+    /// Write a checkpoint the way the product does, with a caller-supplied RAM
+    /// image standing in for a live guest.
+    ///
+    /// **This deliberately shares `commit_checkpoint` with the real writer**
+    /// rather than mirroring it (#180). It used to be a hand-written copy, and
+    /// the copy had already drifted: no `.tmp` staging, no atomic rename, no
+    /// bracketed overlay fingerprint, and no post-write self-verification. So
+    /// every rollback, prune, export and import test was built on an artifact
+    /// the product never produces -- and a change to the real writer's on-disk
+    /// shape left all of them green. Proved by adding a sidecar file to
+    /// `write_checkpoint`: 514 tests passed.
+    ///
+    /// The only thing that may differ from a real capture is the RAM bytes,
+    /// because a test has no guest to dump.
     fn write_test_checkpoint(snapshot_dir: &Path, ram: &[u8], origin: &str) {
         use hypervisor::hvf::checkpoint::{CHECKPOINT_VERSION, CheckpointState};
-        // Mirror write_checkpoint's archive-then-swap, without a live GuestMemory:
-        // archive the current HEAD, then stage a fresh HEAD directly.
         let parent = read_revision(snapshot_dir).ok().map(|r| r.id);
-        match &parent {
-            Some(id) => archive_head(snapshot_dir, id),
-            None => clear_checkpoint(snapshot_dir),
-        }
-        let dir = checkpoint_dir(snapshot_dir);
-        fs::create_dir_all(&dir).unwrap();
-        fs::write(dir.join(MEMORY_RANGES), ram).unwrap();
-        // Mirror write_checkpoint: capture the live disk overlays into the
-        // revision so rollback restores a consistent RAM+disk pair.
-        snapshot_overlays(snapshot_dir, &dir).unwrap();
         let created_at_ms = now_ms() + ram.len() as u64; // keep ids ordered in-test
         let rev = Revision {
             manifest_version: REVISION_MANIFEST_VERSION,
@@ -1792,13 +1849,10 @@ mod tests {
                 ..Default::default()
             },
         };
-        fs::write(dir.join(MANIFEST), serde_json::to_string(&rev).unwrap()).unwrap();
-        fs::write(
-            dir.join(OVERLAY_FINGERPRINT),
-            overlay_fingerprint(snapshot_dir),
-        )
-        .unwrap();
-        prune_revisions(snapshot_dir);
+        commit_checkpoint(snapshot_dir, &rev, |dest, _parent_dump| {
+            fs::write(dest, ram).map_err(|e| format!("write {}: {e}", dest.display()))
+        })
+        .expect("test checkpoint must commit");
     }
 
     /// `chm revisions` lists HEAD, so `chm rollback` must accept it. It did not:
@@ -2760,5 +2814,102 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&snap);
+    }
+
+    /// A checkpoint written by this build has the same directory shape as the
+    /// checkpoints already on disk.
+    ///
+    /// This is the half of #180 that sharing one writer cannot deliver.
+    /// `write_test_checkpoint` now calls `commit_checkpoint`, the same function
+    /// the product calls, which stops the test writer *drifting* from the real
+    /// one. It does nothing about both of them *moving together*: a change to
+    /// the checkpoint layout updates the writer and every test that reads it
+    /// back in the same commit, and the suite stays green while every
+    /// checkpoint already on a user's disk stops being understood. Measured, not
+    /// argued -- adding one sidecar file to `write_checkpoint` left all 514
+    /// tests passing.
+    ///
+    /// So the expected shape comes from outside the code: a listing taken off a
+    /// real 2-vCPU Graviton lineage written by shipped builds. Treat a failure
+    /// as "this build changed the checkpoint layout", never as "the fixture is
+    /// stale".
+    #[test]
+    fn a_checkpoint_written_today_has_the_shape_of_the_ones_already_on_disk() {
+        let expect = |kind: &str| -> Vec<String> {
+            fixture("checkpoint-dir-shape-v1")
+                .lines()
+                .find_map(|l| l.strip_prefix(&format!("{kind}: ")))
+                .unwrap_or_else(|| panic!("fixture has no `{kind}:` line"))
+                .split_whitespace()
+                .map(str::to_string)
+                .collect()
+        };
+        let listing = |dir: &Path| -> Vec<String> {
+            let mut names: Vec<String> = fs::read_dir(dir)
+                .unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+                .filter_map(|e| Some(e.ok()?.file_name().to_string_lossy().into_owned()))
+                .collect();
+            names.sort();
+            names
+        };
+
+        let snap = env::temp_dir().join(format!("chm-shape-{}-{}", process::id(), line!()));
+        let _ = fs::remove_dir_all(&snap);
+        fs::create_dir_all(snap.join(LIVE_OVERLAYS_DIR)).unwrap();
+        fs::write(snap.join(LIVE_OVERLAYS_DIR).join("_disk0-cow.raw"), b"aaaa").unwrap();
+
+        write_test_checkpoint(&snap, b"ram-one", "connect");
+        assert_eq!(
+            listing(&checkpoint_dir(&snap)),
+            expect("resumable"),
+            "a resumable checkpoint must look like the ones already on disk"
+        );
+
+        // Age it out of the resumable budget and it should reduce to exactly the
+        // headstone real prunes leave behind -- not to something new, and not to
+        // nothing.
+        let first = read_revision(&snap).unwrap().id;
+        write_test_checkpoint(&snap, b"ram-two", "connect");
+        prune_revisions_keeping(&snap, 0);
+        assert_eq!(
+            listing(&revisions_dir(&snap).join(&first)),
+            expect("pruned"),
+            "a pruned revision must look like the pruned ones already on disk"
+        );
+
+        let _ = fs::remove_dir_all(&snap);
+    }
+
+    /// The test writer still goes through the product's writer.
+    ///
+    /// The shape fixture above catches the checkpoint *layout* changing. It
+    /// cannot catch this: re-mirroring `write_test_checkpoint` produces exactly
+    /// the same file names, so the shape guard stays green while every test
+    /// quietly stops exercising the `.tmp` staging, the atomic rename, the
+    /// bracketed overlay fingerprint and the post-write self-verification --
+    /// which is the state #180 found this file in.
+    ///
+    /// So this reads the source and requires the call. A guard that asserts an
+    /// outcome cannot see a path that is no longer taken.
+    #[test]
+    fn the_test_writer_shares_the_product_writer() {
+        let src = include_str!("checkpoint.rs");
+        let body = src
+            .split_once("fn write_test_checkpoint(")
+            .expect("write_test_checkpoint must exist")
+            .1;
+        let body = &body[..body.find("\n    }").expect("its closing brace")];
+        assert!(
+            body.contains("commit_checkpoint("),
+            "write_test_checkpoint must call commit_checkpoint, not reimplement it: \
+             a mirror agrees with the original until the agreement is what is under test"
+        );
+        for reimplemented in ["archive_head(", "fs::rename(", "snapshot_overlays("] {
+            assert!(
+                !body.contains(reimplemented),
+                "write_test_checkpoint reimplements `{reimplemented}` -- that step \
+                 belongs to commit_checkpoint, and a second copy of it will drift"
+            );
+        }
     }
 }

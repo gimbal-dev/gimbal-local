@@ -1,0 +1,29 @@
+# The on-disk shape of a checkpoint directory, listed off a working machine.
+#
+# Taken from ~/graviton-agent4 on 2026-08-05 -- a real 2-vCPU Graviton lineage
+# written by shipped builds between 2026-08-03 16:34 and 16:38, then aged by
+# real prunes. Nothing in the current build produced these names, which is the
+# entire point: a guard whose expected value is computed by the code under test
+# agrees with that code about its bugs too.
+#
+# This is the independent half of #180. Sharing one writer between the product
+# and the tests stops the two DRIFTING, but it does not stop them MOVING
+# TOGETHER -- a change to the checkpoint layout updates both sides at once and
+# stays green while every checkpoint already on disk breaks. That is exactly
+# how #178 shipped.
+#
+# A failure here means "this build writes, or expects, a checkpoint layout that
+# differs from the checkpoints that already exist". It never means the fixture
+# is stale. Do not regenerate it to get back to green: regenerating it is
+# precisely the act of deleting the evidence.
+#
+# Format: <kind>: <space-separated entry names, sorted>
+
+# A resumable point: RAM image, the manifest, the disk overlays captured with
+# it, and the fingerprint that pairs the two halves (#139).
+resumable: checkpoint.json memory-ranges overlay.fingerprint overlays
+
+# A pruned point. `prune_revisions_keeping` reclaims the RAM dump and the
+# overlay copies once a revision falls out of the resumable budget, leaving a
+# headstone that still lists in `chm revisions` and still says what it was.
+pruned: checkpoint.json overlay.fingerprint
