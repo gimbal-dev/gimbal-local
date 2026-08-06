@@ -45,6 +45,10 @@ rustls = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 flate2 = "1.1"
+# zstd-compressed layers (#206). Already a direct dependency of the in-tree
+# `block` crate at the same pin, so this is a use of what the workspace already
+# vendors and builds, not a new crate in the tree.
+zstd = "0.13"
 
 [lints]
 workspace = true

@@ -24,6 +24,7 @@
 //! are pure functions over text, tested below with the real shapes Docker Hub
 //! and GHCR return. The IO around them is a thin wrapper.
 
+use std::fmt;
 use std::process::Command;
 
 use ring::digest::{digest as sha256_of, SHA256};
@@ -92,7 +93,101 @@ pub fn is_index(manifest: &Value) -> bool {
 /// Returns the digest to fetch next, or an error naming what the image *does*
 /// offer — because "this image has no arm64 build" is a thing the user can act
 /// on, and an unexplained 404 is not.
-pub fn pick_arm64(index: &Value) -> Result<String, String> {
+/// A platform to select from a multi-architecture image index.
+///
+/// `variant` is `None` when the caller did not name one, which is not the same
+/// as `Some("")`: an unnamed variant matches any entry, while a named one must
+/// match exactly. That distinction is the whole reason this type exists —
+/// selecting on `os`/`architecture` alone cannot tell `linux/arm64/v8` from
+/// `linux/arm64/v9`, so an image publishing both is unaddressable (#207).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Platform {
+    pub os: String,
+    pub arch: String,
+    pub variant: Option<String>,
+}
+
+impl Platform {
+    /// The default: what this host can actually boot.
+    pub fn host() -> Self {
+        Self {
+            os: WANT_OS.to_string(),
+            arch: WANT_ARCH.to_string(),
+            variant: None,
+        }
+    }
+
+    /// Does an index entry's `platform` object satisfy this request?
+    fn matches(&self, os: &str, arch: &str, variant: &str) -> bool {
+        if os != self.os || arch != self.arch {
+            return false;
+        }
+        match self.variant.as_deref() {
+            // The caller named a variant: it must match exactly.
+            Some(want) => variant == want,
+            // The caller did not. Accept an unspecified variant (the common and
+            // correct case) and v8, which is what an Apple Silicon Mac runs.
+            // A v9-only image is deliberately *not* taken by default -- it is
+            // reachable with `--platform linux/arm64/v9`, which is a choice the
+            // operator makes rather than one made silently on their behalf.
+            None => variant.is_empty() || variant == "v8",
+        }
+    }
+}
+
+impl fmt::Display for Platform {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.os, self.arch)?;
+        if let Some(v) = &self.variant {
+            write!(f, "/{v}")?;
+        }
+        Ok(())
+    }
+}
+
+/// Parse an `os/arch[/variant]` platform string, refusing one this host cannot
+/// boot.
+///
+/// **The refusal is the point.** Accepting `linux/amd64` here would pull real
+/// layers, unpack a real rootfs and write a real image directory — and produce
+/// something that can never boot on Apple Silicon. A flag whose job is to make
+/// the platform explicit must not be the flag that quietly builds an artifact
+/// the tool cannot run; that is the exact false-sell shape this codebase keeps
+/// finding. So the check happens before a single byte is fetched.
+pub fn parse_platform(s: &str) -> Result<Platform, String> {
+    let parts: Vec<&str> = s.split('/').collect();
+    let (os, arch, variant) = match parts.as_slice() {
+        [os, arch] => (*os, *arch, None),
+        [os, arch, variant] => (*os, *arch, Some((*variant).to_string())),
+        _ => {
+            return Err(format!(
+                "`{s}` is not a platform. Expected `os/arch` or `os/arch/variant`, \
+                 for example `{WANT_OS}/{WANT_ARCH}` or `{WANT_OS}/{WANT_ARCH}/v8`."
+            ));
+        }
+    };
+    if os.is_empty() || arch.is_empty() || variant.as_deref() == Some("") {
+        return Err(format!(
+            "`{s}` has an empty component. Expected `os/arch` or `os/arch/variant`."
+        ));
+    }
+    if os != WANT_OS || arch != WANT_ARCH {
+        return Err(format!(
+            "`{s}` cannot boot here. This is an Apple Silicon host running Linux \
+             guests under Hypervisor.framework, so the only platform it can start \
+             is {WANT_OS}/{WANT_ARCH}. Building a {os}/{arch} image would produce a \
+             directory that looks complete and can never run."
+        ));
+    }
+    Ok(Platform {
+        os: os.to_string(),
+        arch: arch.to_string(),
+        variant,
+    })
+}
+
+/// Pick the manifest digest for `want` out of a multi-architecture index.
+pub fn pick_platform(index: &Value, want: &Platform) -> Result<String, String> {
     let entries = index
         .get("manifests")
         .and_then(Value::as_array)
@@ -109,26 +204,26 @@ pub fn pick_arm64(index: &Value) -> Result<String, String> {
             continue;
         }
         if let (Some(o), Some(a)) = (os, arch) {
-            offered.push(format!("{o}/{a}"));
-            if o == WANT_OS && a == WANT_ARCH {
-                let variant = plat
-                    .and_then(|p| p.get("variant"))
+            let variant = plat
+                .and_then(|p| p.get("variant"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            offered.push(if variant.is_empty() {
+                format!("{o}/{a}")
+            } else {
+                format!("{o}/{a}/{variant}")
+            });
+            if want.matches(o, a, variant) {
+                return m
+                    .get("digest")
                     .and_then(Value::as_str)
-                    .unwrap_or("");
-                // v8 is the only arm64 variant a Mac can run; an unspecified
-                // variant is the common and correct case.
-                if variant.is_empty() || variant == "v8" {
-                    return m
-                        .get("digest")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                        .ok_or_else(|| "arm64 entry has no digest".to_string());
-                }
+                    .map(str::to_string)
+                    .ok_or_else(|| format!("the {want} entry has no digest"));
             }
         }
     }
     Err(format!(
-        "this image has no {WANT_OS}/{WANT_ARCH} build (it offers {}). \
+        "this image has no {want} build (it offers {}). \
          Apple Silicon runs arm64 guests, so an amd64-only image cannot be booted here.",
         if offered.is_empty() {
             "nothing recognisable".to_string()
@@ -148,17 +243,15 @@ pub struct LayerRef {
 impl LayerRef {
     /// Can this build read this layer?
     ///
-    /// zstd layers are a real and growing thing (`docker buildx` emits them on
-    /// request) and this build cannot read one. Refusing by name at pull time is
-    /// the difference between "rebuild your image with gzip" and a tar parse
-    /// error that reads like corruption.
+    /// Refusing by name at pull time is the difference between a remedy the
+    /// user can act on and a tar parse error that reads like corruption.
+    ///
+    /// zstd used to be refused here. It is read now (#206), and deliberately
+    /// **not** by trusting this media type — see `read_blob`, which sniffs the
+    /// magic bytes instead, because registries mislabel layers often enough
+    /// that the declared type is a hint rather than a fact.
     pub fn readable(&self) -> Result<(), String> {
         let m = &self.media_type;
-        if m.contains("zstd") {
-            return Err(format!(
-                "this image has zstd-compressed layers (`{m}`), which this build cannot read.                  Rebuild it with gzip layers, or pull a different tag."
-            ));
-        }
         if m.contains("foreign") {
             return Err(format!(
                 "this image has a foreign/non-distributable layer (`{m}`), which the registry                  will not serve. That is usually a Windows base image."
@@ -360,9 +453,8 @@ impl Registry {
         Ok(resp.body)
     }
 
-    /// Fetch the manifest, following a multi-architecture index to the arm64
-    /// image.
-    pub fn manifest(&mut self) -> Result<Value, String> {
+    /// Fetch the manifest, following a multi-architecture index to `want`.
+    pub fn manifest(&mut self, want: &Platform) -> Result<Value, String> {
         let url = format!(
             "https://{}/v2/{}/manifests/{}",
             self.reference.registry, self.reference.repository, self.reference.reference
@@ -373,13 +465,13 @@ impl Registry {
         if !is_index(&v) {
             return Ok(v);
         }
-        let digest = pick_arm64(&v)?;
+        let digest = pick_platform(&v, want)?;
         let url = format!(
             "https://{}/v2/{}/manifests/{}",
             self.reference.registry, self.reference.repository, digest
         );
         let body = self.get_authed(&url, Some(ACCEPT))?;
-        serde_json::from_slice(&body).map_err(|e| format!("arm64 manifest was not JSON: {e}"))
+        serde_json::from_slice(&body).map_err(|e| format!("the {want} manifest was not JSON: {e}"))
     }
 
     /// Fetch a blob and **verify its digest before returning it**.
@@ -552,7 +644,10 @@ mod tests {
             {"digest": "sha256:amd", "platform": {"os": "linux", "architecture": "amd64"}},
             {"digest": "sha256:arm", "platform": {"os": "linux", "architecture": "arm64"}}
         ]});
-        assert_eq!(pick_arm64(&idx).unwrap(), "sha256:arm");
+        assert_eq!(
+            pick_platform(&idx, &Platform::host()).unwrap(),
+            "sha256:arm"
+        );
     }
 
     /// `docker buildx` attaches attestation manifests with `unknown/unknown`.
@@ -569,7 +664,10 @@ mod tests {
             {"digest": "sha256:att", "platform": {"os": "unknown", "architecture": "unknown"}},
             {"digest": "sha256:arm", "platform": {"os": "linux", "architecture": "arm64"}}
         ]});
-        assert_eq!(pick_arm64(&idx).unwrap(), "sha256:arm");
+        assert_eq!(
+            pick_platform(&idx, &Platform::host()).unwrap(),
+            "sha256:arm"
+        );
 
         // The load-bearing half: an image with no arm64 build must not name a
         // platform the user could never have asked for.
@@ -577,7 +675,7 @@ mod tests {
             {"digest": "sha256:att", "platform": {"os": "unknown", "architecture": "unknown"}},
             {"digest": "sha256:a", "platform": {"os": "linux", "architecture": "amd64"}}
         ]});
-        let e = pick_arm64(&amd_only).unwrap_err();
+        let e = pick_platform(&amd_only, &Platform::host()).unwrap_err();
         assert!(e.contains("linux/amd64"), "{e}");
         assert!(!e.contains("unknown"), "offered a platform that is not one: {e}");
     }
@@ -587,7 +685,7 @@ mod tests {
         let idx = json!({"manifests": [
             {"digest": "sha256:a", "platform": {"os": "linux", "architecture": "amd64"}}
         ]});
-        let e = pick_arm64(&idx).unwrap_err();
+        let e = pick_platform(&idx, &Platform::host()).unwrap_err();
         assert!(e.contains("linux/amd64"), "{e}");
         assert!(e.contains("Apple Silicon"), "{e}");
     }
@@ -598,7 +696,7 @@ mod tests {
             {"digest": "sha256:v7", "platform":
                 {"os": "linux", "architecture": "arm", "variant": "v7"}}
         ]});
-        assert!(pick_arm64(&idx).is_err());
+        assert!(pick_platform(&idx, &Platform::host()).is_err());
     }
 
     #[test]
@@ -613,19 +711,114 @@ mod tests {
         assert_eq!(config_digest(&m).as_deref(), Some("sha256:cfg"));
     }
 
-    /// A zstd layer must be named at pull time. Letting it reach the tar reader
-    /// produces "unreadable size field", which reads as a corrupt download and
-    /// sends the user looking in entirely the wrong place.
+    /// zstd layers are read now (#206), so the pull-time refusal that used to
+    /// name them must be gone -- otherwise the codec support is unreachable and
+    /// the feature is a false sell.
+    ///
+    /// Note what is *not* asserted here: that `readable()` recognises zstd. It
+    /// deliberately does not care. The declared `mediaType` is a hint -- this
+    /// registry client already sniffs gzip magic rather than trusting it,
+    /// because layers are mislabelled often -- so the codec decision lives in
+    /// `read_blob` where the bytes are, and this only has to stop refusing.
     #[test]
-    fn a_zstd_layer_is_refused_by_name_before_it_is_parsed() {
+    fn a_zstd_layer_is_no_longer_refused_at_pull_time() {
+        for mt in [
+            "application/vnd.oci.image.layer.v1.tar+zstd",
+            "application/vnd.docker.image.rootfs.diff.tar.zstd",
+        ] {
+            let m = json!({"layers": [{"digest": "sha256:z", "mediaType": mt}]});
+            layer_specs(&m).unwrap()[0]
+                .readable()
+                .unwrap_or_else(|e| panic!("`{mt}` must be pullable now: {e}"));
+        }
+    }
+
+    /// A foreign layer is still refused, so the change above narrowed the
+    /// refusal rather than deleting it.
+    #[test]
+    fn a_foreign_layer_is_still_refused_by_name() {
         let m = json!({"layers": [
-            {"digest": "sha256:z",
-             "mediaType": "application/vnd.oci.image.layer.v1.tar+zstd"}
+            {"digest": "sha256:f",
+             "mediaType": "application/vnd.docker.image.rootfs.foreign.diff.tar.gzip"}
         ]});
-        let specs = layer_specs(&m).unwrap();
-        let e = specs[0].readable().unwrap_err();
-        assert!(e.contains("zstd"), "{e}");
-        assert!(e.contains("Rebuild it with gzip"), "{e}");
+        let e = layer_specs(&m).unwrap()[0].readable().unwrap_err();
+        assert!(e.contains("foreign"), "{e}");
+        assert!(e.contains("Windows base image"), "{e}");
+    }
+
+    /// `--platform` exists to make the choice explicit; it must not become the
+    /// flag that quietly builds an artifact this host can never boot.
+    #[test]
+    fn a_platform_this_host_cannot_boot_is_refused_before_anything_is_fetched() {
+        for bad in [
+            "linux/amd64",
+            "windows/arm64",
+            "linux/riscv64",
+            "darwin/arm64",
+        ] {
+            let e = parse_platform(bad).unwrap_err();
+            assert!(
+                e.contains("cannot boot here") && e.contains("linux/arm64"),
+                "`{bad}` must be refused with the reason and the supported value, got: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_platform_that_is_not_a_platform_says_what_the_shape_is() {
+        for bad in [
+            "arm64",
+            "",
+            "linux/arm64/v8/extra",
+            "linux/",
+            "/arm64",
+            "linux/arm64/",
+        ] {
+            let e = parse_platform(bad).unwrap_err();
+            assert!(
+                e.contains("os/arch"),
+                "`{bad}` must be refused with the expected shape, got: {e}"
+            );
+        }
+    }
+
+    /// The point of the flag: an image publishing several arm64 variants is
+    /// addressable, and a named variant must match *exactly* rather than
+    /// falling back to the default's v8-or-unspecified rule.
+    #[test]
+    fn a_named_variant_selects_that_variant_and_only_that_variant() {
+        let idx = json!({"manifests": [
+            {"digest": "sha256:v8",
+             "platform": {"os": "linux", "architecture": "arm64", "variant": "v8"}},
+            {"digest": "sha256:v9",
+             "platform": {"os": "linux", "architecture": "arm64", "variant": "v9"}}
+        ]});
+        let v9 = parse_platform("linux/arm64/v9").unwrap();
+        assert_eq!(pick_platform(&idx, &v9).unwrap(), "sha256:v9");
+        let v8 = parse_platform("linux/arm64/v8").unwrap();
+        assert_eq!(pick_platform(&idx, &v8).unwrap(), "sha256:v8");
+
+        // Without a variant the default takes v8 and leaves v9 alone: running
+        // ARMv9 code is a choice the operator makes, not one made for them.
+        assert_eq!(pick_platform(&idx, &Platform::host()).unwrap(), "sha256:v8");
+    }
+
+    /// A variant that is not offered must be refused by name, and the refusal
+    /// must list variants -- saying an image "offers linux/arm64" when the ask
+    /// was `linux/arm64/v9` is a message that reads like a bug in the tool.
+    #[test]
+    fn an_unavailable_variant_is_refused_listing_the_variants_that_exist() {
+        let idx = json!({"manifests": [
+            {"digest": "sha256:v8",
+             "platform": {"os": "linux", "architecture": "arm64", "variant": "v8"}}
+        ]});
+        let v9 = parse_platform("linux/arm64/v9").unwrap();
+        let e = pick_platform(&idx, &v9).unwrap_err();
+        assert!(e.contains("no linux/arm64/v9 build"), "{e}");
+        assert!(
+            e.contains("linux/arm64/v8"),
+            "the offer list must name variants: {e}"
+        );
     }
 
     #[test]
