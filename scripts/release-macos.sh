@@ -139,6 +139,21 @@ if [[ "$publish" == "yes" ]]; then
       Found instead:
 $(grep -n 'github.com/[^)]*/releases' README.md | sed 's/^/        /' || echo '        (no releases link at all)')"
     fi
+
+    # gh refuses to create a release when a tag of that name exists locally but
+    # not on the remote -- and it refuses at publish time, i.e. after the build,
+    # the notarization round trip and the staple. That is the whole point of a
+    # preflight: find it now, not four minutes of Apple's time later. This is
+    # reachable in practice because deleting a release with --cleanup-tag
+    # removes the remote tag and leaves the local one behind.
+    if git rev-parse -q --verify "refs/tags/v$version" >/dev/null 2>&1 \
+        && ! git ls-remote --exit-code --tags origin "refs/tags/v$version" >/dev/null 2>&1; then
+        die "the tag v$version exists here but not on $target_repo, and gh will refuse
+      to create the release -- after the build and notarization have run.
+
+      Delete the stale local tag and re-run:
+          git tag -d v$version"
+    fi
 fi
 
 # One artifact must not carry two version numbers. --version sets the bundle's
