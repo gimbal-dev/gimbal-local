@@ -52,7 +52,7 @@ private struct WelcomeBanner: View {
                     Text("Welcome to Gimbal Local")
                         .font(.title2.weight(.heavy))
                         .foregroundStyle(.white)
-                    Text("Create a sandbox from a snapshot image, then open a terminal and work inside it. The local engine starts itself.")
+                    Text(FirstRunGuidance.welcome)
                         .font(.callout)
                         .foregroundStyle(.white.opacity(0.78))
                         .fixedSize(horizontal: false, vertical: true)
