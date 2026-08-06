@@ -253,13 +253,29 @@ private struct PathsSettingsTab: View {
                     .foregroundStyle(.secondary)
             }
 
-            if !model.settingsNotices.isEmpty {
+            if !model.visibleSettingsNotices.isEmpty || model.libraryAgreement != nil {
                 Section("Since you last used these") {
-                    ForEach(Array(model.settingsNotices.enumerated()), id: \.offset) { _, notice in
+                    ForEach(Array(model.visibleSettingsNotices.enumerated()), id: \.offset) { _, notice in
                         Label {
                             Text(notice.message)
                                 .font(.caption)
                                 .fixedSize(horizontal: false, vertical: true)
+                        } icon: {
+                            Image(systemName: "exclamationmark.triangle")
+                                .foregroundStyle(.orange)
+                        }
+                    }
+                    if let agreement = model.libraryAgreement {
+                        Label {
+                            VStack(alignment: .leading, spacing: 2) {
+                                Text(agreement.note)
+                                    .font(.caption)
+                                    .fixedSize(horizontal: false, vertical: true)
+                                Text(agreement.remedy)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
                         } icon: {
                             Image(systemName: "exclamationmark.triangle")
                                 .foregroundStyle(.orange)

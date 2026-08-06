@@ -587,24 +587,34 @@ fn handle_conn(stream: UnixStream, daemon: &Daemon) {
     }
 }
 
+/// The daemon's status, as a line for a human.
+///
+/// Reports `library` alongside the state for the same reason `status_json`
+/// does: the directory is fixed at `chm serve <dir>`, so someone reading `chm
+/// ctl status` after configuring a different one is looking at a daemon that
+/// will never see their snapshots. Kept in step with `status_json` — a text
+/// form that omits what the JSON form carries is a second answer waiting to
+/// drift.
 fn status_line(daemon: &Daemon) -> String {
+    let library = daemon.library_dir.display();
     let guard = daemon.current.lock().unwrap();
     match guard.as_ref() {
-        None => "idle\n".to_string(),
+        None => format!("idle\tlibrary {library}\n"),
         Some(vm) => {
             let inner = vm.inner.lock().unwrap();
             let bytes = inner.dropped + inner.console.len();
             match &inner.status {
                 RunStatus::Running => format!(
-                    "running\t{}\t{}s\t{} console bytes\n",
+                    "running\t{}\t{}s\t{} console bytes\tlibrary {}\n",
                     vm.name,
                     vm.started.elapsed().as_secs(),
-                    bytes
+                    bytes,
+                    library
                 ),
                 RunStatus::Stopped(reason) => {
                     format!(
-                        "stopped\t{}\t{}\t{} console bytes\n",
-                        vm.name, reason, bytes
+                        "stopped\t{}\t{}\t{} console bytes\tlibrary {}\n",
+                        vm.name, reason, bytes, library
                     )
                 }
             }
@@ -630,25 +640,37 @@ fn list_json(daemon: &Daemon) -> String {
     out
 }
 
+/// The daemon's status, as JSON.
+///
+/// Carries `library` in **every** branch, including idle. The library a
+/// daemon serves is fixed at `chm serve <dir>` and cannot be overridden
+/// per-request, so a caller configured for a different directory is reading a
+/// list that has nothing to do with its own setting — and the idle case is
+/// exactly when that is least visible, because there is no running guest to
+/// contradict it. Same reasoning as `posture_json`: the process that owns the
+/// fact is the one that should report it.
 fn status_json(daemon: &Daemon) -> String {
+    let library = json_escape(&daemon.library_dir.display().to_string());
     let guard = daemon.current.lock().unwrap();
     match guard.as_ref() {
-        None => "{\"state\":\"idle\"}\n".to_string(),
+        None => format!("{{\"state\":\"idle\",\"library\":\"{library}\"}}\n"),
         Some(vm) => {
             let inner = vm.inner.lock().unwrap();
             let bytes = inner.dropped + inner.console.len();
             match &inner.status {
                 RunStatus::Running => format!(
-                    "{{\"state\":\"running\",\"name\":\"{}\",\"uptime_seconds\":{},\"console_bytes\":{}}}\n",
+                    "{{\"state\":\"running\",\"name\":\"{}\",\"uptime_seconds\":{},\"console_bytes\":{},\"library\":\"{}\"}}\n",
                     json_escape(&vm.name),
                     vm.started.elapsed().as_secs(),
-                    bytes
+                    bytes,
+                    library
                 ),
                 RunStatus::Stopped(reason) => format!(
-                    "{{\"state\":\"stopped\",\"name\":\"{}\",\"reason\":\"{}\",\"console_bytes\":{}}}\n",
+                    "{{\"state\":\"stopped\",\"name\":\"{}\",\"reason\":\"{}\",\"console_bytes\":{},\"library\":\"{}\"}}\n",
                     json_escape(&vm.name),
                     json_escape(reason),
-                    bytes
+                    bytes,
+                    library
                 ),
             }
         }
@@ -1816,9 +1838,60 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// A proxy answer of "nothing configured" is only actionable if it names the
-    /// directory it looked in: rules dropped in the library root are read by
-    /// nothing, because a guest resolves them from its own workspace folder.
+    /// The library a daemon serves is fixed at `chm serve <dir>`, so a caller
+    /// configured for a different one is reading a list that has nothing to do
+    /// with its own setting. **Idle is the case that matters**: with no running
+    /// guest there is nothing else on screen to contradict a wrong library, and
+    /// that is exactly the shape the app hit — a banner predicting an empty
+    /// list above a sidebar full of snapshots from somewhere else.
+    #[test]
+    fn status_reports_the_library_it_serves_even_when_idle() {
+        let dir = std::env::temp_dir().join(format!("chm-statuslib-{}", process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let daemon = Daemon {
+            library: Vec::new(),
+            library_dir: dir.clone(),
+            idle_exit_secs: 0,
+            max_seconds: 0,
+            socket_path: dir.join("chm.sock"),
+            current: Mutex::new(None),
+        };
+
+        let parsed: serde_json::Value =
+            serde_json::from_str(&status_json(&daemon)).expect("valid JSON");
+        assert_eq!(parsed["state"], "idle");
+        assert_eq!(parsed["library"], dir.to_str().unwrap());
+
+        // The human form must carry it too. A text answer that omits what the
+        // JSON answer has is a second opinion waiting to drift apart.
+        let line = status_line(&daemon);
+        assert!(line.starts_with("idle\t"), "{line}");
+        assert!(line.contains(dir.to_str().unwrap()), "{line}");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A library path can contain a character JSON must escape. The field is
+    /// interpolated into a hand-built object like every other field here, so
+    /// prove the escaping is applied rather than assumed.
+    #[test]
+    fn status_escapes_a_library_path_that_needs_it() {
+        let dir = std::env::temp_dir().join(format!("chm-esc-\"{}", process::id()));
+        let daemon = Daemon {
+            library: Vec::new(),
+            library_dir: dir.clone(),
+            idle_exit_secs: 0,
+            max_seconds: 0,
+            socket_path: dir.join("chm.sock"),
+            current: Mutex::new(None),
+        };
+
+        let out = status_json(&daemon);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&out).unwrap_or_else(|e| panic!("not valid JSON: {e}: {out}"));
+        assert_eq!(parsed["library"], dir.to_str().unwrap());
+    }
+
     #[test]
     fn daemon_proxy_json_names_the_directory_it_assessed() {
         let dir = std::env::temp_dir().join(format!("chm-proxy-{}", process::id()));

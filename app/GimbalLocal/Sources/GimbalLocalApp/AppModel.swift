@@ -1030,6 +1030,32 @@ final class AppModel: ObservableObject {
         NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Terminal") != nil
     }
 
+    /// Whether the daemon answering `chm ctl list` is serving the library this
+    /// app is configured for. `nil` when they agree or the daemon did not say.
+    ///
+    /// Read from `status` rather than probed, so it costs nothing and cannot
+    /// disagree with the state the rest of the UI is rendering.
+    var libraryAgreement: LibraryAgreement.State? {
+        LibraryAgreement.evaluate(
+            daemonLibrary: status.library,
+            configured: settings.libraryPath
+        )
+    }
+
+    /// `settingsNotices` with any notice the daemon has overtaken removed.
+    ///
+    /// "\(path) exists but is empty, so this list will stay blank" is a correct
+    /// observation with a wrong conclusion when a daemon is serving a different
+    /// library: the configured folder really is empty, and the list is full
+    /// anyway. Showing both is how the app came to contradict itself on screen.
+    /// The agreement note replaces it and explains strictly more.
+    var visibleSettingsNotices: [SettingsStore.Notice] {
+        guard libraryAgreement != nil else { return settingsNotices }
+        return settingsNotices.filter {
+            !($0.field == .libraryPath && $0.predictsEmptyList)
+        }
+    }
+
     /// Where a sandbox's state lives, and whether that is still under the
     /// current library. `nil` for a sandbox that has never been started.
     func workspaceLocation(for sandbox: Sandbox) -> WorkspaceLocation.State? {
