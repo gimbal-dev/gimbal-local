@@ -124,6 +124,10 @@ struct SandboxStatus: Codable, Equatable {
     var consoleBytes: Int?
     var reason: String?
     var message: String?
+    /// The snapshot library the daemon is actually serving. Optional because the
+    /// app connects to daemons it did not build, including ones predating the
+    /// field; a missing value means "it did not say", never "it agrees".
+    var library: String?
 
     enum CodingKeys: String, CodingKey {
         case state
@@ -132,6 +136,7 @@ struct SandboxStatus: Codable, Equatable {
         case consoleBytes = "console_bytes"
         case reason
         case message
+        case library
     }
 
     static let disconnected = SandboxStatus(

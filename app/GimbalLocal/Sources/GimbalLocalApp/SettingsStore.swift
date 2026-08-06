@@ -149,6 +149,29 @@ enum SettingsStore {
         /// execute bit. `fileExists` says yes to both.
         case notExecutable(field: SettingsField, path: String)
 
+        /// Which setting this is about. Exposed so a caller can suppress a
+        /// notice whose *conclusion* another fact has overtaken — see
+        /// ``LibraryAgreement``, where "this list will stay blank" is wrong
+        /// whenever a daemon is serving a different library and the list is
+        /// full.
+        var field: SettingsField {
+            switch self {
+            case let .environmentOverride(field, _, _, _): field
+            case let .missingFallback(field, _, _): field
+            case let .missingKept(field, _): field
+            case let .presentButEmpty(field, _): field
+            case let .notExecutable(field, _): field
+            }
+        }
+
+        /// True when this notice predicts an empty list. Only such a notice can
+        /// be contradicted by a daemon serving somewhere else; a missing path
+        /// or an environment override stays true regardless.
+        var predictsEmptyList: Bool {
+            if case .presentButEmpty = self { return true }
+            return false
+        }
+
         var message: String {
             switch self {
             case let .environmentOverride(field, variable, saved, active):

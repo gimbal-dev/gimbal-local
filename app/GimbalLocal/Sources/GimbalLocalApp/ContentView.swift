@@ -52,15 +52,31 @@ private struct SettingsNoticeBanner: View {
     @EnvironmentObject private var model: AppModel
 
     var body: some View {
-        if !model.settingsNotices.isEmpty {
+        if !model.visibleSettingsNotices.isEmpty || model.libraryAgreement != nil {
             VStack(alignment: .leading, spacing: 6) {
-                ForEach(Array(model.settingsNotices.enumerated()), id: \.offset) { _, notice in
+                ForEach(Array(model.visibleSettingsNotices.enumerated()), id: \.offset) { _, notice in
                     HStack(alignment: .firstTextBaseline, spacing: 8) {
                         Image(systemName: "exclamationmark.triangle.fill")
                             .foregroundStyle(Theme.orange)
                         Text(notice.message)
                             .font(.caption)
                             .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 8)
+                    }
+                }
+                if let agreement = model.libraryAgreement {
+                    HStack(alignment: .firstTextBaseline, spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .foregroundStyle(Theme.orange)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(agreement.note)
+                                .font(.caption)
+                                .fixedSize(horizontal: false, vertical: true)
+                            Text(agreement.remedy)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+                        }
                         Spacer(minLength: 8)
                     }
                 }
