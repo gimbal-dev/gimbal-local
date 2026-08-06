@@ -24,14 +24,27 @@ struct AppSettings: Equatable {
         controlPlaneURL: "http://127.0.0.1:8080"
     )
 
+    /// Where cold-boot images live.
+    ///
+    /// This must agree with `chm`'s `images_library()`, because `chm image
+    /// build` is the thing that *writes* here and this is the thing that reads.
+    /// They disagreed until V9.7: `chm` wrote to `~/gimbal-images` while this
+    /// returned `<repo>/images`, a directory that had never existed — so the
+    /// New sandbox menu said "No local images yet" with images sitting on
+    /// disk. Two implementations of one rule, drifting exactly as you would
+    /// expect.
+    ///
+    /// Unlike `chmPath` and `libraryPath`, there is no repo-root branch here.
+    /// `chm` is a build artefact so looking beside the checkout is right for
+    /// it; images are user data a shipped app must still find when there is no
+    /// checkout at all. `GIMBAL_IMAGES` remains the override, and is the same
+    /// variable `chm` reads.
     private static func defaultLocalImagesPath() -> String {
         if let images = ProcessInfo.processInfo.environment["GIMBAL_IMAGES"], !images.isEmpty {
             return images
         }
-        if let root = repoRootCandidate() {
-            return root.appending(path: "images").path
-        }
-        return "images"
+        return FileManager.default.homeDirectoryForCurrentUser
+            .appending(path: "gimbal-images").path
     }
 
     private static func defaultChmPath() -> String {

@@ -2,6 +2,7 @@
 //
 // SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 
+import Foundation
 import Testing
 
 @testable import GimbalLocalApp
@@ -178,5 +179,41 @@ struct StatusLibraryDecodingTests {
         let status = try ChmClient.parseStatus(#"{"state":"idle"}"#)
         #expect(status.library == nil)
         #expect(status.state == .idle)
+    }
+
+    /// The app *reads* cold-boot images; `chm image build` *writes* them. Two
+    /// programs, one rule, and until V9.7 they disagreed: `chm` wrote to
+    /// `~/gimbal-images` while the app looked in `<repo>/images`, a directory
+    /// that had never existed. The New sandbox menu therefore said "No local
+    /// images yet" while three images sat on disk — a refusal that was
+    /// perfectly worded and completely wrong.
+    ///
+    /// This reads `chm`'s own source rather than restating its answer, so the
+    /// two cannot drift apart again without something going red. A restated
+    /// constant would have passed happily through the whole bug.
+    @Test("the app looks for images where chm writes them")
+    func testImageLibraryAgreesWithChm() throws {
+        let repo = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // GimbalLocalAppTests
+            .deletingLastPathComponent()  // Tests
+            .deletingLastPathComponent()  // GimbalLocal
+            .deletingLastPathComponent()  // app
+            .deletingLastPathComponent()  // repo root
+        let source = try String(
+            contentsOf: repo.appending(path: "chm/src/oci/image.rs"), encoding: .utf8
+        )
+
+        // `chm`'s images_library(): $GIMBAL_IMAGES, else $HOME/gimbal-images.
+        #expect(
+            source.contains(#"env::var_os("GIMBAL_IMAGES")"#),
+            "chm no longer reads GIMBAL_IMAGES; the app still does"
+        )
+        #expect(
+            source.contains(#"home.join("gimbal-images")"#),
+            "chm's fallback moved; AppSettings.defaultLocalImagesPath must follow"
+        )
+
+        let home = FileManager.default.homeDirectoryForCurrentUser.appending(path: "gimbal-images")
+        #expect(AppSettings.defaults.localImagesPath == home.path)
     }
 }
