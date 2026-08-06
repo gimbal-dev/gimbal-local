@@ -43,17 +43,27 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 
 publish="no"
-if [[ "${1:-}" == "--publish" ]]; then
-    publish="yes"
-elif [[ -n "${1:-}" ]]; then
-    echo "release-macos.sh: unknown argument: $1" >&2
-    echo "usage: release-macos.sh [--publish]" >&2
-    exit 2
-fi
+version="${GIMBAL_VERSION:-0.1.0}"
+
+# A loop, not a single positional read: the earlier form inspected only $1, so
+# `--publish --version 0.2.0` would have published 0.1.0 without complaining.
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --publish) publish="yes"; shift ;;
+        --version)
+            [[ -n "${2:-}" ]] || { echo "release-macos.sh: --version needs a value" >&2; exit 2; }
+            version="$2"; shift 2 ;;
+        --version=*) version="${1#*=}"; shift ;;
+        -h|--help) echo "usage: release-macos.sh [--publish] [--version X.Y.Z]"; exit 0 ;;
+        *)
+            echo "release-macos.sh: unknown argument: $1" >&2
+            echo "usage: release-macos.sh [--publish] [--version X.Y.Z]" >&2
+            exit 2 ;;
+    esac
+done
 
 identity="${GIMBAL_SIGN_IDENTITY:-}"
 notary_profile="${GIMBAL_NOTARY_PROFILE:-gimbal-notary}"
-version="${GIMBAL_VERSION:-0.1.0}"
 build_number="${GIMBAL_BUILD:-1}"
 
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
