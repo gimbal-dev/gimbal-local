@@ -132,4 +132,66 @@ final class FirstRunGuidanceTests: XCTestCase {
             "stripping emphasis must not lose the remedy"
         )
     }
+
+    /// The welcome banner must name the route that works on a Mac alone.
+    ///
+    /// It shipped saying only *"create a sandbox from a snapshot image"* — the
+    /// exact sentence #175 removed from the empty state, because a snapshot is
+    /// captured on a KVM host and someone whose only machine is this Mac cannot
+    /// make one. Naming the snapshot route is fine and true; naming *only* it
+    /// tells a first-run user to go and do the one thing they cannot do.
+    func testTheWelcomeBannerNamesTheRouteThatNeedsNoKvmHost() {
+        let welcome = FirstRunGuidance.welcome.lowercased()
+        XCTAssertTrue(
+            welcome.contains("cold-boot") || welcome.contains("cold boot"),
+            "the banner must name cold boot — it is the only route that works "
+                + "on a Mac that has never had a KVM host or a control plane"
+        )
+        XCTAssertTrue(
+            welcome.contains("snapshot"),
+            "the banner should still name the snapshot route; it is real"
+        )
+    }
+
+    /// The banner text must come from `FirstRunGuidance`, not a literal.
+    ///
+    /// This is the shape of the bug, not just an instance of it: #175 fixed the
+    /// wording in the empty state and the banner kept its own hardcoded copy,
+    /// so the corrected sentence and the uncorrected one rendered on the same
+    /// screen — with the wrong one on top, and still rendering long after the
+    /// empty state had been replaced by a sandbox list.
+    ///
+    /// Asserting the *content* of `welcome` cannot see that: a re-hardcoded
+    /// literal in the view would leave `welcome` perfectly correct and unused.
+    /// So this reads the view's own source, the way `testImageLibraryAgreesWithChm`
+    /// reads `chm`'s.
+    func testTheBannerRendersTheSharedCopyRatherThanItsOwn() throws {
+        let repo = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // GimbalLocalAppTests
+            .deletingLastPathComponent()  // Tests
+            .deletingLastPathComponent()  // GimbalLocal
+            .deletingLastPathComponent()  // app
+            .deletingLastPathComponent()  // repo root
+        let source = try String(
+            contentsOf: repo.appending(
+                path: "app/GimbalLocal/Sources/GimbalLocalApp/SandboxesView.swift"
+            ),
+            encoding: .utf8
+        )
+
+        guard let banner = source.range(of: "private struct WelcomeBanner") else {
+            return XCTFail("WelcomeBanner was renamed; this guard no longer covers it")
+        }
+        let body = String(source[banner.lowerBound...].prefix(1200))
+
+        XCTAssertTrue(
+            body.contains("FirstRunGuidance.welcome"),
+            "the welcome banner must render the shared copy, or the next "
+                + "correction will land in one place and be contradicted in the other"
+        )
+        XCTAssertFalse(
+            body.contains("Create a sandbox from a snapshot image"),
+            "the snapshot-only sentence is back in the banner"
+        )
+    }
 }

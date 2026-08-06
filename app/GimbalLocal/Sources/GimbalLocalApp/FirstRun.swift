@@ -116,4 +116,23 @@ enum FirstRunGuidance {
             rejections: []
         )
     }
+
+    /// The one-paragraph pitch on the welcome banner.
+    ///
+    /// **This is not decoration.** The banner shipped saying *"create a sandbox
+    /// from a snapshot image"* and nothing else — the exact sentence #175
+    /// removed from the empty state, because a snapshot is captured on a KVM
+    /// host and someone whose only machine is this Mac cannot produce one. The
+    /// banner is the *more* prominent of the two: it renders first, and it keeps
+    /// rendering after the empty state has been replaced by a sandbox list. So
+    /// the fix landed in one place and the lie survived in the louder one.
+    ///
+    /// A value rather than a literal in the view, so a test can assert both
+    /// routes are named. Kept to prose a banner can hold; the layout detail
+    /// lives in `layoutHelp`.
+    static let welcome = """
+        Cold-boot a local image, or rehydrate a Cloud Hypervisor snapshot \
+        brought down from the cloud. Either way the engine starts itself and \
+        you get a terminal inside the sandbox.
+        """
 }
