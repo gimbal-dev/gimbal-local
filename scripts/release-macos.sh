@@ -141,6 +141,27 @@ $(grep -n 'github.com/[^)]*/releases' README.md | sed 's/^/        /' || echo ' 
     fi
 fi
 
+# One artifact must not carry two version numbers. --version sets the bundle's
+# CFBundleShortVersionString, but `chm --version` prints CARGO_PKG_VERSION from
+# chm/Cargo.toml, so the two drift apart the moment one moves without the other.
+# v0.1.1 shipped exactly that: an app reporting 0.1.1 whose own bundled chm said
+# 0.1.0, which means a bug report quotes a version that does not identify the
+# build it came from.
+#
+# Refuse rather than rewrite chm/Cargo.toml here. The version is a fact about
+# the source, recorded in a commit and covered by the tag; a script editing it
+# mid-release would make the published tree disagree with the tree that built
+# it, and the disagreement would be invisible afterwards.
+chm_version="$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^version *=/{gsub(/[",]/,"");print $3;exit}' chm/Cargo.toml)"
+[[ -n "$chm_version" ]] || die "could not read the package version from chm/Cargo.toml."
+if [[ "$chm_version" != "$version" ]]; then
+    die "chm/Cargo.toml says $chm_version but this release is $version, so the app
+      would report $version while its own bundled chm reports $chm_version.
+
+      Bump it, commit, and re-run:
+          chm/Cargo.toml  version = \"$version\""
+fi
+
 echo "  identity        $identity"
 echo "  notary profile  $notary_profile"
 echo "  version         $version (build $build_number)"
