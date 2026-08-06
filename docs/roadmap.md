@@ -193,8 +193,23 @@ it is the track [`living-workspaces.md`](living-workspaces.md) creates.
 notarized, stapled build, and it has been verified the way a stranger receives
 it. Everything below is now product work on top of something someone can have.
 
+**And it has now been accepted from the outside.** On 2026-08-06 this Mac was
+wiped of every trace of gimbal, the release was installed the way a downloader
+installs it, and it was tested three ways. A vanilla Graviton2 KVM snapshot
+rehydrated carrying **`617849s` — 7.15 days — of guest uptime** from the AWS
+capture, which a cold boot cannot fake; a container image pulled from Docker
+Hub cold-booted on a *different* kernel, proving the two paths share nothing;
+and the app cold-booted a guest from its own emitted command with the RTC
+correct at boot. Details and evidence in the session record.
+
+What that run also found is a coherent product gap rather than a hypervisor
+defect, and it is now **V9.18** below: the obvious path a new user takes —
+build a container image, start it from the app, run an agent in it — has
+potholes at every step (#222, #224, #225, #226).
+
 | | Milestone | Goal | Why now | Size |
 | --- | --- | --- | --- | --- |
+| **V9.18 ★** (#222, #224, #225, #226) | **The first-run path actually works** | G1, G3, G6, G9 | Measured from a clean machine on the released binary. A container-derived guest has **no network and no disk**, because cold boot is virtio-mmio and every downloadable arm64 distro kernel builds `VIRTIO_MMIO`/`NET`/`BLK` as modules while a container rootfs ships no `/lib/modules` (#222). The app reports **"No sandboxes yet" while a guest it launched is running**, because cold boot is a subprocess and `refreshLocal()` lists only what the daemon knows (#225). Every guest opens with `can't access tty; job control turned off`, so **Ctrl-C does not interrupt** (#226). And the obvious `*-alpine` image cannot run the Copilot CLI, whose prebuilt musl runtime fails to load (#224, docs). None of these is a hypervisor defect; together they decide whether the product feels finished. | M |
 | **V9.8 ★** (#156) | **Runtime-mutable egress policy** | **G17** | Change what a sandbox may reach without throwing away its work. | M |
 | **V9.9 ★** (#155) | **Opt-in ingress** — reach a named port inside a sandbox | **G20** | An agent that starts a dev server cannot be reached. Must be per-port and opt-in or it undoes M30/M31. | M |
 | **V9.12 ★** (#157) | **MCP server surface** | **G21** | V9.2 shipped, so this now depends only on V9.3. An MCP tool call *is* "start from a spec" + "exec and report". | L |
