@@ -151,17 +151,24 @@ registries mislabel. gzip and zstd are both read.
 
 ## What you get in the guest
 
-The generated init brings the rootfs up and starts your entrypoint. You will
-currently see:
+The generated init brings the rootfs up and hands over to your entrypoint with
+a controlling terminal, so job control works and Ctrl-C interrupts:
 
 ```
 gimbal: container rootfs up; starting /bin/sh
+~ # tty
+/dev/ttyAMA0
+```
+
+If your image has no `setsid` — it comes from busybox on Alpine and util-linux
+on Debian, so nearly everything has one — init falls back to starting the
+entrypoint directly. You then get the older behaviour, and it says so:
+
+```
 /bin/sh: can't access tty; job control turned off
 ```
 
-The shell has no controlling terminal, so **Ctrl-C does not interrupt a running
-command**. Tracking:
-[#226](https://github.com/gimbal-dev/gimbal-local/issues/226).
+That is a working shell without Ctrl-C, not a failure.
 
 ## Networking, once the drivers are there
 

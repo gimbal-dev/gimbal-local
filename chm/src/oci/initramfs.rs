@@ -336,6 +336,22 @@ pub fn default_init(entrypoint: &str, env: &[String], workdir: Option<&str>) -> 
 # entrypoint. Booted as a guest there is no runtime, so we do it here. Each
 # mount is tolerated failing: a minimal image may lack the mount point, and a
 # missing /sys is much better than a kernel panic before any output exists.
+
+# The entrypoint is written once, in one place, and is reached two ways: either
+# re-entered under `setsid` with a controlling terminal (below), or called
+# directly if that is not possible. Writing it twice would let the two paths
+# drift, and only one of them is the one anybody normally takes.
+gimbal_start() {{
+{exports}{cd}exec {entrypoint}
+}}
+
+# Re-entry. The mounts below have already run in the parent, so skip straight
+# to the handover, leaving a marker to say the session really started.
+if [ "$1" = "--gimbal-session" ]; then
+    : > /dev/.gimbal-session 2>/dev/null
+    gimbal_start
+fi
+
 mount -t proc proc /proc 2>/dev/null
 mount -t sysfs sysfs /sys 2>/dev/null
 mount -t devtmpfs devtmpfs /dev 2>/dev/null || {{
@@ -356,11 +372,41 @@ mkdir -p /dev/pts && mount -t devpts devpts /dev/pts 2>/dev/null
 # Loopback, so anything binding 127.0.0.1 works without a network policy.
 ip link set lo up 2>/dev/null || ifconfig lo up 2>/dev/null
 
-# The image's declared environment. Without this a shell inherits nothing and
-# binaries the image installed outside /bin are unreachable by name.
-{exports}{cd}
 echo "gimbal: container rootfs up; starting {entrypoint}"
-exec {entrypoint}
+
+# Hand over with a controlling terminal, so job control works and Ctrl-C
+# interrupts something.
+#
+# Without one the first line a user reads is "can't access tty; job control
+# turned off", which reads as a fault, and SIGINT has no foreground process
+# group to be delivered to -- so Ctrl-C does nothing at all.
+#
+# `setsid` sets the controlling terminal from *its own* stdin, so the
+# redirection belongs here rather than on the inner command. /dev/ttyAMA0 and
+# not /dev/console: TIOCSCTTY cannot make /dev/console a controlling terminal,
+# so attaching to it would leave exactly the problem this solves.
+#
+# It is deliberately not `exec`d. `exec` is one-way, so an image or kernel
+# without a working `setsid -c` would boot to nothing at all rather than to a
+# shell without job control. A failure here simply falls through to the plain
+# handover below, which is what shipped before and works everywhere.
+if [ -c /dev/ttyAMA0 ]; then
+    setsid -c /bin/sh /init --gimbal-session </dev/ttyAMA0 >/dev/ttyAMA0 2>&1
+    _rc=$?
+    # Fall through unless the session provably started. An exit status cannot
+    # tell "setsid is absent, or rejected -c" from "the session ran and exited
+    # nonzero", and the two need opposite responses -- so the child leaves a
+    # marker and that is what decides.
+    #
+    # The bias is deliberate. Falling through when the session did run costs a
+    # second shell, which is odd and harmless; exiting when it never ran means
+    # init exits and the kernel panics with no shell at all.
+    if [ -e /dev/.gimbal-session ]; then
+        exit $_rc
+    fi
+fi
+
+gimbal_start
 "#
     )
 }
@@ -736,5 +782,138 @@ mod tests {
             .windows(needle.len())
             .position(|w| w == needle)
             .map(|p| p + from)
+    }
+
+    /// The init is a shell script the *guest* runs, so the only authority on
+    /// whether it parses is a shell -- not a substring assertion. This asks a
+    /// real one, which is what catches an unbalanced quote introduced by an
+    /// entrypoint or an env value we interpolated.
+    fn sh_parses(script: &str) -> Result<(), String> {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+        let mut c = Command::new("/bin/sh")
+            .args(["-n"])
+            .stdin(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        c.stdin
+            .as_mut()
+            .ok_or("no stdin")?
+            .write_all(script.as_bytes())
+            .map_err(|e| e.to_string())?;
+        let out = c.wait_with_output().map_err(|e| e.to_string())?;
+        if out.status.success() {
+            Ok(())
+        } else {
+            Err(String::from_utf8_lossy(&out.stderr).into_owned())
+        }
+    }
+
+    #[test]
+    fn a_generated_init_parses_as_a_shell_script() {
+        for (name, s) in [
+            ("plain", default_init("/bin/sh", &[], None)),
+            (
+                "quoted entrypoint",
+                default_init("/bin/sh -c 'echo hello'", &[], None),
+            ),
+            (
+                "env and workdir",
+                default_init(
+                    "/usr/local/bin/python3",
+                    &[
+                        "PATH=/usr/local/bin:/bin".to_string(),
+                        "A=b c'd".to_string(),
+                    ],
+                    Some("/srv/app"),
+                ),
+            ),
+        ] {
+            if let Err(e) = sh_parses(&s) {
+                panic!("{name}: generated init does not parse: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_entrypoint_is_written_once_so_the_two_paths_cannot_drift() {
+        // It is reached both by re-entry under setsid and by the direct
+        // fallback. Two copies would let a change land on only one of them,
+        // and only one is the path anybody normally takes.
+        let s = default_init("/usr/local/bin/gunicorn", &[], None);
+        assert_eq!(
+            s.matches("exec /usr/local/bin/gunicorn").count(),
+            1,
+            "the entrypoint must be spelled out exactly once:\n{s}"
+        );
+    }
+
+    #[test]
+    fn the_session_is_given_a_controlling_terminal() {
+        let s = default_init("/bin/sh", &[], None);
+        // Deliberately matched against the invocation and not the word: the
+        // script's own comments mention `setsid -c`, so a looser assertion
+        // passes happily while the command has lost its flag. That is exactly
+        // the mutation this test exists to catch, and it survived one.
+        assert!(
+            s.contains("\n    setsid -c /bin/sh /init --gimbal-session "),
+            "without -c there is no controlling terminal and Ctrl-C does nothing:\n{s}"
+        );
+        assert!(
+            s.contains("--gimbal-session </dev/ttyAMA0 >/dev/ttyAMA0"),
+            "setsid takes the ctty from its own stdin, so the tty must be \
+             redirected onto setsid itself:\n{s}"
+        );
+        assert!(
+            !s.contains("setsid -c /bin/sh /init --gimbal-session </dev/console"),
+            "TIOCSCTTY cannot make /dev/console a controlling terminal, so \
+             attaching to it would leave the exact problem this solves"
+        );
+    }
+
+    #[test]
+    fn a_missing_setsid_still_reaches_the_entrypoint() {
+        // `exec` is one-way. If the handover were exec'd, an image without a
+        // working setsid would boot to nothing at all rather than to a shell
+        // without job control.
+        let s = default_init("/bin/sh", &[], None);
+        assert!(
+            !s.contains("exec setsid"),
+            "setsid must not be exec'd, or a failure leaves no fallback:\n{s}"
+        );
+        let setsid = s.find("setsid -c").expect("no setsid in init");
+        let fallback = s.rfind("gimbal_start").expect("no fallback call");
+        assert!(
+            fallback > setsid,
+            "the plain handover must come after the setsid attempt, so a \
+             failure falls through to it:\n{s}"
+        );
+        assert!(
+            s.contains("/dev/.gimbal-session"),
+            "an exit status cannot distinguish 'setsid never ran the session' \
+             from 'the session exited nonzero', and the two need opposite \
+             responses -- so a marker must decide:\n{s}"
+        );
+        // The bias must be toward running the entrypoint again, never toward
+        // init exiting: the first costs a second shell, the second is a kernel
+        // panic with no shell at all.
+        assert!(
+            s.contains("if [ -e /dev/.gimbal-session ]; then\n        exit $_rc"),
+            "init may only exit when the session provably ran:\n{s}"
+        );
+    }
+
+    #[test]
+    fn re_entry_skips_the_setup_it_has_already_done() {
+        let s = default_init("/bin/sh", &[], None);
+        let guard = s
+            .find(r#"if [ "$1" = "--gimbal-session" ]"#)
+            .expect("no re-entry guard");
+        let mounts = s.find("mount -t proc").expect("no proc mount");
+        assert!(
+            guard < mounts,
+            "re-entry must return before remounting what the parent mounted:\n{s}"
+        );
     }
 }
