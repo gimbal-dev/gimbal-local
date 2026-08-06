@@ -44,6 +44,7 @@ ring = "0.17.14"
 rustls = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
+flate2 = "1.1"
 
 [lints]
 workspace = true

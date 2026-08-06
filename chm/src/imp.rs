@@ -18,6 +18,7 @@ use crate::bundle;
 use crate::checkpoint;
 use crate::livesnap;
 use crate::create::create_main;
+use crate::oci::image::image_main;
 use crate::cloud;
 use crate::console::{self, RawConsole};
 use crate::console_filter::ConsoleFilter;
@@ -1036,6 +1037,7 @@ pub fn main() -> ExitCode {
         Some("ctl") => serve::ctl_main(&raw[1..]),
         Some("exec") => serve::exec_main(&raw[1..]),
         Some("spec") => spec::spec_main(&raw[1..]),
+        Some("image") => image_main(&raw[1..]),
         Some("fork") => match fork(&raw[1..]) {
             Ok(code) => code,
             Err(e) => {
@@ -1140,6 +1142,9 @@ fn usage() -> String {
          chm exec [OPTIONS] -- <CMD> [ARG...]  (run a command in the guest)\n\
     \
          chm spec <COMMAND> [OPTIONS]          (describe a sandbox in a file)\n\
+     \n\
+     BUILD AN IMAGE\n    \
+         chm image build <REF> --kernel <I>    (bootable rootfs from a container)\n\
      \n\
      SNAPSHOTS AND LINEAGE\n    \
          chm workspace <IMAGE_DIR> <WS_DIR>    (isolated sandbox workspace)\n    \

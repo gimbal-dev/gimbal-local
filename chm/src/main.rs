@@ -59,6 +59,11 @@ mod livesnap;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod coldboot;
 
+// Turning a container image into a bootable local image (V9.7, #153). Kept
+// beside `coldboot` because its whole output is a cold-boot image directory.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod oci;
+
 // The `chm create` verb: drives a cold guest image on Hypervisor.framework.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod create;

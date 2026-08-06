@@ -1049,6 +1049,7 @@ name = "gimbal-local"
 version = "0.1.0"
 dependencies = [
  "arch",
+ "flate2",
  "hypervisor",
  "libc",
  "linux-loader",
