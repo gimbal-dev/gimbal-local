@@ -240,23 +240,6 @@ struct ChmClient {
         return trail
     }
 
-    /// Decode `chm ctl capabilities`. Daemon-only, deliberately: a capability
-    /// list assembled here would describe this app's idea of `chm`, not the
-    /// binary that would actually run the guest — which is the whole failure
-    /// this panel exists to end. No local fallback; nil means "not established".
-    func capabilities(settings: AppSettings, dir: String? = nil) async -> CapabilityReport? {
-        var args = ["ctl", "capabilities"]
-        if let dir { args.append(dir) }
-        args += ["--socket", settings.socketPath]
-        let result = await runRaw(settings: settings, args: args)
-        guard result.status == 0, let data = result.output.data(using: .utf8),
-              let report = try? JSONDecoder().decode(CapabilityReport.self, from: data)
-        else {
-            return nil
-        }
-        return report
-    }
-
     /// Decode `chm ctl proxy ca`. Returns nil when the daemon has no CA yet, so
     /// the caller falls through rather than offering to install nothing.
     static func decodeCa(_ result: CommandResult) -> ProxyCa? {

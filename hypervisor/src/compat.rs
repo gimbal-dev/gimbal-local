@@ -26,6 +26,13 @@ mod macos {
     const F_SETFL: i32 = 4;
     const F_SETFD: i32 = 2;
     const FD_CLOEXEC: i32 = 1;
+    // The query halves of the pairs above. Only the tests read flags back —
+    // production code sets them and moves on — so they are test-only rather
+    // than carrying an #[allow(dead_code)] that would also hide a real one.
+    #[cfg(test)]
+    const F_GETFL: i32 = 3;
+    #[cfg(test)]
+    const F_GETFD: i32 = 1;
 
     pub const EFD_NONBLOCK: i32 = O_NONBLOCK;
 
@@ -43,7 +50,14 @@ mod macos {
         fn read(fd: i32, buf: *mut core::ffi::c_void, n: usize) -> isize;
         fn write(fd: i32, buf: *const core::ffi::c_void, n: usize) -> isize;
         fn close(fd: i32) -> i32;
-        fn fcntl(fd: i32, cmd: i32, arg: i32) -> i32;
+        // `fcntl` is variadic in C (`int fcntl(int, int, ...)`), and on Apple
+        // arm64 a variadic argument is passed on the STACK while a fixed one is
+        // passed in a register. Declaring the third argument as fixed therefore
+        // hands `fcntl` whatever happens to sit on the stack: measured as 0x0
+        // under `-C opt-level=0` and 0x4000c0 under `-C opt-level=s`, so
+        // `O_NONBLOCK` was never actually set and a debug build only worked by
+        // luck. It must be declared variadic to match the ABI.
+        fn fcntl(fd: i32, cmd: i32, ...) -> i32;
         fn poll(fds: *mut PollFd, nfds: u32, timeout: i32) -> i32;
     }
 
@@ -194,7 +208,8 @@ mod macos {
 
     #[cfg(test)]
     mod tests {
-        use super::{EFD_NONBLOCK, EventFd};
+        use super::{AsRawFd, EFD_NONBLOCK, EventFd};
+        use std::io;
         use std::sync::mpsc;
         use std::thread;
         use std::time::Duration;
@@ -250,6 +265,45 @@ mod macos {
             });
             let got = within(Duration::from_secs(5), move || fd.wait_timeout(5_000).unwrap());
             assert_eq!(got, 1, "the parked waiter should observe the cross-thread write");
+        }
+
+        /// The read descriptor really is `O_NONBLOCK`, asked of the kernel.
+        ///
+        /// The three tests above assert the *behaviour* that depends on this, and
+        /// they are the ones that matter -- but they only fired in a release
+        /// build. `fcntl` is variadic in C, and a non-variadic Rust declaration
+        /// passes the third argument in a register where Apple arm64 expects it
+        /// on the stack, so the flag actually applied was whatever the stack
+        /// happened to hold: 0x0 under `-C opt-level=0` (harmless here, because
+        /// the tests' pipes are drained before the blocking read is reached) and
+        /// 0x4000c0 under `-C opt-level=s`. A guard that only fires in one
+        /// profile is a guard nobody runs, so this asks the descriptor directly
+        /// and fails identically in both.
+        #[test]
+        fn the_read_fd_is_really_non_blocking() {
+            let fd = EventFd::new(EFD_NONBLOCK).unwrap();
+            // SAFETY: querying flags on a descriptor the EventFd owns and keeps
+            // alive for the duration of this call.
+            let flags = unsafe { super::fcntl(fd.as_raw_fd(), super::F_GETFL) };
+            assert!(flags >= 0, "F_GETFL failed: {}", io::Error::last_os_error());
+            assert_eq!(
+                flags & super::O_NONBLOCK,
+                super::O_NONBLOCK,
+                "read fd flags 0x{flags:x} lack O_NONBLOCK; drain_pipe would block forever"
+            );
+
+            // SAFETY: same descriptor, descriptor-flag class this time.
+            let fdflags = unsafe { super::fcntl(fd.as_raw_fd(), super::F_GETFD) };
+            assert!(
+                fdflags >= 0,
+                "F_GETFD failed: {}",
+                io::Error::last_os_error()
+            );
+            assert_eq!(
+                fdflags & super::FD_CLOEXEC,
+                super::FD_CLOEXEC,
+                "read fd flags 0x{fdflags:x} lack FD_CLOEXEC; it would leak into a guest's children"
+            );
         }
     }
 }

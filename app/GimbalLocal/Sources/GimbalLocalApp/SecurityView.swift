@@ -76,11 +76,6 @@ private struct PostureSummary: View {
                     value: "\(report.weakened)",
                     color: isClean ? Theme.green : Theme.orange
                 )
-                BigMetric(
-                    title: "Assessed by",
-                    value: report.isFromDaemon ? "chm serve" : "this app",
-                    color: report.isFromDaemon ? Theme.green : Theme.orange
-                )
             }
 
             if !isClean {
@@ -93,7 +88,7 @@ private struct PostureSummary: View {
                 .fixedSize(horizontal: false, vertical: true)
             }
 
-            MetricRow(label: "Workspace", value: report.workspace)
+            MetricRow(label: "Workspace", value: DisplayPath.abbreviated(report.workspace))
             if let scope = report.scopeDescription {
                 MetricRow(label: "Scope", value: scope)
             }
@@ -191,13 +186,6 @@ private struct PostureControlRow: View {
 
             VStack(alignment: .leading, spacing: 5) {
                 HStack(spacing: 8) {
-                    Text(control.invariant)
-                        .font(.system(size: 10, weight: .black, design: .monospaced))
-                        .foregroundStyle(Theme.cyan)
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 3)
-                        .background(Theme.cyan.opacity(0.14), in: Capsule())
-
                     Text(control.control)
                         .font(.headline)
 

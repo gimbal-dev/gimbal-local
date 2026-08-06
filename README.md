@@ -40,7 +40,39 @@ chm: guest resumed — serial console follows.
 
 ---
 
-## Requirements
+## Install
+
+Download the latest `GimbalLocal-<version>.zip` from
+[Releases](https://github.com/nebuk89/cloud-hypervisor-mac/releases), unzip it,
+and drag **Gimbal Local.app** to `/Applications`. The app is signed with a
+Developer ID certificate and notarized by Apple, so it opens without a
+Gatekeeper warning.
+
+**What you need**
+
+- An Apple Silicon Mac (M1 or later).
+- macOS 14 or newer.
+
+**What you do not need** — worth stating plainly, because every comparable tool
+asks for at least one of them:
+
+- No Linux host and no KVM machine. The Mac is the hypervisor.
+- No control plane, no account, no network connection. Everything is local.
+- No Rust toolchain, no Xcode, no source checkout. `chm` ships inside the app.
+
+To use the engine from a terminal, it is inside the bundle:
+
+```sh
+/Applications/GimbalLocal.app/Contents/MacOS/chm --help
+```
+
+Snapshots live in `~/gimbal-snapshots` and cold-boot images in
+`~/gimbal-images`; the app creates both on first launch. You need a Cloud
+Hypervisor **`arm64` snapshot** (`state.json` + `snapshot/memory-ranges`, from
+`ch-remote … snapshot` on a Linux host) to rehydrate — or nothing at all to
+cold-boot a stock kernel.
+
+## Requirements (building from source)
 
 - Apple Silicon Mac (`macOS`, `aarch64`).
 - A Rust toolchain (edition 2024; Rust 1.89.0 or later — see the
