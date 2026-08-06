@@ -136,8 +136,9 @@ Tracking: [#224](https://github.com/gimbal-dev/gimbal-local/issues/224).
 
 The image's own entrypoint is used unless you override it. That is often not a
 shell — `node:22-alpine` defaults to `docker-entrypoint.sh node`, which drops
-you into a Node REPL rather than a prompt. Pass `--entrypoint /bin/sh` when you
-want a shell.
+you into a Node REPL rather than a prompt, and `node:22-slim` defaults to plain
+`node` for the same result. Pass `--entrypoint /bin/sh` (or `/bin/bash` on a
+Debian-based image) when you want a shell.
 
 ## Platform selection
 
@@ -172,17 +173,40 @@ That is a working shell without Ctrl-C, not a failure.
 
 ## Networking, once the drivers are there
 
-The userspace NAT hard-codes the guest at `192.168.249.2/24` with gateway and
-nameserver `192.168.249.1` (see [`networking.md`](networking.md)). A snapshot
-receives this from capture-side cloud-init; **a container rootfs does not**, so
-configure it yourself:
+The guest sits at `192.168.249.2/24` behind gateway `192.168.249.1` (see
+[`networking.md`](networking.md)). A snapshot receives this from capture-side
+cloud-init; a container rootfs has neither cloud-init nor a DHCP client, so
+**the generated init assigns it**, using `ip` if the image has it and
+`ifconfig` otherwise. Both produce the same result, and both are skipped
+entirely when you boot without `--net`.
+
+You do not need to configure anything. If you want to check:
 
 ```
-ip link set eth0 up
-ip addr add 192.168.249.2/24 dev eth0
-ip route add default via 192.168.249.1
-echo nameserver 192.168.249.1 > /etc/resolv.conf
+ip addr show eth0     # inet 192.168.249.2/24
+ip route              # default via 192.168.249.1 dev eth0
 ```
+
+### If the image has neither `ip` nor `ifconfig`
+
+Configuring an interface needs an ioctl, and no shell builtin makes one — so
+if an image ships neither tool there is nothing the init can do, and it says so
+rather than leaving you a silent NIC:
+
+```
+gimbal: eth0 is present but this image has no working 'ip' or
+gimbal: 'ifconfig', so it cannot be configured. Use an image that
+gimbal: has iproute2 or busybox, or configure it yourself:
+```
+
+**The guest still boots and you still get a shell** — only the NIC is
+unconfigured. `node:22-slim` is a real example. This is a chicken-and-egg you
+cannot solve from inside: installing `iproute2` needs the network. Either start
+from a fuller base image, or bake the tool in before you build.
+
+Kernel-side `ip=` autoconfiguration does **not** rescue this — the Ubuntu
+generic kernel is built without `CONFIG_IP_PNP` and prints
+`Unknown kernel command line parameters "ip=..."`.
 
 Egress is default-deny on `chm create`. Name what you need with
 `--egress-allow host:port`; hosts named in a credential rule imply their own
@@ -190,8 +214,9 @@ allowance when the rule and the policy come from the same authority (invariant
 I13, see [`credential-proxy.md`](credential-proxy.md)).
 
 Verified end to end on an Ubuntu-kernel `alpine:3.20` guest: `eth0` appeared
-with no `modprobe`, and `wget https://registry.npmjs.org/` returned `{}` through
-the NAT and the egress allow-list.
+with no `modprobe`, came up already carrying `192.168.249.2/24` and its default
+route, and reached `registry.npmjs.org` through the NAT and the egress
+allow-list.
 
 ### TLS from a bare `alpine` rootfs
 

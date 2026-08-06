@@ -60,7 +60,18 @@ use crate::{coldboot, console, credproxy, postboot};
 ///
 /// Same subnet the restore path's NAT uses, so a guest image built for one
 /// works unchanged on the other.
-const GATEWAY_IP: [u8; 4] = [192, 168, 249, 1];
+pub const GATEWAY_IP: [u8; 4] = [192, 168, 249, 1];
+/// The address a guest is expected to hold.
+///
+/// The NAT does not enforce it -- its DNS socket binds to any address and the
+/// relay translates whatever source it sees -- so this is a convention, and
+/// convention is exactly why it has to be written down once. A captured guest
+/// receives it from capture-side cloud-init; a container rootfs has no
+/// cloud-init and no DHCP client, so the generated init assigns it, and the
+/// two must agree or the guest is on the wrong subnet from its own gateway.
+pub const GUEST_IP: [u8; 4] = [192, 168, 249, 2];
+/// Prefix length of the subnet [`GATEWAY_IP`] and [`GUEST_IP`] share.
+pub const GUEST_PREFIX_LEN: u8 = 24;
 const GATEWAY_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
 const GUEST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 2];
 
