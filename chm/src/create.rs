@@ -442,6 +442,18 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     println!("  cmdline    {}", args.cfg.cmdline);
     println!("  built in   {build_ms:.1} ms");
 
+    // Only when a device was actually asked for: that is the moment the request
+    // and what the guest will see diverge. Placed here, immediately under the
+    // device table, because that block is where someone looks to check the NIC
+    // they asked for was attached -- and it will say it was.
+    if args.cfg.net || !args.cfg.disks.is_empty() {
+        let kernel_bytes = fs::read(&args.cfg.kernel)
+            .map_err(|e| format!("cannot read kernel `{}`: {e}", args.cfg.kernel.display()))?;
+        if let Some(w) = coldboot::VirtioBuiltin::scan(&kernel_bytes).warning() {
+            println!("\n  NOTE: {w}");
+        }
+    }
+
     if args.dry_run {
         println!("chm create: --dry-run, not starting a VM");
         return Ok(ExitCode::SUCCESS);

@@ -48,6 +48,7 @@ use super::initramfs::{default_init, write_cpio};
 use super::reference::{self, Reference};
 use super::registry::{self, ImageConfig, Registry};
 use super::targz;
+use crate::coldboot::VirtioBuiltin;
 use crate::imp::human_bytes;
 use crate::oci::entry::EntryKind;
 use flate2::read::GzDecoder;
@@ -255,6 +256,21 @@ fn check_kernel(path: &Path) -> Result<(), String> {
     Ok(())
 }
 
+/// Warn if this kernel and a container rootfs cannot give the guest devices.
+///
+/// Build time is the one moment the user is *choosing* a kernel and can pick a
+/// different one for free. Discovering it later costs a boot, and the symptom
+/// -- `ip: can't find device 'eth0'` under a device chm has logged as attached
+/// -- points at the network rather than at the pairing.
+///
+/// This does not refuse. The image is perfectly good for a workload that needs
+/// no devices, and that is the flow that works today; see `VirtioBuiltin` for
+/// why absence is warned about rather than enforced.
+fn warn_kernel_virtio(path: &Path) -> Option<String> {
+    let data = fs::read(path).ok()?;
+    VirtioBuiltin::scan(&data).warning()
+}
+
 /// Round the measured rootfs up into a guest RAM figure.
 ///
 /// An initramfs is copied into RAM and then unpacked into a tmpfs, so the
@@ -406,6 +422,11 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
 
     if args.dry_run {
         println!("  --dry-run: nothing written (would be {})", out.display());
+        // A dry run is precisely when someone is checking whether their kernel
+        // is the right one, so it is the last place that should stay quiet.
+        if let Some(w) = kernel.as_deref().and_then(warn_kernel_virtio) {
+            println!("\nNOTE: {w}");
+        }
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -422,6 +443,9 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
     )?;
 
     println!("\nWrote {}", out.display());
+    if let Some(w) = warn_kernel_virtio(&kernel) {
+        println!("\nNOTE: {w}");
+    }
     println!(
         "Boot it:  chm create --kernel {}/Image --initramfs {}/initramfs \\\n\
          \t    --cpus {} --memory {}",

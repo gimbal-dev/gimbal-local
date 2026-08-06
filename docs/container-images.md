@@ -26,8 +26,8 @@ A container image is a **rootfs**. It contains no kernel, so `--kernel` is
 required.
 
 The trap is what happens next. Cold boot presents its devices on
-**virtio-mmio**, and every arm64 distro kernel we have checked builds the whole
-virtio stack as *modules*:
+**virtio-mmio**, and many arm64 distro kernels build the whole virtio stack as
+*modules*:
 
 ```
 $ grep -E "^CONFIG_VIRTIO_(MMIO|NET|BLK)=" config-6.6.142-0-virt
@@ -46,9 +46,43 @@ ip: can't find device 'eth0'
 `--net` is accepted, chm logs the device, and the guest cannot see it. The same
 applies to `--disk`.
 
-**Note the ordering trap if you do supply modules:** loading `virtio_net` alone
-silently succeeds and still leaves no NIC, because the *transport* module has
-not been loaded. `virtio_mmio` must be loaded too.
+**chm now tells you this before you boot.** `chm image build` and
+`chm create --net`/`--disk` scan the kernel and warn when the drivers are not
+built in. It is a warning rather than a refusal: the image is still perfectly
+good for a workload that needs no devices.
+
+### Which kernels actually work
+
+Measured on this project, booting a stock `alpine:3.20` rootfs:
+
+| kernel | virtio built in? | result |
+| --- | --- | --- |
+| **Ubuntu `linux-image-*-generic` arm64** | yes | ✅ **`eth0` with no `modprobe`, real HTTPS egress** |
+| Alpine `linux-virt` / `linux-lts` | no (`=m`) | boots to a shell, no NIC, no disk |
+| Firecracker CI `vmlinux-*` aarch64 | yes | ❌ **no console** — see below |
+
+**Use an Ubuntu `generic` arm64 kernel.** It is the same family as a Graviton
+snapshot, and it is the pairing verified end to end:
+
+```
+curl -O http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-image-unsigned-6.8.0-71-generic_6.8.0-71.71_arm64.deb
+ar x linux-image-*.deb && tar -xf data.tar
+python3 -c "import gzip,sys; d=open('boot/vmlinuz-6.8.0-71-generic','rb').read(); \
+            open('Image','wb').write(gzip.decompress(d[d.find(b'\x1f\x8b\x08'):]))"
+```
+
+(Ubuntu ships `vmlinuz` as a gzip stream; the last line unwraps it to the
+uncompressed `Image` cold boot needs.)
+
+**Firecracker's CI kernels look ideal and are not.** They are mmio-only, so
+virtio is built in — but they are compiled with `CONFIG_SERIAL_8250` and **no
+`CONFIG_SERIAL_AMBA_PL011`**, while chm presents a PL011. The guest boots and
+emits nothing at all, which is indistinguishable from a hang.
+
+**If you must use a modular kernel**, supply its matching modules and note the
+ordering trap: loading `virtio_net` alone silently succeeds and still leaves no
+NIC, because the *transport* module is the one that was missing. `virtio_mmio`
+must be loaded too. Module version must match the kernel exactly.
 
 Tracking: [#222](https://github.com/gimbal-dev/gimbal-local/issues/222).
 
@@ -147,6 +181,23 @@ Egress is default-deny on `chm create`. Name what you need with
 `--egress-allow host:port`; hosts named in a credential rule imply their own
 allowance when the rule and the policy come from the same authority (invariant
 I13, see [`credential-proxy.md`](credential-proxy.md)).
+
+Verified end to end on an Ubuntu-kernel `alpine:3.20` guest: `eth0` appeared
+with no `modprobe`, and `wget https://registry.npmjs.org/` returned `{}` through
+the NAT and the egress allow-list.
+
+### TLS from a bare `alpine` rootfs
+
+A bare `alpine` image has no `curl` and no `openssl`, so busybox `wget` falls
+back to its own minimal built-in TLS. That handshake fails against real-world
+certificate chains with `Connection reset by peer` — measured identically
+against `example.com`, `github.com` and `registry.npmjs.org`, while
+`--no-check-certificate` against the same host succeeds with `rc=0`.
+
+So **this error is not the sandbox's network**, and `--no-check-certificate` is
+the one-line way to prove that before you go looking. For real work install
+`ca-certificates` and a proper client (`apk add curl`), or start from a fuller
+base image.
 
 If a tool inside the guest must trust the credential proxy, note that **Node
 ignores the system trust store** — set `NODE_EXTRA_CA_CERTS` as well as
