@@ -52,6 +52,7 @@ use crate::imp::human_bytes;
 use crate::oci::entry::EntryKind;
 use flate2::read::GzDecoder;
 use serde_json::{json, Value};
+use zstd::stream::read::Decoder as ZstdDecoder;
 
 /// Cap on a single decompressed layer, and on the running total. A registry can
 /// serve a 200 MB layer that expands to 40 GB; the limit is what stops that
@@ -113,6 +114,10 @@ pub fn usage() -> String {
          --ram-mib <N>     Guest RAM. Default is sized from the rootfs, because\n                      \
          an initramfs is unpacked into memory.\n    \
          --vcpus <N>       Default 2.\n    \
+         --platform <P>    os/arch[/variant]. Default linux/arm64, which takes an\n                      \
+         unspecified variant or v8. Name one (e.g. linux/arm64/v9)\n                      \
+         to select among an image's arm64 variants. A platform\n                      \
+         this host cannot boot is refused rather than built.\n    \
          --dry-run         Resolve and report without writing anything.\n\
      \n\
      NOTE: the rootfs ships as an initramfs, so it lives in guest RAM and\n     \
@@ -130,6 +135,7 @@ struct Args {
     ram_mib: Option<u64>,
     vcpus: u32,
     dry_run: bool,
+    platform: registry::Platform,
 }
 
 fn parse(args: &[String]) -> Result<Args, String> {
@@ -140,6 +146,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
     let mut ram_mib = None;
     let mut vcpus = 2;
     let mut dry_run = false;
+    let mut platform = registry::Platform::host();
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
@@ -166,6 +173,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
                     .parse()
                     .map_err(|_| format!("--vcpus wants a number, got `{v}`"))?;
             }
+            "--platform" => platform = registry::parse_platform(&next("--platform")?)?,
             "--dry-run" => dry_run = true,
             other if other.starts_with('-') => {
                 return Err(format!("unknown option `{other}`\n\n{}", usage()));
@@ -187,6 +195,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
         ram_mib,
         vcpus,
         dry_run,
+        platform,
     })
 }
 
@@ -317,7 +326,7 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
     println!("chm image build: {}", args.reference.display());
 
     let mut reg = Registry::new(args.reference.clone());
-    let manifest = reg.manifest()?;
+    let manifest = reg.manifest(&args.platform)?;
     let layers = registry::layer_specs(&manifest)?;
     // Refuse a format we cannot read *before* pulling gigabytes of it.
     for l in &layers {
@@ -434,9 +443,26 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
 /// decide how to *read* one: registries in the wild label gzip layers as plain
 /// `tar` often enough that trusting the label alone turns a working image into
 /// an unexplained parse error.
+/// Decompress a layer blob, choosing the codec by **magic bytes** rather than by
+/// the media type the registry declared.
+///
+/// Registries mislabel layers often enough that the declared `mediaType` is a
+/// hint, not a fact — a gzip layer served as `tar` and a `tar+gzip` that is
+/// really plain tar are both things this has already had to survive. Sniffing
+/// costs four bytes and cannot be wrong about what it is looking at.
+///
+/// The bomb limit is passed through unchanged and applies to the running total
+/// of unpacked bytes, which matters more here than for gzip: zstd reaches far
+/// higher ratios, so this is the format where that limit earns its keep.
 fn read_blob(blob: &[u8], limit: u64) -> Result<targz::Layer, String> {
-    if blob.len() >= 2 && blob[0] == 0x1f && blob[1] == 0x8b {
+    if blob.starts_with(&[0x1f, 0x8b]) {
         return targz::read_layer(GzDecoder::new(blob), limit);
+    }
+    // zstd frame magic, little-endian 0xFD2FB528.
+    if blob.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+        let dec = ZstdDecoder::new(blob)
+            .map_err(|e| format!("this layer is zstd but could not be opened: {e}"))?;
+        return targz::read_layer(dec, limit);
     }
     targz::read_layer(blob, limit)
 }
@@ -663,6 +689,106 @@ mod tests {
         assert!(
             u.contains("carries no kernel") || u.contains("carries no kernel"),
             "{u}"
+        );
+    }
+
+    /// A ustar entry, enough of a tar writer to build a real layer in-test.
+    fn tar_entry(name: &str, body: &[u8]) -> Vec<u8> {
+        let mut h = vec![0u8; 512];
+        h[..name.len()].copy_from_slice(name.as_bytes());
+        h[100..108].copy_from_slice(b"0000644\0");
+        h[124..136].copy_from_slice(format!("{:011o}\0", body.len()).as_bytes());
+        h[156] = b'0';
+        h[257..262].copy_from_slice(b"ustar");
+        for b in &mut h[148..156] {
+            *b = b' ';
+        }
+        let sum: u32 = h.iter().map(|b| u32::from(*b)).sum();
+        h[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+        h.extend_from_slice(body);
+        h.extend(std::iter::repeat_n(0u8, (512 - body.len() % 512) % 512));
+        h
+    }
+
+    /// A zstd layer is decompressed and read (#206).
+    ///
+    /// This is the assertion the feature actually rests on. Removing the
+    /// pull-time refusal is necessary and proves nothing on its own -- without
+    /// this, `chm image build` would accept a zstd image and then fail deep in
+    /// the tar reader with "unreadable size field", which is a worse outcome
+    /// than the honest refusal it replaced.
+    ///
+    /// Compressed here with the real encoder rather than a checked-in blob, so
+    /// the test exercises a frame the zstd crate itself considers valid.
+    #[test]
+    fn a_zstd_compressed_layer_is_decompressed_and_read() {
+        let tar = tar_entry("etc/hostname", b"gimbal\n");
+        let squashed = zstd::stream::encode_all(&tar[..], 3).expect("encode");
+
+        assert_eq!(
+            &squashed[..4],
+            &[0x28, 0xb5, 0x2f, 0xfd],
+            "the encoder must emit the magic read_blob sniffs for"
+        );
+        assert!(
+            squashed != tar,
+            "the fixture must actually be compressed, or this proves nothing"
+        );
+
+        let layer = read_blob(&squashed, 1 << 20).expect("a zstd layer must be readable");
+        assert_eq!(layer.entries.len(), 1);
+        assert_eq!(layer.entries[0].raw.path, "etc/hostname");
+        assert_eq!(layer.entries[0].data, b"gimbal\n");
+    }
+
+    /// The codec is chosen by magic, not by the media type -- so a layer whose
+    /// bytes are zstd is read no matter what the registry called it, and the
+    /// gzip and plain-tar paths still work beside it.
+    ///
+    /// Registries mislabel layers often enough that this is the difference
+    /// between working and not: `read_blob` never sees a `mediaType` at all.
+    #[test]
+    fn every_codec_is_recognised_by_its_bytes() {
+        let tar = tar_entry("etc/hostname", b"gimbal\n");
+
+        let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut gz, &tar).unwrap();
+        let gz = gz.finish().unwrap();
+
+        let zs = zstd::stream::encode_all(&tar[..], 3).unwrap();
+
+        for (what, blob) in [("plain", &tar), ("gzip", &gz), ("zstd", &zs)] {
+            let layer = read_blob(blob, 1 << 20)
+                .unwrap_or_else(|e| panic!("the {what} layer must be readable: {e}"));
+            assert_eq!(
+                layer.entries[0].data, b"gimbal\n",
+                "the {what} layer must decode to the same bytes"
+            );
+        }
+    }
+
+    /// The decompression-bomb limit applies to zstd too.
+    ///
+    /// This is the format where it earns its keep: zstd reaches far higher
+    /// ratios than gzip, so a limit that only covered the gzip path would leave
+    /// the dangerous codec unguarded. 4 MiB of zeroes compresses to a few
+    /// hundred bytes -- small enough that no size check on the *blob* would ever
+    /// notice, which is exactly why the limit is on the unpacked running total.
+    #[test]
+    fn a_zstd_bomb_is_stopped_by_the_same_limit_gzip_is() {
+        let tar = tar_entry("big", &vec![0u8; 4 << 20]);
+        let bomb = zstd::stream::encode_all(&tar[..], 19).unwrap();
+        assert!(
+            bomb.len() < 64 * 1024,
+            "the fixture must be a real bomb (got {} bytes), or the limit is not \
+             what stopped it",
+            bomb.len()
+        );
+
+        let e = read_blob(&bomb, 1 << 20).expect_err("a zstd bomb must be refused");
+        assert!(
+            e.contains("too large") || e.contains("limit"),
+            "the refusal must name the limit, got: {e}"
         );
     }
 }

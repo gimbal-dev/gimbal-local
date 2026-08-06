@@ -1058,6 +1058,7 @@ dependencies = [
  "serde",
  "serde_json",
  "vm-memory",
+ "zstd",
 ]
 
 [[package]]
