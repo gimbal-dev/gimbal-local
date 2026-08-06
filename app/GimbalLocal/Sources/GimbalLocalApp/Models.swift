@@ -47,24 +47,82 @@ struct AppSettings: Equatable {
             .appending(path: "gimbal-images").path
     }
 
+    /// `chm` shipped inside this `.app`, if there is one.
+    ///
+    /// A release bundle carries its own `chm` in `Contents/MacOS`, signed with
+    /// the same identity and the `com.apple.security.hypervisor` entitlement.
+    /// The debug build script deliberately does not put one there, so the
+    /// *presence* of this file is what distinguishes a shipped app from a
+    /// developer's build — no mode flag, no environment variable, nothing that
+    /// can disagree with reality.
+    static func bundledChmPath() -> String? {
+        guard let executable = Bundle.main.executableURL else { return nil }
+        let sibling = executable.deletingLastPathComponent().appending(path: "chm")
+        return FileManager.default.isExecutableFile(atPath: sibling.path) ? sibling.path : nil
+    }
+
+    /// Where to look for `chm`, in the order a wrong answer would do least harm.
+    ///
+    /// Pure so every branch can be driven from a test. The bug this exists to
+    /// prevent only appears when there is *no* checkout, which is precisely the
+    /// situation a test run inside a checkout cannot reach by accident.
+    ///
+    /// The bundled binary is preferred over a checkout because version skew is
+    /// a real hazard: the app parses `chm`'s JSON, and a stale `target/debug`
+    /// binary from an unrelated branch would be found and used silently. The
+    /// bundled one is the binary this app was built and signed against.
+    ///
+    /// A developer who wants their working build still gets it — a debug
+    /// bundle has no `Contents/MacOS/chm`, so the checkout branch fires — and
+    /// `CHM_PATH` overrides everything either way.
+    static func resolveChmPath(env: String?, bundled: String?, repoRoot: URL?, home: URL) -> String {
+        if let env, !env.isEmpty {
+            return env
+        }
+        if let bundled, !bundled.isEmpty {
+            return bundled
+        }
+        if let repoRoot {
+            return repoRoot.appending(path: "target/debug/chm").path
+        }
+        return home.appending(path: "gimbal-bin/chm").path
+    }
+
     private static func defaultChmPath() -> String {
-        if let chm = ProcessInfo.processInfo.environment["CHM_PATH"], !chm.isEmpty {
-            return chm
+        resolveChmPath(
+            env: ProcessInfo.processInfo.environment["CHM_PATH"],
+            bundled: bundledChmPath(),
+            repoRoot: repoRootCandidate(),
+            home: FileManager.default.homeDirectoryForCurrentUser
+        )
+    }
+
+    /// Where snapshot bundles live.
+    ///
+    /// The last resort is a real absolute path under the home directory, not
+    /// the bare relative `"snapshots"` this used to return. A relative path is
+    /// actively harmful here: an app launched from Finder inherits `/` as its
+    /// working directory, so `"snapshots"` silently meant `/snapshots` — a
+    /// directory nobody can create without root, reported as an empty library
+    /// rather than as a mistake. It only ever worked because every run so far
+    /// had a checkout to find. It is the sibling of `~/gimbal-images`, so the
+    /// two halves of a shipped install sit next to each other.
+    static func resolveLibraryPath(env: String?, repoRoot: URL?, home: URL) -> String {
+        if let env, !env.isEmpty {
+            return env
         }
-        if let root = repoRootCandidate() {
-            return root.appending(path: "target/debug/chm").path
+        if let repoRoot {
+            return repoRoot.appending(path: "snapshots").path
         }
-        return "target/debug/chm"
+        return home.appending(path: "gimbal-snapshots").path
     }
 
     private static func defaultLibraryPath() -> String {
-        if let library = ProcessInfo.processInfo.environment["GIMBAL_LIBRARY"], !library.isEmpty {
-            return library
-        }
-        if let root = repoRootCandidate() {
-            return root.appending(path: "snapshots").path
-        }
-        return "snapshots"
+        resolveLibraryPath(
+            env: ProcessInfo.processInfo.environment["GIMBAL_LIBRARY"],
+            repoRoot: repoRootCandidate(),
+            home: FileManager.default.homeDirectoryForCurrentUser
+        )
     }
 
     private static func repoRootCandidate() -> URL? {
@@ -390,7 +448,6 @@ enum SidebarItem: Hashable {
     case securityHome
     case proxyHome
     case activityHome
-    case capabilityHome
     case sandbox(String)   // sandbox id
     case snapshot(String)  // snapshot name
 }
@@ -1005,114 +1062,30 @@ struct AuditTrail: Codable, Equatable {
     }
 }
 
-// MARK: - Capabilities (V6.5)
+// MARK: - Path presentation
 
-/// How strongly a capability claim is held, strongest first.
+/// Turns an absolute path into the form a person writes it in.
 ///
-/// Rendering these identically would throw away the only thing that makes the
-/// panel more useful than a README. `built` in particular is the grade of the
-/// bug this milestone was named for: true of the compiler, silent about the
-/// machine.
-enum CapabilityEvidence: String, Codable {
-    case probed
-    case observed
-    case recorded
-    case built
-    case documented
-
-    /// Whether the claim was established by doing something, now, rather than
-    /// by having been written down.
-    var isMeasured: Bool { self == .probed || self == .observed }
-
-    var label: String {
-        switch self {
-        case .probed: return "probed just now"
-        case .observed: return "observed running"
-        case .recorded: return "read from the capture"
-        case .built: return "compiled in"
-        case .documented: return "written down, unchecked"
-        }
-    }
-}
-
-/// The verdict on one capability.
-enum CapabilitySupport: String, Codable {
-    case yes
-    case degraded
-    case no
-    case unknown
-
-    var label: String {
-        switch self {
-        case .yes: return "Yes"
-        case .degraded: return "Degraded"
-        case .no: return "No"
-        case .unknown: return "Unknown"
-        }
-    }
-}
-
-/// One claim, with the evidence behind it.
-struct CapabilityClaim: Codable, Identifiable, Equatable {
-    var id: String
-    var title: String
-    var detail: String
-    /// Unknown wire values decode to `.unknown`, never to a yes. A newer daemon
-    /// must not be able to make this app render a verdict it does not
-    /// understand as a working one.
-    var support: CapabilitySupport
-    var evidence: CapabilityEvidence
-
-    enum CodingKeys: String, CodingKey { case id, title, support, evidence, detail }
-
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        id = (try? c.decode(String.self, forKey: .id)) ?? UUID().uuidString
-        title = (try? c.decode(String.self, forKey: .title)) ?? id
-        detail = (try? c.decode(String.self, forKey: .detail)) ?? ""
-        let s = (try? c.decode(String.self, forKey: .support)) ?? ""
-        support = CapabilitySupport(rawValue: s) ?? .unknown
-        let e = (try? c.decode(String.self, forKey: .evidence)) ?? ""
-        // An unrecognised grade is the weakest, not the strongest: a claim this
-        // app cannot grade has not been shown to be measured.
-        evidence = CapabilityEvidence(rawValue: e) ?? .documented
-    }
-}
-
-/// The result of checking one snapshot against this build.
-struct CapabilityPreflight: Codable, Equatable {
-    var dir: String
-    var readable: Bool
-    var refusals: Int
-    var degraded: Int
-    var unknowns: Int
-    var summary: String
-    var findings: [CapabilityClaim]
-}
-
-/// `chm ctl capabilities` — what the daemon's binary can do, plus (when there is
-/// one in scope) what it makes of a specific snapshot.
-struct CapabilityReport: Codable, Equatable {
-    var source: String?
-    var assessed: String?
-    var scopeDir: String?
-    var capabilities: [CapabilityClaim]
-    var preflight: CapabilityPreflight?
-
-    enum CodingKeys: String, CodingKey {
-        case source, assessed, capabilities, preflight
-        case scopeDir = "scope_dir"
+/// Presentation only — never feed the result back to the filesystem. It exists
+/// because a raw workspace path is routinely long enough to wrap onto two lines
+/// in a card, which buries the fact it is there to state.
+enum DisplayPath {
+    /// `~`-prefixed when the path is the home directory or lives inside it.
+    ///
+    /// Compares *path components*, never a string prefix: with a home of
+    /// `/Users/ana`, the string `/Users/anabel/work` has `/Users/ana` as a
+    /// prefix and is somebody else's directory entirely. Abbreviating it would
+    /// print a path that does not exist.
+    static func abbreviated(_ path: String, home: String) -> String {
+        guard path.hasPrefix("/"), home.hasPrefix("/") else { return path }
+        let p = (path as NSString).standardizingPath.split(separator: "/").map(String.init)
+        let h = (home as NSString).standardizingPath.split(separator: "/").map(String.init)
+        guard !h.isEmpty, p.count >= h.count, Array(p.prefix(h.count)) == h else { return path }
+        let rest = p.dropFirst(h.count)
+        return rest.isEmpty ? "~" : "~/" + rest.joined(separator: "/")
     }
 
-    var isFromDaemon: Bool { source == "daemon" }
-
-    /// True when no snapshot was in scope. A fact about this reader, not about
-    /// any capture, and it must not read as "nothing to check".
-    var hasNoSnapshotInScope: Bool { assessed == "no-snapshot-in-scope" }
-
-    /// Claims established by doing something rather than by assertion.
-    var measuredCount: Int { capabilities.filter { $0.evidence.isMeasured }.count }
-
-    /// Claims that are only as good as the last person to edit them.
-    var documentedCount: Int { capabilities.filter { $0.evidence == .documented }.count }
+    static func abbreviated(_ path: String) -> String {
+        abbreviated(path, home: FileManager.default.homeDirectoryForCurrentUser.path)
+    }
 }

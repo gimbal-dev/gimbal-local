@@ -168,8 +168,6 @@ final class AppModel: ObservableObject {
     /// not the less.
     @Published var auditTrail: AuditTrail?
     @Published var isLoadingAudit = false
-    @Published var capabilities: CapabilityReport?
-    @Published var isLoadingCapabilities = false
     /// A sandbox the user chose to read history for while nothing is running.
     private var auditScopeDir: String?
 
@@ -341,18 +339,6 @@ final class AppModel: ObservableObject {
     /// What the daemon's binary can do, and what it makes of the snapshot in
     /// scope.
     ///
-    /// Cleared on failure rather than left stale. Posture can survive a missed
-    /// refresh because a configuration probably has not changed, but a
-    /// capability answer is partly a probe of *this moment* — the binary may
-    /// have been rebuilt out from under the daemon, losing its entitlement —
-    /// and a stale yes is the exact shape of the bug this panel exists to end.
-    func refreshCapabilities(dir: String? = nil) async {
-        guard !isLoadingCapabilities else { return }
-        isLoadingCapabilities = true
-        defer { isLoadingCapabilities = false }
-        capabilities = await chm.capabilities(settings: settings, dir: dir)
-    }
-
     /// Install the workspace CA inside the running guest.
     ///
     /// Typed at the console rather than copied in, because there is no shared
@@ -868,6 +854,20 @@ final class AppModel: ObservableObject {
     /// passing the command to `osascript` as an argv parameter via `on run
     /// argv` — never interpolated into the AppleScript source — so a path can
     /// never break out of the script text into host code (M30.3 follow-up, #67).
+    ///
+    /// **Hardened Runtime does not block this, and that was measured rather
+    /// than assumed** (#144). A release build is signed `--options runtime`
+    /// with no entitlements, which restricts Apple Events sent *by this
+    /// binary* — but this binary never sends one. It spawns `/usr/bin/osascript`,
+    /// a separate Apple-signed process, and that process sends the event under
+    /// its own identity. Verified twice: once from a shell, and again from a
+    /// freshly-minted bundle id launched through LaunchServices so it was its
+    /// own responsible process rather than inheriting a terminal's existing
+    /// automation grant. Both returned a live Terminal tab id. So
+    /// `com.apple.security.automation.apple-events` is deliberately **not**
+    /// requested — an entitlement we do not need is a permission we should not
+    /// ask a user for. A first-run "control Terminal" consent prompt is still
+    /// normal macOS behaviour on a Mac that has never approved it.
     private func openTerminal(runningShellCommand command: String) throws {
         // The script is a constant with no interpolation; the command travels as
         // argv item 1, so AppleScript string-literal escaping is not needed.
