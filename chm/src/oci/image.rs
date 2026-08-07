@@ -51,6 +51,7 @@ use super::registry::{self, ImageConfig, Registry};
 use super::targz;
 use crate::coldboot::VirtioBuiltin;
 use crate::imp::human_bytes;
+use crate::kernelimage::{self, KernelForm};
 use crate::oci::entry::EntryKind;
 use flate2::read::GzDecoder;
 use serde_json::{json, Value};
@@ -220,34 +221,22 @@ fn discover_kernels(library: &Path) -> Vec<PathBuf> {
     found
 }
 
-/// Is this file an uncompressed arm64 kernel `Image`?
+/// Read a kernel, unwrapping whatever the distro wrapped it in.
 ///
-/// The app already refuses a gzip-compressed kernel by magic bytes and explains
-/// why; refusing it here too means the failure appears at build time rather than
-/// 30 seconds into a boot that produces no output.
-fn check_kernel(path: &Path) -> Result<(), String> {
+/// Returns the bytes of an uncompressed arm64 `Image` and what the file turned
+/// out to be, so the caller can say what it did rather than silently accepting
+/// something different from what was passed.
+///
+/// This runs at build time on purpose. Discovering a kernel is unusable 30
+/// seconds into a boot that produces no console output is the worst place to
+/// find out, and this is the one moment the user is *choosing* a kernel and can
+/// pick another for free.
+fn read_kernel(path: &Path) -> Result<(Vec<u8>, KernelForm), String> {
     let data =
         fs::read(path).map_err(|e| format!("cannot read kernel `{}`: {e}", path.display()))?;
-    if data.len() < 64 {
-        return Err(format!("`{}` is too small to be a kernel", path.display()));
-    }
-    if data[..2] == [0x1f, 0x8b] {
-        return Err(format!(
-            "`{}` is gzip-compressed; cold boot needs an uncompressed arm64 Image. \
-             Run `gunzip -c {} > Image` first.",
-            path.display(),
-            path.display()
-        ));
-    }
-    // arm64 Image header magic at offset 56: "ARM\x64".
-    if &data[56..60] != b"ARM\x64" {
-        return Err(format!(
-            "`{}` does not carry the arm64 kernel Image magic. \
-             An x86 bzImage or a vmlinux ELF will not boot on this Mac.",
-            path.display()
-        ));
-    }
-    Ok(())
+    let label = path.display().to_string();
+    let (image, form) = kernelimage::decode(&data, &label)?;
+    Ok((image.into_owned(), form))
 }
 
 /// Warn if this kernel and a container rootfs cannot give the guest devices.
@@ -260,9 +249,13 @@ fn check_kernel(path: &Path) -> Result<(), String> {
 /// This does not refuse. The image is perfectly good for a workload that needs
 /// no devices, and that is the flow that works today; see `VirtioBuiltin` for
 /// why absence is warned about rather than enforced.
-fn warn_kernel_virtio(path: &Path) -> Option<String> {
-    let data = fs::read(path).ok()?;
-    VirtioBuiltin::scan(&data).warning()
+/// Takes the *decoded* image, never the file on disk. A wrapped kernel's
+/// compressed bytes contain none of the strings this scans for, so scanning
+/// the file would report "no virtio built in" for a kernel that has it -- a
+/// warning that is wrong in the direction that sends someone chasing #222 for
+/// a guest whose devices would have worked.
+fn warn_kernel_virtio(image: &[u8]) -> Option<String> {
+    VirtioBuiltin::scan(image).warning()
 }
 
 /// Which C library the image ships, when it can be told.
@@ -398,8 +391,15 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
 
     let kernel = match &args.kernel {
         Some(k) => {
-            check_kernel(k)?;
-            Some(k.clone())
+            let (bytes, form) = read_kernel(k)?;
+            if form.was_compressed() {
+                println!(
+                    "chm image build: kernel {} — {}",
+                    k.display(),
+                    form.describe()
+                );
+            }
+            Some((k.clone(), bytes))
         }
         None if args.dry_run => None,
         None => {
@@ -538,16 +538,17 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
         println!("  --dry-run: nothing written (would be {})", out.display());
         // A dry run is precisely when someone is checking whether their kernel
         // is the right one, so it is the last place that should stay quiet.
-        if let Some(w) = kernel.as_deref().and_then(warn_kernel_virtio) {
+        if let Some(w) = kernel.as_ref().and_then(|(_, b)| warn_kernel_virtio(b)) {
             println!("\nNOTE: {w}");
         }
         return Ok(ExitCode::SUCCESS);
     }
 
-    let kernel = kernel.ok_or("--kernel is required")?;
+    let (kernel_path, kernel_image) = kernel.ok_or("--kernel is required")?;
     write_image_dir(
         &out,
-        &kernel,
+        &kernel_path,
+        &kernel_image,
         &cpio,
         &args,
         ram,
@@ -561,7 +562,7 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
     if let Some(w) = libc.warning() {
         println!("\nNOTE: {}", w.replace('\n', "\n      "));
     }
-    if let Some(w) = warn_kernel_virtio(&kernel) {
+    if let Some(w) = warn_kernel_virtio(&kernel_image) {
         println!("\nNOTE: {w}");
     }
     println!(
@@ -630,7 +631,8 @@ fn print_report(report: &apply::Report) {
 #[allow(clippy::too_many_arguments)]
 fn write_image_dir(
     out: &Path,
-    kernel: &Path,
+    kernel_path: &Path,
+    kernel_image: &[u8],
     cpio: &[u8],
     args: &Args,
     ram: u64,
@@ -641,12 +643,14 @@ fn write_image_dir(
 ) -> Result<(), String> {
     fs::create_dir_all(out).map_err(|e| format!("create {}: {e}", out.display()))?;
 
-    // Copy rather than link: the image directory has to keep working when the
-    // kernel it was built from is moved or deleted, and `chm` opens disks
-    // no-follow so a directory of links is a format that half-works.
+    // Write the decoded bytes rather than copying the source file: what the
+    // user passed may have been an EFI zboot or gzip wrapper, and the image
+    // directory has to hold a bootable `Image`. Writing also keeps the earlier
+    // property that the directory works when the original kernel is moved or
+    // deleted, which a link would not.
     let kernel_dst = out.join("Image");
-    fs::copy(kernel, &kernel_dst)
-        .map_err(|e| format!("copy kernel to {}: {e}", kernel_dst.display()))?;
+    fs::write(&kernel_dst, kernel_image)
+        .map_err(|e| format!("write kernel to {}: {e}", kernel_dst.display()))?;
 
     let initramfs_dst = out.join("initramfs");
     fs::write(&initramfs_dst, cpio)
@@ -667,7 +671,7 @@ fn write_image_dir(
         "built by `chm image build` from {}",
         args.reference.display()
     );
-    let _ = writeln!(notes, "kernel:     {} (copied)", kernel.display());
+    let _ = writeln!(notes, "kernel:     {} (copied)", kernel_path.display());
     let _ = writeln!(notes, "entrypoint: {entrypoint}");
     let _ = writeln!(notes, "libc:       {}", libc.label());
     if let Some(w) = libc.warning() {
@@ -730,7 +734,6 @@ fn manifest(vcpus: u32, ram_mib: u64) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::iter;
     use std::process;
 
     #[test]
@@ -793,16 +796,24 @@ mod tests {
         assert!(!n.contains('/'), "{n}");
     }
 
+    /// A wrapped kernel is unwrapped rather than refused, and the bytes that
+    /// reach the image directory are the ones a guest can execute. The old
+    /// behaviour here was to refuse gzip and tell the user to run `gunzip`
+    /// themselves, which is a chore we can do for them (#220).
     #[test]
-    fn a_gzip_kernel_is_refused_with_the_remedy() {
+    fn a_gzip_kernel_is_unwrapped_rather_than_refused() {
         let dir = env::temp_dir().join(format!("chm-img-{}", process::id()));
         let _ = fs::create_dir_all(&dir);
-        let p = dir.join("Image");
-        let mut data = vec![0x1f, 0x8b];
-        data.extend(iter::repeat_n(0u8, 100));
-        fs::write(&p, &data).unwrap();
-        let e = check_kernel(&p).unwrap_err();
-        assert!(e.contains("gunzip"), "{e}");
+        let p = dir.join("Image.gz");
+        let mut inner = vec![0u8; 4096];
+        inner[56..60].copy_from_slice(b"ARM\x64");
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut enc, &inner).unwrap();
+        fs::write(&p, enc.finish().unwrap()).unwrap();
+
+        let (bytes, form) = read_kernel(&p).unwrap();
+        assert_eq!(&bytes[56..60], b"ARM\x64");
+        assert!(form.was_compressed(), "{form:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -814,8 +825,96 @@ mod tests {
         let _ = fs::create_dir_all(&dir);
         let p = dir.join("Image");
         fs::write(&p, vec![0u8; 128]).unwrap();
-        let e = check_kernel(&p).unwrap_err();
-        assert!(e.contains("arm64 kernel Image magic"), "{e}");
+        let e = read_kernel(&p).unwrap_err();
+        assert!(e.contains("arm64"), "{e}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The virtio scan must see the decoded kernel.
+    ///
+    /// A wrapped kernel's compressed bytes contain none of the strings
+    /// [`VirtioBuiltin::scan`] looks for, so scanning the file on disk reports
+    /// "no virtio built in" for a kernel that has it — sending someone down the
+    /// #222 module-loading workaround for a guest whose devices would have
+    /// worked. Wrong in the direction that costs an afternoon.
+    #[test]
+    fn the_virtio_scan_reads_the_decoded_kernel_not_the_wrapper() {
+        let dir = env::temp_dir().join(format!("chm-imgv-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+
+        // A kernel that does carry all three virtio strings, so the correct
+        // answer is silence.
+        let mut inner = vec![0u8; 8192];
+        inner[56..60].copy_from_slice(b"ARM\x64");
+        let mut at = 1024;
+        for s in ["virtio-mmio", "virtio_net", "virtio_blk"] {
+            inner[at] = 0;
+            inner[at + 1..at + 1 + s.len()].copy_from_slice(s.as_bytes());
+            inner[at + 1 + s.len()] = 0;
+            at += 64;
+        }
+        assert!(
+            warn_kernel_virtio(&inner).is_none(),
+            "the uncompressed form should warn about nothing"
+        );
+
+        let p = dir.join("vmlinuz");
+        let mut enc = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        std::io::Write::write_all(&mut enc, &inner).unwrap();
+        fs::write(&p, enc.finish().unwrap()).unwrap();
+
+        let (decoded, _) = read_kernel(&p).unwrap();
+        assert!(
+            warn_kernel_virtio(&decoded).is_none(),
+            "a wrapped kernel with virtio built in must not be warned about"
+        );
+        // And the thing that must never be what gets scanned:
+        assert!(
+            warn_kernel_virtio(&fs::read(&p).unwrap()).is_some(),
+            "precondition: the compressed bytes really do look device-less"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The bytes in the image directory must be the ones a guest can execute,
+    /// not the file that was named.
+    ///
+    /// Without this, `image build` accepts a zboot kernel, prints that it
+    /// decompressed it, and writes the *wrapper* into `Image` — an image that
+    /// announces success and cannot boot. Every other test in this file passes
+    /// while that is true, because none of them reads what was written.
+    #[test]
+    fn the_image_directory_holds_the_decoded_kernel_not_the_file_named() {
+        let dir = env::temp_dir().join(format!("chm-imgw-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::create_dir_all(&dir);
+
+        // A source file that is deliberately NOT a bootable Image, so copying
+        // it instead of writing the decoded bytes is unmistakable.
+        let src = dir.join("vmlinuz");
+        fs::write(&src, b"wrapper bytes, not a kernel").unwrap();
+
+        let mut decoded = vec![0u8; 4096];
+        decoded[56..60].copy_from_slice(b"ARM\x64");
+
+        let out = dir.join("image");
+        write_image_dir(
+            &out,
+            &src,
+            &decoded,
+            b"cpio",
+            &parse(&["alpine:3.20".to_string()]).unwrap(),
+            512,
+            "/bin/sh",
+            &apply::Report::default(),
+            0,
+            Libc::Musl,
+        )
+        .unwrap();
+
+        let written = fs::read(out.join("Image")).unwrap();
+        assert_eq!(written, decoded, "the wrapper was written, not the kernel");
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -827,7 +926,9 @@ mod tests {
         let mut data = vec![0u8; 128];
         data[56..60].copy_from_slice(b"ARM\x64");
         fs::write(&p, &data).unwrap();
-        check_kernel(&p).unwrap();
+        let (bytes, form) = read_kernel(&p).unwrap();
+        assert_eq!(bytes, data);
+        assert!(!form.was_compressed(), "{form:?}");
         let _ = fs::remove_dir_all(&dir);
     }
 

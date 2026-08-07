@@ -54,6 +54,11 @@ mod bundle;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod livesnap;
 
+// Recognising the compressed kernel wrappers distros actually ship (#220).
+// Shared by cold boot and `image build`, which both take a `--kernel` and were
+// each refusing zboot with their own separately-wrong explanation.
+mod kernelimage;
+
 // Cold boot: build a guest from a kernel image rather than rehydrate one from
 // a capture (#101).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
