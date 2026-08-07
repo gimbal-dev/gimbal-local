@@ -109,19 +109,6 @@ case "$identity" in
   cannot be notarized, so the result would not run on anyone else's." ;;
 esac
 
-# Ask Apple, rather than checking that a local file exists. A profile can be
-# present and hold credentials that no longer authenticate; the only way to
-# know is a round trip.
-if ! xcrun notarytool history --keychain-profile "$notary_profile" >/dev/null 2>&1; then
-    die "the notary profile \"$notary_profile\" does not authenticate with Apple.
-
-  Create it with an app-specific password from appleid.apple.com:
-      xcrun notarytool store-credentials \"$notary_profile\" \\
-          --apple-id you@example.com \\
-          --team-id TEAMID \\
-          --password xxxx-xxxx-xxxx-xxxx"
-fi
-
 if [[ "$publish" == "yes" ]]; then
     command -v gh >/dev/null || die "gh is not installed, and --publish needs it to create the release."
     gh auth status >/dev/null 2>&1 || die "gh is not authenticated. Run: gh auth login"
@@ -140,6 +127,26 @@ if [[ "$publish" == "yes" ]]; then
 $(grep -n 'github.com/[^)]*/releases' README.md | sed 's/^/        /' || echo '        (no releases link at all)')"
     fi
 
+    # The link can name the right repo and still be unfollowable: a release
+    # asset on a private repo answers an unauthenticated fetch with nine bytes
+    # reading "Not Found", which unzip reports as a corrupt archive. The
+    # artifact is fine and the instructions are wrong.
+    #
+    # Publishing a private build is legitimate, so this does not refuse one --
+    # it refuses a private build whose README claims a public download. What
+    # makes that claim honest is admitting access is needed, so that is what is
+    # checked, and only when the repo is actually private.
+    if [[ "$(gh repo view --json isPrivate --jq .isPrivate)" == "true" ]] \
+        && ! grep -qi "repository is private" README.md; then
+        die "$target_repo is private, so the Releases link in README.md 404s for
+      anyone without access to it -- they get a 9-byte file containing
+      \"Not Found\", which fails to unzip with no useful error.
+
+      Either make the repository public, or say so in README.md near the
+      download instructions. The check looks for the phrase:
+          This repository is private"
+    fi
+
     # gh refuses to create a release when a tag of that name exists locally but
     # not on the remote -- and it refuses at publish time, i.e. after the build,
     # the notarization round trip and the staple. That is the whole point of a
@@ -154,6 +161,23 @@ $(grep -n 'github.com/[^)]*/releases' README.md | sed 's/^/        /' || echo ' 
       Delete the stale local tag and re-run:
           git tag -d v$version"
     fi
+fi
+
+# Last, because it is the only preflight check that leaves this machine. Every
+# check above is instant and local, and a preflight that spends an Apple round
+# trip before noticing an unset variable is failing slower than it needs to.
+#
+# Ask Apple, rather than checking that a local file exists. A profile can be
+# present and hold credentials that no longer authenticate; the only way to
+# know is a round trip.
+if ! xcrun notarytool history --keychain-profile "$notary_profile" >/dev/null 2>&1; then
+    die "the notary profile \"$notary_profile\" does not authenticate with Apple.
+
+  Create it with an app-specific password from appleid.apple.com:
+      xcrun notarytool store-credentials \"$notary_profile\" \\
+          --apple-id you@example.com \\
+          --team-id TEAMID \\
+          --password xxxx-xxxx-xxxx-xxxx"
 fi
 
 # One artifact must not carry two version numbers. --version sets the bundle's

@@ -42,16 +42,32 @@ chm: guest resumed — serial console follows.
 
 ## Install
 
+> **This repository is private, so the download needs access to it.** A browser
+> or a plain `curl` gets a 9-byte file containing `Not Found`, not a build. If
+> you can read this page you almost certainly have that access — use the `gh`
+> command below rather than clicking through, because an unauthenticated fetch
+> fails in a way that looks like a corrupt download.
+
 Download the latest `GimbalLocal-<version>.zip` from
 [Releases](https://github.com/gimbal-dev/gimbal-local/releases), unzip it,
-and drag **Gimbal Local.app** to `/Applications`. The app is signed with a
+and drag **Gimbal Local** to `/Applications`. The app is signed with a
 Developer ID certificate and notarized by Apple, so it opens without a
 Gatekeeper warning.
+
+```sh
+gh release download --repo gimbal-dev/gimbal-local --pattern '*.zip'
+unzip GimbalLocal-*.zip
+mv GimbalLocal.app /Applications/
+```
+
+(Finder shows it as **Gimbal Local**; the bundle on disk is `GimbalLocal.app`.)
 
 **What you need**
 
 - An Apple Silicon Mac (M1 or later).
 - macOS 14 or newer.
+- Read access to this repository, until the release is published somewhere
+  public.
 
 **What you do not need** — worth stating plainly, because every comparable tool
 asks for at least one of them:
