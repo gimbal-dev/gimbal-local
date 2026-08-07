@@ -37,6 +37,7 @@ use std::fmt::Write as _;
 use std::iter;
 
 use super::entry::EntryKind;
+use crate::coldboot::EPOCH_KEY;
 use crate::create::{GATEWAY_IP, GUEST_IP, GUEST_PREFIX_LEN};
 
 /// `newc` magic. The other cpio variants are not read by the kernel.
@@ -315,6 +316,10 @@ pub fn default_init(entrypoint: &str, env: &[String], workdir: Option<&str>) -> 
     // Read from the module that installs it, so the init cannot name a path
     // the image does not have.
     let nicfg = super::nicfg::GUEST_PATH;
+    // Likewise: `create` writes this key onto the command line, and this reads
+    // it back. One definition, so the two cannot drift apart into a guest that
+    // is silently left at the epoch.
+    let epoch_key = EPOCH_KEY;
 
     // The image's own environment, delivered rather than merely understood.
     //
@@ -377,6 +382,30 @@ mount -t devtmpfs devtmpfs /dev 2>/dev/null || {{
 }}
 mount -t tmpfs tmpfs /tmp 2>/dev/null
 mkdir -p /dev/pts && mount -t devpts devpts /dev/pts 2>/dev/null
+
+# The wall clock.
+#
+# A container rootfs ships no /lib/modules, so a kernel that builds its RTC
+# driver as a module -- Ubuntu's arm64 generic kernel puts rtc-pl031 in
+# linux-modules-extra -- has no way to read the PL031 chm attaches, and the
+# guest starts at the Unix epoch. Measured: /dev/rtc0 absent, date 1970-01-01.
+#
+# That breaks far more than a timestamp. Every TLS certificate is "not yet
+# valid" in 1970, so https fails everywhere -- apt, pip, npm, git clone -- with
+# an error that reads like a broken network rather than a wrong clock.
+#
+# chm puts the host's time on the command line at boot, which is the only
+# channel that is a boot-time fact rather than a build-time one.
+for __a in $(cat /proc/cmdline 2>/dev/null); do
+    case "$__a" in
+    {epoch_key}=*) __epoch="${{__a#{epoch_key}=}}" ;;
+    esac
+done
+if [ -n "$__epoch" ]; then
+    date -s "@$__epoch" >/dev/null 2>&1 ||
+        echo "gimbal: could not set the clock; TLS will fail until it is right"
+fi
+unset __a __epoch
 
 # A container image's /etc/resolv.conf is usually absent or points at a runtime
 # resolver that does not exist here.
@@ -1068,4 +1097,58 @@ mod tests {
             "the refusal must name the address to use:\n{s}"
         );
     }
+
+    #[test]
+    fn the_init_reads_the_clock_key_create_actually_writes() {
+        // The two halves are in different modules and only ever meet at run
+        // time inside a guest, where a mismatch is invisible: the loop simply
+        // finds nothing and the clock silently stays at 1970.
+        let key = EPOCH_KEY;
+        let s = default_init("/bin/sh", &[], None);
+        assert!(s.contains(&format!("{key}=*)")), "init does not match {key}");
+        assert!(
+            s.contains(&format!("${{__a#{key}=}}")),
+            "init does not strip {key}"
+        );
+        let arg = crate::coldboot::epoch_arg(std::time::SystemTime::now()).unwrap();
+        assert!(
+            arg.starts_with(&format!("{key}=")),
+            "create writes {arg:?}, which this init would not match"
+        );
+    }
+
+    #[test]
+    fn the_clock_is_set_before_anything_needs_it() {
+        let s = default_init("/bin/sh", &[], None);
+        let clock = s.find("date -s").expect("no clock rung");
+        // Ordering is the property, not presence. Every one of these fails or
+        // misbehaves against a 1970 clock -- TLS most obviously -- so setting
+        // the clock afterwards would be indistinguishable from not setting it.
+        let resolv = s.find("/etc/resolv.conf").expect("no resolv.conf rung");
+        let nic = s.find("/sys/class/net/eth0").expect("no nic rung");
+        let handover = s.rfind("gimbal_start").expect("no handover");
+        assert!(clock < resolv, "clock set after resolv.conf:\n{s}");
+        assert!(clock < nic, "clock set after the NIC:\n{s}");
+        assert!(clock < handover, "clock set after handover:\n{s}");
+    }
+
+    #[test]
+    fn a_guest_told_nothing_leaves_its_clock_alone() {
+        // An explicit --cmdline carries no key, and a wrong guess would be
+        // worse than the epoch: a clock confidently set to the wrong time is
+        // harder to diagnose than one obviously stuck in 1970.
+        let s = default_init("/bin/sh", &[], None);
+        let script = s
+            .split("for __a in")
+            .nth(1)
+            .expect("no cmdline loop")
+            .split("unset __a")
+            .next()
+            .unwrap();
+        assert!(
+            script.contains("[ -n \"$__epoch\" ]"),
+            "the clock is set unconditionally:\n{script}"
+        );
+    }
+
 }
