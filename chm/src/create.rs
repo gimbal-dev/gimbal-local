@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 use std::{fs, io, thread};
 
 use arch::aarch64::layout::LEGACY_RTC_MAPPED_IO_START;
@@ -339,6 +339,14 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     // `--cmdline` is the caller saying they know what the kernel needs, and
     // appending to it could contradict a `root=` they chose deliberately.
     if !cmdline_explicit && let Some(extra) = coldboot::implied_root_args(&cfg) {
+        cfg.cmdline = format!("{} {extra}", cfg.cmdline);
+    }
+    // The guest's wall clock, for the same reason and under the same guard. A
+    // guest that boots at the epoch fails every TLS handshake with "certificate
+    // is not yet valid", which reads as a broken network rather than a wrong
+    // clock. An explicit `--cmdline` is still honoured exactly as written; the
+    // init simply finds no key and leaves the clock alone.
+    if !cmdline_explicit && let Some(extra) = coldboot::epoch_arg(SystemTime::now()) {
         cfg.cmdline = format!("{} {extra}", cfg.cmdline);
     }
     for extra in &cmdline_extra {
@@ -1307,11 +1315,51 @@ mod tests {
     fn a_disk_with_no_initramfs_gets_root_appended() {
         let a = parse(&args(&["--kernel", "/tmp/Image", "--disk", "/tmp/a.img"])).unwrap();
         assert!(
-            a.cfg.cmdline.ends_with("root=/dev/vda rw"),
+            a.cfg.cmdline.contains("root=/dev/vda rw"),
             "cmdline was {:?}",
             a.cfg.cmdline
         );
         assert!(a.cfg.cmdline.contains("console=ttyAMA0"), "default kept");
+    }
+
+    #[test]
+    fn a_cold_guest_is_told_what_time_it_is() {
+        let a = parse(&args(&["--kernel", "/tmp/Image"])).unwrap();
+        let key = crate::coldboot::EPOCH_KEY;
+        let secs = a
+            .cfg
+            .cmdline
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix(&format!("{key}=")))
+            .unwrap_or_else(|| panic!("no {key} on {:?}", a.cfg.cmdline))
+            .parse::<u64>()
+            .expect("epoch is a decimal number");
+        // Bounded rather than merely present: a key carrying a garbage or
+        // zero value would satisfy a `contains` check and still leave the
+        // guest at the epoch, which is the whole failure being prevented.
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(
+            secs.abs_diff(now) < 60,
+            "cmdline says {secs}, host says {now}"
+        );
+    }
+
+    #[test]
+    fn an_explicit_cmdline_is_not_given_a_clock_either() {
+        // The clock is worth having, but not worth contradicting a command
+        // line the caller wrote deliberately. `--cmdline-extra` is the way to
+        // have both, and it stays available.
+        let a = parse(&args(&[
+            "--kernel",
+            "/tmp/Image",
+            "--cmdline",
+            "console=ttyAMA0 root=/dev/vda2 ro",
+        ]))
+        .unwrap();
+        assert_eq!(a.cfg.cmdline, "console=ttyAMA0 root=/dev/vda2 ro");
     }
 
     #[test]

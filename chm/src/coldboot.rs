@@ -47,6 +47,7 @@ use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -329,6 +330,33 @@ impl Default for ColdBootConfig {
 /// if the kernel panics before it opens the console properly.
 pub fn default_cmdline() -> String {
     "console=ttyAMA0 earlycon=pl011,0x9000000 reboot=k panic=1".to_string()
+}
+
+/// The command-line key carrying the host's wall clock into a cold guest.
+///
+/// Named once here because two sides have to agree on it: `create` writes it
+/// and the generated init reads it back out of `/proc/cmdline`. Two spellings
+/// would leave the guest silently at the epoch, which is the failure this
+/// exists to prevent.
+pub const EPOCH_KEY: &str = "gimbal.epoch";
+
+/// The clock argument for a guest booting now, or `None` if the host clock is
+/// itself before 1970.
+///
+/// # Why the guest needs telling at all
+///
+/// chm attaches a PL031, but a driver is the guest's half of that bargain and a
+/// container rootfs ships no `/lib/modules` — Ubuntu's arm64 generic kernel
+/// puts `rtc-pl031` in `linux-modules-extra`, so `/dev/rtc0` is simply absent
+/// and the guest starts at the Unix epoch. Measured, not predicted.
+///
+/// The command line is the right channel because it is the one thing about a
+/// guest that is decided at *boot*. The initramfs is written once by
+/// `chm image build` and booted many times, so a time baked in there would be
+/// the time the image was built.
+pub fn epoch_arg(now: SystemTime) -> Option<String> {
+    let secs = now.duration_since(UNIX_EPOCH).ok()?.as_secs();
+    Some(format!("{EPOCH_KEY}={secs}"))
 }
 
 /// The largest guest RAM a single low-memory region can hold: everything from
