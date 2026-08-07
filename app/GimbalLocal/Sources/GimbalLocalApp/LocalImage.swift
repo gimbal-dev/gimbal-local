@@ -56,7 +56,7 @@ struct LocalImage: Identifiable, Equatable, Hashable {
     /// without the user having to go read `chm create --help`.
     enum Rejection: Equatable {
         case noKernel
-        case kernelIsCompressed(String)
+        case kernelUnusable(String, String)
         case missingFile(String)
         case symlinkedDisk(String)
 
@@ -64,8 +64,12 @@ struct LocalImage: Identifiable, Equatable, Hashable {
             switch self {
             case .noKernel:
                 return "No kernel — expected an `Image` file or an `image.json` naming one"
-            case .kernelIsCompressed(let name):
-                return "`\(name)` is gzip-compressed; cold boot needs an uncompressed arm64 Image (gunzip it first)"
+            case .kernelUnusable(let name, let why):
+                // `why` comes from `chm kernel probe`, which owns the rules.
+                // Restating them here is what made this wrong before: the app
+                // refused `vmlinuz-virt` by name long after the engine learned
+                // to unwrap it.
+                return "`\(name)` cannot be booted: \(why)"
             case .missingFile(let name):
                 return "`\(name)` is named in image.json but is not in the directory"
             case .symlinkedDisk(let name):
@@ -81,14 +85,25 @@ struct LocalImage: Identifiable, Equatable, Hashable {
 /// which layouts are accepted, which are refused and why — is unit-tested
 /// without touching a real filesystem.
 enum LocalImageLibrary {
-    /// Filenames accepted as an uncompressed arm64 kernel, in preference order.
-    static let kernelNames = ["Image", "vmlinux", "kernel"]
-    /// Filenames that are *nearly* right and produce a confusing failure, so we
-    /// name the problem instead of booting into a panic.
-    static let compressedKernelNames = ["Image.gz", "vmlinuz", "vmlinuz.gz", "zImage"]
+    /// Filenames accepted as a kernel, in preference order.
+    ///
+    /// Deliberately includes the compressed spellings. Whether a file is
+    /// bootable is decided by `chm kernel probe`, which reads the bytes —
+    /// a filename is not a format, and treating it as one is what made this
+    /// refuse `vmlinuz-virt`, the file Alpine actually ships.
+    static let kernelNames = [
+        "Image", "vmlinux", "kernel",
+        "Image.gz", "vmlinuz", "vmlinuz-virt", "vmlinuz.gz", "zImage",
+    ]
     /// Filenames accepted as a root disk when there is no manifest.
     static let diskNames = ["rootfs.img", "rootfs.raw", "disk.img", "disk.raw"]
     static let initramfsNames = ["initramfs", "initrd", "initramfs.cpio", "initrd.img"]
+
+    /// What `chm kernel probe` said about a file.
+    enum KernelVerdict: Equatable {
+        case usable
+        case unusable(String)
+    }
 
     struct Entry: Equatable {
         let name: String
@@ -107,7 +122,8 @@ enum LocalImageLibrary {
         path: String,
         entries: [String],
         manifestJSON: Data?,
-        isSymlink: (String) -> Bool = { _ in false }
+        isSymlink: (String) -> Bool = { _ in false },
+        probeKernel: (String) -> KernelVerdict = { _ in .usable }
     ) -> Entry {
         let present = Set(entries)
 
@@ -132,15 +148,16 @@ enum LocalImageLibrary {
             kernelFile = named
         } else if let found = kernelNames.first(where: { present.contains($0) }) {
             kernelFile = found
-        } else if let compressed = compressedKernelNames.first(where: { present.contains($0) }) {
-            return reject(.kernelIsCompressed(compressed))
         } else {
             return reject(.noKernel)
         }
 
-        // A manifest-named kernel that is itself gzip is the same trap.
-        if compressedKernelNames.contains(kernelFile) {
-            return reject(.kernelIsCompressed(kernelFile))
+        // Ask the engine whether these bytes can boot, rather than guessing
+        // from the name. `chm kernel probe` unwraps gzip and EFI zboot and
+        // checks the arm64 magic underneath, so this accepts what a cold boot
+        // would accept -- and still refuses an x86 kernel, by name.
+        if case .unusable(let why) = probeKernel(joined(kernelFile)) {
+            return reject(.kernelUnusable(kernelFile, why))
         }
 
         // Initramfs.
@@ -188,7 +205,15 @@ enum LocalImageLibrary {
 
     /// Scan `root` for image directories. Returns entries sorted by name so the
     /// UI order is stable across launches.
-    static func scan(root: String, fileManager: FileManager = .default) -> [Entry] {
+    /// `probeKernel` has **no default on purpose**. A default would let a
+    /// caller silently stop asking the engine and leave every test green --
+    /// the call-site mutation class that has slipped past this repo four times
+    /// now. Omitting it is a compile error instead.
+    static func scan(
+        root: String,
+        fileManager: FileManager = .default,
+        probeKernel probe: @escaping (String) -> KernelVerdict
+    ) -> [Entry] {
         guard !root.isEmpty,
               let children = try? fileManager.contentsOfDirectory(atPath: root)
         else {
@@ -218,10 +243,50 @@ enum LocalImageLibrary {
                         let full = (dir as NSString).appendingPathComponent(file)
                         let attrs = try? fileManager.attributesOfItem(atPath: full)
                         return (attrs?[.type] as? FileAttributeType) == .typeSymbolicLink
-                    }
+                    },
+                    probeKernel: probe
                 )
             )
         }
         return found
+    }
+
+    /// Ask `chm kernel probe` whether a file can boot.
+    ///
+    /// Shelling out per candidate is affordable because it runs once per image
+    /// directory on a library refresh, and the alternative — reimplementing
+    /// gzip and EFI zboot unwrapping plus the arm64 magic check in Swift — is
+    /// the second copy of the rules that made this wrong in the first place.
+    ///
+    /// A `chm` that cannot be run yields `.usable`: the library is not the
+    /// place to report a broken install, and refusing every image on this path
+    /// would turn a missing binary into "all your images are corrupt". The boot
+    /// itself will say so, properly.
+    static func chmProber(chmPath: String) -> (String) -> KernelVerdict {
+        { path in
+            guard !chmPath.isEmpty else { return .usable }
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: chmPath)
+            p.arguments = ["kernel", "probe", path, "--json"]
+            let out = Pipe()
+            p.standardOutput = out
+            p.standardError = Pipe()
+            do {
+                try p.run()
+            } catch {
+                return .usable
+            }
+            let data = out.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            if p.terminationStatus == 0 { return .usable }
+            // Prefer the engine's own words. Falling back to a generic line
+            // keeps a future JSON change from showing an empty reason.
+            if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let reason = obj["reason"] as? String, !reason.isEmpty
+            {
+                return .unusable(reason)
+            }
+            return .unusable("`chm kernel probe` rejected it")
+        }
     }
 }

@@ -77,13 +77,15 @@ final class FirstRunGuidanceTests: XCTestCase {
     /// `LocalImageLibrary` knows exactly why. Surfacing that only after a failed
     /// launch attempt wastes the best explanation the app has.
     func testAFolderThatCannotBootExplainsItselfUpFront() {
-        let g = evaluate(images: [refused("ubuntu", .kernelIsCompressed("vmlinuz"))])
+        let g = evaluate(
+            images: [refused("ubuntu", .kernelUnusable("Image", "x86 bzImage, not an arm64 kernel"))]
+        )
         XCTAssertFalse(g.canStartSomething)
         XCTAssertEqual(g.rejections.count, 1)
         XCTAssertEqual(g.rejections[0].name, "ubuntu")
         XCTAssertTrue(
-            g.rejections[0].reason.contains("gunzip"),
-            "the remedy the library already knows must reach the empty state"
+            g.rejections[0].reason.contains("x86 bzImage"),
+            "the engine's own verdict must reach the empty state"
         )
         XCTAssertTrue(g.detail.contains("~/gimbal/images"))
     }
@@ -110,7 +112,7 @@ final class FirstRunGuidanceTests: XCTestCase {
     func testTheShortAndLongLayoutDescriptionsAgreeOnTheKernel() {
         let short = FirstRunGuidance.layoutOneLine(imagesPath: "~/img")
         // The facts, not the formatting — the two surfaces render differently.
-        for fact in ["uncompressed", "arm64", "Image"] {
+        for fact in ["arm64", "Image", "gzip"] {
             XCTAssertTrue(short.contains(fact), "menu row must state \(fact)")
             XCTAssertTrue(
                 FirstRunGuidance.layoutHelp.contains(fact),
@@ -128,11 +130,11 @@ final class FirstRunGuidanceTests: XCTestCase {
             FirstRunGuidance.layoutOneLine(imagesPath: "~/img").contains("`"),
             "the menu one-liner must be plain prose"
         )
-        let reason = LocalImage.Rejection.kernelIsCompressed("vmlinuz").reason
+        let reason = LocalImage.Rejection.symlinkedDisk("d.img").reason
         XCTAssertTrue(reason.contains("`"), "reasons stay markdown for the empty state")
         XCTAssertFalse(FirstRunGuidance.plain(reason).contains("`"))
         XCTAssertTrue(
-            FirstRunGuidance.plain(reason).contains("gunzip"),
+            FirstRunGuidance.plain(reason).contains("cp -c"),
             "stripping emphasis must not lose the remedy"
         )
     }

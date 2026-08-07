@@ -12,7 +12,12 @@ final class ColdBootHardwareProbe: XCTestCase {
     func testEmitTheRealCommand() throws {
         try XCTSkipUnless(ProcessInfo.processInfo.environment["GIMBAL_PROBE"] == "1")
         let root = ProcessInfo.processInfo.environment["GIMBAL_IMAGES"] ?? ""
-        let entries = LocalImageLibrary.scan(root: root)
+        let entries = LocalImageLibrary.scan(
+            root: root,
+            probeKernel: LocalImageLibrary.chmProber(
+                chmPath: ProcessInfo.processInfo.environment["CHM_PATH"] ?? "chm"
+            )
+        )
         for e in entries {
             if let image = e.image {
                 var opts = ColdBootTerminalCommand.Options()
@@ -37,7 +42,12 @@ final class LocalImageScanProbe: XCTestCase {
         guard let root = ProcessInfo.processInfo.environment["GIMBAL_PROBE_DIR"] else {
             throw XCTSkip("set GIMBAL_PROBE_DIR to scan a real image directory")
         }
-        let entries = LocalImageLibrary.scan(root: root)
+        let entries = LocalImageLibrary.scan(
+            root: root,
+            probeKernel: LocalImageLibrary.chmProber(
+                chmPath: ProcessInfo.processInfo.environment["CHM_PATH"] ?? "chm"
+            )
+        )
         print("PROBE_SCAN root=\(root) entries=\(entries.count)")
         for entry in entries {
             if let rejection = entry.rejection {

@@ -869,7 +869,10 @@ final class AppModel: ObservableObject {
     /// which is when someone who just dropped an image in Finder comes looking
     /// for it.
     func refreshLocalImages() {
-        localImages = LocalImageLibrary.scan(root: settings.localImagesPath)
+        localImages = LocalImageLibrary.scan(
+            root: settings.localImagesPath,
+            probeKernel: LocalImageLibrary.chmProber(chmPath: settings.chmPath)
+        )
     }
 
     /// Hand an already-quoted, already-validated shell command to Terminal.app.
