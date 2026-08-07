@@ -12,7 +12,10 @@ Gimbal Local app — these are the docs you want:
 
 | Doc | What it covers |
 | --- | --- |
-| [`roadmap.md`](roadmap.md) | Milestones to date and what remains, on the V1–V4 vanilla-first spine. **Read this first.** |
+| [`project-state.md`](project-state.md) | **Where the project actually is right now** — what works and the evidence for it, the measured limitations, the gate numbers, what is being worked on, and the open issues grouped. **Start here.** |
+| [`engineering-discipline.md`](engineering-discipline.md) | **How we work here.** Measure don't assert; mutation-test every guard; never restate a constant; fail honestly; and the build/toolchain traps that have each cost real hours. Read before your first change. |
+| [`agents.md`](agents.md) | The eight specialist agents in [`.github/agents/`](../.github/agents/) — which one to use, and what they all assume. Also the fastest honest briefing for a human new to an area. |
+| [`roadmap.md`](roadmap.md) | Milestones to date and what remains, on the V1–V4 vanilla-first spine. The canonical durable tracker. |
 | [`security-model.md`](security-model.md) | Threat model, security invariants, and the M30 hardening plan — how untrusted snapshots and hostile guest workloads are confined. |
 | [`network-policy-plan.md`](network-policy-plan.md) | M28 plan (Pillar ③): how the plane's egress allow-list follows a sandbox to the Mac and is enforced by a userspace NAT — the "provably can't get out" demo. |
 | [`networking.md`](networking.md) | User guide: how a rehydrated guest reaches the network through the userspace NAT, and how the control-plane egress allow-list is enforced locally (DNS + TCP connect). |
