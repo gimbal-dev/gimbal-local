@@ -171,7 +171,7 @@ chm proxy — the credential-injecting egress proxy
 
 USAGE:
     chm proxy show [WORKSPACE_DIR|--workspace DIR] [--rules FILE] [--json]
-    chm proxy ca   <WORKSPACE_DIR|--workspace DIR> [--out FILE]
+    chm proxy ca   <WORKSPACE_DIR|--workspace DIR> [--out FILE] [--for-guest]
     chm proxy check --host HOST [--port N] [--path P] [--rules FILE]
                     [--control] [--json]
 
@@ -217,6 +217,28 @@ fn workspace_arg(args: &[String]) -> Option<&str> {
 }
 
 /// Reject flags this command does not know, naming the offender.
+/// What each subcommand accepts, named once.
+///
+/// These were inline literals at the call site and duplicated again in the
+/// tests, and that is exactly how `--for-guest` came to be implemented,
+/// documented in the banner `chm proxy ca` prints, and refused by the parser
+/// as unknown — the handler was unreachable. `usage_promises_only_flags_the_parser_accepts`
+/// now holds them to the help text.
+const SHOW_FLAGS: &[&str] = &["--rules", "--json", "--workspace"];
+const CA_FLAGS: &[&str] = &["--out", "--workspace", "--for-guest"];
+
+/// The remedy `chm proxy ca` prints beside the certificate.
+///
+/// A const rather than an inline `eprintln!` because it is a *third* place the
+/// same promise is made — after `USAGE` and the parser's allow-list — and the
+/// two that were already in the code disagreed. A guard that reads only the
+/// help text cannot see a hint hardcoded at the point of use; it stays green
+/// while the sentence the user actually reads sends them at a flag that does
+/// not work.
+const CA_GUEST_HINT: &str = "\
+`chm proxy ca <WORKSPACE_DIR> --for-guest` prints an installer to
+paste into the guest console.";
+
 fn reject_unknown(cmd: &str, args: &[String], known: &[&str]) -> Result<(), ExitCode> {
     for a in args {
         if a.starts_with("--") && !known.contains(&a.as_str()) {
@@ -247,7 +269,7 @@ fn positional(args: &[String]) -> Option<&str> {
 }
 
 fn show(args: &[String]) -> ExitCode {
-    if let Err(e) = reject_unknown("show", args, &["--rules", "--json", "--workspace"]) {
+    if let Err(e) = reject_unknown("show", args, SHOW_FLAGS) {
         return e;
     }
     let workspace = workspace_arg(args).map(PathBuf::from);
@@ -391,7 +413,7 @@ fn quote(s: &str) -> String {
 }
 
 fn ca(args: &[String]) -> ExitCode {
-    if let Err(e) = reject_unknown("ca", args, &["--out", "--workspace"]) {
+    if let Err(e) = reject_unknown("ca", args, CA_FLAGS) {
         return e;
     }
     let Some(ws) = workspace_arg(args) else {
@@ -422,8 +444,9 @@ fn ca(args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     eprintln!("# sha256 {}", ca.fingerprint());
-    eprintln!("# `chm proxy ca <WORKSPACE_DIR> --for-guest` prints an installer to");
-    eprintln!("# paste into the guest console.");
+    for line in CA_GUEST_HINT.lines() {
+        eprintln!("# {line}");
+    }
     print!("{pem}");
     ExitCode::SUCCESS
 }
@@ -483,27 +506,88 @@ pub(crate) fn ca_json_for_daemon(workspace: &Path) -> String {
 fn guest_install_script(pem: &str, fingerprint: &str) -> String {
     format!(
         "set -e\n\
-         sudo tee /usr/local/share/ca-certificates/gimbal-proxy.crt >/dev/null <<'GIMBAL_CA_EOF'\n\
+         # Root already, or borrow authority only if it is actually available.\n\
+         # A container rootfs has no sudo and needs none: its init runs as root,\n\
+         # and hardcoding `sudo` made every line of this script fail there.\n\
+         if [ \"$(id -u)\" = 0 ]; then S=; elif command -v sudo >/dev/null 2>&1; then S=sudo; else\n\
+         \x20 echo 'NOT INSTALLED: not root and no sudo.'; exit 1\n\
+         fi\n\
+         # The copy that always exists, wherever this guest keeps its trust store.\n\
+         $S mkdir -p /etc/gimbal\n\
+         $S tee {CA_PATH} >/dev/null <<'GIMBAL_CA_EOF'\n\
          {pem}GIMBAL_CA_EOF\n\
-         CRT=/usr/local/share/ca-certificates/gimbal-proxy.crt\n\
-         sudo update-ca-certificates >/dev/null 2>&1 \\\n\
-           || echo 'note: update-ca-certificates failed; linking the CA directly'\n\
-         if ! openssl verify -CApath /etc/ssl/certs \"$CRT\" >/dev/null 2>&1; then\n\
-         \x20 # update-ca-certificates did not take. Do by hand what it would have\n\
-         \x20 # done, so a broken helper does not cost us the install.\n\
-         \x20 H=$(openssl x509 -hash -noout -in \"$CRT\")\n\
-         \x20 sudo cp \"$CRT\" /etc/ssl/certs/gimbal-proxy.pem\n\
-         \x20 sudo ln -sf gimbal-proxy.pem \"/etc/ssl/certs/$H.0\"\n\
+         CRT={CA_PATH}\n\
+         # --- the OS trust store, for anything using it (curl, git, apt) -------\n\
+         SYS=skipped\n\
+         if [ -d /usr/local/share/ca-certificates ] || $S mkdir -p /usr/local/share/ca-certificates 2>/dev/null; then\n\
+         \x20 $S cp \"$CRT\" /usr/local/share/ca-certificates/gimbal-proxy.crt\n\
+         \x20 $S update-ca-certificates >/dev/null 2>&1 || true\n\
+         \x20 if command -v openssl >/dev/null 2>&1; then\n\
+         \x20   if ! openssl verify -CApath /etc/ssl/certs \"$CRT\" >/dev/null 2>&1; then\n\
+         \x20     # update-ca-certificates is absent or did not take. Do by hand\n\
+         \x20     # what it would have done, so a broken helper does not cost us\n\
+         \x20     # the install.\n\
+         \x20     H=$(openssl x509 -hash -noout -in \"$CRT\") \\\n\
+         \x20       && $S cp \"$CRT\" /etc/ssl/certs/gimbal-proxy.pem \\\n\
+         \x20       && $S ln -sf gimbal-proxy.pem \"/etc/ssl/certs/$H.0\" || true\n\
+         \x20   fi\n\
+         \x20   if openssl verify -CApath /etc/ssl/certs \"$CRT\" >/dev/null 2>&1; then\n\
+         \x20     SYS=trusted\n\
+         \x20   else SYS='NOT TRUSTED'; fi\n\
+         \x20 else SYS='installed, unverified (no openssl here)'; fi\n\
          fi\n\
-         if openssl verify -CApath /etc/ssl/certs \"$CRT\" >/dev/null 2>&1; then\n\
-         \x20 echo \"trusted:  $(openssl x509 -noout -fingerprint -sha256 -in \"$CRT\" \\\n\
-         \x20   | tr -d ':' | tr 'A-Z' 'a-z' | sed 's/.*=//')\"\n\
-         else\n\
-         \x20 echo 'NOT TRUSTED: the guest still does not trust this CA.'\n\
+         # --- Node, which does not consult the OS trust store at all ----------\n\
+         # Measured, not assumed: with the CA verified in the system store,\n\
+         # `node` still failed SELF_SIGNED_CERT_IN_CHAIN against an intercepted\n\
+         # host, and the same request succeeded with NODE_EXTRA_CA_CERTS set.\n\
+         # A coding agent is a Node program, so leaving this out ships a guest\n\
+         # where curl works and the agent does not.\n\
+         printf 'export NODE_EXTRA_CA_CERTS=%s\\n' \"$CRT\" | $S tee {ENV_PATH} >/dev/null\n\
+         $S mkdir -p /etc/profile.d \\\n\
+         \x20 && $S cp {ENV_PATH} /etc/profile.d/gimbal-proxy-ca.sh 2>/dev/null || true\n\
+         . {ENV_PATH}\n\
+         NODE=skipped\n\
+         if command -v node >/dev/null 2>&1; then\n\
+         \x20 # Node ignores an unreadable or unparseable NODE_EXTRA_CA_CERTS\n\
+         \x20 # *silently*, so the useful check is that node itself can read and\n\
+         \x20 # parse this exact file — the failure this catches has no symptom.\n\
+         \x20 if node -e 'new (require(\"crypto\").X509Certificate)(require(\"fs\").readFileSync(process.env.NODE_EXTRA_CA_CERTS))' 2>/dev/null; then\n\
+         \x20   NODE=configured\n\
+         \x20 else NODE='NOT LOADED: node cannot parse the CA file'; fi\n\
          fi\n\
-         echo \"expected: {fingerprint}\"\n"
+         echo \"system store: $SYS\"\n\
+         echo \"node:         $NODE ($CRT)\"\n\
+         GOT=$(openssl x509 -noout -fingerprint -sha256 -in \"$CRT\" 2>/dev/null \\\n\
+         \x20 | tr -d ':' | tr 'A-Z' 'a-z' | sed 's/.*=//')\n\
+         echo \"installed:    ${{GOT:-<no openssl here to read it back>}}\"\n\
+         echo \"expected:     {fingerprint}\"\n\
+         # A script cannot export into the shell that ran it. Saying otherwise\n\
+         # was measured false: `node` still failed SELF_SIGNED_CERT_IN_CHAIN\n\
+         # after a run that reported the variable set -- because it was set in\n\
+         # this script's shell and nowhere else. And /etc/profile.d is only read\n\
+         # by *login* shells, which a container guest's `/bin/sh` is not.\n\
+         echo \"this shell:   . {ENV_PATH}\"\n\
+         echo \"              (already done if you sourced this script)\"\n",
     )
 }
+
+/// Where the CA lands in the guest.
+///
+/// A fixed path outside the distribution's own trust-store layout, because it
+/// has two readers with different needs: `update-ca-certificates` wants its
+/// source under `/usr/local/share/ca-certificates`, and `NODE_EXTRA_CA_CERTS`
+/// wants a stable file that exists whether or not this guest has a trust store
+/// at all. A container rootfs has neither the directory nor the tool.
+const CA_PATH: &str = "/etc/gimbal/proxy-ca.crt";
+
+/// A one-line file that a shell can source to pick the CA up.
+///
+/// Necessary because `export` in a script reaches that script's shell and no
+/// other, so the delivery path this repo already uses -- decode, then
+/// `sh /tmp/gimbal-ca.sh` -- cannot configure the console it was typed into.
+/// Measured: an installer reporting the variable set, in a guest where the next
+/// `node` still failed `SELF_SIGNED_CERT_IN_CHAIN`.
+const ENV_PATH: &str = "/etc/gimbal/proxy-ca.env";
 
 /// Where the base64 of the installer lands in the guest while it is being typed.
 const TRANSFER_B64: &str = "/tmp/gimbal-ca.b64";
@@ -1221,13 +1305,13 @@ mod tests {
             .iter()
             .map(ToString::to_string)
             .collect();
-        assert!(reject_unknown("show", &args, &["--rules", "--json", "--workspace"]).is_err());
+        assert!(reject_unknown("show", &args, SHOW_FLAGS).is_err());
 
         let ok: Vec<String> = ["--workspace", "/ws", "--json"]
             .iter()
             .map(ToString::to_string)
             .collect();
-        assert!(reject_unknown("show", &ok, &["--rules", "--json", "--workspace"]).is_ok());
+        assert!(reject_unknown("show", &ok, SHOW_FLAGS).is_ok());
     }
 
     #[test]
@@ -1273,7 +1357,89 @@ mod tests {
         // And a failure has to be sayable. A script that can only print success
         // is the bug this replaced.
         assert!(script.contains("NOT TRUSTED"), "the installer must be able to say no");
-        assert!(script.contains("expected: beefcafe"));
+        assert!(script.contains("expected:     beefcafe"));
+    }
+
+    /// The installer must work on a guest with no sudo and no trust store.
+    ///
+    /// Measured on a `node:22-slim` container guest: `sudo`, `openssl` and
+    /// `update-ca-certificates` are all absent and **none** of
+    /// `/usr/local/share/ca-certificates`, `/usr/share/ca-certificates` or
+    /// `/etc/ssl/certs` exists. The previous script opened with `sudo tee`, so
+    /// every line of it failed — on the image the docs recommend for running an
+    /// agent, which is the case this whole feature exists to serve.
+    #[test]
+    fn the_ca_installer_does_not_assume_sudo_or_a_trust_store() {
+        let script = guest_install_script("-----BEGIN CERTIFICATE-----\nAA\n", "beefcafe");
+
+        assert!(
+            !script.contains("sudo tee") && !script.contains("sudo cp \"$CRT\" /usr"),
+            "the installer must not hardcode sudo: a container guest has none"
+        );
+        assert!(
+            script.contains("if [ \"$(id -u)\" = 0 ]; then S=;"),
+            "root must be recognised rather than assumed to need sudo"
+        );
+        // Absent tools must degrade to a named outcome, never a hard failure
+        // under `set -e` -- and never a silent claim of success.
+        for guard in ["command -v sudo", "command -v openssl", "command -v node"] {
+            assert!(
+                script.contains(guard),
+                "missing availability check: {guard}"
+            );
+        }
+        assert!(
+            script.contains("no openssl here"),
+            "an unverifiable install must say so rather than claim trust"
+        );
+    }
+
+    /// Node does not read the OS trust store, so installing there is not enough.
+    ///
+    /// Measured in one guest, seconds apart, with the CA verified in the system
+    /// store: `node` failed `SELF_SIGNED_CERT_IN_CHAIN` against an intercepted
+    /// host, and the identical request with `NODE_EXTRA_CA_CERTS` set returned a
+    /// real HTTP status. An installer that stops at the system store ships a
+    /// guest where `curl` works and the coding agent does not -- and the agent
+    /// is the workload.
+    #[test]
+    fn the_ca_installer_configures_node_as_well_as_the_system_store() {
+        let script = guest_install_script("-----BEGIN CERTIFICATE-----\nAA\n", "beefcafe");
+
+        assert!(
+            script.contains("NODE_EXTRA_CA_CERTS"),
+            "node is not configured"
+        );
+        // A script cannot export into the shell that ran it, so the variable
+        // has to be reachable as a *file* someone can source -- and the script
+        // must say so rather than claim the caller's shell is configured.
+        assert!(
+            script.contains(ENV_PATH),
+            "there must be a file a shell can source"
+        );
+        assert!(
+            script.contains(&format!("this shell:   . {ENV_PATH}")),
+            "the caller's own shell needs a named, runnable remedy"
+        );
+        assert!(
+            !script.contains("already exported"),
+            "claiming the caller's shell is configured was measured false"
+        );
+        assert!(
+            script.contains("/etc/profile.d/gimbal-proxy-ca.sh"),
+            "login shells should get it without being asked"
+        );
+        // Node ignores an unreadable or unparseable file *silently*, so the
+        // check has to be that node itself can read this exact one.
+        assert!(
+            script.contains("X509Certificate") && script.contains("NOT LOADED"),
+            "node's silent-ignore failure mode must be detectable"
+        );
+        // The report must not collapse two different answers into one word.
+        assert!(
+            script.contains("system store:") && script.contains("node:"),
+            "each client's trust must be reported separately"
+        );
     }
 
     /// The transfer must reassemble to exactly the script, and the guest must be
@@ -1419,4 +1585,98 @@ mod tests {
         );
         assert!(got.is_empty(), "{got:?}");
     }
+    /// Every flag the help text offers must be one the parser accepts.
+    ///
+    /// This is the #210 bug as a test. `--for-guest` was fully implemented,
+    /// and the banner `chm proxy ca` prints told the reader to use it — but
+    /// the allow-list handed to `reject_unknown` omitted it, so the flag was
+    /// refused as unknown and the handler below it could never run. A remedy
+    /// that is itself wrong is worse than no remedy: the reader has no reason
+    /// left to doubt the tool.
+    ///
+    /// Reads the promise out of `USAGE` rather than restating it, for the same
+    /// reason `chm --help`'s guard reads the dispatch table out of `imp.rs`:
+    /// a restated expectation drifts with the thing it is meant to pin.
+    #[test]
+    fn usage_promises_only_flags_the_parser_accepts() {
+        for (cmd, known) in [("show", SHOW_FLAGS), ("ca", CA_FLAGS)] {
+            let promised = flags_promised_for(cmd);
+            assert!(
+                !promised.is_empty(),
+                "found no `chm proxy {cmd}` line in USAGE — the parser below \
+                 has changed shape and this guard is no longer reading it"
+            );
+            for f in &promised {
+                assert!(
+                    known.contains(&f.as_str()),
+                    "USAGE offers `chm proxy {cmd} {f}` but the parser refuses \
+                     it as unknown; promised={promised:?} accepted={known:?}"
+                );
+            }
+        }
+
+        // The hint printed beside the certificate is a third copy of the same
+        // promise, and it is the one the user is most likely to act on: it
+        // arrives unprompted, in the output they already asked for.
+        for f in flags_in(CA_GUEST_HINT) {
+            assert!(
+                CA_FLAGS.contains(&f.as_str()),
+                "the hint printed by `chm proxy ca` tells the reader to use \
+                 `{f}`, which the parser refuses as unknown"
+            );
+        }
+    }
+
+    /// The flags USAGE offers for one subcommand, including continuation lines.
+    fn flags_promised_for(cmd: &str) -> Vec<String> {
+        let section = USAGE
+            .split_once("USAGE:\n")
+            .expect("USAGE: header")
+            .1
+            .split("\n\n")
+            .next()
+            .expect("a synopsis block");
+        let mut out = Vec::new();
+        let mut mine = false;
+        for line in section.lines() {
+            let t = line.trim();
+            if let Some(rest) = t.strip_prefix("chm proxy ") {
+                // A new synopsis entry: it is ours only if the verb matches.
+                mine = rest.split_whitespace().next() == Some(cmd);
+            }
+            if !mine {
+                continue;
+            }
+            out.extend(flags_in(t));
+        }
+        out.sort();
+        out.dedup();
+        out
+    }
+
+    /// Every `--flag` mentioned in a piece of prose.
+    fn flags_in(text: &str) -> Vec<String> {
+        text.split(|c: char| !(c.is_ascii_alphanumeric() || c == '-'))
+            .filter(|t| t.starts_with("--") && t.len() > 2)
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A workspace directory is positional *or* `--workspace`, and `--for-guest`
+    /// must survive alongside either — the refusal fired before the handler,
+    /// so neither form reached it.
+    #[test]
+    fn for_guest_is_accepted_in_both_workspace_forms() {
+        let positional = vec!["/tmp/ws".to_string(), "--for-guest".to_string()];
+        let flagged = vec![
+            "--workspace".to_string(),
+            "/tmp/ws".to_string(),
+            "--for-guest".to_string(),
+        ];
+        assert!(reject_unknown("ca", &positional, CA_FLAGS).is_ok());
+        assert!(reject_unknown("ca", &flagged, CA_FLAGS).is_ok());
+        assert_eq!(workspace_arg(&positional), Some("/tmp/ws"));
+        assert_eq!(workspace_arg(&flagged), Some("/tmp/ws"));
+    }
+
 }
