@@ -150,6 +150,34 @@ final class LocalImageTests: XCTestCase {
         XCTAssertTrue(cmd.contains("--memory 2048"))
     }
 
+    /// An image that names no command line must not be given one.
+    ///
+    /// `chm create` deliberately never appends to an explicit `--cmdline`, so
+    /// inventing one here does not add a default -- it *replaces* the real one,
+    /// silently dropping `earlycon`, `panic=1` and the guest's wall clock. A
+    /// guest booting at the Unix epoch fails every TLS handshake with
+    /// "certificate is not yet valid", and this is the one path where nobody
+    /// ever reads the command line to find out why.
+    func testAnImageThatNamesNoCommandLineIsNotGivenOne() throws {
+        let bare = LocalImage(
+            name: "container",
+            path: "/images/container",
+            kernelPath: "/images/container/Image",
+            initramfsPath: "/images/container/initramfs",
+            diskPaths: [],
+            cmdline: nil,
+            vcpus: 2,
+            ramMib: 3008
+        )
+        let cmd = try ColdBootTerminalCommand.shellCommand(
+            chmPath: "/bin/chm", image: bare, options: .init(), workdir: "/work"
+        )
+        XCTAssertFalse(cmd.contains("--cmdline"), "invented a command line: \(cmd)")
+        // Still a complete invocation otherwise, or this would pass by being broken.
+        XCTAssertTrue(cmd.contains("--kernel '/images/container/Image'"))
+        XCTAssertTrue(cmd.contains("--memory 3008"))
+    }
+
     /// A timer expiring mid-write is a power cut on a writable disk, and it has
     /// corrupted a rootfs here before. An interactive window must run until the
     /// user ends it.

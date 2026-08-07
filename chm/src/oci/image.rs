@@ -65,13 +65,6 @@ const LAYER_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// doing something once it boots. Below this even a shell prompt is tight.
 const RAM_FLOOR_MIB: u64 = 512;
 
-/// The kernel command line written into `image.json`.
-///
-/// `console=ttyAMA0` matches `chm create`'s own default (`create.rs`). It is
-/// asserted against that default in a test, because the two drifting apart
-/// yields a guest that boots and says nothing.
-const DEFAULT_CMDLINE: &str = "console=ttyAMA0";
-
 pub fn image_main(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         Some("build") => match build(&args[1..]) {
@@ -555,18 +548,8 @@ fn write_image_dir(
     fs::write(&initramfs_dst, cpio)
         .map_err(|e| format!("write {}: {e}", initramfs_dst.display()))?;
 
-    let manifest = json!({
-        "kernel": "Image",
-        "initramfs": "initramfs",
-        // `chm create`'s own default console. Getting this wrong produces a
-        // guest that boots correctly and emits nothing, which is
-        // indistinguishable from a hang. Deliberately without `quiet`: a
-        // container rootfs is a new thing to boot and the kernel messages are
-        // how a user finds out what it did.
-        "cmdline": DEFAULT_CMDLINE,
-        "vcpus": args.vcpus,
-        "ram_mib": ram,
-    });
+    let manifest = manifest(args.vcpus, ram);
+
     let manifest_path = out.join("image.json");
     fs::write(
         &manifest_path,
@@ -608,6 +591,32 @@ fn write_image_dir(
     }
     fs::write(out.join("BUILD.txt"), notes).map_err(|e| format!("write BUILD.txt: {e}"))?;
     Ok(())
+}
+
+/// What `image.json` says about a freshly built image.
+///
+/// # Why there is no `cmdline` here
+///
+/// A container rootfs needs nothing beyond what `chm create` already boots
+/// with, and naming it here would not be a *copy* of that default -- it would
+/// be a second definition of it, which is worse than none.
+///
+/// Worse in a specific, measured way: the app passes a manifest `cmdline`
+/// straight to `--cmdline`, and an explicit `--cmdline` is by design never
+/// appended to. So restating the console alone silently removed `earlycon`,
+/// `panic=1` and the guest's wall clock -- every one of them, and only on the
+/// path a user takes through the app, which is the path whose command line
+/// nobody reads.
+///
+/// An image that genuinely needs different boot arguments can still say so.
+/// This is about not claiming to need them when we do not.
+fn manifest(vcpus: u32, ram_mib: u64) -> serde_json::Value {
+    json!({
+        "kernel": "Image",
+        "initramfs": "initramfs",
+        "vcpus": vcpus,
+        "ram_mib": ram_mib,
+    })
 }
 
 #[cfg(test)]
@@ -718,14 +727,20 @@ mod tests {
     /// nothing — the failure mode hardest to attribute. This asserts against
     /// `create.rs`'s own source so the two cannot drift apart silently.
     #[test]
-    fn the_written_cmdline_matches_the_console_chm_create_uses() {
-        let create = include_str!("../create.rs");
+    fn the_manifest_does_not_restate_the_default_command_line() {
+        // The app passes a manifest cmdline straight to `--cmdline`, and that
+        // flag is deliberately never appended to -- so a manifest that merely
+        // repeats the default is not a no-op, it is a silent downgrade.
+        let m = manifest(2, 1024);
         assert!(
-            create.contains("console=ttyAMA0"),
-            "chm create no longer defaults to ttyAMA0; image.json would name a \
-             console the guest does not have"
+            m.get("cmdline").is_none(),
+            "image.json names a command line again: {m}"
         );
-        assert!(DEFAULT_CMDLINE.contains("console=ttyAMA0"));
+        // The default it defers to still has to name a console the guest has.
+        assert!(
+            crate::coldboot::default_cmdline().contains("console=ttyAMA0"),
+            "chm create no longer defaults to ttyAMA0"
+        );
     }
 
     #[test]
