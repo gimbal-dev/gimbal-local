@@ -43,25 +43,53 @@ fine and says nothing. It is indistinguishable from a hang unless you know.
 
 **If you get silence, suspect the console before you suspect the hypervisor.**
 
-### 2. Most arm64 distro kernels build virtio as *modules*
+### 2. Many arm64 distro kernels build virtio as *modules*
 
 Cold boot is virtio-mmio. A container rootfs ships no `/lib/modules`. So a
 kernel with `VIRTIO_MMIO`/`NET`/`BLK` as modules gives the guest **no NIC and no
-disk**, silently. This is [#222](https://github.com/gimbal-dev/gimbal-local/issues/222).
+disk** unless the modules are supplied. This was
+[#222](https://github.com/gimbal-dev/gimbal-local/issues/222), now closed two
+ways.
 
-**The kernel that works — verified end to end, use this one:**
+**Path A — a kernel that needs nothing.** Ubuntu `generic` arm64 has virtio
+built in:
 
 ```bash
 curl -O http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-image-unsigned-6.8.0-71-generic_6.8.0-71.71_arm64.deb
 ar x linux-image-*.deb && tar -xf data.tar     # data.tar is UNCOMPRESSED; tar -xzf FAILS
-python3 -c "import gzip,sys; d=open('boot/vmlinuz-6.8.0-71-generic','rb').read(); \
-            open('Image','wb').write(gzip.decompress(d[d.find(b'\x1f\x8b\x08'):]))"
 ```
 
-Ubuntu `generic` arm64 gives you `eth0` with **no modprobe**. Note honestly:
-its `CONFIG_VIRTIO_MMIO` has never been read from a config file (the
+Hand `boot/vmlinuz-*` straight to chm — `kernelimage::decode` unwraps gzip and
+EFI zboot itself. `eth0` appears with **no modprobe**. Note honestly: its
+`CONFIG_VIRTIO_MMIO` has never been read from a config file (the
 `linux-image-unsigned` deb ships no `config-*`) — it is confirmed by *hardware
 behaviour*, which is stronger evidence, but say so rather than citing a config.
+
+**Path B — a modular kernel plus its tree.** `chm image build --modules <DIR>`
+resolves the virtio closure, installs it, and generates an init that loads it
+before the NIC block. Three traps it handles, all of which cost real time here:
+
+- **`virtio_mmio` must load first.** Loading `virtio_net` alone returns success
+  and still leaves no NIC — the *transport* is what was missing.
+- **`insmod` may not exist.** `debian:12-slim` has neither `insmod` nor
+  `modprobe`; `oci/modload` is a freestanding 808-byte aarch64 binary calling
+  `finit_module` directly.
+- **A module's init returning is not the device being ready.** virtio_mmio
+  probes on a workqueue. Five `insmod` fork/execs were slow enough to win that
+  race; the single-process loader lost it every time. The init waits, bounded,
+  for `/sys/class/net/eth0`.
+
+**Matched pair, the easy way:** Alpine's `linux-virt` apk ships both
+`boot/vmlinuz-virt` and `lib/modules/<release>/` as siblings in one download,
+so `locate()` finds the tree automatically. An apk is concatenated gzip members:
+`gunzip -c linux-virt.apk | tar -xf -`. The version skew is between *netboot*
+and *apk*, not within the apk.
+
+**A cpio entry whose parent directory has no entry of its own is dropped in
+silence.** `init/initramfs.c` does not create missing parents — `openat` fails
+ENOENT and the kernel says nothing. This cost a full hardware run: all five
+modules were in the archive and none were in the guest. Same class as the
+usr-merge symlink trap `nicfg::GUEST_PATH` documents.
 
 ### 3. Detecting built-in virtio: match NUL-delimited symbols
 

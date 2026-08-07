@@ -16,11 +16,11 @@ Images written to your local images directory (default `~/gimbal-images`, or
 
 ## Read this before you start
 
-Three limits will bite you in the first ten minutes if you do not know about
-them. All three were measured on the released build; none is a hypervisor
-defect, and each has an open issue.
+One limit will bite you in the first ten minutes if you do not know about it,
+and two that used to are now handled for you. All were measured on real
+hardware; none is a hypervisor defect.
 
-### 1. You must bring your own kernel, and most of them will not have drivers
+### 1. You must bring your own kernel, and most of them need their modules too
 
 A container image is a **rootfs**. It contains no kernel, so `--kernel` is
 required.
@@ -36,20 +36,48 @@ CONFIG_VIRTIO_NET=m
 CONFIG_VIRTIO_MMIO=m      <-- the transport itself
 ```
 
-A container rootfs ships no `/lib/modules`, so the modules are not there to
-load. The result is a guest that boots to a shell perfectly and then:
+A container rootfs ships no `/lib/modules`, so on its own the driver and its bus
+can never meet: the guest boots to a shell perfectly and then
 
 ```
 ip: can't find device 'eth0'
 ```
 
-`--net` is accepted, chm logs the device, and the guest cannot see it. The same
-applies to `--disk`.
+**Point `--modules` at the kernel's module tree and chm handles the rest.**
 
-**chm now tells you this before you boot.** `chm image build` and
-`chm create --net`/`--disk` scan the kernel and warn when the drivers are not
-built in. It is a warning rather than a refusal: the image is still perfectly
-good for a workload that needs no devices.
+```
+chm image build alpine:3.20 --out ~/gimbal-images/alpine \
+    --kernel /path/to/Image --modules /path/to/lib/modules/6.6.142-0-virt
+```
+
+chm reads the release banner out of the kernel itself, checks each module's
+`vermagic` against it, resolves the virtio dependency closure, installs it, and
+generates an init that loads it **before** configuring the interface. On Alpine
+`linux-virt` that is 5 modules and 238 KiB out of 916 in the tree:
+
+```
+bundled 5 virtio modules (238.2 KiB) from lib/modules/6.6.142-0-virt
+  virtio_mmio, failover, net_failover, virtio_net, virtio_blk
+```
+
+Three things it does for you that are easy to get wrong by hand:
+
+- **Order.** Loading `virtio_net` alone returns success and still leaves no NIC,
+  because the *transport* is what was missing. `virtio_mmio` goes first.
+- **No `insmod` required.** `debian:12-slim` ships neither `insmod` nor
+  `modprobe`; chm falls back to a small static loader that calls
+  `finit_module` directly.
+- **Waiting.** virtio_mmio probes devices on a workqueue, so `eth0` appears
+  *after* the load call returns. The generated init waits for the interface
+  rather than racing it.
+
+`--modules` requires `--kernel` and is refused without it, before anything is
+pulled — the release to match against comes from the kernel's own banner.
+
+Where to get a matched pair: Alpine's `linux-virt` apk ships **both** the kernel
+and its modules in one download, already siblings, so chm finds the tree
+automatically if you pass a kernel from inside the extracted apk. An apk is
+concatenated gzip members, so extract with `gunzip -c linux-virt.apk | tar -xf -`.
 
 ### Which kernels actually work
 
@@ -57,45 +85,35 @@ Measured on this project, booting a stock `alpine:3.20` rootfs:
 
 | kernel | virtio built in? | result |
 | --- | --- | --- |
-| **Ubuntu `linux-image-*-generic` arm64** | yes | ✅ **`eth0` with no `modprobe`, real HTTPS egress** |
-| Alpine `linux-virt` / `linux-lts` | no (`=m`) | boots to a shell, no NIC, no disk |
+| **Ubuntu `linux-image-*-generic` arm64** | yes | ✅ `eth0` with no modules at all |
+| Alpine `linux-virt` / `linux-lts` | no (`=m`) | ✅ with `--modules`; no NIC and no disk without it |
 | Firecracker CI `vmlinux-*` aarch64 | yes | ❌ **no console** — see below |
 
-**Use an Ubuntu `generic` arm64 kernel.** It is the same family as a Graviton
-snapshot, and it is the pairing verified end to end:
+Either of the first two is fine. Ubuntu `generic` is the same family as a
+Graviton snapshot and needs no module tree:
 
 ```
 curl -O http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-image-unsigned-6.8.0-71-generic_6.8.0-71.71_arm64.deb
 ar x linux-image-*.deb && tar -xf data.tar
-python3 -c "import gzip,sys; d=open('boot/vmlinuz-6.8.0-71-generic','rb').read(); \
-            open('Image','wb').write(gzip.decompress(d[d.find(b'\x1f\x8b\x08'):]))"
 ```
 
-(Ubuntu ships `vmlinuz` as a gzip stream; the last line unwraps it to the
-uncompressed `Image` cold boot needs.)
+Hand `chm` the `boot/vmlinuz-*` directly — it unwraps gzip and EFI zboot itself
+(see §2).
 
 **Firecracker's CI kernels look ideal and are not.** They are mmio-only, so
 virtio is built in — but they are compiled with `CONFIG_SERIAL_8250` and **no
 `CONFIG_SERIAL_AMBA_PL011`**, while chm presents a PL011. The guest boots and
 emits nothing at all, which is indistinguishable from a hang.
 
-**If you must use a modular kernel**, supply its matching modules and note the
-ordering trap: loading `virtio_net` alone silently succeeds and still leaves no
-NIC, because the *transport* module is the one that was missing. `virtio_mmio`
-must be loaded too. Module version must match the kernel exactly.
+### 2. Compressed kernels are unwrapped for you
 
-Tracking: [#222](https://github.com/gimbal-dev/gimbal-local/issues/222).
+Alpine's `vmlinuz-virt` is an **EFI zboot** wrapper (`MZ` at 0, `zimg` at 4),
+not a raw `Image`, and Ubuntu ships a plain gzip stream. Both used to be
+refused, and the zboot refusal named *x86*, which was actively misleading.
 
-### 2. Some distro kernels are not in the format they look like
-
-Alpine's `vmlinuz-virt`, for example, is an **EFI zboot** wrapper (`MZ` magic
-followed by `zimg`), not a raw `Image`. `chm image build` currently refuses it
-with a message about x86, which is misleading — it is an arm64 kernel in a
-container chm does not yet unwrap.
-
-You want an uncompressed arm64 `Image` with `ARM\x64` at offset `0x38`.
-
-Tracking: [#220](https://github.com/gimbal-dev/gimbal-local/issues/220).
+`chm` now reads the container header, decompresses the payload and verifies
+`ARM\x64` at offset `0x38` of the result, so you can hand it the file the distro
+actually ships. It says which form it found.
 
 ### 3. The rootfs unpacks into guest RAM
 

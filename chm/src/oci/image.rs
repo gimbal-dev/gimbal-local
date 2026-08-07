@@ -103,8 +103,9 @@ pub fn usage() -> String {
          `ghcr.io/owner/name:tag`. Defaults to Docker Hub and `latest`.\n\
      \n\
      OPTIONS:\n    \
-         --kernel <PATH>   An uncompressed arm64 `Image`. Required: a container\n                      \
-         image carries no kernel.\n    \
+         --kernel <PATH>   An arm64 kernel: a raw `Image`, or the compressed\n                      \
+         form a distro ships (gzip or EFI zboot), which is unwrapped\n                      \
+         for you. Required: a container image carries no kernel.\n    \
          --out <DIR>       Where to write the image directory\n                      \
          (default: <images library>/<name>-<tag>).\n    \
          --entrypoint <C>  Override the command init hands over to. Default is\n                      \

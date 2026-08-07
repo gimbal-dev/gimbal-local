@@ -43,6 +43,7 @@ three ways:
 | Vanilla Graviton2 snapshot rehydrated | Booted, carrying 7.15 days of prior guest uptime |
 | Container image pulled from Docker Hub, cold-booted | Worked on a *different* kernel — proving the two paths share nothing |
 | The app cold-booting a guest from its own emitted command | Worked, RTC correct at boot |
+| A container-derived guest reaching the internet | `alpine:3.20` → `wget https://registry.npmjs.org/` rc 0; `debian:12-slim` → TCP to `deb.debian.org:443`, both with virtio bundled by `chm image build --modules` |
 
 ### Known, measured limitations
 
@@ -69,9 +70,9 @@ three ways:
 
 | Suite | Command | Passing |
 | --- | --- | --- |
-| chm | `cd chm && cargo test` | **537** passed / 3 ignored (lib), plus **2** passed / 7 ignored (integration) |
+| chm | `cd chm && cargo test` | **609** passed / 3 ignored (lib), plus **2** passed / 7 ignored (integration) |
 | hypervisor | `cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib` | **216** |
-| Swift app | `cd app/GimbalLocal && swift test` | **216** XCTest (3 skipped) + **10**, plus **34** Swift Testing cases in 5 suites |
+| Swift app | `cd app/GimbalLocal && swift test` | **221** XCTest (3 skipped) + **10**, plus **34** Swift Testing cases in 5 suites |
 | Lints | `make clippy` | **0** |
 
 `cargo test` and `swift test` each print **more than one** result line. Quote all
@@ -123,55 +124,40 @@ Progress on that track:
 | Issue | State |
 | --- | --- |
 | [#226](https://github.com/gimbal-dev/gimbal-local/issues/226) — no controlling terminal, so Ctrl-C did nothing | **Closed** (PR #229) |
-| [#222](https://github.com/gimbal-dev/gimbal-local/issues/222) — container guests get no network or disk | **Partly addressed** (PR #228 warns; PR #230 configures the NIC). Remaining: auto-detect sibling `lib/modules`, `--modules <dir>` |
-| [#225](https://github.com/gimbal-dev/gimbal-local/issues/225) — app says "No sandboxes yet" while a guest it launched runs | Open |
-| [#224](https://github.com/gimbal-dev/gimbal-local/issues/224) — agent workloads need a glibc rootfs | Open, and **newly blocked** (see below) |
+| [#227](https://github.com/gimbal-dev/gimbal-local/issues/227) — a guest never configured its own NIC | **Closed** (PR #230, plus the static `nicfg` configurator) |
+| [#224](https://github.com/gimbal-dev/gimbal-local/issues/224) — agent workloads need a glibc rootfs | **Closed** (PR #236 — `chm image build` says which libc an image ships) |
+| [#220](https://github.com/gimbal-dev/gimbal-local/issues/220) — a zboot-wrapped kernel was refused as if it were x86 | **Closed** (PR #240) |
+| [#222](https://github.com/gimbal-dev/gimbal-local/issues/222) — container guests get no network or disk | **Closed** — `chm image build --modules <DIR>` bundles the virtio closure and the generated init loads it. Hardware-proved on both musl (`insmod` present) and glibc (`insmod` absent, via chm's own static loader) |
+| [#225](https://github.com/gimbal-dev/gimbal-local/issues/225) — app says "No sandboxes yet" while a guest it launched runs | **Open — the last one on this track** |
 
 ### The live problem
 
-`node:22` — the **full** Debian-based image, ~1.1 GB — ships **neither `ip` nor
-`ifconfig`**. Nor does `node:22-slim`. Measured by running `which ip ifconfig`
-inside a booted guest and reading `rc=1`.
+**#225 — the app's model of "what is running" has a hole exactly the shape of
+its own flagship feature.** Cold boot is a subprocess by design (the daemon owns
+the single process-global HVF slot, so routing cold boots through it would
+serialise them), but `refreshLocal()` lists what the *daemon* knows, and the
+daemon knows nothing about a process it did not spawn. So the app reports
+`All sandboxes 0` while a guest **it built the command for** is running in
+Terminal. Same disease as #192 and #202 — except here the app is the owner.
 
-This matters more than it first looks. `chm` now configures the guest NIC from
-its generated init, preferring `ip` and falling back to `ifconfig`, and that is
-hardware-verified on `alpine:3.20`. But when an image ships neither tool, there
-is nothing a shell script can do — configuring an interface is an **ioctl**, and
-no shell builtin makes one. It is a chicken-and-egg: `apt install iproute2`
-needs the network.
-
-So the honest refusal `chm` prints is correct, but it is firing on the
-**mainstream** case, not an edge case. The direction under consideration is to stop depending on tools inside the
-guest and ship a small static aarch64 configurator in the initramfs that
-performs the interface ioctls directly. **This is a requirement sketch, not a
-settled design** — nothing has been built or measured. It would need, at
-minimum: `SIOCSIFADDR`, `SIOCSIFNETMASK` (the `/24` prefix is load-bearing),
-`SIOCSIFFLAGS` and `SIOCADDRT`; a defined failure behaviour; and a reproducible
-build with its provenance recorded. Binary size is unknown until someone
-builds it.
-
-Kernel-side `ip=` autoconfiguration does **not** rescue this: the Ubuntu generic
-kernel is built without `CONFIG_IP_PNP`.
+There is no lockout to fall back on: `hv_vm_create` is per-*process*, so a
+second guest starts fine. No bound, no visibility, and closing the Terminal
+window is a power cut on a writable overlay.
 
 ---
 
 ## The open issue list, grouped
 
-**First-run path (V9.18):** #222, #224, #225
-**Correctness / honesty of our own gates:** #214 (debug-only tests), #223 (Swift
-suite leaks a UserDefaults plist per run — 136 found on this machine)
+**First-run path (V9.18):** #225 is the only one left; #220, #222, #224 and
+#226 are all closed.
+**Correctness / honesty of our own gates:** #214 (debug-only tests)
 **CLI surface gaps:** #199 (`export --with-base`), #205 (disk-backed rootfs),
-#210 (`chm proxy ca` advertises a flag that does not exist), #211 (import is
-19× slower than export), #219 (README download link 404s for anyone outside the
-repo), #220 (zboot kernel refused as if it were x86)
-**Possibly stale — verify before working:** #215 says `chm exec` has no
-deadline, but `chm exec --help` documents `--timeout SECS (default 300)` and
-`exec_run` in `serve.rs` sets a single deadline covering the whole wait, with
-exit 124 for "did not answer in time". **Reproduce before fixing; close if
-fixed.**
+#211 (import is 19× slower than export), #219 (README download link 404s for
+anyone outside the repo)
 **Sandbox spec alignment (V9.15):** #182–#189
 **Product tracks:** #155 (opt-in ingress), #156 (runtime-mutable egress), #157
-(MCP server surface), #159 (V10 Living Workspaces), #170, #171, #174
+(MCP server surface), #159 (V10 Living Workspaces), #170, #171, #174, #238 (the
+generated init could install the proxy CA)
 **Security:** #36, #39
 **Control plane / cross-repo:** #5, #6, #20, #21
 
