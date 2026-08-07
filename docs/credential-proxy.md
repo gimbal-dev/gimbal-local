@@ -59,13 +59,62 @@ $ chm proxy ca ./my-workspace --for-guest
 ```
 
 This prints a self-contained shell block to paste into the guest console. It
-installs the certificate, then asks the guest's own trust store whether it
-accepts it — `openssl verify -CApath /etc/ssl/certs` — and prints `trusted:`
-with the fingerprint or `NOT TRUSTED`. **Scope:** the proxy only ever
-mints a leaf for a host that a rule already names — everything else is relayed
-with the origin's own certificate, so the CA's reach is exactly the allow-list.
+installs the certificate and then reports, separately, what each kind of client
+will actually do with it:
 
-Two things that check has to be, learned by getting both wrong:
+```
+system store: trusted
+node:         configured (/etc/gimbal/proxy-ca.crt)
+installed:    82ea8085…
+expected:     82ea8085…
+this shell:   . /etc/gimbal/proxy-ca.env
+```
+
+**Scope:** the proxy only ever mints a leaf for a host that a rule already
+names — everything else is relayed with the origin's own certificate, so the
+CA's reach is exactly the allow-list.
+
+### Node does not read the system trust store
+
+Installing the CA where `curl`, `git` and `apt` look does **not** configure
+Node, which carries its own compiled-in root list and consults
+`NODE_EXTRA_CA_CERTS` for anything else. Measured in one guest, seconds apart,
+with the CA verified in the system store:
+
+| | |
+| --- | --- |
+| `node` | `fail SELF_SIGNED_CERT_IN_CHAIN` |
+| `NODE_EXTRA_CA_CERTS=… node` | `ok status=403` |
+
+The 403 is the proof, not a problem: the handshake completed and the request
+reached GitHub, which rejected the deliberately fake token the probe rule
+attached. **A coding agent is a Node program**, so an installer that stopped at
+the system store shipped a guest where `curl` worked and the agent did not.
+
+Two consequences worth knowing:
+
+- **A script cannot export into the shell that ran it.** The certificate is
+  written with a one-line `/etc/gimbal/proxy-ca.env` beside it, and the
+  installer prints `. /etc/gimbal/proxy-ca.env` for the shell you are in.
+  `/etc/profile.d` covers later *login* shells — which a container guest's
+  `/bin/sh` is not.
+- **Node ignores an unreadable or unparseable `NODE_EXTRA_CA_CERTS` silently.**
+  So the installer has Node itself parse the file and reports `NOT LOADED` if
+  it cannot — a failure that otherwise has no symptom at all until a request
+  fails for an unrelated-looking reason.
+
+### A container guest has none of the usual furniture
+
+Measured on `node:22-slim`: no `sudo`, no `openssl`, no
+`update-ca-certificates`, and none of `/usr/local/share/ca-certificates`,
+`/usr/share/ca-certificates` or `/etc/ssl/certs`. An earlier installer opened
+with `sudo tee`, so **every line of it failed** — on exactly the kind of image
+these docs recommend for running an agent. It now uses `sudo` only if it is
+both needed and present, creates what it needs, and degrades to a named
+outcome (`installed, unverified (no openssl here)`) rather than either failing
+or claiming a trust it did not verify.
+
+Two things the trust-store check has to be, learned by getting both wrong:
 
 - **It must ask the question the guest will ask.** An earlier version re-read
   the file it had just written and reported matching fingerprints on a guest
