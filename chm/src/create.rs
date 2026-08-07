@@ -455,9 +455,60 @@ pub fn create_main(raw: &[String]) -> ExitCode {
     }
 }
 
+/// The CA archive to append to this run's initramfs, if there is one to append.
+///
+/// Deliberately silent and `None` in every case where a CA is not clearly
+/// wanted: no `--proxy-rules` at all, a rules file that resolves to nothing, or
+/// a workspace whose CA has not been generated yet. A first run generates the
+/// CA when the proxy starts, which is after this point -- so the honest answer
+/// there is that this guest does not have one, not a boot failure.
+///
+/// Only for container guests. A rehydrated snapshot's filesystem is the user's,
+/// and this appends to an initramfs chm itself wrote; there is no initramfs on
+/// the rehydrate path to append to.
+fn ca_archive_for(args: &CreateArgs) -> Result<Option<Vec<u8>>, String> {
+    let Some(rules) = args.proxy_rules.as_deref() else {
+        return Ok(None);
+    };
+    if args.cfg.initramfs.is_none() {
+        return Ok(None);
+    }
+    // The same workspace derivation the proxy itself uses below. Two
+    // derivations would eventually disagree, and the symptom would be a CA
+    // installed in the guest that does not match the one intercepting its
+    // traffic -- a TLS failure that names neither.
+    let Some(ws) = args
+        .workspace
+        .clone()
+        .or_else(|| rules.parent().map(Path::to_path_buf))
+    else {
+        return Ok(None);
+    };
+    credproxy::cli::ca_cpio_for(&ws)
+}
+
 fn run(args: &CreateArgs) -> Result<ExitCode, String> {
+    // The credential proxy's CA has to be in the rootfs before the rootfs is in
+    // guest RAM, and `build` below is what puts it there. So this is resolved
+    // first, even though the proxy itself does not start until the NIC exists.
+    //
+    // A CA that arrives later cannot help: the guest's init reads it during
+    // boot, and by the time the proxy starts the kernel has already unpacked
+    // the archive it was given.
+    let ca_cpio = ca_archive_for(args)?;
+
     let t_build = Instant::now();
-    let image = coldboot::build(&args.cfg)?;
+    // The only field that differs from `args.cfg`, and the only consumer of it
+    // is `build`. Everything below reads `args.cfg`, which is identical in
+    // every respect that any of it looks at.
+    let mut cfg = coldboot::ColdBootConfig {
+        initramfs_append: ca_cpio,
+        ..args.cfg.clone()
+    };
+    if cfg.initramfs_append.is_some() {
+        cfg.cmdline = format!("{} {}=1", cfg.cmdline, coldboot::CA_SENT_KEY);
+    }
+    let image = coldboot::build(&cfg)?;
     let build_ms = t_build.elapsed().as_secs_f64() * 1000.0;
 
     println!(
@@ -474,7 +525,34 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
             size as f64 / (1u64 << 20) as f64
         );
     }
-    println!("  cmdline    {}", args.cfg.cmdline);
+    // An initramfs has to be resident twice while the kernel unpacks it -- the
+    // archive itself, plus the rootfs it is writing into page cache -- and only
+    // then is the archive freed. Exceed that and the kernel stops unpacking
+    // *silently*: the guest boots, the rootfs looks complete, and whatever was
+    // at the tail is simply absent. Measured on node:22-slim at 768 MiB, where
+    // the appended CA archive vanished with no message from anything.
+    //
+    // A warning rather than a refusal, because this is a heuristic about the
+    // guest's memory and the threshold is calibrated from three measurements,
+    // not derived. Refusing a boot that would have worked is worse than warning
+    // about one that does.
+    if let Some((_, size)) = image.initramfs_placed {
+        let ram = args.cfg.memory_mib << 20;
+        if size * 4 > ram {
+            println!(
+                "  NOTE       the initramfs is {:.0} MiB of the guest's {} MiB. The \
+                 kernel needs it and its\n             unpacked copy resident at once, \
+                 and stops unpacking without saying so if it\n             cannot: \
+                 files at the end of the archive then simply do not exist.\n\
+                 \x20            Give it more memory with --memory if something is missing.",
+                size as f64 / (1u64 << 20) as f64,
+                args.cfg.memory_mib
+            );
+        }
+    }
+    // `cfg`, not `args.cfg`: the CA flag is added above and the printed command
+    // line has to be the one the guest is actually given.
+    println!("  cmdline    {}", cfg.cmdline);
     println!("  built in   {build_ms:.1} ms");
 
     // Only when a device was actually asked for: that is the moment the request
@@ -1242,6 +1320,23 @@ mod tests {
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| (*s).to_string()).collect()
     }
+    /// chm knows both numbers before the guest boots, so a silently-dropped
+    /// tail can be predicted rather than discovered inside a TLS error.
+    #[test]
+    fn a_cold_boot_says_so_when_the_initramfs_will_not_fit_twice_in_ram() {
+        let src = include_str!("create.rs");
+        let needle = format!("if {} * 4 > {} {{", "size", "ram");
+        assert!(
+            src.contains(&needle),
+            "the warning must compare the archive against the guest's RAM; the \
+             kernel needs the archive and its unpacked copy resident at once"
+        );
+        assert!(
+            src.contains("stops unpacking without saying so"),
+            "the note has to say the kernel is silent, or a reader will assume \
+             a missing file would have been reported"
+        );
+    }
 
     #[test]
     fn kernel_is_required_and_the_error_says_so() {
@@ -1585,5 +1680,38 @@ mod tests {
         .expect("must parse");
         assert!(!a.dry_run);
         assert_eq!(a.postboot.post_boot.as_ref().unwrap().len(), 3);
+    }
+
+    /// A guard is worth nothing if production stops calling it.
+    ///
+    /// Six times in this repo a rule has been correct, tested, and unreachable
+    /// because the call site quietly stopped consulting it -- and an assertion
+    /// about an *outcome* structurally cannot see a path that is no longer
+    /// taken. Every test below reads a generated init or an emitted archive, so
+    /// `run` resolving the CA and then discarding it leaves all of them green.
+    ///
+    /// The needles are assembled from parts on purpose: a literal would match
+    /// this test's own source and pass while `run` did nothing at all.
+    #[test]
+    fn the_resolved_ca_reaches_the_guest_rather_than_being_computed_and_dropped() {
+        let src = include_str!("create.rs");
+        let resolved = format!("let {} = {}(args)?;", "ca_cpio", "ca_archive_for");
+        assert!(
+            src.contains(&resolved),
+            "`run` must resolve the CA archive; without this the proxy still \
+             starts and the guest never learns to trust it"
+        );
+        let carried = format!("{}: {},", "initramfs_append", "ca_cpio");
+        assert!(
+            src.contains(&carried),
+            "the resolved archive must reach the boot config -- resolving it and \
+             dropping it costs nothing visible and breaks every guest"
+        );
+        let flagged = format!("{}, coldboot::{}_KEY)", "cfg.cmdline", "CA_SENT");
+        assert!(
+            src.contains(&flagged),
+            "the command line must say a CA was sent, or the init cannot tell \
+             `no proxy was asked for` from `the archive was lost in the boot`"
+        );
     }
 }

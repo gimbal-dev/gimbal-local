@@ -330,6 +330,15 @@ pub struct ColdBootConfig {
     pub disks: Vec<PathBuf>,
     /// Attach a `virtio-net` NIC backed by the userspace NAT.
     pub net: bool,
+    /// A second cpio archive appended after `initramfs`, for files only
+    /// `create` can know about -- today, the credential proxy's CA.
+    ///
+    /// Appended rather than merged because the image's initramfs is written
+    /// once, at `chm image build`, and a CA is per-workspace and per-run. The
+    /// kernel unpacks concatenated archives in order, so a later archive simply
+    /// adds to the rootfs the earlier one laid down. This is the same property
+    /// the module bundling already relies on.
+    pub initramfs_append: Option<Vec<u8>>,
 }
 
 impl Default for ColdBootConfig {
@@ -342,6 +351,7 @@ impl Default for ColdBootConfig {
             memory_mib: 1024,
             disks: Vec::new(),
             net: false,
+            initramfs_append: None,
         }
     }
 }
@@ -364,6 +374,15 @@ pub fn default_cmdline() -> String {
 /// would leave the guest silently at the epoch, which is the failure this
 /// exists to prevent.
 pub const EPOCH_KEY: &str = "gimbal.epoch";
+
+/// The command-line key telling a cold guest that a CA archive was appended.
+///
+/// The guest cannot otherwise tell "no proxy was asked for" from "a proxy was
+/// asked for and the archive did not survive the boot". Those need different
+/// answers -- silence and a diagnosis -- and the kernel gives no signal for the
+/// second: it stops unpacking without a word when memory runs short, which is
+/// exactly how this was measured on node:22-slim at 768 MiB.
+pub const CA_SENT_KEY: &str = "gimbal.ca";
 
 /// Whether a command line already carries an epoch key of its own.
 ///
@@ -794,18 +813,39 @@ pub fn build(cfg: &ColdBootConfig) -> Result<ColdGuestImage, String> {
                 .map_err(|e| format!("sizing initramfs {}: {e}", path.display()))?;
             f.seek(SeekFrom::Start(0))
                 .map_err(|e| format!("rewinding initramfs {}: {e}", path.display()))?;
-            let addr = (ram_end - size) & !0xfff_u64;
+
+            // A concatenated archive must start 4-byte aligned or the kernel
+            // reads its header off by a byte or three and stops unpacking --
+            // silently, which is the same failure mode as a cpio entry with no
+            // parent directory. `write_cpio` pads its own records, but the
+            // *first* archive is whatever the caller gave us.
+            let append = cfg.initramfs_append.as_deref().unwrap_or(&[]);
+            let pad = if append.is_empty() {
+                0
+            } else {
+                usize::try_from(size % 4).unwrap_or(0)
+            };
+            let pad = if pad == 0 { 0 } else { 4 - pad };
+            let total = size + pad as u64 + append.len() as u64;
+
+            let addr = (ram_end - total) & !0xfff_u64;
             if addr < kernel_end {
                 return Err(format!(
                     "initramfs is {} MiB and the kernel ends at {kernel_end:#x}, so it \
                      would not fit below the {} MiB of RAM; give the guest more memory",
-                    size.div_ceil(1 << 20),
+                    total.div_ceil(1 << 20),
                     cfg.memory_mib
                 ));
             }
             mem.read_exact_volatile_from(GuestAddress(addr), &mut f, size as usize)
                 .map_err(|e| format!("loading initramfs {}: {e}", path.display()))?;
-            Some((addr, size))
+            if !append.is_empty() {
+                let mut tail = vec![0u8; pad];
+                tail.extend_from_slice(append);
+                mem.write_slice(&tail, GuestAddress(addr + size))
+                    .map_err(|e| format!("loading the appended initramfs: {e}"))?;
+            }
+            Some((addr, total))
         }
     };
     let initramfs_cfg = initramfs_placed.map(|(addr, size)| InitramfsConfig {
