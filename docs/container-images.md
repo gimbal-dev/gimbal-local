@@ -182,23 +182,23 @@ Debian-based image) when you want a shell.
 
 ## A working agent sandbox, end to end
 
-Three things must all be true before the GitHub Copilot CLI will run in a
+Two things must both be true before the GitHub Copilot CLI will run in a
 container-image guest, and each one fails differently. The issue that prompted
 this ([#224](https://github.com/gimbal-dev/gimbal-local/issues/224)) named only
-the first; the other two were found by testing the recommendation rather than
-publishing it.
+the first; the second — and a third that has since been fixed outright — were
+found by testing the recommendation rather than publishing it.
 
 | requirement | if you skip it |
 | --- | --- |
 | **glibc rootfs** | `Node-API symbol napi_create_function has not been loaded` at first run |
-| **a kernel whose PL031 driver is present** | `certificate is not yet valid` — reads as a network fault, *is* a dead clock |
 | **`--entrypoint /bin/sh`** | you land in a Node REPL, not a shell |
 
-The second is the one to watch, because the symptom names the wrong subsystem
-entirely. See [the clock section](#the-guest-is-told-what-time-it-is): `chm`
-now passes the host time on the kernel command line in every case, so this is
-handled, but a kernel with a builtin PL031 (Alpine `virt`) is still the more
-robust choice.
+A third used to bite here — a kernel with no RTC driver left the guest at the
+epoch, and *every* TLS handshake then failed with `certificate is not yet
+valid`, an error that names the network for a fault in the clock. `chm` now
+passes the host time on the kernel command line in every case, and that is
+verified to work on a kernel with **no RTC at all**, so you no longer have to
+think about it. See [the clock section](#the-guest-is-told-what-time-it-is).
 
 Kernel and userland are independent, so mixing them is legitimate and is what
 the working combination does — the Alpine `virt` kernel for its drivers, a
