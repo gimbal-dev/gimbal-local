@@ -33,10 +33,14 @@ final class FirstRunGuidanceTests: XCTestCase {
 
     private func evaluate(
         snapshots: Bool = false,
-        images: [LocalImageLibrary.Entry] = []
+        images: [LocalImageLibrary.Entry] = [],
+        running: Int = 0
     ) -> FirstRunGuidance.State {
         FirstRunGuidance.evaluate(
-            hasSnapshots: snapshots, localImages: images, imagesPath: "~/gimbal/images"
+            hasSnapshots: snapshots,
+            localImages: images,
+            imagesPath: "~/gimbal/images",
+            runningGuests: running
         )
     }
 

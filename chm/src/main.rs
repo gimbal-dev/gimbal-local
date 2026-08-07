@@ -125,6 +125,12 @@ mod credproxy;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod startup;
 
+// A registry of running guests (#225). One HVF VM per process means no single
+// process can answer "what is running?", so each one records itself and
+// anything that wants the answer reads the directory.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod runs;
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn main() -> ExitCode {
     imp::main()

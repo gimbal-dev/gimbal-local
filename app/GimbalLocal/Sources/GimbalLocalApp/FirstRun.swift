@@ -69,8 +69,32 @@ enum FirstRunGuidance {
     static func evaluate(
         hasSnapshots: Bool,
         localImages: [LocalImageLibrary.Entry],
-        imagesPath: String
+        imagesPath: String,
+        // No default. A default is what let the call site drop this argument
+        // and still compile, so every test asserting the *outcome* stayed green
+        // while the app went back to denying a running guest. Requiring it makes
+        // that mutation a compile error rather than a silent regression — the
+        // same move that keeps the `fcntl` variadic declaration from reverting.
+        runningGuests: Int
     ) -> State {
+        // "No sandboxes yet" while a guest this app started is running in a
+        // Terminal window is the lie #225 reports, and it is a lie the app is
+        // uniquely placed to tell: a cold boot is a subprocess, so it never
+        // becomes a saved sandbox no matter how long it runs. Say what is
+        // actually true instead — there is nothing *saved* — and name the
+        // difference, because it is the thing a reader does not know.
+        if runningGuests > 0 {
+            let noun = runningGuests == 1 ? "guest is" : "guests are"
+            return State(
+                canStartSomething: true,
+                headline: "Nothing saved yet",
+                detail: "\(runningGuests) \(noun) running now, listed under "
+                    + "**Running now**. A cold boot runs straight from an image "
+                    + "and is not saved as a sandbox, so this page stays empty "
+                    + "until you create one from a snapshot.",
+                rejections: []
+            )
+        }
         let bootable = localImages.filter { $0.image != nil }
         let refused = localImages.filter { $0.image == nil }
         let rejections = refused.map {

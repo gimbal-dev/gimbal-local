@@ -21,6 +21,15 @@ struct ContentView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) {
             EngineStatusBar()
         }
+        // On the whole window, not on the "Running now" section: a section that
+        // only polls while it is on screen can never discover the first guest,
+        // and a guest started from the CLI being invisible here is the whole of
+        // #225. Two seconds is one cheap `chm ps`, chosen against the one-second
+        // uptime tick so a row cannot outlive its process by more than it takes
+        // to notice.
+        .onReceive(Timer.publish(every: 2, on: .main, in: .common).autoconnect()) { _ in
+            Task { await model.pollRunningGuests() }
+        }
         .toolbar {
             ToolbarItemGroup {
                 NewSandboxMenu()
@@ -128,6 +137,21 @@ private struct Sidebar: View {
                         .padding(.vertical, 2)
                 }
 
+                // In the sidebar rather than behind a page, because a guest you
+                // have to navigate to find is a guest you do not know about —
+                // which is the whole of #225. Hidden when empty so it does not
+                // become furniture.
+                if !model.unlistedRunningGuests.isEmpty {
+                    Section("Running now") {
+                        ForEach(model.unlistedRunningGuests) { record in
+                            SidebarRunRow(
+                                record: record,
+                                isStopping: model.stoppingPIDs.contains(record.pid)
+                            )
+                        }
+                    }
+                }
+
                 Section("Snapshots") {
                     SidebarPageRow(
                         title: "All snapshots",
@@ -195,6 +219,67 @@ private struct BrandHeader: View {
                     .foregroundStyle(.secondary)
             }
         }
+    }
+}
+
+/// One guest the app did not start, or started as a subprocess it cannot track.
+///
+/// Carries its own Stop because there is nowhere else for it to live: a cold
+/// boot has no saved sandbox and therefore no detail page. Without this the only
+/// way to stop one is to close its Terminal window, which is a power cut on a
+/// writable disk.
+private struct SidebarRunRow: View {
+    @EnvironmentObject private var model: AppModel
+    let record: RunRecord
+    let isStopping: Bool
+
+    /// Ticks so the age on screen stays true; a run listed as "0s" ten minutes
+    /// later reads as a stuck app.
+    @State private var now = Date()
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(Theme.cyan)
+                .frame(width: 7, height: 7)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(record.label)
+                    .font(.callout.weight(.semibold))
+                    .lineLimit(1)
+                Text(detail)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: 4)
+            Button("Stop") { model.stopRunningGuest(record) }
+                .buttonStyle(.plain)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                // Still enabled: a second SIGTERM costs nothing, and disabling
+                // the only control over a guest that is refusing to go would
+                // leave the user watching it.
+                // `String(record.pid)`, not the number itself: `help` takes a
+                // LocalizedStringKey, so an interpolated integer is locale
+                // formatted and a PID renders as "92,384" — which is not a PID
+                // and cannot be pasted into `kill`. The whole point of showing
+                // it is that someone can act on it.
+                .help("Ask this guest to shut down (pid \(String(record.pid)))")
+        }
+        .padding(.vertical, 3)
+        .onReceive(Timer.publish(every: 1, on: .main, in: .common).autoconnect()) {
+            now = $0
+        }
+    }
+
+    /// Reports the stop while it is outstanding, because the uptime is the wrong
+    /// answer then: a guest that has been asked to go and is still climbing
+    /// reads as a button that did nothing.
+    private var detail: String {
+        if isStopping {
+            return "\(record.kindDescription) · stopping…"
+        }
+        return "\(record.kindDescription) · \(record.sizeDescription) · \(record.uptimeDescription(now: now))"
     }
 }
 

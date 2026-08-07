@@ -17,6 +17,7 @@ use std::{env, fs, io, thread};
 use crate::bundle;
 use crate::checkpoint;
 use crate::livesnap;
+use crate::runs;
 use crate::create::create_main;
 use crate::oci::image::image_main;
 use crate::cloud;
@@ -1036,6 +1037,7 @@ pub fn main() -> ExitCode {
         Some("serve") => serve::serve_main(&raw[1..]),
         Some("ctl") => serve::ctl_main(&raw[1..]),
         Some("exec") => serve::exec_main(&raw[1..]),
+        Some("ps") => runs::ps_main(&raw[1..]),
         Some("spec") => spec::spec_main(&raw[1..]),
         Some("image") => image_main(&raw[1..]),
         Some("fork") => match fork(&raw[1..]) {
@@ -1139,7 +1141,8 @@ fn usage() -> String {
          chm restore <SNAPSHOT_DIR> [OPTIONS]  (alias for run)\n    \
          chm resume <SNAPSHOT_DIR> [OPTIONS]   (restore a saved checkpoint)\n    \
          chm connect <SNAPSHOT_DIR> [OPTIONS]  (interactive session)\n    \
-         chm exec [OPTIONS] -- <CMD> [ARG...]  (run a command in the guest)\n\
+         chm exec [OPTIONS] -- <CMD> [ARG...]  (run a command in the guest)\n    \
+         chm ps [--json]                       (what is running right now)\n\
     \
          chm spec <COMMAND> [OPTIONS]          (describe a sandbox in a file)\n\
      \n\
@@ -1974,7 +1977,7 @@ fn connect(args: &ConnectArgs) -> Result<ExitCode, String> {
     if !args.no_stop_daemon {
         stop_daemon_vm_if_present(&args.socket_path)?;
     }
-    run(&args.run)
+    run_as(&args.run, runs::Kind::Connect)
 }
 
 fn stop_daemon_vm_if_present(socket_path: &Path) -> Result<(), String> {
@@ -2023,6 +2026,17 @@ fn stop_daemon_vm_if_present(socket_path: &Path) -> Result<(), String> {
 }
 
 fn run(args: &Args) -> Result<ExitCode, String> {
+    run_as(args, runs::Kind::Run)
+}
+
+/// The shared body of `chm run` and `chm connect`.
+///
+/// `kind` is passed in rather than inferred, because the two differ only in
+/// what the caller meant and a guess would show up as a mislabelled row in
+/// `chm ps`. Inferring it from `--session-lock` was the obvious shortcut and is
+/// wrong: that flag says the app wants to watch the session, not which command
+/// was typed.
+fn run_as(args: &Args, kind: runs::Kind) -> Result<ExitCode, String> {
     let dir = &args.snapshot_dir;
     let loaded = load_snapshot(dir)?;
     startup::stamp("snapshot parsed");
@@ -2049,7 +2063,7 @@ fn run(args: &Args) -> Result<ExitCode, String> {
     // as pinned boundary tests against `hypervisor::hvf::gic` (see
     // `hypervisor/tests/hvf_boot.rs`); what is retired is the runtime path,
     // not the proof.
-    run_usgic(args, loaded)
+    run_usgic(args, loaded, kind)
 }
 
 /// Did **chm** choose the moment this session ended, rather than the user or the
@@ -2124,7 +2138,23 @@ impl its::LpiSink for UsgicLpiSink {
 }
 
 /// `chm run --userspace-gic`: drive the shared engine with an interactive
-fn run_usgic(args: &Args, loaded: Loaded) -> Result<ExitCode, String> {
+fn run_usgic(args: &Args, loaded: Loaded, kind: runs::Kind) -> Result<ExitCode, String> {
+    // Announce the run for the lifetime of the session (#225). The session lock
+    // below answers "is *this sandbox* live?" for a caller that already knows
+    // which sandbox it means; this answers "what is running on this machine?"
+    // for a caller that does not, which is the question the app could not ask.
+    let _registration = runs::register(
+        kind,
+        &runs::label_for(&args.snapshot_dir),
+        &args.snapshot_dir.display().to_string(),
+        loaded.num_vcpus,
+        loaded.total_ram / (1 << 20),
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("chm: warning: could not record this run: {e}");
+        None
+    });
+
     // Session-liveness lock, held for the whole interactive session. The app
     // reconciles which sandboxes are live by scanning these files, so it has to
     // be taken on the path the guest actually runs on. Held in a binding rather
