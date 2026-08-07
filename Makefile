@@ -7,7 +7,7 @@
 CHM_BIN := target/debug/chm
 SOCKET  ?= $${TMPDIR:-/tmp}/gimbal-local/chm.sock
 
-.PHONY: help chm chm-run chm-serve clippy fmt test-hvf security-check
+.PHONY: help chm chm-run chm-serve clippy fmt test-hvf test-release security-check
 
 help:
 	@echo "Cloud Hypervisor for macOS — make targets:"
@@ -18,6 +18,7 @@ help:
 	@echo "  make security-check           Enforce the no-host-FS-passthrough guard"
 	@echo "  make fmt                      Format (nightly rustfmt)"
 	@echo "  make test-hvf                 Run hvf_boot tests (signs, runs serially)"
+	@echo "  make test-release             Run every suite in RELEASE configuration"
 
 # Build and code-sign chm; prints the signed binary path on stdout.
 chm:
@@ -43,6 +44,36 @@ security-check:
 
 fmt:
 	cargo +nightly fmt --all
+
+# Every suite, in the configuration we actually ship.
+#
+# This target exists because of a shipped bug, not a preference. The first
+# signed release hung on *every* boot: `fcntl` was declared with a fixed third
+# argument, and on Apple arm64 variadic arguments go on the stack while fixed
+# ones go in registers, so `O_NONBLOCK` was never set and every vCPU parked
+# before one guest instruction. Correct tests for that behaviour existed and
+# passed the whole time — in debug, where the garbage happened to be a zero.
+#
+#   fn fcntl(fd, cmd, arg: i32)   opt-level=0 -> flags=0x0        (benign)
+#                                 opt-level=s -> flags=0x4000c0   (garbage)
+#
+# A suite that has only ever run in one configuration reports safety it does
+# not provide for any other. `scripts/release-macos.sh` runs these before it
+# builds anything, so a release cannot ship on debug-only evidence again — but
+# finding a release-only failure *at release time* is the worst moment for it:
+# highest pressure, least slack. This makes the configuration one command away.
+#
+# Run it before any milestone that claims a gate, not only before a release.
+test-release:
+	@set -e; \
+	echo "==> chm, release"; \
+	(cd chm && cargo test --release); \
+	echo "==> hypervisor, release (hvf,kvm-snapshot)"; \
+	cargo test -p hypervisor --release --no-default-features \
+		--features hvf,kvm-snapshot --lib; \
+	echo "==> app, release"; \
+	swift test -c release --package-path app/GimbalLocal; \
+	echo; echo "All suites green in release configuration."
 
 # The HVF integration tests create real VMs, so they need two things a plain
 # `cargo test` does not give them:

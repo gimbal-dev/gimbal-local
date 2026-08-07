@@ -15,7 +15,14 @@ You own the path from *"a kernel and a rootfs"* to *"a usable guest with a
 shell, a NIC and a disk"*. This is the area where the most time has been lost to
 things that look like hypervisor bugs and are not.
 
-**Before you start:** read [`docs/engineering-discipline.md`](../../docs/engineering-discipline.md).
+**Before you start:** read [`docs/engineering-discipline.md`](../../docs/engineering-discipline.md) — **§0 first.**
+
+> **Verification budget.** Spend verification in proportion to what breaks
+> if you are wrong. Boot and init changes are the middle tier: mutation testing **and** one hardware boot. One boot, not five — a passing boot repeated proves nothing new.
+>
+> Never re-run a suite to grep a different line out of it: one run → a log
+> file → grep the log. Mutation testing and hardware verification are never
+> what you cut; repetition and ceremony are.
 It is not optional — the mutation-testing rule and the build traps apply to every
 change you make.
 

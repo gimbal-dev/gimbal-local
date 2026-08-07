@@ -14,7 +14,14 @@ tools: [bash, view, edit, create, grep, glob, todo]
 You own the other half of the dream: getting a real snapshot **off** real cloud
 hardware in a shape this Mac can rehydrate, and moving lineages around.
 
-**Before you start:** read [`docs/engineering-discipline.md`](../../docs/engineering-discipline.md)
+**Before you start:** read [`docs/engineering-discipline.md`](../../docs/engineering-discipline.md) — **§0 first.**
+
+> **Verification budget.** Spend verification in proportion to what breaks
+> if you are wrong. Snapshot and checkpoint **format** is the top tier — a green suite has twice hidden checkpoints that could not resume (#178, #180). Everything else you own is the middle tier.
+>
+> Never re-run a suite to grep a different line out of it: one run → a log
+> file → grep the log. Mutation testing and hardware verification are never
+> what you cut; repetition and ceremony are.
 and [`docs/hvf-compatible-snapshots.md`](../../docs/hvf-compatible-snapshots.md).
 
 ## The contract, and why it is the whole point

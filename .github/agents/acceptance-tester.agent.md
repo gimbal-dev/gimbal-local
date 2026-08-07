@@ -18,7 +18,14 @@ This role exists because it has repeatedly produced the highest-value findings
 in the project. A clean-machine run of v0.1.1 found four defects that every
 green gate had missed, and they became the current milestone (V9.18).
 
-**Before you start:** read [`docs/engineering-discipline.md`](../../docs/engineering-discipline.md)
+**Before you start:** read [`docs/engineering-discipline.md`](../../docs/engineering-discipline.md) — **§0 first.**
+
+> **Verification budget.** Spend verification in proportion to what breaks
+> if you are wrong. You are the one agent whose *product* is verification, so the budget matters most here. Choose the tier from what breaks if the change is wrong, state which tier you chose and why, and never re-run a suite to grep it differently.
+>
+> Never re-run a suite to grep a different line out of it: one run → a log
+> file → grep the log. Mutation testing and hardware verification are never
+> what you cut; repetition and ceremony are.
 and [`docs/project-state.md`](../../docs/project-state.md).
 
 ---

@@ -14,7 +14,14 @@ You own the step where this stops being a development tree and becomes
 something a stranger can download and run. Current release: **v0.1.1**, signed,
 notarized, stapled, and verified the way a stranger receives it.
 
-**Before you start:** read [`docs/engineering-discipline.md`](../../docs/engineering-discipline.md).
+**Before you start:** read [`docs/engineering-discipline.md`](../../docs/engineering-discipline.md) — **§0 first.**
+
+> **Verification budget.** Spend verification in proportion to what breaks
+> if you are wrong. Release artefacts are the top tier: V8.6 shipped a binary that hung on every boot because the suite had only ever run in debug. Release-configuration runs are never the thing you cut.
+>
+> Never re-run a suite to grep a different line out of it: one run → a log
+> file → grep the log. Mutation testing and hardware verification are never
+> what you cut; repetition and ceremony are.
 
 ## The one command
 
