@@ -265,6 +265,100 @@ fn warn_kernel_virtio(path: &Path) -> Option<String> {
     VirtioBuiltin::scan(&data).warning()
 }
 
+/// Which C library the image ships, when it can be told.
+///
+/// This is not trivia. A prebuilt native addon is linked against one of these
+/// and will not load against the other, and the failure surfaces long after the
+/// build, in a message that never mentions the base image — see
+/// [`Libc::warning`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Libc {
+    Gnu,
+    Musl,
+    Unknown,
+}
+
+impl Libc {
+    /// The one case worth interrupting someone over. The message carries no
+    /// indentation of its own — each caller owns its own layout, and one baked
+    /// in indent can only ever line up under one of them. glibc is the assumption
+    /// most prebuilt binaries are built against, so it needs no comment, and
+    /// `Unknown` must not be reported as a problem — an image we cannot
+    /// classify is not thereby broken, and guessing would make the note
+    /// worthless everywhere.
+    pub fn warning(self) -> Option<&'static str> {
+        match self {
+            Self::Musl => Some(
+                "this image uses musl. Prebuilt Node-API addons are linked against\n\
+                 glibc and fail here with `napi_* has not been loaded` — the GitHub\n\
+                 Copilot CLI among them. Measured: node:22-alpine fails, node:22-slim\n\
+                 succeeds, same node version. Use a glibc base to run an agent inside.",
+            ),
+            Self::Gnu | Self::Unknown => None,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Gnu => "glibc",
+            Self::Musl => "musl",
+            Self::Unknown => "not identified",
+        }
+    }
+}
+
+/// Is this file name a shared object rather than something merely named after
+/// one? What follows `.so` must be a version — nothing, or `.1`, or `.6`. This
+/// exists because `ld-linux-aarch64.so.1.txt` passed a naive `.contains(".so")`
+/// and classified a whole image on the strength of a text file.
+fn is_shared_object(base: &str) -> bool {
+    match base.split_once(".so") {
+        None => false,
+        Some((_, "")) => true,
+        Some((_, rest)) => rest
+            .strip_prefix('.')
+            .is_some_and(|v| !v.is_empty() && v.chars().all(|c| c.is_ascii_digit() || c == '.')),
+    }
+}
+
+/// Classify by the dynamic loader's **file name**, never its directory.
+///
+/// Measured rather than assumed, because the obvious rule is wrong: musl sits
+/// at `lib/ld-musl-aarch64.so.1` while Debian's glibc is usr-merged three
+/// levels down at `usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1`. Anchoring
+/// to a directory would classify every usr-merged glibc image as unknown.
+///
+/// A loader is a shared object, so the name has to look like one — see
+/// [`is_shared_object`]. Without that, a note *about* the loader
+/// (`ld-linux-aarch64.so.1.txt`) classifies the whole image.
+///
+/// **An image carrying both loaders is `Unknown`, deliberately.** Both readings
+/// are real — a Debian image with `musl-dev` runs a glibc `node` whose addons
+/// load fine, an Alpine image with `gcompat` runs a musl `node` whose addons do
+/// not — and nothing here can tell them apart. A warning that fires on a
+/// working image is worse than a missing one, because it teaches people to
+/// ignore it everywhere.
+pub fn libc_flavour<'a>(paths: impl Iterator<Item = &'a str>) -> Libc {
+    let (mut gnu, mut musl) = (false, false);
+    for p in paths {
+        let base = p.rsplit('/').next().unwrap_or(p);
+        if !is_shared_object(base) {
+            continue;
+        }
+        if base.starts_with("ld-musl-") {
+            musl = true;
+        }
+        if base.starts_with("ld-linux-") || base == "libc.so.6" {
+            gnu = true;
+        }
+    }
+    match (gnu, musl) {
+        (false, true) => Libc::Musl,
+        (true, false) => Libc::Gnu,
+        _ => Libc::Unknown,
+    }
+}
+
 /// Round the measured rootfs up into a guest RAM figure.
 ///
 /// An initramfs is copied into RAM and then unpacked into a tmpfs, so the
@@ -379,6 +473,11 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
     let content = rootfs.content_bytes();
     println!("  rootfs: {} paths, {}", rootfs.len(), human_bytes(content));
 
+    // Classify what the *image* shipped, before the generated init is added —
+    // the init is ours and carries no loader, but the question being answered
+    // is about the base someone chose.
+    let libc = libc_flavour(rootfs.paths());
+
     print_report(&report);
 
     // The generated init goes in last, so image content can never shadow it —
@@ -455,9 +554,13 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
         &entrypoint,
         &report,
         pulled,
+        libc,
     )?;
 
     println!("\nWrote {}", out.display());
+    if let Some(w) = libc.warning() {
+        println!("\nNOTE: {}", w.replace('\n', "\n      "));
+    }
     if let Some(w) = warn_kernel_virtio(&kernel) {
         println!("\nNOTE: {w}");
     }
@@ -534,6 +637,7 @@ fn write_image_dir(
     entrypoint: &str,
     report: &apply::Report,
     pulled: u64,
+    libc: Libc,
 ) -> Result<(), String> {
     fs::create_dir_all(out).map_err(|e| format!("create {}: {e}", out.display()))?;
 
@@ -565,6 +669,10 @@ fn write_image_dir(
     );
     let _ = writeln!(notes, "kernel:     {} (copied)", kernel.display());
     let _ = writeln!(notes, "entrypoint: {entrypoint}");
+    let _ = writeln!(notes, "libc:       {}", libc.label());
+    if let Some(w) = libc.warning() {
+        let _ = writeln!(notes, "            {}", w.replace('\n', "\n            "));
+    }
     let _ = writeln!(notes, "pulled:     {} compressed", human_bytes(pulled));
     let _ = writeln!(notes, "initramfs:  {}", human_bytes(cpio.len() as u64));
     let _ = writeln!(
@@ -852,4 +960,85 @@ mod tests {
             "the refusal must name the limit, got: {e}"
         );
     }
+
+    /// The exact path Debian's node:22-slim ships, read back out of the cpio
+    /// this build produced. Three levels down and usr-merged, which is why the
+    /// classifier matches a file name rather than a directory.
+    #[test]
+    fn a_usr_merged_glibc_image_is_recognised() {
+        let paths = [
+            "usr/bin/node",
+            "usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+            "usr/lib/aarch64-linux-gnu/libc.so.6",
+        ];
+        assert_eq!(libc_flavour(paths.into_iter()), Libc::Gnu);
+        assert_eq!(libc_flavour(paths.into_iter()).warning(), None);
+    }
+
+    /// The exact path node:22-alpine ships. Directly under `lib/`, nowhere
+    /// near where glibc lives.
+    #[test]
+    fn a_musl_image_is_recognised_and_warned_about() {
+        let paths = ["usr/bin/node", "lib/ld-musl-aarch64.so.1"];
+        assert_eq!(libc_flavour(paths.into_iter()), Libc::Musl);
+        let w = libc_flavour(paths.into_iter())
+            .warning()
+            .expect("musl is the case worth interrupting someone over");
+        assert!(w.contains("napi_"), "name the symptom the user will actually see: {w}");
+        assert!(w.contains("glibc"), "name the remedy: {w}");
+    }
+
+    /// The classifier is documented as layout-independent, so it is asserted at
+    /// a second layout. Without this, anchoring the musl branch to `lib/` — the
+    /// one place Alpine happens to put it — passes the whole suite, which is
+    /// exactly what mutation M2 demonstrated.
+    #[test]
+    fn a_musl_loader_is_recognised_wherever_it_sits() {
+        for p in [
+            "lib/ld-musl-aarch64.so.1",
+            "usr/lib/ld-musl-aarch64.so.1",
+            "usr/lib/aarch64-linux-musl/ld-musl-aarch64.so.1",
+        ] {
+            assert_eq!(
+                libc_flavour(["usr/bin/node", p].into_iter()),
+                Libc::Musl,
+                "{p} should classify"
+            );
+        }
+    }
+
+    /// An image we cannot classify is not thereby broken. Reporting it as a
+    /// problem would make the note worthless on every image that is fine.
+    #[test]
+    fn an_unclassifiable_image_is_not_reported_as_a_problem() {
+        let paths = ["bin/busybox", "etc/passwd"];
+        assert_eq!(libc_flavour(paths.into_iter()), Libc::Unknown);
+        assert_eq!(libc_flavour(paths.into_iter()).warning(), None);
+        assert_eq!(Libc::Unknown.label(), "not identified");
+    }
+
+    /// Both readings of a two-loader image are real and nothing here can tell
+    /// them apart, so it must not claim either. A warning that fires on a
+    /// working glibc image is worse than a missing one.
+    #[test]
+    fn an_image_with_both_loaders_claims_neither() {
+        let both = [
+            "usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+            "lib/ld-musl-aarch64.so.1",
+        ];
+        assert_eq!(libc_flavour(both.into_iter()), Libc::Unknown);
+        assert_eq!(libc_flavour(both.into_iter()).warning(), None);
+        // Order must not decide it.
+        let reversed: Vec<&str> = both.into_iter().rev().collect();
+        assert_eq!(libc_flavour(reversed.into_iter()), Libc::Unknown);
+    }
+
+    /// A note *about* the loader is not a loader. `.so` is what separates them,
+    /// and this fired for real on the first run.
+    #[test]
+    fn a_file_named_after_a_loader_does_not_classify_the_image() {
+        let paths = ["opt/ld-musl-notes/README", "srv/ld-linux-aarch64.so.1.txt"];
+        assert_eq!(libc_flavour(paths.into_iter()), Libc::Unknown);
+    }
+
 }

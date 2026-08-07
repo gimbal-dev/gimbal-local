@@ -91,6 +91,12 @@ impl Rootfs {
         self.files.values().map(|n| n.data.len() as u64).sum()
     }
 
+    /// Every path in the image, so a caller can ask a question about the
+    /// rootfs as a whole without this type having to know what the question is.
+    pub fn paths(&self) -> impl Iterator<Item = &str> {
+        self.files.keys().map(String::as_str)
+    }
+
     pub fn insert(&mut self, path: String, kind: EntryKind, data: Vec<u8>) {
         self.files.insert(path, Node { kind, data });
     }
