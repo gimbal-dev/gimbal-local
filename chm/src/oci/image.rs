@@ -266,6 +266,54 @@ fn read_kernel(path: &Path) -> Result<(Vec<u8>, KernelForm), String> {
 /// the file would report "no virtio built in" for a kernel that has it -- a
 /// warning that is wrong in the direction that sends someone chasing #222 for
 /// a guest whose devices would have worked.
+/// Shell program names, matched on the **basename of the first token** only.
+///
+/// The trap this exists to avoid is `docker-entrypoint.sh node` -- the very
+/// entrypoint that prompted #246. It *ends in* `.sh`, so a suffix test says
+/// "shell" and stays quiet about the one image that most needs the warning.
+/// A substring test is worse again: `bash` contains `sh`, and so does
+/// `docker-entrypoint.sh`. Only the program name decides.
+const SHELL_NAMES: &[&str] = &["sh", "bash", "ash", "dash", "zsh", "ksh", "mksh", "busybox"];
+
+/// Whether a resolved entrypoint lands the user in a shell.
+///
+/// `busybox` is a shell only when told to be one -- `busybox sh` is, plain
+/// `busybox` prints its applet list and exits -- so it is the one name whose
+/// next token matters.
+fn entrypoint_is_shell(entrypoint: &str) -> bool {
+    let mut tokens = entrypoint.split_whitespace();
+    let Some(first) = tokens.next() else {
+        return false;
+    };
+    let program = first.rsplit('/').next().unwrap_or(first);
+    if program == "busybox" {
+        return tokens
+            .next()
+            .is_some_and(|a| SHELL_NAMES.contains(&a) && a != "busybox");
+    }
+    SHELL_NAMES.contains(&program)
+}
+
+/// Say so when the image's own entrypoint is not a shell.
+///
+/// Honouring the entrypoint is correct and stays the default. But an
+/// interactive sandbox almost always wants one, and the way you found out
+/// before was typing a shell command into a Node REPL and reading
+/// `Uncaught SyntaxError: Unexpected identifier` -- minutes into a boot, after
+/// a multi-hundred-MB pull. This fires *before* the pull.
+///
+/// Silent when `--entrypoint` was given: someone who chose it meant it.
+fn warn_entrypoint_not_shell(entrypoint: &str, explicit: bool) -> Option<String> {
+    if explicit || entrypoint_is_shell(entrypoint) {
+        return None;
+    }
+    Some(
+        "this is not a shell, so the guest will boot straight into it.\n\
+         For an interactive sandbox, build with --entrypoint /bin/sh"
+            .to_string(),
+    )
+}
+
 fn warn_kernel_virtio(image: &[u8], bundled: Option<&modules::Resolved>) -> Option<String> {
     let supplied: Vec<&str> = bundled
         .map(|r| r.modules.iter().map(|m| m.name.as_str()).collect())
@@ -605,6 +653,12 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
         .clone()
         .unwrap_or_else(|| config.boot_command());
     println!("  entrypoint: {entrypoint}");
+    // Before the layer pull, not after: the whole cost of finding this out the
+    // hard way is the pull and the boot that follow.
+    if let Some(w) = warn_entrypoint_not_shell(&entrypoint, args.entrypoint.is_some()) {
+        println!("\nNOTE: {}", w.replace('\n', "\n      "));
+        println!();
+    }
 
     let mut read_layers = Vec::new();
     let mut pulled = 0u64;
@@ -1241,6 +1295,80 @@ mod tests {
         ];
         assert_eq!(libc_flavour(paths.into_iter()), Libc::Gnu);
         assert_eq!(libc_flavour(paths.into_iter()).warning(), None);
+    }
+
+    /// #246. `docker-entrypoint.sh node` is what node:22-slim resolves to,
+    /// and it is the reason this is a basename test on the first token rather
+    /// than anything simpler: it *ends in* `.sh`, so a suffix test calls it a
+    /// shell and stays silent about the exact image that needs the warning.
+    #[test]
+    fn an_entrypoint_ending_in_sh_is_not_thereby_a_shell() {
+        assert!(!entrypoint_is_shell("docker-entrypoint.sh node"));
+        assert!(!entrypoint_is_shell("/usr/local/bin/docker-entrypoint.sh"));
+        assert!(!entrypoint_is_shell("/entrypoint.sh"));
+        assert!(warn_entrypoint_not_shell("docker-entrypoint.sh node", false).is_some());
+    }
+
+    #[test]
+    fn a_real_shell_is_recognised_by_any_of_its_usual_paths() {
+        for e in [
+            "/bin/sh",
+            "sh",
+            "/bin/bash",
+            "/bin/bash -l",
+            "/bin/ash",
+            "/usr/bin/zsh",
+            "busybox sh",
+        ] {
+            assert!(entrypoint_is_shell(e), "{e} should be a shell");
+            assert!(warn_entrypoint_not_shell(e, false).is_none(), "{e}");
+        }
+    }
+
+    /// Plain `busybox` prints its applet list and exits, so it is not a shell
+    /// -- only `busybox sh` is. The one name whose next token decides.
+    #[test]
+    fn busybox_is_a_shell_only_when_told_to_be_one() {
+        assert!(entrypoint_is_shell("busybox sh"));
+        assert!(entrypoint_is_shell("/bin/busybox ash"));
+        assert!(!entrypoint_is_shell("busybox"));
+        assert!(!entrypoint_is_shell("busybox httpd"));
+        assert!(!entrypoint_is_shell("busybox busybox"));
+    }
+
+    /// Someone who passed --entrypoint chose it. Telling them what they just
+    /// asked for is not a warning, it is noise.
+    #[test]
+    fn an_explicit_entrypoint_is_never_second_guessed() {
+        assert!(warn_entrypoint_not_shell("node", true).is_none());
+        assert!(warn_entrypoint_not_shell("/bin/sh", true).is_none());
+    }
+
+    /// The call site, guarded at the source, because a mutation that hardcodes
+    /// the `explicit` argument leaves every other test in this file green --
+    /// measured, not assumed. Same class that #242 found for the fourth time.
+    ///
+    /// The needle is assembled from parts so this assertion cannot match its
+    /// own text: the #226 guard passed a mutation because the string it looked
+    /// for appeared in the comment doing the looking.
+    #[test]
+    fn the_build_asks_whether_the_entrypoint_was_chosen() {
+        let src = include_str!("image.rs");
+        let needle = format!(
+            "{}(&entrypoint, args.{}.is_some())",
+            "warn_entrypoint_not_shell", "entrypoint"
+        );
+        assert!(
+            src.contains(&needle),
+            "the build must pass whether --entrypoint was given, not a constant"
+        );
+    }
+
+    #[test]
+    fn the_warning_names_the_flag_that_fixes_it() {
+        let w = warn_entrypoint_not_shell("node", false).expect("should warn");
+        assert!(w.contains("--entrypoint /bin/sh"), "{w}");
+        assert!(!entrypoint_is_shell(""));
     }
 
     /// The exact path node:22-alpine ships. Directly under `lib/`, nowhere
