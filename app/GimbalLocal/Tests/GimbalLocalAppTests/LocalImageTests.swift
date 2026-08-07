@@ -12,12 +12,17 @@ import XCTest
 /// builder are the whole feature. Both are pure, so both are tested directly
 /// rather than through a live filesystem or a live Terminal.
 final class LocalImageTests: XCTestCase {
-    private func classify(_ entries: [String], manifest: String? = nil) -> LocalImageLibrary.Entry {
+    private func classify(
+        _ entries: [String],
+        manifest: String? = nil,
+        probe: @escaping (String) -> LocalImageLibrary.KernelVerdict = { _ in .usable }
+    ) -> LocalImageLibrary.Entry {
         LocalImageLibrary.classify(
             name: "img",
             path: "/images/img",
             entries: entries,
-            manifestJSON: manifest.map { Data($0.utf8) }
+            manifestJSON: manifest.map { Data($0.utf8) },
+            probeKernel: probe
         )
     }
 
@@ -37,19 +42,63 @@ final class LocalImageTests: XCTestCase {
         XCTAssertEqual(e.image?.diskPaths, ["/images/img/rootfs.img"])
     }
 
-    /// The failure this prevents is the expensive one: a distro `vmlinuz` is
-    /// gzip, boots to nothing, and looks like a hypervisor bug rather than a
-    /// wrong file. Naming it costs one branch.
-    func testACompressedKernelIsRefusedByNameRatherThanBooted() {
-        let e = classify(["vmlinuz", "rootfs.img"])
-        XCTAssertNil(e.image)
-        XCTAssertEqual(e.rejection, .kernelIsCompressed("vmlinuz"))
-        XCTAssertTrue(e.rejection!.reason.contains("gunzip"))
+    /// #242. The app used to refuse every gzip-named kernel outright, which was
+    /// right when the engine could only boot a raw `Image` and became wrong the
+    /// moment it learned to unwrap gzip and EFI zboot. Alpine ships
+    /// `vmlinuz-virt`, so this was the first thing a new user hit.
+    func testACompressedKernelTheEngineCanUnwrapIsAccepted() {
+        let e = classify(["vmlinuz-virt", "rootfs.img"])
+        XCTAssertNil(e.rejection)
+        XCTAssertEqual(e.image?.kernelPath, "/images/img/vmlinuz-virt")
     }
 
-    func testAManifestNamedKernelThatIsAlsoGzipIsStillRefused() {
+    func testAManifestNamedCompressedKernelIsAcceptedToo() {
         let e = classify(["Image.gz"], manifest: #"{"kernel":"Image.gz"}"#)
-        XCTAssertEqual(e.rejection, .kernelIsCompressed("Image.gz"))
+        XCTAssertNil(e.rejection)
+        XCTAssertEqual(e.image?.kernelPath, "/images/img/Image.gz")
+    }
+
+    /// Accepting more must not mean accepting everything. The verdict is the
+    /// engine's, so an x86 kernel is still named rather than booted -- and the
+    /// app carries the engine's own sentence rather than a guess of its own.
+    func testAKernelTheEngineRefusesIsStillRefusedByName() {
+        let e = classify(["Image"], probe: { _ in .unusable("x86 bzImage, not an arm64 kernel") })
+        XCTAssertNil(e.image)
+        XCTAssertEqual(e.rejection, .kernelUnusable("Image", "x86 bzImage, not an arm64 kernel"))
+        XCTAssertTrue(e.rejection!.reason.contains("x86 bzImage"))
+    }
+
+    /// The probe must run on the kernel that was actually chosen, not on a
+    /// name the app guessed at, or a manifest could route around it.
+    func testTheProbeSeesTheChosenKernelPath() {
+        var asked: [String] = []
+        _ = classify(
+            ["Image", "vmlinuz"], manifest: #"{"kernel":"vmlinuz"}"#,
+            probe: { p in
+                asked.append(p)
+                return .usable
+            }
+        )
+        XCTAssertEqual(asked, ["/images/img/vmlinuz"])
+    }
+
+    /// The guard against #242 coming back: the app must not hold its own list
+    /// of which kernels are bootable. `chm kernel probe` is the one authority,
+    /// and a compressed *spelling* is now just a filename like any other.
+    func testTheAppDoesNotReimplementTheEnginesKernelRules() throws {
+        let src = try String(
+            contentsOfFile: (((#filePath as NSString).deletingLastPathComponent as NSString)
+                .deletingLastPathComponent as NSString).deletingLastPathComponent
+                + "/Sources/GimbalLocalApp/LocalImage.swift",
+            encoding: .utf8
+        )
+        for smell in ["compressedKernelNames", "0x1f, 0x8b", "gzipMagic", "\"zimg\""] {
+            XCTAssertFalse(
+                src.contains(smell),
+                "LocalImage.swift should ask `chm kernel probe`, not restate its rules (found \(smell))"
+            )
+        }
+        XCTAssertTrue(src.contains("\"kernel\", \"probe\""))
     }
 
     func testADirectoryWithNoKernelIsRefusedWithAUsableReason() {

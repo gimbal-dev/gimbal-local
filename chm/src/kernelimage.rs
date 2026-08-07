@@ -36,7 +36,10 @@
 //! handle.
 
 use std::borrow::Cow;
+use std::fs;
 use std::io::Read;
+use std::path::Path;
+use std::process::ExitCode;
 use std::str;
 
 use flate2::read::GzDecoder;
@@ -323,6 +326,139 @@ fn le_u32(data: &[u8], at: usize) -> u32 {
     u32::from_le_bytes(data[at..at + 4].try_into().expect("4 bytes in range"))
 }
 
+/// `chm kernel <COMMAND>` — the group, so the dispatch in `imp.rs` stays one
+/// line per top-level command like every other multi-command group here.
+pub fn kernel_main(raw: &[String]) -> ExitCode {
+    use std::process::ExitCode;
+    match raw.first().map(String::as_str) {
+        Some("probe") => probe_main(&raw[1..]),
+        Some("-h" | "--help") | None => {
+            println!("{}", kernel_usage());
+            // No subcommand is a usage error, not a success: a script that
+            // typed nothing did not get what it asked for.
+            if raw.is_empty() {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            }
+        }
+        Some(other) => {
+            eprintln!(
+                "chm kernel: unknown subcommand {other}\n\n{}",
+                kernel_usage()
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn kernel_usage() -> String {
+    "chm kernel <COMMAND>\n\nCOMMANDS:\n    probe <PATH> [--json]    can this host cold-boot PATH?"
+        .to_string()
+}
+
+/// `chm kernel probe <PATH>` — is this file a kernel this host can cold-boot?
+///
+/// Exists so the **app** has one authority to ask rather than a second copy of
+/// these rules. The app used to classify kernels by filename, which cannot see
+/// that `Image` is really gzip and refused `vmlinuz-virt` — the file every
+/// distro ships — on the strength of its name. Filenames are not a format.
+pub fn probe_main(raw: &[String]) -> ExitCode {
+    use std::process::ExitCode;
+    let mut json = false;
+    let mut path: Option<&str> = None;
+    for a in raw {
+        match a.as_str() {
+            "--json" => json = true,
+            "-h" | "--help" => {
+                println!("{}", probe_usage());
+                return ExitCode::SUCCESS;
+            }
+            other if other.starts_with('-') => {
+                eprintln!(
+                    "chm kernel probe: unknown option {other}\n\n{}",
+                    probe_usage()
+                );
+                return ExitCode::FAILURE;
+            }
+            other => {
+                if path.is_some() {
+                    eprintln!("chm kernel probe: one path at a time\n\n{}", probe_usage());
+                    return ExitCode::FAILURE;
+                }
+                path = Some(other);
+            }
+        }
+    }
+    let Some(path) = path else {
+        eprintln!("chm kernel probe: missing <PATH>\n\n{}", probe_usage());
+        return ExitCode::FAILURE;
+    };
+    let label = Path::new(path)
+        .file_name()
+        .map_or_else(|| path.to_string(), |n| n.to_string_lossy().into_owned());
+
+    // Only the header is needed to classify, but a compressed kernel has to be
+    // inflated to check the arm64 magic underneath -- so read the file.
+    let data = match fs::read(path) {
+        Ok(d) => d,
+        Err(e) => return probe_answer(json, Err(format!("`{label}` could not be read: {e}"))),
+    };
+    probe_answer(json, decode(&data, &label).map(|(_, form)| form.describe()))
+}
+
+/// One place that formats both outcomes, so the JSON and human shapes cannot
+/// drift apart and the exit status always matches what was printed.
+fn probe_answer(json: bool, r: Result<String, String>) -> ExitCode {
+    use std::process::ExitCode;
+    match r {
+        Ok(form) => {
+            if json {
+                println!("{}", probe_json(&Ok(form.clone())));
+            } else {
+                println!("{form}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(reason) => {
+            if json {
+                // The reason goes to stdout with the JSON, not stderr: a caller
+                // parsing this wants the explanation in the object it already
+                // has, not split across two streams.
+                println!("{}", probe_json(&Err(reason)));
+            } else {
+                eprintln!("{reason}");
+            }
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// The `--json` body for either outcome.
+///
+/// Split out from the printing so the shape the app parses is testable without
+/// spawning a process. `usable` is always present, so a caller never has to
+/// infer the verdict from which *other* key it finds.
+#[must_use]
+pub fn probe_json(r: &Result<String, String>) -> String {
+    match r {
+        Ok(form) => serde_json::json!({ "usable": true, "form": form }).to_string(),
+        Err(reason) => serde_json::json!({ "usable": false, "reason": reason }).to_string(),
+    }
+}
+
+fn probe_usage() -> String {
+    "chm kernel probe <PATH> [--json]\n\n\
+     Report whether PATH is an arm64 kernel this host can cold-boot, and in\n\
+     what form. gzip and EFI zboot wrappings are unwrapped and the payload\n\
+     checked, so a distro's shipped `vmlinuz` is usable as-is.\n\n\
+     Exit status is 0 when usable and 1 when not, so a caller can branch on it\n\
+     without parsing anything.\n\n\
+     OPTIONS:\n    \
+     --json    machine-readable: {\"usable\":bool,\"form\"|\"reason\":string}"
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -530,5 +666,41 @@ mod tests {
         );
         let (decoded, _) = decode(&wrapped, "vmlinuz").expect("decodes");
         assert_eq!(release(&decoded).as_deref(), Some("6.6.142-0-virt"));
+    }
+
+    /// The app branches on `usable`, so it has to be present in both shapes --
+    /// inferring the verdict from which other key turned up would make a typo
+    /// in either name read as "usable".
+    #[test]
+    fn probe_json_always_states_the_verdict() {
+        let ok = probe_json(&Ok("uncompressed arm64 Image".to_string()));
+        assert!(ok.contains(r#""usable":true"#), "{ok}");
+        assert!(ok.contains("uncompressed arm64 Image"), "{ok}");
+
+        let bad = probe_json(&Err("`x` is not a kernel".to_string()));
+        assert!(bad.contains(r#""usable":false"#), "{bad}");
+        assert!(bad.contains("is not a kernel"), "{bad}");
+    }
+
+    /// A reason carrying a quote or a backslash must not produce a document the
+    /// app cannot parse. The real message does exactly this: it contains
+    /// `ARM\x64` and backquotes.
+    #[test]
+    fn probe_json_escapes_a_hostile_reason() {
+        let raw = "`a\"b` has ARM\\x64 and a\nnewline";
+        let out = probe_json(&Err(raw.to_string()));
+        let v: serde_json::Value = serde_json::from_str(&out).expect("parses as JSON");
+        assert_eq!(v["usable"], serde_json::Value::Bool(false));
+        assert_eq!(v["reason"], serde_json::Value::String(raw.to_string()));
+    }
+
+    /// The whole point of the subcommand: the file a distro actually ships is
+    /// usable, not refused. This is the case the app was rejecting by name.
+    #[test]
+    fn a_zboot_wrapped_kernel_probes_as_usable() {
+        let wrapped = zboot(&gzip(&arm64_image(4096)), "gzip");
+        let (_, form) = decode(&wrapped, "vmlinuz-virt").expect("decodes");
+        let out = probe_json(&Ok(form.describe()));
+        assert!(out.contains(r#""usable":true"#), "{out}");
     }
 }

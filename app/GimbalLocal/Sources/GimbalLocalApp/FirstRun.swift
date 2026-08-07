@@ -40,10 +40,11 @@ enum FirstRunGuidance {
     /// What a usable image directory contains. Stated once, here, so the empty
     /// state and the New sandbox menu cannot drift apart on the answer.
     static let layoutHelp = """
-        An image is a **folder** containing an uncompressed arm64 `Image` \
-        kernel. Everything else is optional: an `initramfs`, raw disks \
-        (`rootfs.img` becomes `/dev/vda`), and an `image.json` naming them \
-        explicitly if the filenames differ.
+        An image is a **folder** containing an arm64 `Image` kernel — \
+        gzip and EFI zboot kernels such as Alpine's `vmlinuz-virt` are \
+        unwrapped for you. Everything else is optional: an `initramfs`, raw \
+        disks (`rootfs.img` becomes `/dev/vda`), and an `image.json` naming \
+        them explicitly if the filenames differ.
         """
 
     /// The same load-bearing fact as `layoutHelp`, short enough for a menu row.
@@ -56,7 +57,7 @@ enum FirstRunGuidance {
     /// Both are checked against each other by a test, so the menu and the empty
     /// state cannot come to disagree about what a kernel file is.
     static func layoutOneLine(imagesPath: String) -> String {
-        "Put a folder with an uncompressed arm64 Image file in \(imagesPath)"
+        "Put a folder with an arm64 Image kernel (gzip is fine) in \(imagesPath)"
     }
 
     /// Strip markdown emphasis for somewhere that cannot render it — menus, in
