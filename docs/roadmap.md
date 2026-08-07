@@ -2076,16 +2076,21 @@ vs. real builds), so they double as end-to-end validation of M30/M31.
   recommended capture shape.** The remaining gap is that `chm serve` has not been
   wired to it yet (#102), so the daemon still requires a `gicv2m-message-spi`
   capture. See [`hvf-compatible-snapshots.md`](hvf-compatible-snapshots.md).
-- **Counter frequency is a hard, unfixable-at-restore part of the compatibility
-  contract.** A guest caches `CNTFRQ_EL0` at boot and never re-reads it. Apple
-  presents HVF guests **24 000 000 Hz** and offers no way to change it —
-  `hv_vcpu_set_vtimer_offset` sets an *offset*, never a *rate*. **Measured
-  2026-07-28:** an AWS Graviton2 guest (`121 875 000 Hz`) resumed on Apple silicon
-  runs **5.08× slow** in wall-clock terms — correct, self-consistent, and living
-  in dilated time. It presents as sluggishness, not as a clock fault, which makes
-  it the most dangerous failure mode we have. The HVF path does not yet check
-  (#104). See [`graviton-acid-test-results.md`](graviton-acid-test-results.md) §4
-  for every mitigation considered and why each one is or is not available.
+- **Counter frequency is a real constraint, and it is corrected — not endured.**
+  ~~Unfixable at restore.~~ **Retracted 2026-07-30.** A guest caches `CNTFRQ_EL0`
+  at boot and never re-reads it; Apple presents HVF guests **24 000 000 Hz** and
+  `hv_vcpu_set_vtimer_offset` sets an *offset*, never a *rate*. An AWS Graviton2
+  guest (`121 875 000 Hz`) therefore ran **5.081×** slow. But **an offset moved
+  continuously *is* a rate**: re-stepping it onto
+  `base + (now − base_host) × guest_hz / host_hz` synthesizes one, and `325/64`
+  reduces exactly so u128 math drifts zero. **Measured 1.000×** (#108).
+
+  What genuinely remains: a capture must **record** its host's counter frequency
+  for this to happen automatically, which needs a cloud-hypervisor build
+  including upstream `69637dde6`. An older capture must be told
+  `CHM_GUEST_CNTFRQ=121875000`; `CHM_STRICT_CNTFRQ=1` refuses to start rather
+  than run dilated. See
+  [`graviton-acid-test-results.md`](graviton-acid-test-results.md) §4.
 - **arm64 KVM capacity.** Producing real snapshots needs a genuine arm64 `/dev/kvm`
   host (a Lima nested-KVM guest for $0, or Graviton bare metal); the Mac itself
   can only *run* snapshots, never capture them.

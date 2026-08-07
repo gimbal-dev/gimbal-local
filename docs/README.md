@@ -29,7 +29,7 @@ Gimbal Local app — these are the docs you want:
 | [`graviton-capture-request.md`](graviton-capture-request.md) | The exact snapshot we need captured on real cloud hardware, and how to produce it. Corrected after round 1. |
 | [`cpu-feature-deltas.md`](cpu-feature-deltas.md) | **Which of a capture's CPU registers this Mac actually reproduces** (V1.4). 105 of 238 restore faithfully — and the one real bug is a register HVF restores *perfectly*: the guest still believes it can run 32-bit binaries, and doing so wedges the vCPU. |
 | [`environment-variables.md`](environment-variables.md) | Every `CHM_*` variable: the `CHM_TRACE_*` diagnostic surface (there is no debugger for a guest vCPU), the behavioural overrides for A/B-ing a bug, and the policy bindings. |
-| [`graviton-acid-test-results.md`](graviton-acid-test-results.md) | **What happened when we ran it.** A vanilla Graviton2 snapshot boots on Apple silicon — and the guest's clock runs 5.08× slow. The evidence, the numbers, and what can and cannot be fixed. |
+| [`graviton-acid-test-results.md`](graviton-acid-test-results.md) | **What happened when we ran it.** A vanilla Graviton2 snapshot boots on Apple silicon. Includes the counter-frequency dilation — measured at 5.081× uncorrected, and **1.000× once corrected** — with every mitigation considered and why each is or is not available. |
 | [`aws-byo-setup.md`](aws-byo-setup.md) | Bring-your-own-AWS setup for the remote→local→remote capture loop (`chm cloud …`). |
 | [`raspberry-pi-offbox-plan.md`](raspberry-pi-offbox-plan.md) | Plan for off-box snapshot capture on a Raspberry Pi / ARM Linux host. |
 
