@@ -54,6 +54,7 @@ pub mod apply;
 pub mod entry;
 pub mod image;
 pub mod initramfs;
+pub mod nicfg;
 pub mod reference;
 pub mod registry;
 pub mod targz;

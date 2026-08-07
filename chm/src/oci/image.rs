@@ -46,6 +46,7 @@ use std::process::ExitCode;
 use super::apply;
 use super::initramfs::{default_init, write_cpio};
 use super::reference::{self, Reference};
+use super::nicfg;
 use super::registry::{self, ImageConfig, Registry};
 use super::targz;
 use crate::coldboot::VirtioBuiltin;
@@ -399,6 +400,27 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
         },
         init.into_bytes(),
     );
+    // chm's own NIC configurator, for the images that ship neither `ip` nor
+    // `ifconfig` — which includes node:22 and node:22-slim. Installed beside
+    // the init and, like it, last, so image content cannot shadow it.
+    //
+    // A failure here is a build-integrity problem, not something the user's
+    // image did, so it is reported and the build continues: the init still
+    // falls through to a refusal that names the addresses, which is what
+    // happened before this existed.
+    match nicfg::configurator() {
+        Ok(bytes) => {
+            rootfs.insert(
+                nicfg::GUEST_PATH.to_string(),
+                EntryKind::File {
+                    mode: 0o755,
+                    size: bytes.len() as u64,
+                },
+                bytes,
+            );
+        }
+        Err(e) => eprintln!("  warning: {e}"),
+    }
     // The mount points the init needs. A `FROM scratch` image has none of these,
     // and a missing /proc turns into a guest that boots to a shell where nothing
     // works, which reads as a broken kernel.

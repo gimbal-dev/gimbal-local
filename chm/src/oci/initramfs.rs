@@ -312,6 +312,9 @@ pub fn default_init(entrypoint: &str, env: &[String], workdir: Option<&str>) -> 
     let gateway_ip = dotted(GATEWAY_IP);
     let guest_prefix = GUEST_PREFIX_LEN;
     let guest_netmask = dotted(prefix_to_netmask(GUEST_PREFIX_LEN));
+    // Read from the module that installs it, so the init cannot name a path
+    // the image does not have.
+    let nicfg = super::nicfg::GUEST_PATH;
 
     // The image's own environment, delivered rather than merely understood.
     //
@@ -398,13 +401,18 @@ if [ -e /sys/class/net/eth0 ]; then
         :
     elif ifconfig eth0 {guest_ip} netmask {guest_netmask} up 2>/dev/null; then
         route add default gw {gateway_ip} 2>/dev/null
+    elif /{nicfg} 2>/dev/null; then
+        # Neither tool is present, so chm's own configurator does the ioctls.
+        # This is the mainstream case, not an edge case: node:22 and
+        # node:22-slim both ship neither `ip` nor `ifconfig`.
+        :
     else
         # Configuring an interface needs an ioctl, and no shell builtin makes
-        # one -- so if the image ships neither tool there is nothing this init
-        # can do. Say which tools are missing rather than leaving a silent NIC.
-        echo "gimbal: eth0 is present but this image has no working 'ip' or"
-        echo "gimbal: 'ifconfig', so it cannot be configured. Use an image that"
-        echo "gimbal: has iproute2 or busybox, or configure it yourself:"
+        # one -- so with no tool and no working configurator there is nothing
+        # this init can do. Say so rather than leaving a silent NIC.
+        echo "gimbal: eth0 is present but could not be configured: this image"
+        echo "gimbal: has no working 'ip' or 'ifconfig', and chm's own"
+        echo "gimbal: configurator did not run. Configure it yourself with:"
         echo "gimbal:   <tool> addr add {guest_ip}/{guest_prefix} dev eth0"
         echo "gimbal:   <tool> route add default via {gateway_ip}"
     fi
@@ -1023,18 +1031,41 @@ mod tests {
     }
 
     #[test]
-    fn an_image_with_no_network_tool_is_told_which_tools_are_missing() {
+    fn an_image_with_no_network_tool_still_gets_configured() {
         // Configuring an interface needs an ioctl and no shell builtin makes
-        // one, so this case is unfixable from inside the init -- which makes
-        // saying so the whole of the remedy. node:22-slim is a real example.
+        // one. This used to be the end of the story, and the init could only
+        // print a refusal -- on the *mainstream* case, since node:22 and
+        // node:22-slim ship neither `ip` nor `ifconfig`. chm now carries its
+        // own configurator, so there is a third rung before giving up.
         let s = default_init("/bin/sh", &[], None);
+        let nicfg = super::super::nicfg::GUEST_PATH;
+
         assert!(
-            s.contains("no working 'ip' or"),
+            s.contains(&format!("elif /{nicfg} 2>/dev/null; then")),
+            "the configurator must be tried before refusing:\n{s}"
+        );
+        // Order matters: it is the fallback, not the default. An image that
+        // ships `ip` should use it, because it is the more capable and more
+        // debuggable tool and it is what the distro expects.
+        let ip = s.find("ip link set eth0 up").expect("ip rung");
+        let ifc = s.find("elif ifconfig eth0").expect("ifconfig rung");
+        let own = s.find(&format!("elif /{nicfg}")).expect("nicfg rung");
+        assert!(
+            ip < ifc && ifc < own,
+            "rungs are out of order: ip={ip} ifconfig={ifc} nicfg={own}"
+        );
+        // And the refusal still exists for the case where even that fails,
+        // naming the addresses so the operator can finish the job by hand.
+        assert!(
+            s.contains("could not be configured"),
             "a silent NIC reads as broken networking:\n{s}"
         );
         assert!(
-            s.contains("iproute2 or busybox"),
-            "name what the image needs, not just what it lacks:\n{s}"
+            s.contains(&format!(
+                "addr add {}.{}.{}.{}/",
+                GUEST_IP[0], GUEST_IP[1], GUEST_IP[2], GUEST_IP[3]
+            )),
+            "the refusal must name the address to use:\n{s}"
         );
     }
 }
