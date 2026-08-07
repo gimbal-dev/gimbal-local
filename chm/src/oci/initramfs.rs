@@ -475,10 +475,41 @@ for __a in $(cat /proc/cmdline 2>/dev/null); do
     esac
 done
 if [ -n "$__epoch" ]; then
-    date -s "@$__epoch" >/dev/null 2>&1 ||
-        echo "gimbal: could not set the clock; TLS will fail until it is right"
+    # No `||` here on purpose: BusyBox's `date -s` exits 0 even when it fails,
+    # so an exit-status branch would be dead code on every Alpine guest. The
+    # year check below measures the clock instead, which is the only reading
+    # that cannot lie.
+    date -s "@$__epoch" >/dev/null 2>&1
 fi
 unset __a __epoch
+# Whatever the reason -- no argument, no `date`, or a `date` that said it
+# worked and did not -- a guest left in 1970 does not fail in a way that names
+# the clock. It fails with `certificate is not yet valid` on every TLS
+# handshake, because 1970 predates every certificate it will ever be shown, and
+# that reads as a broken network.
+#
+# This checks the clock rather than the exit status of the thing that set it,
+# because the exit status lies. Measured on BusyBox 1.36 arm64: `date -s @0`
+# prints "can't set date: Invalid argument" and **exits 0**, so an `||` branch
+# never runs and the failure would be silent. (That particular refusal is
+# BusyBox declining to move the clock *backwards* to 1970; setting it forward
+# from the command line works, and is verified to work on a kernel with no RTC
+# at all.) The point stands: only reading the clock afterwards is trustworthy.
+__y=$(date -u +%Y 2>/dev/null)
+case "$__y" in
+'' | *[!0-9]*) ;;
+*)
+    if [ "$__y" -lt 2000 ]; then
+        echo "gimbal: the guest clock is at the epoch ($(date -u 2>/dev/null))."
+        echo "gimbal: every TLS handshake will fail with 'certificate is not"
+        echo "gimbal: yet valid' -- that is this clock, not your network."
+        echo "gimbal: neither this kernel's RTC nor gimbal.epoch= on the"
+        echo "gimbal: command line could set it. A kernel with PL031 builtin"
+        echo "gimbal: (Alpine's 'virt') or --modules carrying rtc-pl031 fixes it."
+    fi
+    ;;
+esac
+unset __y
 {load_modules}
 # A container image's /etc/resolv.conf is usually absent or points at a runtime
 # resolver that does not exist here.
@@ -1170,6 +1201,30 @@ mod tests {
                 GUEST_IP[0], GUEST_IP[1], GUEST_IP[2], GUEST_IP[3]
             )),
             "the refusal must name the address to use:\n{s}"
+        );
+    }
+
+    /// A guest left in 1970 fails with `certificate is not yet valid` on every
+    /// TLS handshake, which names the network for a fault in the clock. The
+    /// init is the only place that can see the clock before anything uses it.
+    #[test]
+    fn the_init_says_so_when_the_clock_is_at_the_epoch() {
+        let s = default_init("/bin/sh", &[], None, &[]);
+        assert!(
+            s.contains("-lt 2000"),
+            "init does not check the year:\n{s}"
+        );
+        // Naming the symptom is the point: the user meets the TLS error first
+        // and needs to be able to connect it to this line.
+        assert!(
+            s.contains("certificate is not"),
+            "the warning must name the error the user will actually see:\n{s}"
+        );
+        // Guarded against a non-numeric `date` output, or the `-lt` aborts the
+        // init with a shell error before the entrypoint ever runs.
+        assert!(
+            s.contains("*[!0-9]*"),
+            "an unparsable year would break the comparison:\n{s}"
         );
     }
 
