@@ -1520,7 +1520,7 @@ const REVISIONS_USAGE: &str = "usage: chm revisions <SNAPSHOT_DIR> [--json] [--u
      chm revisions <SNAPSHOT_DIR> label  <REVISION_ID> <TEXT>|--clear\n       \
      chm revisions <SNAPSHOT_DIR> delete <REVISION_ID> [--dry-run]\n       \
      chm revisions <SNAPSHOT_DIR> gc [--dry-run]\n       \
-     chm revisions <SNAPSHOT_DIR> export <REVISION_ID>|--all <BUNDLE_DIR>\n       \
+     chm revisions <SNAPSHOT_DIR> export <REVISION_ID>|--all <BUNDLE_DIR> [--with-base]\n       \
      chm revisions <SNAPSHOT_DIR> import <BUNDLE_DIR> [--dry-run] [--skip-existing]\n\
      \n\
      List the snapshot's saved revisions (its lineage), oldest first, with\n     \
@@ -1555,13 +1555,22 @@ const REVISIONS_USAGE: &str = "usage: chm revisions <SNAPSHOT_DIR> [--json] [--u
      `export` writes revisions into a portable bundle directory. Its\n     \
      payload is content-addressed on the same 64 KiB grid the delta\n     \
      writer uses, so a lineage whose revisions overlap exports at close\n     \
-     to the size of one of them rather than the sum of all. The bundle\n     \
-     does NOT contain the base snapshot and never rewrites it — it\n     \
-     records the base's identity so an import can refuse a mismatch.\n     \
+     to the size of one of them rather than the sum of all. By default\n     \
+     the bundle does NOT contain the base snapshot, and it never\n     \
+     rewrites it — it\n     \
+     records the base's identity so an import can refuse a mismatch.\n\
+     \n     \
+     --with-base carries the base snapshot's own files too, so the\n     \
+     bundle stands alone on a machine that has never held it. The\n     \
+     base shares the revisions' chunk store, so it costs only what\n     \
+     genuinely differs from them.\n     \
      `tar` the directory if you want a single file.\n\
      \n\
      `import` adds a bundle's revisions to this snapshot's lineage. The\n     \
-     target must be the same base snapshot the bundle came from. An\n     \
+     target must be the same base snapshot the bundle came from --\n     \
+     or, for a bundle exported --with-base, an empty directory, which\n     \
+     is where the base is laid down. An existing base is never\n     \
+     overwritten. An\n     \
      imported revision never becomes HEAD — use `chm rollback` to move\n     \
      there deliberately. A revision id already present is refused;\n     \
      --skip-existing imports the rest instead.\n\
@@ -1595,6 +1604,7 @@ fn revisions(raw: &[String]) -> Result<ExitCode, String> {
     let clearing = raw.iter().any(|a| a == "--clear");
     let all = raw.iter().any(|a| a == "--all");
     let skip_existing = raw.iter().any(|a| a == "--skip-existing");
+    let with_base = raw.iter().any(|a| a == "--with-base");
     let positionals: Vec<&String> = raw.iter().filter(|a| !a.starts_with('-')).collect();
 
     // Every verb acts on a revision inside a snapshot, so they follow the
@@ -1634,6 +1644,7 @@ fn revisions(raw: &[String]) -> Result<ExitCode, String> {
             clearing,
             all,
             skip_existing,
+            with_base,
         };
         return revisions_verb(&dir, verb, &positionals, &opts);
     }
@@ -1727,6 +1738,7 @@ struct RevisionsOpts {
     clearing: bool,
     all: bool,
     skip_existing: bool,
+    with_base: bool,
 }
 
 /// Dispatch a `chm revisions <dir> <verb>` sub-verb.
@@ -1817,7 +1829,7 @@ fn revisions_verb(
             } else {
                 (vec![positionals[2].to_string()], positionals[3])
             };
-            let report = bundle::export(dir, &ids, Path::new(out.as_str()))?;
+            let report = bundle::export(dir, &ids, Path::new(out.as_str()), opts.with_base)?;
             println!(
                 "exported {} revision(s) to {}",
                 report.revisions.len(),
@@ -1825,6 +1837,13 @@ fn revisions_verb(
             );
             for id in &report.revisions {
                 println!("  {id}");
+            }
+            if report.base_files > 0 {
+                println!(
+                    "  plus the base snapshot: {} file(s), {}",
+                    report.base_files,
+                    human_bytes(report.base_apparent)
+                );
             }
             println!("  {} stored", human_bytes(report.stored));
             let saved = report.apparent.saturating_sub(report.stored);
@@ -1849,6 +1868,9 @@ fn revisions_verb(
                 bundle::OnCollision::Refuse
             };
             let report = bundle::import(src, dir, on_collision, dry_run)?;
+            if report.base_written {
+                println!("laid down the base snapshot in {}", dir.display());
+            }
             let verbed = if dry_run { "would import" } else { "imported" };
             println!(
                 "{verbed} {} revision(s) ({}) into {}",
@@ -4312,5 +4334,32 @@ mod revisions_args_tests {
         assert!(err.contains("delete"), "the error should list real verbs: {err}");
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `--with-base` is parsed, stored and threaded through, and every
+    /// assertion about what a bundle contains still passes if the flag is
+    /// dropped on the way to `export` -- a test that asserts an outcome
+    /// structurally cannot see a path that is no longer taken. This repo has
+    /// now banked that eight times, so the guard reads the call itself.
+    ///
+    /// The needle is assembled from parts because a guard whose needle appears
+    /// in its own assertion text matches itself and can never fail.
+    #[test]
+    fn the_with_base_flag_reaches_export_rather_than_being_parsed_and_dropped() {
+        let src = include_str!("imp.rs");
+        let field = format!("opts.{}_base", "with");
+        let call = format!("bundle::export(dir, &ids, Path::new(out.as_str()), {field})");
+        assert!(
+            src.contains(&call),
+            "export must be handed the flag the user typed; found instead: {:?}",
+            src.lines()
+                .find(|l| l.contains("bundle::export("))
+                .unwrap_or("<no call at all>")
+        );
+        let parse = format!("--{}-base", "with");
+        assert!(
+            src.contains(&parse),
+            "and the flag must still be recognised on the command line"
+        );
     }
 }
