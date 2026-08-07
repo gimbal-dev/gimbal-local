@@ -94,7 +94,8 @@ private struct SandboxesEmptyState: View {
         FirstRunGuidance.evaluate(
             hasSnapshots: !model.snapshots.isEmpty,
             localImages: model.localImages,
-            imagesPath: model.settings.localImagesPath
+            imagesPath: model.settings.localImagesPath,
+            runningGuests: model.unlistedRunningGuests.count
         )
     }
 

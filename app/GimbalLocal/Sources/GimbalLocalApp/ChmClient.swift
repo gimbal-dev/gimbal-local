@@ -43,6 +43,31 @@ struct ChmClient {
         return try Self.parseStatus(output)
     }
 
+    /// Every guest running on this machine (`chm ps`).
+    ///
+    /// Deliberately **not** `runChecked`: a failure here means the app cannot
+    /// enumerate runs, which is a worse state to be in silently than to report
+    /// nothing, but it must never take down a refresh that is also fetching
+    /// snapshots and status. An unreadable registry yields an empty list, and
+    /// the caller decides what to say about it.
+    func runningGuests(settings: AppSettings) async -> [RunRecord] {
+        guard let result = try? await run(settings: settings, args: ["ps", "--json"]),
+              result.status == 0
+        else {
+            return []
+        }
+        return Self.parseRunList(result.output)
+    }
+
+    static func parseRunList(_ output: String) -> [RunRecord] {
+        guard let data = output.data(using: .utf8),
+              let list = try? JSONDecoder().decode(RunList.self, from: data)
+        else {
+            return []
+        }
+        return list.runs
+    }
+
     func startSnapshot(_ name: String, settings: AppSettings) async throws -> String {
         try await runChecked(settings: settings, args: ["ctl", "start", name])
     }
@@ -469,13 +494,32 @@ struct ChmClient {
         }
     }
 
+    /// The argv for a command, including the daemon socket where that means
+    /// anything.
+    ///
+    /// `--socket` names the daemon to talk to, so it belongs on commands that
+    /// talk to one. `chm ps` reads a directory of records written by every guest
+    /// process on the machine and never opens the socket, so it refuses the flag
+    /// outright — and because `run` appended it unconditionally, the app's very
+    /// first call failed with `unknown option --socket` and the list came back
+    /// empty. That looked exactly like the bug it was meant to fix: a guest was
+    /// running and the app said nothing was.
+    ///
+    /// A pure function so the invocation is testable. Every unit test here reads
+    /// *output*, and no amount of parsing coverage can see a command that never
+    /// ran.
+    static func argv(for args: [String], socketPath: String) -> [String] {
+        guard args.first != "ps" else { return args }
+        return args + ["--socket", socketPath]
+    }
+
     func run(settings: AppSettings, args: [String]) async throws -> CommandResult {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
                     let process = Process()
                     process.executableURL = URL(fileURLWithPath: settings.chmPath)
-                    process.arguments = args + ["--socket", settings.socketPath]
+                    process.arguments = Self.argv(for: args, socketPath: settings.socketPath)
 
                     let pipe = Pipe()
                     process.standardOutput = pipe

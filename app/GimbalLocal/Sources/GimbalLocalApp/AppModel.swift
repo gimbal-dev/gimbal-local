@@ -128,6 +128,22 @@ final class AppModel: ObservableObject {
     /// is the source of truth for local liveness — correct across app restarts
     /// and independent of which session's console the app happens to be tracking.
     @Published var liveLocalSessionIDs: Set<String> = []
+
+    /// Every guest running on this machine, as the engine reports it.
+    ///
+    /// The app cannot work this out for itself: a cold boot is handed to
+    /// Terminal.app via `osascript`, so this process never holds the child's
+    /// PID, and `chm ctl list` only describes what the *daemon* started. Asking
+    /// the party that owns the fact is the same move `refreshPosture` and the
+    /// daemon's `library` field already make.
+    @Published var runningGuests: [RunRecord] = []
+
+    /// Guests that have been asked to shut down and have not yet gone.
+    ///
+    /// Shown rather than hidden: a guest that ignores SIGTERM is a thing the
+    /// user needs to see, and optimistically removing the row would claim an
+    /// outcome we have not observed.
+    @Published var stoppingPIDs: Set<Int32> = []
     @Published var welcomeDismissed = UserDefaults.standard.bool(forKey: "gimbal.welcomeDismissed")
 
     /// Local-only mode: hide every surface that needs the control plane.
@@ -249,8 +265,10 @@ final class AppModel: ObservableObject {
         do {
             async let loadedSnapshots = chm.listSnapshots(settings: settings)
             async let loadedStatus = chm.status(settings: settings)
+            async let loadedRuns = chm.runningGuests(settings: settings)
             snapshots = try await loadedSnapshots
             status = try await loadedStatus
+            runningGuests = await loadedRuns
             if selectedSnapshot == nil {
                 selectedSnapshot = snapshots.first
             }
@@ -260,6 +278,13 @@ final class AppModel: ObservableObject {
         } catch {
             status = SandboxStatus.disconnected
             snapshots = []
+            // `runningGuests` is deliberately left alone. The registry is a
+            // directory on disk and does not depend on the daemon this refresh
+            // just failed to reach, so clearing it here would answer "nothing
+            // is running" using the failure of an unrelated question — the
+            // #202 mistake, where in-memory state was used to interpret an
+            // out-of-process truth.
+            runningGuests = await chm.runningGuests(settings: settings)
             appendLog("local runtime: \(error.localizedDescription)")
         }
     }
@@ -950,6 +975,63 @@ final class AppModel: ObservableObject {
         }
 
         liveLocalSessionIDs = live
+    }
+
+    /// Guests running on this machine that the app is not already showing.
+    ///
+    /// A `chm connect` run is registered by the engine *and* tracked here by
+    /// session lock, so it would otherwise appear twice — once as a running
+    /// sandbox and once as a bare row. Attribution is by PID, because that is
+    /// the operating system's own answer to "is this the same process".
+    var unlistedRunningGuests: [RunRecord] {
+        unattributedRuns(
+            all: runningGuests,
+            attributedPIDs: Set(
+                liveLocalSessionIDs.compactMap { liveSessionPID(for: $0) }
+            )
+        )
+    }
+
+    /// Stop a run the app did not start, by signalling the process that holds it.
+    ///
+    /// `SIGTERM`, not `SIGKILL`: `chm` shuts a guest down on it, and a guest
+    /// with a writable disk that is killed outright leaves RAM describing a
+    /// filesystem that moved — the failure #139 exists to refuse. The registry
+    /// record disappears on its own either way, because the kernel releases the
+    /// lock however the process dies.
+    func stopRunningGuest(_ record: RunRecord) {
+        guard kill(record.pid, SIGTERM) == 0 else {
+            appendLog("could not stop \(record.label) (pid \(record.pid)): \(String(cString: strerror(errno)))")
+            return
+        }
+        appendLog("asked \(record.label) (pid \(record.pid)) to shut down")
+        // SIGTERM is a request, not an act: the guest still has to unmount and
+        // close its console. Refreshing here would find it alive and re-render
+        // the row unchanged, which reads as "the button did nothing". Say what
+        // was actually done and let the poll report when it lands.
+        stoppingPIDs.insert(record.pid)
+    }
+
+    /// Re-read the machine's run registry, and nothing else.
+    ///
+    /// Separate from `refreshLocal` because it runs on a cadence: a guest is
+    /// another process, so it can appear (started from the CLI) or vanish
+    /// (expiry, `exit`, a crash) with the app doing nothing at all. Without a
+    /// poll the list is only ever correct at the instant something else happened
+    /// to refresh it — and a row outliving its process is worse than no row,
+    /// because its Stop button then aims a signal at a PID the kernel is free to
+    /// have reused.
+    ///
+    /// Deliberately does not call `refreshLocal`: that shells out four times and
+    /// re-reads the daemon, the snapshot library and the posture report, none of
+    /// which change on this cadence. This is one cheap `chm ps`.
+    func pollRunningGuests() async {
+        let loaded = await chm.runningGuests(settings: settings)
+        runningGuests = loaded
+        // Forget a stop once its process is gone, so a reused PID cannot inherit
+        // the previous occupant's "Stopping…" label.
+        let live = Set(loaded.map(\.pid))
+        stoppingPIDs.formIntersection(live)
     }
 
     /// The PID recorded in a sandbox's session lock, if the file names a live
