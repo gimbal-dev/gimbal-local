@@ -347,9 +347,16 @@ final class SettingsStoreTests: XCTestCase {
         XCTAssertEqual(model.settings.localImagesPath, unique)
         // The directory does not exist, so the user is told rather than left to
         // wonder why the list is empty.
-        XCTAssertEqual(
-            model.settingsNotices,
-            [.missingKept(field: .localImagesPath, saved: unique)]
+        //
+        // Asserted by containment, not equality. The other two fields resolve
+        // to paths *inside the checkout* -- a built `chm` and a `snapshots`
+        // directory -- so an equality assertion here is really an assertion
+        // about the developer's machine: it passes in a worktree that has been
+        // built in and fails on a cold build in a fresh one. Caught doing
+        // exactly that, verifying that each commit tests alone.
+        XCTAssertTrue(
+            model.settingsNotices.contains(.missingKept(field: .localImagesPath, saved: unique)),
+            "the missing image directory must be reported, got \(model.settingsNotices)"
         )
     }
 
