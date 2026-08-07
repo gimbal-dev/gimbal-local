@@ -54,6 +54,7 @@
 //! command and loses nothing, because the deduplication has already happened.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::env::current_dir;
 use std::ffi::CString;
 use std::fs::{self, File};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -126,6 +127,17 @@ pub(crate) struct BaseIdentity {
     /// restored revision's RAM was captured against, so a different digest is a
     /// different machine, whatever the directory is called.
     pub state_sha256: String,
+    /// The base snapshot's own files, when `--with-base` carried them. Empty
+    /// means the bundle describes a base it does not contain, which is the
+    /// original behaviour and still the default.
+    ///
+    /// `#[serde(default)]` rather than a format bump: a build that predates
+    /// this field reads a bundle carrying one, ignores the base, imports the
+    /// revisions and requires the base to be present locally -- which is
+    /// exactly what it did before. Incomplete, not wrong, and the version gate
+    /// exists for the wrong case.
+    #[serde(default)]
+    pub files: Vec<ExportedFile>,
 }
 
 /// One revision's payload, as a list of files made of chunks.
@@ -181,6 +193,10 @@ pub(crate) struct ExportReport {
     pub apparent: u64,
     /// Bytes the bundle actually holds, after identical chunks collapse.
     pub stored: u64,
+    /// Apparent bytes of the carried base, or 0 when none was carried.
+    pub base_apparent: u64,
+    /// How many of the base's files were carried.
+    pub base_files: usize,
 }
 
 /// What an import did, or would do.
@@ -196,6 +212,11 @@ pub(crate) struct ImportReport {
     /// revisions share, which is the number that answers "what did this cost
     /// me".
     pub written: u64,
+    /// Whether this import had to lay down the base snapshot as well, i.e.
+    /// whether the target was an empty directory rather than an existing
+    /// snapshot. Reported because it is the difference between adding to
+    /// somebody's lineage and creating a machine.
+    pub base_written: bool,
 }
 
 fn now_ms() -> u64 {
@@ -268,6 +289,96 @@ fn carried_files(dir: &Path) -> Result<Vec<PathBuf>, String> {
     }
     let mut out = Vec::new();
     walk(dir, dir, &mut out)?;
+    out.sort();
+    Ok(out)
+}
+
+/// Everything under a snapshot directory that belongs to Cloud Hypervisor
+/// rather than to us: `state.json`, the memory dump, the disks.
+///
+/// The `.chm-*` directories are skipped, and that is the whole of C1 in one
+/// predicate. They hold *our* lineage -- the revisions this bundle already
+/// carries chunk by chunk, the live overlays of a session that is nobody
+/// else's business, and a checkpoint that names this machine's HEAD. Carrying
+/// them would double the bundle, hand over a working directory as if it were a
+/// snapshot, and make "the base arrives vanilla" untrue in the one place it has
+/// to be true.
+///
+/// A skipped directory is not walked at all, so a large `.chm-revisions` costs
+/// nothing to exclude.
+/// Resolve `path` to an absolute form even when it does not exist yet, by
+/// canonicalising the deepest ancestor that does and re-appending the rest.
+/// Plain `starts_with` on unresolved paths answers the wrong question: a
+/// symlinked or relative bundle path would read as elsewhere while landing
+/// squarely inside the snapshot.
+fn resolved(path: &Path) -> PathBuf {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        current_dir().unwrap_or_default().join(path)
+    };
+    let mut rest = Vec::new();
+    let mut at = absolute.as_path();
+    loop {
+        if let Ok(real) = at.canonicalize() {
+            let mut out = real;
+            for part in rest.iter().rev() {
+                out.push(part);
+            }
+            return out;
+        }
+        match (at.file_name(), at.parent()) {
+            (Some(name), Some(parent)) => {
+                rest.push(name.to_os_string());
+                at = parent;
+            }
+            _ => return absolute,
+        }
+    }
+}
+
+/// Containment by whole components, never by string prefix: `/a/b-old` has
+/// `/a/b` as a prefix and is a different directory.
+fn is_inside(child: &Path, parent: &Path) -> bool {
+    let (child, parent) = (resolved(child), resolved(parent));
+    let mut c = child.components();
+    for want in parent.components() {
+        if c.next() != Some(want) {
+            return false;
+        }
+    }
+    true
+}
+
+fn carried_base_files(snapshot_dir: &Path) -> Result<Vec<PathBuf>, String> {
+    fn walk(root: &Path, at: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+        let entries = fs::read_dir(at).map_err(|e| format!("read {}: {e}", at.display()))?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with(".chm-") {
+                continue;
+            }
+            let md = match entry.metadata() {
+                Ok(md) => md,
+                Err(e) => return Err(format!("stat {}: {e}", path.display())),
+            };
+            if md.is_dir() {
+                walk(root, &path, out)?;
+            } else if md.is_file() {
+                if name.ends_with(".tmp") {
+                    continue;
+                }
+                let rel = path
+                    .strip_prefix(root)
+                    .map_err(|_| format!("{} escaped {}", path.display(), root.display()))?;
+                out.push(rel.to_path_buf());
+            }
+        }
+        Ok(())
+    }
+    let mut out = Vec::new();
+    walk(snapshot_dir, snapshot_dir, &mut out)?;
     out.sort();
     Ok(out)
 }
@@ -361,13 +472,30 @@ pub(crate) fn export(
     snapshot_dir: &Path,
     ids: &[String],
     bundle: &Path,
+    with_base: bool,
 ) -> Result<ExportReport, String> {
-    let base = BaseIdentity {
+    // A bundle written inside the snapshot it is exporting becomes part of that
+    // snapshot, so `--with-base` would carry the bundle into itself -- measured
+    // on the first hardware run of this feature: 12,307 of the bundle's own
+    // chunks absorbed as base files. Skipping the bundle silently is the wrong
+    // repair, because then the carried base is *not* what the directory holds
+    // and "the base arrives as it was" stops being true. Say so instead.
+    if with_base && is_inside(bundle, snapshot_dir) {
+        return Err(format!(
+            "{} is inside the snapshot {}, so --with-base would carry the bundle \
+             into itself -- write the bundle somewhere outside the snapshot",
+            bundle.display(),
+            snapshot_dir.display()
+        ));
+    }
+
+    let mut base = BaseIdentity {
         name: snapshot_dir
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default(),
         state_sha256: base_state_digest(snapshot_dir)?,
+        files: Vec::new(),
     };
 
     let all = checkpoint::list_revisions(snapshot_dir);
@@ -445,6 +573,34 @@ pub(crate) fn export(
         ));
     }
 
+    // Absorbed *after* the revisions, through the same `have` set and the same
+    // chunk store. A revision's RAM dump is a delta of the base's on the same
+    // 64 KiB grid, so every unchanged region is a chunk the revisions already
+    // put there and the base costs only what genuinely differs.
+    //
+    // Chunked rather than `fs::copy`ed, and that is not a weakening of "the
+    // base arrives identical": every chunk carries its own sha256 and every
+    // file its exact length, so a bad write is *detected*, which a copy cannot
+    // do. The bytes are reproduced or the import refuses.
+    if with_base {
+        for rel in carried_base_files(snapshot_dir)? {
+            base.files.push(absorb_file(
+                bundle,
+                snapshot_dir,
+                &rel,
+                &mut have,
+                &mut stored,
+            )?);
+        }
+        if base.files.is_empty() {
+            return Err(format!(
+                "{} holds no base snapshot files to carry -- --with-base is for \
+                 exporting a lineage together with the snapshot it deltas",
+                snapshot_dir.display()
+            ));
+        }
+    }
+
     let envelope = Envelope {
         format: BUNDLE_FORMAT,
         created_at_ms: now_ms(),
@@ -464,6 +620,8 @@ pub(crate) fn export(
 
     Ok(ExportReport {
         bundle: bundle.to_path_buf(),
+        base_apparent: envelope.base.files.iter().map(|f| f.len).sum(),
+        base_files: envelope.base.files.len(),
         apparent: envelope
             .revisions
             .iter()
@@ -571,6 +729,85 @@ fn emit_file(
     drop(out);
     set_mtime(&dest, file.mtime_ns)?;
     Ok(written)
+}
+
+/// Write a carried base snapshot into an empty target directory.
+///
+/// Staged beside the target and renamed, so an interrupted import leaves either
+/// no base or a complete one -- never a directory holding half a snapshot that
+/// the next run would mistake for a base already present and refuse to replace.
+///
+/// ## What the digest check here is, and what it is not
+///
+/// Every other check in this module compares the import against the export, and
+/// a writer and reader that agree by construction agree about a bug too --
+/// #178 and #180 are this repo's two records of exactly that. The
+/// `state_sha256` check in `import` has independent authority precisely because
+/// the file it reads was already on the receiving machine.
+///
+/// A carried base has no such counterparty: the bundle holds both the bytes and
+/// the digest that describes them, so this can only prove the bytes were
+/// **reproduced faithfully**, not that they are the base anyone intended. That
+/// is integrity, not identity, and it is worth having -- a truncated chunk, a
+/// short write or a re-grid is caught here rather than surfacing much later as
+/// a guest that will not boot. It is stated rather than implied because the
+/// same code shape does two different jobs a few lines apart.
+fn write_base(bundle: &Path, snapshot_dir: &Path, base: &BaseIdentity) -> Result<(), String> {
+    let staging = snapshot_dir.with_file_name(format!(
+        "{}.chm-base.tmp",
+        snapshot_dir.file_name().map_or_else(
+            || "snapshot".to_string(),
+            |s| s.to_string_lossy().into_owned()
+        )
+    ));
+    let _ = fs::remove_dir_all(&staging);
+    fs::create_dir_all(&staging).map_err(|e| format!("create {}: {e}", staging.display()))?;
+
+    let result = (|| -> Result<(), String> {
+        for file in &base.files {
+            emit_file(bundle, &staging, file, None)?;
+        }
+        let written = staging.join("state.json");
+        if !written.is_file() {
+            return Err("the carried base has no state.json, so it is not a snapshot".to_string());
+        }
+        let bytes = fs::read(&written).map_err(|e| format!("read {}: {e}", written.display()))?;
+        let got = sha256_hex(&bytes);
+        if got != base.state_sha256 {
+            return Err(format!(
+                "the base snapshot did not survive the transfer: its state.json \
+                 hashes to {}… but the envelope recorded {}…. The bundle is \
+                 damaged; re-export it.",
+                &got[..12],
+                &base.state_sha256[..12],
+            ));
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        let _ = fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+
+    // The target may exist as an empty directory the caller made; a rename onto
+    // it fails, so take it away first. It has no state.json -- that is why we
+    // are here -- and everything else under it is left where it is by moving
+    // the staged base *into* it rather than over it.
+    if snapshot_dir.is_dir() {
+        for entry in fs::read_dir(&staging)
+            .map_err(|e| format!("read {}: {e}", staging.display()))?
+            .flatten()
+        {
+            let to = snapshot_dir.join(entry.file_name());
+            fs::rename(entry.path(), &to)
+                .map_err(|e| format!("move the base into {}: {e}", to.display()))?;
+        }
+        let _ = fs::remove_dir(&staging);
+    } else {
+        fs::rename(&staging, snapshot_dir)
+            .map_err(|e| format!("move the base into {}: {e}", snapshot_dir.display()))?;
+    }
+    Ok(())
 }
 
 /// Restore a file's recorded modification time.
@@ -820,8 +1057,34 @@ pub(crate) fn import(
 ) -> Result<ImportReport, String> {
     let envelope = read_envelope(bundle)?;
 
+    // A base that is not here yet is the case --with-base exists for, and it
+    // is the *only* case in which materialising one is safe: an existing base
+    // is the receiving machine's own artifact, and overwriting it would replace
+    // a snapshot somebody is using with one that arrived in the post.
+    let materialise_base = !snapshot_dir.join("state.json").is_file();
+    if materialise_base {
+        if envelope.base.files.is_empty() {
+            return Err(format!(
+                "{} has no state.json, so there is no base snapshot here to add \
+                 these revisions to -- and this bundle does not carry one. A \
+                 revision is a delta against a base; without it there is nothing \
+                 to resume. Re-export with `--with-base`, or unpack the base \
+                 snapshot `{}` here first.",
+                snapshot_dir.display(),
+                envelope.base.name,
+            ));
+        }
+        if !dry_run {
+            write_base(bundle, snapshot_dir, &envelope.base)?;
+        }
+    }
+
+    // Skipped when we just wrote the base: comparing a file against the digest
+    // that came in the same envelope is the writer/reader self-agreement #180
+    // is about, and `write_base` has already made the honest version of that
+    // check -- integrity, not identity.
     let here = base_state_digest(snapshot_dir)?;
-    if here != envelope.base.state_sha256 {
+    if !materialise_base && here != envelope.base.state_sha256 {
         return Err(format!(
             "this bundle was exported from base snapshot `{}` ({}…), but {} is a \
              different machine ({}…). A revision's captured RAM matches the memory \
@@ -875,6 +1138,7 @@ pub(crate) fn import(
             pinned_at_source,
             bytes,
             written: 0,
+            base_written: materialise_base,
         });
     }
 
@@ -954,6 +1218,7 @@ pub(crate) fn import(
         pinned_at_source,
         bytes,
         written,
+        base_written: materialise_base,
     })
 }
 
@@ -969,6 +1234,15 @@ pub(crate) fn describe(bundle: &Path) -> Result<Vec<String>, String> {
             &envelope.base.state_sha256[..12.min(envelope.base.state_sha256.len())]
         ),
         format!("chunk         {} bytes", envelope.chunk_bytes),
+        if envelope.base.files.is_empty() {
+            "base files    not carried — the target must already hold this snapshot".to_string()
+        } else {
+            format!(
+                "base files    {} carried ({}), so this bundle stands alone",
+                envelope.base.files.len(),
+                human_bytes(envelope.base.files.iter().map(|f| f.len).sum::<u64>()),
+            )
+        },
     ];
     // Count each chunk once across the whole bundle: the saving is the point of
     // the format, so reporting the apparent total alone would hide it.
@@ -1438,5 +1712,254 @@ mod tests {
             .map(|p| p.to_string_lossy().into_owned())
             .collect();
         assert!(names.contains(&"something-new".to_string()), "{names:?}");
+    }
+
+    /// A base is the vanilla Cloud Hypervisor snapshot. Our own lineage lives
+    /// beside it in `.chm-*` directories, and carrying those would double the
+    /// bundle, hand over somebody's working directory as if it were a snapshot,
+    /// and make "the base arrives vanilla" untrue in the one place it matters.
+    #[test]
+    fn the_carried_base_is_the_snapshot_and_not_our_lineage() {
+        let root = tmp("basefiles");
+        let snap = root.join("snap");
+        fs::create_dir_all(snap.join(".chm-revisions/rev-1")).unwrap();
+        fs::create_dir_all(snap.join(".chm-overlays")).unwrap();
+        fs::create_dir_all(snap.join("nested")).unwrap();
+        fs::write(snap.join("state.json"), b"{}").unwrap();
+        fs::write(snap.join("memory-ranges"), b"m").unwrap();
+        fs::write(snap.join("nested/disk.raw"), b"d").unwrap();
+        fs::write(snap.join(".chm-revisions/rev-1/ram.bin"), b"r").unwrap();
+        fs::write(snap.join(".chm-overlays/disk0.cow"), b"o").unwrap();
+        fs::write(snap.join("half-written.tmp"), b"x").unwrap();
+
+        let got: Vec<String> = carried_base_files(&snap)
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                "memory-ranges".to_string(),
+                "nested/disk.raw".to_string(),
+                "state.json".to_string()
+            ],
+            "only Cloud Hypervisor's own files travel: our revisions are already \
+             carried chunk by chunk, the live overlays are a running session's \
+             business, and a .tmp is a half-written file"
+        );
+    }
+
+    /// The whole point of `--with-base`: a machine that has never held this
+    /// snapshot ends up able to resume it.
+    #[test]
+    fn a_bundle_with_a_base_imports_into_an_empty_directory() {
+        let root = tmp("withbase");
+        let snap = root.join("snap");
+        fs::create_dir_all(&snap).unwrap();
+        let state = br#"{"memory":{"size":1}}"#;
+        fs::write(snap.join("state.json"), state).unwrap();
+        fs::write(snap.join("disk.raw"), vec![9u8; CHUNK + 5]).unwrap();
+
+        let bundle = root.join("b");
+        fs::create_dir_all(&bundle).unwrap();
+        let mut have = BTreeSet::new();
+        let mut stored = 0u64;
+        let mut base = BaseIdentity {
+            name: "snap".to_string(),
+            state_sha256: sha256_hex(state),
+            files: Vec::new(),
+        };
+        for rel in carried_base_files(&snap).unwrap() {
+            base.files
+                .push(absorb_file(&bundle, &snap, &rel, &mut have, &mut stored).unwrap());
+        }
+
+        let target = root.join("fresh");
+        write_base(&bundle, &target, &base).unwrap();
+        assert_eq!(fs::read(target.join("state.json")).unwrap(), state);
+        assert_eq!(
+            fs::read(target.join("disk.raw")).unwrap(),
+            vec![9u8; CHUNK + 5],
+            "the base must arrive byte for byte, short final chunk included"
+        );
+    }
+
+    /// The bundle carries both the bytes and the digest describing them, so
+    /// this can only prove faithful reproduction -- but that is exactly what
+    /// catches a damaged bundle before it becomes a guest that will not boot.
+    #[test]
+    fn a_base_that_did_not_survive_the_transfer_is_refused() {
+        let root = tmp("badbase");
+        let snap = root.join("snap");
+        fs::create_dir_all(&snap).unwrap();
+        fs::write(snap.join("state.json"), b"{}").unwrap();
+
+        let bundle = root.join("b");
+        fs::create_dir_all(&bundle).unwrap();
+        let mut have = BTreeSet::new();
+        let mut stored = 0u64;
+        let mut base = BaseIdentity {
+            name: "snap".to_string(),
+            // A digest that does not describe the bytes: the shape a truncated
+            // or re-gridded chunk produces.
+            state_sha256: sha256_hex(b"something else entirely"),
+            files: Vec::new(),
+        };
+        for rel in carried_base_files(&snap).unwrap() {
+            base.files
+                .push(absorb_file(&bundle, &snap, &rel, &mut have, &mut stored).unwrap());
+        }
+
+        let target = root.join("fresh");
+        let e = write_base(&bundle, &target, &base).unwrap_err();
+        assert!(e.contains("did not survive the transfer"), "{e}");
+        assert!(
+            !target.join("state.json").is_file(),
+            "a refused base must leave nothing behind, or the next run finds a \
+             state.json, believes a base is already present and never retries"
+        );
+    }
+
+    /// A bundle without a base is still the default, and telling somebody to
+    /// go and find a snapshot is only useful if it names the flag that would
+    /// have avoided the trip.
+    #[test]
+    fn importing_into_an_empty_directory_without_a_carried_base_says_what_to_do() {
+        let root = tmp("nobase");
+        let bundle = root.join("b");
+        fs::create_dir_all(&bundle).unwrap();
+        let envelope = Envelope {
+            format: BUNDLE_FORMAT,
+            created_at_ms: now_ms(),
+            chunk_bytes: CHUNK,
+            base: BaseIdentity {
+                name: "graviton-2cpu-net".to_string(),
+                state_sha256: sha256_hex(b"{}"),
+                files: Vec::new(),
+            },
+            revisions: Vec::new(),
+        };
+        fs::write(
+            bundle.join(ENVELOPE),
+            serde_json::to_string(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        let target = root.join("fresh");
+        fs::create_dir_all(&target).unwrap();
+        let e = import(&bundle, &target, OnCollision::Refuse, false)
+            .err()
+            .expect("must refuse");
+        assert!(e.contains("--with-base"), "the remedy must be named: {e}");
+        assert!(
+            e.contains("graviton-2cpu-net"),
+            "and so must the base it wants, or the reader cannot go and get it: {e}"
+        );
+    }
+
+    /// Asserted against literal JSON text rather than against a struct this
+    /// build serializes: a writer and a reader that move together agree about
+    /// a break too, which is how this repo shipped broken checkpoints twice.
+    /// This is the whole claim behind not bumping BUNDLE_FORMAT -- an old
+    /// bundle stays readable, so an old build reading a new one is incomplete
+    /// rather than wrong.
+    #[test]
+    fn a_bundle_written_before_with_base_existed_still_reads() {
+        let old = r#"{
+            "format": 1,
+            "created_at_ms": 1750000000000,
+            "chunk_bytes": 65536,
+            "base": {
+                "name": "graviton-vanilla-1cpu",
+                "state_sha256": "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+            },
+            "revisions": []
+        }"#;
+        let e: Envelope = serde_json::from_str(old).expect("an old envelope must still parse");
+        assert_eq!(e.base.name, "graviton-vanilla-1cpu");
+        assert!(
+            e.base.files.is_empty(),
+            "no file list means the base does not travel, which is what every \
+             bundle written before this feature meant"
+        );
+    }
+
+    /// Found on the first hardware run of `--with-base`, not by a test: the
+    /// bundle was written inside the snapshot and absorbed 12,307 of its own
+    /// chunks as base files.
+    #[test]
+    fn a_bundle_written_inside_the_snapshot_is_refused_before_it_eats_itself() {
+        let root = tmp("nested");
+        let snap = root.join("snap");
+        fs::create_dir_all(&snap).unwrap();
+        fs::write(snap.join("state.json"), b"{}").unwrap();
+
+        let inside = snap.join("bundle");
+        let e = export(&snap, &[], &inside, true)
+            .err()
+            .expect("must refuse");
+        assert!(e.contains("into itself"), "{e}");
+        assert!(
+            !inside.exists(),
+            "refuse before creating anything, or the refusal leaves litter in \
+             the snapshot it was protecting"
+        );
+
+        // A sibling whose name merely starts the same way is a different
+        // directory, and a prefix comparison would wrongly refuse it.
+        assert!(!is_inside(&root.join("snap-old"), &snap));
+        assert!(is_inside(&snap.join("a/b"), &snap));
+    }
+
+    /// An existing base is the receiving machine's own artifact and the only
+    /// thing here with independent authority over what this lineage belongs
+    /// to. Overwriting it would replace a snapshot somebody is using with one
+    /// that arrived in the post.
+    #[test]
+    fn a_base_already_here_is_checked_against_and_never_replaced() {
+        let root = tmp("existingbase");
+        let bundle = root.join("b");
+        fs::create_dir_all(&bundle).unwrap();
+        let mut have = BTreeSet::new();
+        let mut stored = 0u64;
+        let donor = root.join("donor");
+        fs::create_dir_all(&donor).unwrap();
+        fs::write(donor.join("state.json"), b"{\"from\":\"the bundle\"}").unwrap();
+        let mut files = Vec::new();
+        for rel in carried_base_files(&donor).unwrap() {
+            files.push(absorb_file(&bundle, &donor, &rel, &mut have, &mut stored).unwrap());
+        }
+        let envelope = Envelope {
+            format: BUNDLE_FORMAT,
+            created_at_ms: now_ms(),
+            chunk_bytes: CHUNK,
+            base: BaseIdentity {
+                name: "donor".to_string(),
+                state_sha256: sha256_hex(b"{\"from\":\"the bundle\"}"),
+                files,
+            },
+            revisions: Vec::new(),
+        };
+        fs::write(
+            bundle.join(ENVELOPE),
+            serde_json::to_string(&envelope).unwrap(),
+        )
+        .unwrap();
+
+        let target = root.join("mine");
+        fs::create_dir_all(&target).unwrap();
+        let mine = b"{\"from\":\"this machine\"}";
+        fs::write(target.join("state.json"), mine).unwrap();
+
+        let e = import(&bundle, &target, OnCollision::Refuse, false)
+            .err()
+            .expect("must refuse");
+        assert!(e.contains("different machine"), "{e}");
+        assert_eq!(
+            fs::read(target.join("state.json")).unwrap(),
+            mine,
+            "a carried base must never overwrite one that is already here"
+        );
     }
 }
