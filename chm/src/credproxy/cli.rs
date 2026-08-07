@@ -5,6 +5,8 @@
 //! what it would do before you trust it with a credential, and confirm it can
 //! actually reach an origin from this machine.
 
+use crate::oci::entry::EntryKind;
+use crate::oci::initramfs::{Rootfs, write_cpio};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
@@ -578,7 +580,7 @@ fn guest_install_script(pem: &str, fingerprint: &str) -> String {
 /// source under `/usr/local/share/ca-certificates`, and `NODE_EXTRA_CA_CERTS`
 /// wants a stable file that exists whether or not this guest has a trust store
 /// at all. A container rootfs has neither the directory nor the tool.
-const CA_PATH: &str = "/etc/gimbal/proxy-ca.crt";
+pub(crate) const CA_PATH: &str = "/etc/gimbal/proxy-ca.crt";
 
 /// A one-line file that a shell can source to pick the CA up.
 ///
@@ -587,7 +589,61 @@ const CA_PATH: &str = "/etc/gimbal/proxy-ca.crt";
 /// `sh /tmp/gimbal-ca.sh` -- cannot configure the console it was typed into.
 /// Measured: an installer reporting the variable set, in a guest where the next
 /// `node` still failed `SELF_SIGNED_CERT_IN_CHAIN`.
-const ENV_PATH: &str = "/etc/gimbal/proxy-ca.env";
+pub(crate) const ENV_PATH: &str = "/etc/gimbal/proxy-ca.env";
+
+/// A cpio archive carrying just the CA, for `create` to append to a container
+/// image's initramfs.
+///
+/// The image's initramfs is written once, at `chm image build`, and knows
+/// nothing about a workspace. The CA is per-workspace and is generated on
+/// demand. The kernel unpacks concatenated archives in order, so the two facts
+/// meet without either having to know the other's timing -- the same property
+/// the bundled kernel modules already rely on.
+///
+/// Returns `None` when the workspace has no CA. That is not an error: a run
+/// with no `--proxy-rules` is the ordinary case, and a guest that gets no CA
+/// is exactly right for it.
+/// Unlike [`ca_json_for_daemon`], this one *mints* a CA when none exists yet.
+///
+/// The distinction is who is asking. That function answers a question about
+/// someone else's workspace and has no business creating a trust anchor there.
+/// This one runs on the way to starting a proxy in this workspace, and that
+/// proxy calls [`ProxyCa::load_or_create`] itself a few hundred lines later --
+/// so the CA is coming into existence either way, and the only question is
+/// whether the guest is built early enough to know about it.
+///
+/// Reading rather than creating here looked correct and was measured wrong: a
+/// fresh workspace has no CA at initramfs-build time, so the guest shipped
+/// without one and the proxy then minted it moments later. The first run of
+/// every new workspace would have silently had no CA, and only the *second*
+/// would have worked -- the worst shape of bug, because it looks fixed.
+pub(crate) fn ca_cpio_for(workspace: &Path) -> Result<Option<Vec<u8>>, String> {
+    let ca = ProxyCa::load_or_create(&ca_dir(workspace)).map_err(|e| format!("proxy CA: {e}"))?;
+    Ok(Some(ca_cpio_from_pem(&ca.cert_pem())))
+}
+
+/// The archive itself, split out so a test can build one without a CA on disk.
+///
+/// Parent directories are materialized deliberately. A cpio entry whose parent
+/// has no entry of its own is dropped by the kernel *in silence* -- measured in
+/// #222, where five modules were in the archive and none reached the guest --
+/// so `/etc` and `/etc/gimbal` must be present as entries, not merely implied.
+pub(crate) fn ca_cpio_from_pem(pem: &str) -> Vec<u8> {
+    let mut rootfs = Rootfs::default();
+    // Relative, as cpio paths are: a leading slash would create an entry the
+    // kernel resolves against nothing.
+    let path = CA_PATH.trim_start_matches('/').to_string();
+    rootfs.insert(
+        path,
+        EntryKind::File {
+            mode: 0o644,
+            size: pem.len() as u64,
+        },
+        pem.as_bytes().to_vec(),
+    );
+    rootfs.materialize_parents();
+    write_cpio(&rootfs)
+}
 
 /// Where the base64 of the installer lands in the guest while it is being typed.
 const TRANSFER_B64: &str = "/tmp/gimbal-ca.b64";
@@ -1368,6 +1424,73 @@ mod tests {
     /// `/etc/ssl/certs` exists. The previous script opened with `sudo tee`, so
     /// every line of it failed — on the image the docs recommend for running an
     /// agent, which is the case this whole feature exists to serve.
+    #[test]
+    /// A cpio entry whose parent has no entry of its own is dropped by the
+    /// kernel in silence. Measured in #222: five modules in the archive, none
+    /// in the guest, no message. So the parents must be present as entries.
+    fn the_ca_archive_carries_its_own_parent_directories() {
+        let pem = "-----BEGIN CERTIFICATE-----\nZmFrZQ==\n-----END CERTIFICATE-----\n";
+        let cpio = ca_cpio_from_pem(pem);
+        let text = String::from_utf8_lossy(&cpio);
+        // `./`-prefixed, which is what `write_cpio` emits and what the kernel
+        // resolves against the root it is building. Checked in that exact form
+        // after a bare-name check passed against a path that could equally have
+        // been absolute -- the assertion has to be able to tell those apart.
+        for needed in ["./etc\0", "./etc/gimbal\0", "./etc/gimbal/proxy-ca.crt\0"] {
+            assert!(
+                text.contains(needed),
+                "`{needed}` has no entry, so the kernel drops what is under it \
+                 without saying anything"
+            );
+        }
+        assert!(
+            text.contains(pem),
+            "the archive must carry the certificate itself, not just its name"
+        );
+        assert!(
+            !text.contains("\0/etc/gimbal"),
+            "a cpio name must not be absolute; the kernel resolves it against the \
+             root it is building, and a leading slash resolves against nothing"
+        );
+        assert!(text.contains("TRAILER!!!"), "an archive must be terminated");
+        assert_eq!(
+            cpio.len() % 4,
+            0,
+            "the archive must end 4-byte aligned, or anything concatenated after \
+             it starts misaligned and the kernel stops unpacking -- silently"
+        );
+    }
+
+    /// The first run of a workspace has no CA on disk yet -- the proxy mints it
+    /// later in the same command. If this read rather than created, that first
+    /// guest would ship without a CA and only the *second* run would work.
+    #[test]
+    fn a_fresh_workspace_still_gets_a_ca_rather_than_waiting_for_the_second_run() {
+        let dir = std::env::temp_dir().join(format!("chm-cafresh-{}", std::process::id()));
+        fs::remove_dir_all(&dir).ok();
+        fs::create_dir_all(&dir).unwrap();
+        let first = ca_cpio_for(&dir).expect("a fresh workspace must not be refused");
+        let pem = ProxyCa::load_existing(&ca_dir(&dir))
+            .expect("readable")
+            .expect("the CA the proxy will use must now exist")
+            .cert_pem();
+        let second = ca_cpio_for(&dir).expect("second call");
+        fs::remove_dir_all(&dir).ok();
+
+        let bytes = first.expect("a workspace bound for a proxy always gets an archive");
+        assert!(
+            String::from_utf8_lossy(&bytes).contains(&pem),
+            "the archive must carry the CA the proxy will actually sign with"
+        );
+        assert_eq!(
+            Some(bytes),
+            second,
+            "resolving twice must not mint a second CA; the guest would trust one \
+             the proxy does not use, and every intercepted connection would fail \
+             a certificate check *after* we reported success"
+        );
+    }
+
     #[test]
     fn the_ca_installer_does_not_assume_sudo_or_a_trust_store() {
         let script = guest_install_script("-----BEGIN CERTIFICATE-----\nAA\n", "beefcafe");

@@ -32,6 +32,8 @@
 //! The archive is therefore emitted from a sorted path list, which makes (3)
 //! true by construction rather than by hoping the layer order was kind.
 
+use crate::coldboot::CA_SENT_KEY;
+use crate::credproxy::cli::{CA_PATH, ENV_PATH};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::iter;
@@ -331,6 +333,13 @@ pub fn default_init(
     // it back. One definition, so the two cannot drift apart into a guest that
     // is silently left at the epoch.
     let epoch_key = EPOCH_KEY;
+    let ca_sent_key = CA_SENT_KEY;
+    // Read from the credential proxy's own constants. The manual installer and
+    // this init must agree on where the CA lives, or a guest that has one is
+    // told it does not -- and `chm proxy ca` still prints these paths as the
+    // remedy when something goes wrong.
+    let ca_crt = CA_PATH;
+    let ca_env = ENV_PATH;
 
     // The image's own environment, delivered rather than merely understood.
     //
@@ -433,7 +442,18 @@ unset __mod_fail __mod_how __mod_wait
 # directly if that is not possible. Writing it twice would let the two paths
 # drift, and only one of them is the one anybody normally takes.
 gimbal_start() {{
-{exports}{cd}exec {entrypoint}
+{exports}# The proxy CA, if chm delivered one. Sourced here rather than in the main
+# body because the `--gimbal-session` re-entry below skips that body entirely,
+# and this is the only code both handover paths run.
+#
+# Only when the image did not set it: an image naming its own bundle is an
+# explicit choice, and infrastructure should not silently overwrite one. An
+# image that does so will not trust the proxy, which is the caller's decision
+# to have made.
+if [ -z "${{NODE_EXTRA_CA_CERTS:-}}" ] && [ -r {ca_env} ]; then
+    . {ca_env}
+fi
+{cd}exec {entrypoint}
 }}
 
 # Re-entry. The mounts below have already run in the parent, so skip straight
@@ -472,6 +492,7 @@ mkdir -p /dev/pts && mount -t devpts devpts /dev/pts 2>/dev/null
 for __a in $(cat /proc/cmdline 2>/dev/null); do
     case "$__a" in
     {epoch_key}=*) __epoch="${{__a#{epoch_key}=}}" ;;
+    {ca_sent_key}=*) __ca_sent=1 ;;
     esac
 done
 if [ -n "$__epoch" ]; then
@@ -550,6 +571,85 @@ if [ -e /sys/class/net/eth0 ]; then
         echo "gimbal:   <tool> route add default via {gateway_ip}"
     fi
 fi
+
+# The credential proxy's CA, if chm staged one into this rootfs.
+#
+# Tested at runtime, not at build time: the same image boots both with and
+# without --proxy-rules, and only `create` knows which. chm appends a second
+# cpio carrying this file when a proxy is in play, so its presence *is* the
+# question being asked.
+#
+# Without this the guest is a manual step away from working, and the failure it
+# produces names the wrong thing -- a TLS error that reads as a network fault.
+if [ -r {ca_crt} ]; then
+    # Node does not consult the OS trust store at all. Measured on one guest
+    # seconds apart, same CA file: `node` failed SELF_SIGNED_CERT_IN_CHAIN, and
+    # the same request with NODE_EXTRA_CA_CERTS set returned a status. A coding
+    # agent is a Node program, so this line is the difference between the agent
+    # working and not.
+    mkdir -p /etc/gimbal 2>/dev/null
+    printf 'export NODE_EXTRA_CA_CERTS=%s\n' {ca_crt} > {ca_env} 2>/dev/null
+
+    # The OS trust store as well, for curl, git, apk and apt.
+    #
+    # Appending to a bundle the TLS library already reads is the only mechanism
+    # here that needs nothing installed -- and the bundle has to exist, or the
+    # guest could not have made an HTTPS request in the first place. Measured on
+    # alpine:3.20, which has neither `update-ca-certificates` nor the `openssl`
+    # CLI: both of the obvious installers silently did nothing and the guest's
+    # first HTTPS request failed `certificate verify failed`, i.e. the trust
+    # error this whole rung exists to prevent, with the CA sitting on disk.
+    #
+    # The needle is the certificate's first body line, so re-running is a no-op
+    # and a bundle reached twice through a symlink is appended to once.
+    __n=0
+    __line=$(head -n 2 {ca_crt} 2>/dev/null | tail -n 1)
+    for __b in /etc/ssl/certs/ca-certificates.crt /etc/ssl/cert.pem \
+               /etc/pki/tls/certs/ca-bundle.crt; do
+        [ -f "$__b" ] || continue
+        grep -qF "$__line" "$__b" 2>/dev/null && continue
+        cat {ca_crt} >> "$__b" 2>/dev/null && __n=$((__n + 1))
+    done
+
+    # And the proper install where the tooling exists, so a later
+    # `update-ca-certificates` regenerates the bundle *with* our CA in it
+    # rather than dropping the line we appended above.
+    if mkdir -p /usr/local/share/ca-certificates 2>/dev/null; then
+        cp {ca_crt} /usr/local/share/ca-certificates/gimbal-proxy.crt 2>/dev/null
+        command -v update-ca-certificates >/dev/null 2>&1 &&
+            update-ca-certificates >/dev/null 2>&1
+    fi
+    unset __line
+
+    # Report what happened, not what was attempted. An installer that says it
+    # succeeded because a command exited 0 is worse than no installer: the guest
+    # then fails a certificate check *after* being told it was trusted, and the
+    # error names TLS rather than us.
+    if [ "$__n" -gt 0 ]; then
+        echo "gimbal: credential proxy CA installed ({ca_crt}); \
+$__n system trust store(s) updated"
+    else
+        echo "gimbal: credential proxy CA at {ca_crt}, and \
+NODE_EXTRA_CA_CERTS set, but no system trust store was found here --
+gimbal: so node works and curl/git may still refuse the proxy's certificate"
+    fi
+    unset __n
+elif [ -n "$__ca_sent" ]; then
+    # chm said it appended a CA archive and the file is not here, so the kernel
+    # stopped unpacking before it reached the tail. It does that in silence when
+    # the initramfs and its unpacked copy will not both fit in guest RAM --
+    # measured on node:22-slim at 768 MiB, where the CA simply was not there.
+    #
+    # Named rather than left silent because the alternative is a TLS failure
+    # later that blames the certificate, or the network, or the clock: anything
+    # except the memory setting that actually caused it.
+    echo "gimbal: the credential proxy CA did not survive the boot -- the kernel \
+stops unpacking the
+gimbal: initramfs without saying so when it runs short of memory. Give the guest \
+more memory with
+gimbal: --memory; until then HTTPS through the proxy fails a certificate check."
+fi
+unset __ca_sent
 
 echo "gimbal: container rootfs up; starting {entrypoint}"
 
@@ -890,6 +990,92 @@ mod tests {
                 "the shell did not read `{hostile}` back unchanged"
             );
         }
+    }
+
+    /// The CA env has to be sourced on the path everybody actually takes.
+    #[test]
+    fn the_ca_env_is_sourced_where_both_handover_paths_reach_it() {
+        let s = default_init("/bin/sh", &[], None, &[]);
+        let start = s.find("gimbal_start() {").expect("no gimbal_start");
+        let end = s[start..].find("\n}\n").expect("unterminated") + start;
+        let body = &s[start..end];
+        assert!(
+            body.contains("/etc/gimbal/proxy-ca.env"),
+            "the CA env must be sourced inside gimbal_start: the --gimbal-session \
+             re-entry skips the whole main body, so anywhere else is lost on the \
+             path that actually runs.\n{body}"
+        );
+        assert!(
+            body.find("proxy-ca.env").expect("no env") < body.find("exec ").expect("no exec"),
+            "it must be sourced before the entrypoint, or the entrypoint cannot see it"
+        );
+    }
+
+    /// An image that names its own bundle made an explicit choice.
+    #[test]
+    fn an_image_that_sets_the_variable_itself_wins() {
+        let s = default_init("/bin/sh", &[], None, &[]);
+        assert!(
+            s.contains(r#"[ -z "${NODE_EXTRA_CA_CERTS:-}" ]"#),
+            "chm's CA must not overwrite one the image set deliberately:\n{s}"
+        );
+    }
+
+    /// Conditional at *runtime*: the same image boots with and without a proxy.
+    #[test]
+    fn the_ca_install_asks_whether_the_file_arrived() {
+        let s = default_init("/bin/sh", &[], None, &[]);
+        assert!(
+            s.contains("if [ -r /etc/gimbal/proxy-ca.crt ]; then"),
+            "the presence of the file is the question, so one image serves both runs"
+        );
+        assert!(
+            s.contains("NODE_EXTRA_CA_CERTS"),
+            "Node ignores the OS trust store, so the system store alone is not enough"
+        );
+        assert!(
+            s.contains("update-ca-certificates"),
+            "curl, git and apt read the OS store, so Node alone is not enough either"
+        );
+        assert!(
+            s.contains("/etc/ssl/certs/ca-certificates.crt") && s.contains(">> \"$__b\""),
+            "appending to a bundle the TLS library already reads is the only \
+             mechanism that needs nothing installed -- measured on alpine:3.20, \
+             which ships neither update-ca-certificates nor the openssl CLI, so \
+             without this the CA sits on disk and every HTTPS request still fails"
+        );
+    }
+
+    #[test]
+    /// The kernel drops the tail of an initramfs it cannot fit in memory and
+    /// says nothing. Without this branch the guest is silent too, and the
+    /// failure surfaces much later as a certificate error naming TLS.
+    fn a_ca_that_was_sent_and_did_not_arrive_is_named_rather_than_left_silent() {
+        let script = default_init("/bin/sh", &[], None, &[]);
+        let key = crate::coldboot::CA_SENT_KEY;
+        assert!(
+            script.contains(&format!("{key}=*) __ca_sent=1 ;;")),
+            "the init must read whether chm claimed to send a CA; without that it \
+             cannot tell `no proxy was asked for` from `the archive was lost`"
+        );
+        assert!(
+            script.contains("elif [ -n \"$__ca_sent\" ]; then"),
+            "the diagnosis must hang off the *absence* of the file, so it fires \
+             exactly when the file did not arrive"
+        );
+        assert!(
+            script.contains("did not survive the boot") && script.contains("--memory"),
+            "the message has to name the remedy; `the CA is missing` sends a \
+             reader to look at the proxy, which is working"
+        );
+        let quiet = script
+            .split("elif [ -n \"$__ca_sent\" ]; then")
+            .nth(1)
+            .expect("the branch exists");
+        assert!(
+            !quiet.starts_with("\nfi"),
+            "an empty branch would report nothing, which is the bug"
+        );
     }
 
     #[test]
