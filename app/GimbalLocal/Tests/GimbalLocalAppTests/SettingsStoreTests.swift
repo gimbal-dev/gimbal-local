@@ -278,9 +278,7 @@ final class SettingsStoreTests: XCTestCase {
     /// because both would use the same wrong key from `defaultsKey`. This one
     /// drives real storage.
     func testSaveThenLoadThroughRealUserDefaults() throws {
-        let suite = "gimbal.tests.\(UUID().uuidString)"
-        let store = try XCTUnwrap(UserDefaults(suiteName: suite))
-        defer { UserDefaults.standard.removePersistentDomain(forName: suite) }
+        let store = try throwawayDefaults()
 
         var chosen = base
         chosen.chmPath = "/opt/persisted/chm"
@@ -305,9 +303,7 @@ final class SettingsStoreTests: XCTestCase {
     }
 
     func testAnEnvironmentOverriddenFieldNeverReachesStorage() throws {
-        let suite = "gimbal.tests.\(UUID().uuidString)"
-        let store = try XCTUnwrap(UserDefaults(suiteName: suite))
-        defer { UserDefaults.standard.removePersistentDomain(forName: suite) }
+        let store = try throwawayDefaults()
 
         store.set("/opt/mine/chm", forKey: SettingsField.chmPath.defaultsKey)
 
