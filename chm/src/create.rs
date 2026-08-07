@@ -54,6 +54,7 @@ use crate::imp::{
     wait_for_cpu_on_request,
 };
 use crate::oci::modules;
+use crate::runs;
 use crate::spec::{Overrides, SandboxSpec, resolve, spec_file_for};
 use crate::{coldboot, console, credproxy, postboot};
 
@@ -495,6 +496,33 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     }
 
     let hv = HvfHypervisor::new().map_err(|e| format!("Hypervisor.framework unavailable: {e}"))?;
+
+    // Announce the run now that a VM is genuinely being created, and hold the
+    // registration for the rest of this function. Before this point there is
+    // nothing to report; after `--dry-run` returns there never will be.
+    //
+    // The label comes from the image directory rather than the kernel file,
+    // because every image has a kernel called `Image` and a list of six rows
+    // all saying "Image" is a list that tells you nothing.
+    let image_dir = args
+        .cfg
+        .kernel
+        .parent()
+        .unwrap_or(&args.cfg.kernel)
+        .to_path_buf();
+    let _registration = runs::register(
+        runs::Kind::Cold,
+        &runs::label_for(&image_dir),
+        &image_dir.display().to_string(),
+        args.cfg.vcpus.into(),
+        args.cfg.memory_mib,
+    )
+    .unwrap_or_else(|e| {
+        // A registry that cannot be written is a guest you cannot see, not a
+        // guest you cannot have. Say so and carry on.
+        eprintln!("chm: warning: could not record this run: {e}");
+        None
+    });
 
     let uart = Arc::new(Pl011::new());
     let bus = Arc::new(MmioBus::new());
