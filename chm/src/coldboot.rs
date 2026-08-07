@@ -43,9 +43,13 @@
 use std::collections::HashMap;
 use std::fmt::Write as _;
 use std::fs::File;
+use std::fs;
+use std::io::Cursor;
 use std::io::Read;
 use std::io::Seek;
 use std::io::SeekFrom;
+
+use crate::kernelimage;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::path::PathBuf;
@@ -79,8 +83,12 @@ pub type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
 /// Documented in `Documentation/arch/arm64/booting.rst`. The four bytes are
 /// `ARM\x64`; everything before them is a small PE/COFF stub so the same file
 /// can also be an EFI application.
-const ARM64_MAGIC_OFFSET: u64 = 0x38;
-const ARM64_MAGIC: [u8; 4] = *b"ARM\x64";
+/// One definition, in [`crate::kernelimage`], which is where the decoding that
+/// depends on it lives. Two copies of "what an arm64 kernel looks like" is the
+/// drift that let this file and `oci::image` refuse the same kernel for two
+/// different wrong reasons (#220).
+#[cfg(test)]
+use kernelimage::{ARM64_MAGIC, ARM64_MAGIC_OFFSET};
 
 /// The alignment upstream loads an arm64 kernel at.
 ///
@@ -629,35 +637,43 @@ impl VirtioKind {
     }
 }
 
-/// Read the arm64 header and report `(image_size, text_offset)`.
+/// Read the kernel, unwrapping whatever the distro wrapped it in, and report
+/// `(image, image_size, text_offset)`.
 ///
-/// Fails with an explanation rather than a magic number when the file is not an
-/// arm64 `Image` — see the module docs on `vmlinuz`.
-fn read_arm64_header(path: &Path) -> Result<(u64, u64), String> {
-    let mut f = File::open(path).map_err(|e| format!("opening kernel {}: {e}", path.display()))?;
-    let mut hdr = [0_u8; 64];
-    f.read_exact(&mut hdr)
-        .map_err(|e| format!("reading the 64-byte arm64 header from {}: {e}", path.display()))?;
+/// The bytes come back rather than a path, because after unwrapping there may
+/// be no file holding them. Writing a decompressed kernel to a temp file would
+/// need somewhere to put it, a cleanup owner and a failure mode when the disk
+/// is full — for a 34 MiB buffer that is already being read into RAM to be
+/// copied into guest RAM.
+///
+/// Refusals name what the file actually is; see [`crate::kernelimage`] for why
+/// that matters more than it sounds (#220).
+fn read_kernel_image(path: &Path) -> Result<(Vec<u8>, u64, u64), String> {
+    let raw = fs::read(path).map_err(|e| format!("opening kernel {}: {e}", path.display()))?;
+    let label = path.display().to_string();
+    let (image, form) = kernelimage::decode(&raw, &label)?;
+    let image = image.into_owned();
 
-    let magic = &hdr[ARM64_MAGIC_OFFSET as usize..ARM64_MAGIC_OFFSET as usize + 4];
-    if magic != ARM64_MAGIC {
-        let hint = if hdr[0] == 0x1f && hdr[1] == 0x8b {
-            "\n  This is a gzip stream. A distro `vmlinuz` on arm64 is a compressed\n  Image; decompress it first: gunzip -c vmlinuz-... > Image"
-        } else {
-            ""
-        };
+    if form.was_compressed() {
+        // Said out loud because the kernel that boots is not the file that was
+        // named, and a `uname -r` that surprises someone should have an
+        // explanation earlier in the same transcript.
+        println!("chm: kernel {} — {}", path.display(), form.describe());
+    }
+
+    // `decode` has already checked the magic, so a short read here would be a
+    // bug in this crate rather than a bad file.
+    if image.len() < 64 {
         return Err(format!(
-            "{} is not an arm64 kernel Image: expected {:x?} at offset {:#x}, found {:x?}{hint}",
+            "{} decoded to {} bytes, too short for an arm64 header",
             path.display(),
-            ARM64_MAGIC,
-            ARM64_MAGIC_OFFSET,
-            magic,
+            image.len()
         ));
     }
 
-    let text_offset = u64::from_le_bytes(hdr[8..16].try_into().expect("8 bytes"));
-    let image_size = u64::from_le_bytes(hdr[16..24].try_into().expect("8 bytes"));
-    Ok((image_size, text_offset))
+    let text_offset = u64::from_le_bytes(image[8..16].try_into().expect("8 bytes"));
+    let image_size = u64::from_le_bytes(image[16..24].try_into().expect("8 bytes"));
+    Ok((image, image_size, text_offset))
 }
 
 /// Build a cold guest image: allocate RAM, load the kernel, write the tree.
@@ -690,7 +706,7 @@ pub fn build(cfg: &ColdBootConfig) -> Result<ColdGuestImage, String> {
         ));
     }
 
-    let (image_size, text_offset) = read_arm64_header(&cfg.kernel)?;
+    let (kernel_image, image_size, text_offset) = read_kernel_image(&cfg.kernel)?;
     let ram_size = (cfg.memory_mib << 20) as usize;
     let ram_base = layout::RAM_START.0;
 
@@ -718,19 +734,13 @@ pub fn build(cfg: &ColdBootConfig) -> Result<ColdGuestImage, String> {
     let mem = GuestMemoryMmap::from_ranges(&[(layout::RAM_START, ram_size)])
         .map_err(|e| format!("allocating {} MiB of guest RAM: {e}", cfg.memory_mib))?;
 
-    let mut kernel_file = File::open(&cfg.kernel)
-        .map_err(|e| format!("opening kernel {}: {e}", cfg.kernel.display()))?;
-    let kernel_file_size = kernel_file
-        .seek(SeekFrom::End(0))
-        .map_err(|e| format!("sizing kernel {}: {e}", cfg.kernel.display()))?;
-    kernel_file
-        .seek(SeekFrom::Start(0))
-        .map_err(|e| format!("rewinding kernel {}: {e}", cfg.kernel.display()))?;
+    let kernel_file_size = kernel_image.len() as u64;
+    let mut kernel_reader = Cursor::new(kernel_image);
 
     let loaded = PE::load(
         &mem,
         Some(GuestAddress(kernel_addr)),
-        &mut kernel_file,
+        &mut kernel_reader,
         None,
     )
     .map_err(|e| format!("loading {} at {kernel_addr:#x}: {e}", cfg.kernel.display()))?;
@@ -909,19 +919,24 @@ mod tests {
         d
     }
 
+    /// The header is read from the *decoded* image, so a wrapped kernel's
+    /// header is the inner kernel's header and not the wrapper's. Getting this
+    /// wrong would size guest RAM against a compressed payload and place the
+    /// kernel somewhere it does not belong.
     #[test]
-    fn a_gzip_vmlinuz_is_named_as_such_rather_than_called_corrupt() {
+    fn a_wrapped_kernels_header_is_read_from_the_kernel_inside_it() {
         let d = tmpdir("gzip");
+        let inner = std::fs::read(fake_image(&d, "inner", 0x0387_0000, 0, 4096)).unwrap();
+        let mut enc =
+            flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        enc.write_all(&inner).unwrap();
         let p = d.join("vmlinuz");
-        let mut f = File::create(&p).unwrap();
-        // gzip magic, then enough bytes to fill the header read.
-        f.write_all(&[0x1f, 0x8b, 0x08, 0x00]).unwrap();
-        f.write_all(&[0_u8; 60]).unwrap();
-        drop(f);
+        std::fs::write(&p, enc.finish().unwrap()).unwrap();
 
-        let err = read_arm64_header(&p).unwrap_err();
-        assert!(err.contains("gzip"), "{err}");
-        assert!(err.contains("gunzip"), "{err}");
+        let (image, image_size, text_offset) = read_kernel_image(&p).unwrap();
+        assert_eq!(image_size, 0x0387_0000);
+        assert_eq!(text_offset, 0);
+        assert_eq!(image, inner);
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -930,8 +945,8 @@ mod tests {
         let d = tmpdir("short");
         let p = d.join("tiny");
         File::create(&p).unwrap().write_all(b"nope").unwrap();
-        let err = read_arm64_header(&p).unwrap_err();
-        assert!(err.contains("64-byte arm64 header"), "{err}");
+        let err = read_kernel_image(&p).unwrap_err();
+        assert!(err.contains("too small"), "{err}");
         let _ = std::fs::remove_dir_all(&d);
     }
 
@@ -939,7 +954,7 @@ mod tests {
     fn the_header_is_read_not_guessed() {
         let d = tmpdir("hdr");
         let p = fake_image(&d, "Image", 0x0387_0000, 0, 4096);
-        let (image_size, text_offset) = read_arm64_header(&p).unwrap();
+        let (_, image_size, text_offset) = read_kernel_image(&p).unwrap();
         assert_eq!(image_size, 0x0387_0000);
         assert_eq!(text_offset, 0);
         let _ = std::fs::remove_dir_all(&d);
