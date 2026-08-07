@@ -180,6 +180,69 @@ you into a Node REPL rather than a prompt, and `node:22-slim` defaults to plain
 `node` for the same result. Pass `--entrypoint /bin/sh` (or `/bin/bash` on a
 Debian-based image) when you want a shell.
 
+## A working agent sandbox, end to end
+
+Three things must all be true before the GitHub Copilot CLI will run in a
+container-image guest, and each one fails differently. The issue that prompted
+this ([#224](https://github.com/gimbal-dev/gimbal-local/issues/224)) named only
+the first; the other two were found by testing the recommendation rather than
+publishing it.
+
+| requirement | if you skip it |
+| --- | --- |
+| **glibc rootfs** | `Node-API symbol napi_create_function has not been loaded` at first run |
+| **a kernel whose PL031 driver is present** | `certificate is not yet valid` — reads as a network fault, *is* a dead clock |
+| **`--entrypoint /bin/sh`** | you land in a Node REPL, not a shell |
+
+The second is the one to watch, because the symptom names the wrong subsystem
+entirely. See [the clock section](#the-guest-is-told-what-time-it-is): `chm`
+now passes the host time on the kernel command line in every case, so this is
+handled, but a kernel with a builtin PL031 (Alpine `virt`) is still the more
+robust choice.
+
+Kernel and userland are independent, so mixing them is legitimate and is what
+the working combination does — the Alpine `virt` kernel for its drivers, a
+Debian rootfs for its glibc:
+
+```bash
+chm image build node:22-slim \
+  --kernel /path/to/vmlinuz-virt \
+  --modules /path/to/alpine-modules \
+  --entrypoint /bin/sh \
+  --out ~/gimbal-images/agent
+
+chm create \
+  --kernel ~/gimbal-images/agent/Image \
+  --initramfs ~/gimbal-images/agent/initramfs \
+  --cpus 2 --memory 3008 --net \
+  --egress-allow registry.npmjs.org:443 \
+  --egress-allow github.com:443 \
+  --egress-allow objects.githubusercontent.com:443 \
+  --egress-allow api.github.com:443
+```
+
+Then, in the guest:
+
+```
+npm i -g @github/copilot && copilot --version
+```
+
+Measured on this exact combination, so it can be retested rather than believed:
+
+```
+CLOCK=2026-08-07T16:32:34   RTC=/dev/rtc0   NIC=02:00:00:00:00:02
+NPM_RC=0
+CV_RC=0
+CVOUT=GitHub Copilot CLI 1.0.78
+```
+
+Versions: Copilot CLI **1.0.78**, node **v22.23.2**, npm **10.9.8**, Alpine
+`virt` kernel **6.6.142-0-virt**, `node:22-slim` (glibc 2.36).
+
+The `--egress-allow` list is the minimum for `npm i -g @github/copilot`;
+authenticating and running the agent needs more, and the guest names each host
+it is refused so you can add them one at a time.
+
 ## Platform selection
 
 `--platform os/arch[/variant]` picks a manifest from a multi-arch index. A
@@ -233,21 +296,32 @@ before the NIC, before your entrypoint. `date` ships in coreutils (Debian
 Essential) and in busybox, and the init is a shell script, so any image it runs
 in has one; verified on GNU coreutils and BusyBox 1.36.1.
 
-You do not need to do anything. To check:
+You do not need to do anything, and this now holds **however you booted** —
+including with an explicit `--cmdline`. To check:
 
 ```
 date -u        # within a second or two of your Mac
 ```
 
-**A guest given an explicit `--cmdline` is not given a clock**, deliberately.
-That flag is honoured exactly as written and never appended to — use
-`--cmdline-extra` if you want both. A clock confidently set to the wrong time is
-harder to diagnose than one obviously stuck in 1970.
-
-> **Images built before this need rebuilding.** Older `image.json` files carry a
-> `cmdline` field, which takes the explicit path and therefore gets no clock.
-> Current builds omit it. `chm image build` again over the same output directory
-> is enough.
+> **This was not always true, and the failure was ugly.** Until recently the
+> clock was attached only when you did *not* pass `--cmdline` — by analogy with
+> `root=`, which genuinely must not be overridden. The analogy is false: `root=`
+> is a *choice*, and the wall clock is a *fact about now*. There is no command
+> line for which "and therefore the year is 1970" is what the caller meant.
+>
+> It stayed hidden because the app passes `--cmdline console=ttyAMA0` on every
+> cold boot, and Alpine's `virt` kernel has PL031 **builtin** — so the RTC
+> covered for the missing argument and the guest's clock was right anyway. Boot
+> the same rootfs on Ubuntu's generic kernel, which has no builtin PL031, and
+> the clock silently falls back to the epoch. Measured, on identical rootfs:
+>
+> | kernel | `/dev/rtc0` | guest clock |
+> | --- | --- | --- |
+> | Alpine `virt` 6.6.142-0-virt | present | correct |
+> | Ubuntu generic 6.8 | **absent** | **1970-01-01** |
+>
+> If you set `gimbal.epoch=` yourself, that is taken at your word and left
+> alone.
 
 ## Networking, once the drivers are there
 

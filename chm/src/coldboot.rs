@@ -365,6 +365,18 @@ pub fn default_cmdline() -> String {
 /// exists to prevent.
 pub const EPOCH_KEY: &str = "gimbal.epoch";
 
+/// Whether a command line already carries an epoch key of its own.
+///
+/// Word-wise rather than a substring search: `console=ttyAMA0` must not be
+/// mistaken for an epoch, and neither must a key that merely *ends* with our
+/// name. A caller who sets this deliberately keeps it — the point of the check
+/// is to leave a caller's own clock alone, not to guess at one.
+pub fn mentions_epoch(cmdline: &str) -> bool {
+    cmdline
+        .split_whitespace()
+        .any(|w| w.split('=').next() == Some(EPOCH_KEY))
+}
+
 /// The clock argument for a guest booting now, or `None` if the host clock is
 /// itself before 1970.
 ///

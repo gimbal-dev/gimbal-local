@@ -364,7 +364,7 @@ fn resolve_modules(
     };
     let index = modules::Index::build(&tree)?;
     let total = index.len();
-    let resolved = modules::resolve(&index, &modules::VIRTIO_ROOTS, &release)?;
+    let resolved = modules::resolve(&index, &modules::MODULE_ROOTS, &release)?;
 
     if resolved.modules.is_empty() {
         // Every root builtin. Say so: someone who passed --modules deliberately
