@@ -187,6 +187,22 @@ impl VirtioBuiltin {
         }
     }
 
+    /// Treat these module names as supplied, because chm is bundling them.
+    ///
+    /// A driver chm has just put in the initramfs is one the guest will have,
+    /// so warning about it would report a problem this build already solved --
+    /// and a warning that is wrong costs more than its absence, because the
+    /// next true one gets read the same way.
+    #[must_use]
+    pub fn satisfied_by(self, bundled: &[&str]) -> Self {
+        let has = |n: &str| bundled.contains(&n);
+        Self {
+            mmio: self.mmio || has("virtio_mmio"),
+            net: self.net || has("virtio_net"),
+            blk: self.blk || has("virtio_blk"),
+        }
+    }
+
     /// The sentence to show a user, or `None` when nothing is wrong.
     ///
     /// The transport is reported on its own, because loading `virtio_net`
@@ -216,8 +232,9 @@ impl VirtioBuiltin {
              no NIC and no disk.\n    \
              An Ubuntu `generic` arm64 kernel has these built in and is known to \
              work; Alpine's `virt` does not.\n    \
-             If you must use this kernel, supply the matching modules and load \
-             virtio_mmio *as well as* virtio_net.",
+             If you must use this kernel, point `chm image build --modules` at \
+             the module tree from the same kernel package and they will be \
+             bundled for you, transport first.",
             missing.join(", ")
         ))
     }

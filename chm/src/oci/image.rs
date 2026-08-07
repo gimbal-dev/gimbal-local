@@ -45,8 +45,10 @@ use std::process::ExitCode;
 
 use super::apply;
 use super::initramfs::{default_init, write_cpio};
-use super::reference::{self, Reference};
+use super::modload;
+use super::modules;
 use super::nicfg;
+use super::reference::{self, Reference};
 use super::registry::{self, ImageConfig, Registry};
 use super::targz;
 use crate::coldboot::VirtioBuiltin;
@@ -101,8 +103,9 @@ pub fn usage() -> String {
          `ghcr.io/owner/name:tag`. Defaults to Docker Hub and `latest`.\n\
      \n\
      OPTIONS:\n    \
-         --kernel <PATH>   An uncompressed arm64 `Image`. Required: a container\n                      \
-         image carries no kernel.\n    \
+         --kernel <PATH>   An arm64 kernel: a raw `Image`, or the compressed\n                      \
+         form a distro ships (gzip or EFI zboot), which is unwrapped\n                      \
+         for you. Required: a container image carries no kernel.\n    \
          --out <DIR>       Where to write the image directory\n                      \
          (default: <images library>/<name>-<tag>).\n    \
          --entrypoint <C>  Override the command init hands over to. Default is\n                      \
@@ -110,6 +113,11 @@ pub fn usage() -> String {
          --ram-mib <N>     Guest RAM. Default is sized from the rootfs, because\n                      \
          an initramfs is unpacked into memory.\n    \
          --vcpus <N>       Default 2.\n    \
+         --modules <DIR>   A kernel module tree for this kernel: either\n                      \
+         `lib/modules/<release>` itself or a directory holding it.\n                      \
+         Only the virtio drivers and what they depend on are\n                      \
+         bundled. Found automatically beside --kernel when a\n                      \
+         distro kernel package has been unpacked there.\n    \
          --platform <P>    os/arch[/variant]. Default linux/arm64, which takes an\n                      \
          unspecified variant or v8. Name one (e.g. linux/arm64/v9)\n                      \
          to select among an image's arm64 variants. A platform\n                      \
@@ -126,6 +134,7 @@ pub fn usage() -> String {
 struct Args {
     reference: Reference,
     kernel: Option<PathBuf>,
+    modules: Option<PathBuf>,
     out: Option<PathBuf>,
     entrypoint: Option<String>,
     ram_mib: Option<u64>,
@@ -137,6 +146,7 @@ struct Args {
 fn parse(args: &[String]) -> Result<Args, String> {
     let mut reference = None;
     let mut kernel = None;
+    let mut modules = None;
     let mut out = None;
     let mut entrypoint = None;
     let mut ram_mib = None;
@@ -154,6 +164,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
         };
         match a {
             "--kernel" => kernel = Some(PathBuf::from(next("--kernel")?)),
+            "--modules" => modules = Some(PathBuf::from(next("--modules")?)),
             "--out" => out = Some(PathBuf::from(next("--out")?)),
             "--entrypoint" => entrypoint = Some(next("--entrypoint")?),
             "--ram-mib" => {
@@ -186,6 +197,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
     Ok(Args {
         reference: reference.ok_or_else(|| format!("which image?\n\n{}", usage()))?,
         kernel,
+        modules,
         out,
         entrypoint,
         ram_mib,
@@ -254,8 +266,131 @@ fn read_kernel(path: &Path) -> Result<(Vec<u8>, KernelForm), String> {
 /// the file would report "no virtio built in" for a kernel that has it -- a
 /// warning that is wrong in the direction that sends someone chasing #222 for
 /// a guest whose devices would have worked.
-fn warn_kernel_virtio(image: &[u8]) -> Option<String> {
-    VirtioBuiltin::scan(image).warning()
+fn warn_kernel_virtio(image: &[u8], bundled: Option<&modules::Resolved>) -> Option<String> {
+    let supplied: Vec<&str> = bundled
+        .map(|r| r.modules.iter().map(|m| m.name.as_str()).collect())
+        .unwrap_or_default();
+    VirtioBuiltin::scan(image).satisfied_by(&supplied).warning()
+}
+
+/// Put the modules, and the loader that can load them, into the rootfs.
+///
+/// Returns the guest paths in load order, which is the same list the generated
+/// init is built from -- one list, so the files that exist and the files the
+/// init names cannot drift apart.
+fn install_modules(
+    rootfs: &mut super::initramfs::Rootfs,
+    bundled: Option<&modules::Resolved>,
+) -> Result<Vec<String>, String> {
+    let Some(resolved) = bundled else {
+        return Ok(Vec::new());
+    };
+    // The directory FIRST, and it is not optional.
+    //
+    // `init/initramfs.c` does not create missing parents: a file whose parent
+    // directory has no entry of its own fails `openat` with ENOENT and the
+    // kernel drops it *without a word*. Measured -- the first hardware run put
+    // all five modules in the cpio and the guest had none of them, looking
+    // exactly like not having bundled anything. Same silent drop as the
+    // usr-merge symlink trap `nicfg` documents, through a different door.
+    rootfs.insert(
+        modules::GUEST_DIR.to_string(),
+        EntryKind::Directory { mode: 0o755 },
+        Vec::new(),
+    );
+
+    let mut paths = Vec::with_capacity(resolved.modules.len());
+    for m in &resolved.modules {
+        let guest = m.guest_path();
+        let absolute = format!("/{guest}");
+        if !modload::is_reportable(Path::new(&absolute)) {
+            return Err(format!(
+                "module `{}` (from `{}`) has an unusable guest path",
+                m.name,
+                m.source.display()
+            ));
+        }
+        rootfs.insert(
+            guest,
+            EntryKind::File {
+                mode: 0o644,
+                size: m.image.len() as u64,
+            },
+            m.image.clone(),
+        );
+        paths.push(absolute);
+    }
+    // chm's own loader, for images with no insmod. node:22-slim -- the glibc
+    // base #224 says an agent needs -- is one of them.
+    rootfs.insert(
+        modload::GUEST_PATH.to_string(),
+        EntryKind::File {
+            mode: 0o755,
+            size: modload::loader().len() as u64,
+        },
+        modload::loader().to_vec(),
+    );
+    Ok(paths)
+}
+
+/// Find, verify and resolve the modules this kernel needs, if any are to be had.
+///
+/// Returns `None` when there is nothing to bundle, which is the ordinary
+/// outcome in two quite different cases — no module tree was supplied or found,
+/// and a tree that has no virtio modules because the kernel has them builtin.
+/// Neither is an error, and the difference is reported rather than inferred.
+fn resolve_modules(
+    kernel_path: &Path,
+    kernel_image: &[u8],
+    explicit: Option<&Path>,
+) -> Result<Option<modules::Resolved>, String> {
+    let Some(release) = kernelimage::release(kernel_image) else {
+        // Without a release there is nothing to match a module's vermagic
+        // against, and bundling unverified modules is how you get a guest that
+        // boots with no devices and no explanation.
+        if let Some(dir) = explicit {
+            return Err(format!(
+                "cannot bundle modules from `{}`: `{}` carries no `Linux version` banner, \
+                 so there is no release to match them against.",
+                dir.display(),
+                kernel_path.display()
+            ));
+        }
+        return Ok(None);
+    };
+
+    let Some(tree) = modules::locate(kernel_path, explicit, &release)? else {
+        return Ok(None);
+    };
+    let index = modules::Index::build(&tree)?;
+    let total = index.len();
+    let resolved = modules::resolve(&index, &modules::VIRTIO_ROOTS, &release)?;
+
+    if resolved.modules.is_empty() {
+        // Every root builtin. Say so: someone who passed --modules deliberately
+        // is owed the difference between "not needed" and "not found".
+        println!(
+            "  modules: {} has none of the virtio drivers as modules — this kernel has them builtin",
+            tree.describe()
+        );
+        return Ok(None);
+    }
+
+    let names: Vec<&str> = resolved.modules.iter().map(|m| m.name.as_str()).collect();
+    println!(
+        "  modules: {} for {release} — {} of {total}, {}",
+        tree.describe(),
+        resolved.modules.len(),
+        human_bytes(resolved.total_bytes() as u64)
+    );
+    println!("           {}", names.join(", "));
+    if !resolved.builtin_or_absent.is_empty() {
+        println!(
+            "           {} not present, so builtin in this kernel",
+            resolved.builtin_or_absent.join(", ")
+        );
+    }
+    Ok(Some(resolved))
 }
 
 /// Which C library the image ships, when it can be told.
@@ -422,6 +557,24 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
         }
     };
 
+    // Kernel modules, before anything is pulled: a mismatched module tree is a
+    // refusal, and refusing after a multi-gigabyte pull wastes the pull.
+    //
+    // `--modules` with no `--kernel` cannot be honoured -- the release to match
+    // comes from the kernel's own banner -- and silently ignoring it would
+    // produce exactly the guest the flag was passed to avoid.
+    let bundled = match (&kernel, &args.modules) {
+        (Some((kpath, kbytes)), explicit) => resolve_modules(kpath, kbytes, explicit.as_deref())?,
+        (None, Some(dir)) => {
+            return Err(format!(
+                "--modules `{}` needs --kernel: which modules to bundle is decided by \
+                 the kernel's own release, read out of the kernel.",
+                dir.display()
+            ));
+        }
+        (None, None) => None,
+    };
+
     let out = args
         .out
         .clone()
@@ -480,10 +633,20 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
 
     print_report(&report);
 
-    // The generated init goes in last, so image content can never shadow it —
-    // a layer shipping its own `/init` would otherwise decide what a guest runs
-    // before any of our setup happened.
-    let init = default_init(&entrypoint, &config.env, config.workdir.as_deref());
+    // The modules, before the init that loads them is written — the init names
+    // these paths, so the two are built from one list rather than two.
+    //
+    // Inserted after image content for the same reason the init is: a layer
+    // that happened to ship a file at one of these paths must not decide what
+    // driver the guest loads.
+    let module_paths = install_modules(&mut rootfs, bundled.as_ref())?;
+
+    let init = default_init(
+        &entrypoint,
+        &config.env,
+        config.workdir.as_deref(),
+        &module_paths,
+    );
     rootfs.insert(
         "init".to_string(),
         EntryKind::File {
@@ -538,7 +701,10 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
         println!("  --dry-run: nothing written (would be {})", out.display());
         // A dry run is precisely when someone is checking whether their kernel
         // is the right one, so it is the last place that should stay quiet.
-        if let Some(w) = kernel.as_ref().and_then(|(_, b)| warn_kernel_virtio(b)) {
+        if let Some(w) = kernel
+            .as_ref()
+            .and_then(|(_, b)| warn_kernel_virtio(b, bundled.as_ref()))
+        {
             println!("\nNOTE: {w}");
         }
         return Ok(ExitCode::SUCCESS);
@@ -562,7 +728,7 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
     if let Some(w) = libc.warning() {
         println!("\nNOTE: {}", w.replace('\n', "\n      "));
     }
-    if let Some(w) = warn_kernel_virtio(&kernel_image) {
+    if let Some(w) = warn_kernel_virtio(&kernel_image, bundled.as_ref()) {
         println!("\nNOTE: {w}");
     }
     println!(
@@ -734,6 +900,7 @@ fn manifest(vcpus: u32, ram_mib: u64) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
     use std::process;
 
     #[test]
@@ -855,7 +1022,7 @@ mod tests {
             at += 64;
         }
         assert!(
-            warn_kernel_virtio(&inner).is_none(),
+            warn_kernel_virtio(&inner, None).is_none(),
             "the uncompressed form should warn about nothing"
         );
 
@@ -866,12 +1033,12 @@ mod tests {
 
         let (decoded, _) = read_kernel(&p).unwrap();
         assert!(
-            warn_kernel_virtio(&decoded).is_none(),
+            warn_kernel_virtio(&decoded, None).is_none(),
             "a wrapped kernel with virtio built in must not be warned about"
         );
         // And the thing that must never be what gets scanned:
         assert!(
-            warn_kernel_virtio(&fs::read(&p).unwrap()).is_some(),
+            warn_kernel_virtio(&fs::read(&p).unwrap(), None).is_some(),
             "precondition: the compressed bytes really do look device-less"
         );
         let _ = fs::remove_dir_all(&dir);
@@ -1142,4 +1309,194 @@ mod tests {
         assert_eq!(libc_flavour(paths.into_iter()), Libc::Unknown);
     }
 
+    /// `--modules` needs a kernel, because which modules to bundle is decided
+    /// by the kernel's own release. Ignoring the flag would produce precisely
+    /// the deviceless guest it was passed to prevent, and would do it quietly.
+    #[test]
+    fn modules_without_a_kernel_is_refused_by_name() {
+        let e = build(&[
+            "alpine:3.20".to_string(),
+            "--modules".to_string(),
+            "/tmp/nowhere".to_string(),
+            "--dry-run".to_string(),
+        ])
+        .unwrap_err();
+        assert!(e.contains("--modules"), "{e}");
+        assert!(e.contains("--kernel"), "{e}");
+    }
+
+    /// Modules install at the root, NOT under `lib/modules/`.
+    ///
+    /// On a usr-merge image `/lib` is a *symlink* to `usr/lib`. A cpio unpacks
+    /// in the order its entries appear, so `./lib/modules/x.ko` is reached
+    /// before `./usr/lib` exists, the symlink resolves to a directory that is
+    /// not there, and the kernel drops the file without a word. `nicfg` was
+    /// bitten by exactly this on node:22-slim, and this test is what stops the
+    /// obvious-looking path being reintroduced.
+    #[test]
+    fn modules_do_not_install_under_a_path_a_symlink_can_swallow() {
+        let m = modules::Module {
+            name: "virtio_net".to_string(),
+            depends: vec![],
+            vermagic: "6.6.142-0-virt SMP".to_string(),
+            image: vec![0u8; 4],
+            source: PathBuf::from("/x/virtio_net.ko.gz"),
+        };
+        let p = m.guest_path();
+        assert!(!p.starts_with("lib/"), "{p}");
+        assert!(!p.starts_with("usr/"), "{p}");
+        assert!(!p.contains("/lib/"), "{p}");
+        assert_eq!(p, "gimbal-modules/virtio_net.ko");
+    }
+
+    /// A driver chm has just bundled is one the guest will have, so the
+    /// builtin-scan warning must stop naming it. A warning that is wrong gets
+    /// the next true one ignored too.
+    #[test]
+    fn bundling_a_driver_withdraws_the_warning_about_it() {
+        // A kernel image with none of the three strings: modular on all counts.
+        let bare = vec![0u8; 4096];
+        let before = warn_kernel_virtio(&bare, None).expect("a bare kernel should warn");
+        assert!(before.contains("virtio_mmio"), "{before}");
+        assert!(before.contains("virtio_net"), "{before}");
+
+        let module = |n: &str| modules::Module {
+            name: n.to_string(),
+            depends: vec![],
+            vermagic: "6.6.142-0-virt SMP".to_string(),
+            image: vec![0u8; 4],
+            source: PathBuf::from("/x"),
+        };
+        let partial = modules::Resolved {
+            modules: vec![module("virtio_mmio"), module("virtio_net")],
+            builtin_or_absent: vec![],
+        };
+        // Still warns -- about the one that is genuinely still missing, and
+        // only that one. Withdrawing the whole warning would be the easy bug.
+        let after = warn_kernel_virtio(&bare, Some(&partial)).expect("virtio_blk is still missing");
+        // Only the list of what is missing is asserted on: the rest of the
+        // message is advice, and naming a driver there is not a claim about
+        // this kernel.
+        let missing = after.lines().next().unwrap_or_default();
+        assert!(missing.contains("virtio_blk"), "{after}");
+        assert!(!missing.contains("virtio_mmio"), "{after}");
+        assert!(!missing.contains("virtio_net"), "{after}");
+
+        let full = modules::Resolved {
+            modules: vec![
+                module("virtio_mmio"),
+                module("virtio_net"),
+                module("virtio_blk"),
+            ],
+            builtin_or_absent: vec![],
+        };
+        assert!(
+            warn_kernel_virtio(&bare, Some(&full)).is_none(),
+            "every driver bundled, nothing left to warn about"
+        );
+    }
+
+    /// The flag has to be reachable from the help, or it may as well not exist:
+    /// #222 is a failure nobody diagnoses without being told the remedy.
+    #[test]
+    fn the_modules_flag_is_documented() {
+        assert!(usage().contains("--modules"), "{}", usage());
+    }
+
+    /// The bug that reached hardware: all five modules present in the cpio, none
+    /// of them in the guest, and no message anywhere.
+    ///
+    /// `init/initramfs.c` does not create missing parents -- a file whose
+    /// parent has no entry of its own fails `openat` with ENOENT and is dropped
+    /// silently. So this walks the emitted archive the way the kernel's
+    /// unpacker does, over the rootfs `install_modules` really builds.
+    #[test]
+    fn a_bundled_module_is_reachable_when_the_kernel_unpacks_it() {
+        let module = |n: &str| modules::Module {
+            name: n.to_string(),
+            depends: vec![],
+            vermagic: "6.6.142-0-virt SMP".to_string(),
+            image: vec![0xffu8; 64],
+            source: PathBuf::from("/x"),
+        };
+        let resolved = modules::Resolved {
+            modules: vec![module("virtio_mmio"), module("virtio_net")],
+            builtin_or_absent: vec![],
+        };
+        let mut rootfs = super::super::initramfs::Rootfs::default();
+        let paths = install_modules(&mut rootfs, Some(&resolved)).unwrap();
+        assert_eq!(paths.len(), 2);
+
+        let cpio = super::super::initramfs::write_cpio(&rootfs);
+        let mut dirs: BTreeSet<String> = BTreeSet::new();
+        let mut files: BTreeSet<String> = BTreeSet::new();
+        let mut i = 0usize;
+        while i + 110 <= cpio.len() {
+            assert_eq!(&cpio[i..i + 6], b"070701");
+            let f = |k: usize| {
+                usize::from_str_radix(
+                    str::from_utf8(&cpio[i + 6 + k * 8..i + 6 + (k + 1) * 8]).unwrap(),
+                    16,
+                )
+                .unwrap()
+            };
+            let (mode, filesize, namesize) = (f(1), f(6), f(11));
+            let name = String::from_utf8_lossy(&cpio[i + 110..i + 110 + namesize - 1]).into_owned();
+            if name == "TRAILER!!!" {
+                break;
+            }
+            let path = name.trim_start_matches("./").to_string();
+            if let Some((parent, _)) = path.rsplit_once('/') {
+                assert!(
+                    dirs.contains(parent),
+                    "`{path}` unpacks before its parent `{parent}` exists, so the kernel \
+                     drops it without a word -- the exact #222 hardware failure"
+                );
+            }
+            if mode & 0o170000 == 0o040000 {
+                dirs.insert(path);
+            } else {
+                files.insert(path);
+            }
+            i += (110 + namesize).div_ceil(4) * 4 + filesize.div_ceil(4) * 4;
+        }
+        // And the init's paths are files that really landed.
+        for p in &paths {
+            assert!(
+                files.contains(p.trim_start_matches('/')),
+                "init loads `{p}`, which is not in the archive"
+            );
+        }
+        assert!(files.contains(modload::GUEST_PATH), "no loader shipped");
+    }
+
+    /// The resolved modules must actually reach the build, and the files that
+    /// land must be the files the init names.
+    ///
+    /// A mutation that changed the *call site* to `install_modules(.., None)`
+    /// left every other test in this file green: the function was correct and
+    /// simply never given anything, so the whole feature silently no-opped.
+    /// An assertion about an outcome structurally cannot see a path that is no
+    /// longer taken, so this reads the dispatch out of the source, the way
+    /// `chm --help`'s guard does.
+    #[test]
+    fn the_resolved_modules_reach_both_the_rootfs_and_the_init() {
+        let src = include_str!("image.rs");
+        // The needles are assembled rather than written out, or the test finds
+        // its own assertion text and passes against any source at all. That
+        // happened on the first attempt and the mutation went undetected.
+        let call = format!("install_modules(&mut rootfs, {}.as_ref())?", "bundled");
+        assert!(
+            src.contains(&call),
+            "the build no longer hands the resolved modules to the installer, so \
+             nothing is bundled however well the installer works"
+        );
+        // One list feeds both, or the files that exist and the files the init
+        // loads drift apart -- and the guest reports neither.
+        let feeds_init = format!("&{}_paths,", "module");
+        assert!(
+            src.contains(&feeds_init),
+            "the init is no longer built from the installer's own return value"
+        );
+    }
 }

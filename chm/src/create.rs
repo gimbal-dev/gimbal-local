@@ -53,6 +53,7 @@ use crate::imp::{
     CpuPowerSlot, PL011_BASE, PL011_SIZE, PsciCoordinator, apply_psci_cpu_on_state,
     wait_for_cpu_on_request,
 };
+use crate::oci::modules;
 use crate::spec::{Overrides, SandboxSpec, resolve, spec_file_for};
 use crate::{coldboot, console, credproxy, postboot};
 
@@ -468,7 +469,22 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     if args.cfg.net || !args.cfg.disks.is_empty() {
         let kernel_bytes = fs::read(&args.cfg.kernel)
             .map_err(|e| format!("cannot read kernel `{}`: {e}", args.cfg.kernel.display()))?;
-        if let Some(w) = coldboot::VirtioBuiltin::scan(&kernel_bytes).warning() {
+        // An initramfs built by `chm image build --modules` carries the
+        // drivers this kernel lacks. Warning about them anyway would be
+        // telling someone to fix something already fixed, in the same breath
+        // as the device table that is about to work -- and a warning that is
+        // wrong gets the next true one read the same way.
+        let bundled = args
+            .cfg
+            .initramfs
+            .as_deref()
+            .map(modules::bundled_in_initramfs)
+            .unwrap_or_default();
+        let supplied: Vec<&str> = bundled.iter().map(String::as_str).collect();
+        if let Some(w) = coldboot::VirtioBuiltin::scan(&kernel_bytes)
+            .satisfied_by(&supplied)
+            .warning()
+        {
             println!("\n  NOTE: {w}");
         }
     }

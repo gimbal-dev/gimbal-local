@@ -250,6 +250,53 @@ fn verify_arm64(out: &[u8], label: &str, what: &str) -> Result<(), String> {
     ))
 }
 
+/// The banner every Linux kernel carries, and the prefix we find it by.
+const VERSION_BANNER: &[u8] = b"Linux version ";
+
+/// The release string a kernel reports as `uname -r`, read out of the image.
+///
+/// Every kernel embeds `Linux version <release> (builder@host) (compiler) …`
+/// as the string it prints first at boot, so this is the kernel's own account
+/// of what it is rather than an inference from a filename — and a filename is
+/// exactly what cannot be trusted here. Alpine's netboot kernel and its
+/// `linux-virt` apk are both called `virt` and are routinely *different
+/// releases* (measured: netboot 6.6.134 against apk 6.6.142 on the same
+/// v3.20 line, and the same skew on v3.21 and v3.22). Modules from one will
+/// not load into the other, and nothing about the two names says so.
+///
+/// Takes the **decoded** image. A compressed or zboot-wrapped kernel contains
+/// no readable banner, so passing the file would report "no version" for every
+/// kernel a distro actually ships — see [`decode`].
+///
+/// Returns `None` rather than an error: a kernel with no banner is unusual but
+/// not thereby unbootable, and refusing to build an image over it would trade a
+/// working guest for a missing string.
+pub fn release(image: &[u8]) -> Option<String> {
+    let at = image
+        .windows(VERSION_BANNER.len())
+        .position(|w| w == VERSION_BANNER)?
+        + VERSION_BANNER.len();
+    let rest = &image[at..];
+    // The release runs to the first space; the banner continues with the build
+    // host and compiler, which are not part of `uname -r` and would never match
+    // a module directory name. Bounded, so a corrupt image cannot make this
+    // scan the whole file: no kernel release is anywhere near this long.
+    const MAX_RELEASE: usize = 96;
+    let window = &rest[..rest.len().min(MAX_RELEASE)];
+    let end = window
+        .iter()
+        .position(|&b| b == b' ' || b == 0 || b == b'\n')?;
+    let release = str::from_utf8(&window[..end]).ok()?;
+    // A release always starts with a digit. Anything else means the window
+    // matched some other occurrence of the phrase -- a string table, a help
+    // text -- and a bogus release is worse than none, because it would be
+    // compared against a module's vermagic and refuse a matching pair.
+    if release.is_empty() || !release.starts_with(|c: char| c.is_ascii_digit()) {
+        return None;
+    }
+    Some(release.to_string())
+}
+
 /// Name what the file actually is, having ruled out every form we accept.
 ///
 /// The point of this function is that it never says "an x86 bzImage or a
@@ -428,5 +475,60 @@ mod tests {
         pe[..2].copy_from_slice(b"MZ");
         let e = decode(&pe, "something.efi").unwrap_err();
         assert!(e.contains("zimg"), "{e}");
+    }
+
+    fn image_with_banner(banner: &str) -> Vec<u8> {
+        let mut img = arm64_image(8192);
+        let at = 4096;
+        img[at..at + banner.len()].copy_from_slice(banner.as_bytes());
+        img
+    }
+
+    #[test]
+    fn the_release_is_read_from_the_kernels_own_banner() {
+        let img = image_with_banner(
+            "Linux version 6.6.142-0-virt (buildozer@build-3-20-aarch64) (gcc (Alpine 13.2.1)) #1",
+        );
+        assert_eq!(release(&img).as_deref(), Some("6.6.142-0-virt"));
+    }
+
+    /// The build host and compiler follow the release in the same string and
+    /// are not part of `uname -r`; a module directory is named by the release
+    /// alone, so including any of the rest would never match one.
+    #[test]
+    fn the_release_stops_before_the_build_host() {
+        let img = image_with_banner("Linux version 6.8.0-71-generic (buildd@bos03-arm64-042) #71");
+        let r = release(&img).expect("a release");
+        assert_eq!(r, "6.8.0-71-generic");
+        assert!(!r.contains("buildd"), "{r}");
+    }
+
+    /// A bogus release is worse than none: it would be compared against a
+    /// module's vermagic and could refuse a pair that actually matches.
+    #[test]
+    fn a_banner_that_is_not_followed_by_a_version_yields_nothing() {
+        let img = image_with_banner("Linux version is what this string table says");
+        assert_eq!(release(&img), None);
+    }
+
+    #[test]
+    fn an_image_with_no_banner_is_not_an_error() {
+        assert_eq!(release(&arm64_image(8192)), None);
+    }
+
+    /// The banner is only readable once the image is decoded. Reading the file
+    /// would report "no version" for every kernel a distro actually ships,
+    /// which is the same class of bug as scanning a wrapper for virtio.
+    #[test]
+    fn the_release_is_not_readable_in_the_compressed_form() {
+        let img = image_with_banner("Linux version 6.6.142-0-virt (buildozer@x) #1");
+        let wrapped = gzip(&img);
+        assert_eq!(
+            release(&wrapped),
+            None,
+            "the compressed bytes must not appear to carry a release"
+        );
+        let (decoded, _) = decode(&wrapped, "vmlinuz").expect("decodes");
+        assert_eq!(release(&decoded).as_deref(), Some("6.6.142-0-virt"));
     }
 }

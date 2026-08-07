@@ -310,7 +310,12 @@ pub fn write_cpio(rootfs: &Rootfs) -> Vec<u8> {
 /// It is `/bin/sh` rather than a compiled init because every base image that
 /// can host a shell session already has a shell, and shipping a binary would
 /// mean shipping one per libc.
-pub fn default_init(entrypoint: &str, env: &[String], workdir: Option<&str>) -> String {
+pub fn default_init(
+    entrypoint: &str,
+    env: &[String],
+    workdir: Option<&str>,
+    modules: &[String],
+) -> String {
     // Read from the constants `create` declares rather than restated here: a
     // guest configured onto a different subnet from its own gateway has a NIC
     // that is up, has an address, and reaches nothing.
@@ -351,6 +356,68 @@ pub fn default_init(entrypoint: &str, env: &[String], workdir: Option<&str>) -> 
             .push_str("export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin\n");
     }
     let cd = workdir.map_or_else(String::new, |d| format!("cd {} 2>/dev/null\n", sh_quote(d)));
+
+    // The drivers the kernel needs before it can see anything chm attached.
+    //
+    // Order is the caller's, resolved from each module's own `depends=`, and
+    // must not be rearranged here: `virtio_net` loaded before its transport
+    // returns *success* and still leaves the guest with no interface. This
+    // block runs before the NIC block below for the same reason -- the NIC
+    // block tests for `/sys/class/net/eth0`, which does not exist until the
+    // driver is in.
+    let load_modules = if modules.is_empty() {
+        String::new()
+    } else {
+        let insmod_lines: String = modules
+            .iter()
+            .map(|p| format!("    insmod {} 2>/dev/null || __mod_fail=1\n", sh_quote(p)))
+            .collect();
+        let modload = super::modload::command(modules);
+        format!(
+            r#"
+# Kernel modules chm bundled, because this kernel builds virtio as modules and
+# a container rootfs ships no /lib/modules. Without these the guest boots fine
+# and has no network and no disk, under a host log saying both are attached.
+#
+# `insmod` first where the image has it, so failures come back in the guest's
+# own words; chm's loader otherwise, because node:22-slim -- the glibc base an
+# agent needs -- ships neither insmod nor modprobe.
+__mod_fail=0
+if [ ! -d /{dir} ]; then
+    # chm put these here at build time. If they are gone, the cpio dropped
+    # them -- the kernel does that silently when a parent directory has no
+    # entry of its own -- and the guest is about to come up with no devices.
+    echo "gimbal: /{dir} is missing, so no drivers can be loaded."
+    __mod_fail=1
+elif command -v insmod >/dev/null 2>&1; then
+{insmod_lines}    __mod_how=insmod
+else
+    {modload} || __mod_fail=1
+    __mod_how=chm
+fi
+if [ "$__mod_fail" = 1 ]; then
+    echo "gimbal: some bundled drivers did not load; this guest may have no"
+    echo "gimbal: network and no disk. The modules must come from the same"
+    echo "gimbal: kernel package as the kernel."
+fi
+
+# A module's init returning is not the device being ready. virtio_mmio probes
+# on a workqueue, so `eth0` appears some time *after* the load call comes back
+# -- and the block below tests for it. Measured: loading via chm's own loader
+# is fast enough to lose that race every time, while five `insmod` fork/execs
+# happened to be slow enough to win it. A race you win by being slow is one you
+# will lose the moment anything gets faster, so it is waited on rather than
+# left to luck.
+__mod_wait=0
+while [ ! -e /sys/class/net/eth0 ] && [ "$__mod_wait" -lt 50 ]; do
+    __mod_wait=$((__mod_wait + 1))
+    sleep 0.1 2>/dev/null || sleep 1
+done
+unset __mod_fail __mod_how __mod_wait
+"#,
+            dir = super::modules::GUEST_DIR,
+        )
+    };
 
     format!(
         r#"#!/bin/sh
@@ -412,7 +479,7 @@ if [ -n "$__epoch" ]; then
         echo "gimbal: could not set the clock; TLS will fail until it is right"
 fi
 unset __a __epoch
-
+{load_modules}
 # A container image's /etc/resolv.conf is usually absent or points at a runtime
 # resolver that does not exist here.
 [ -s /etc/resolv.conf ] || echo "nameserver 1.1.1.1" > /etc/resolv.conf 2>/dev/null
@@ -725,7 +792,7 @@ mod tests {
 
     #[test]
     fn the_generated_init_mounts_proc_and_execs_the_entrypoint() {
-        let s = default_init("/bin/sh", &[], None);
+        let s = default_init("/bin/sh", &[], None, &[]);
         assert!(s.starts_with("#!/bin/sh"));
         assert!(s.contains("mount -t proc proc /proc"));
         assert!(s.contains("exec /bin/sh"));
@@ -736,7 +803,7 @@ mod tests {
     /// debug.
     #[test]
     fn the_init_falls_back_to_making_console_by_hand() {
-        let s = default_init("/bin/sh", &[], None);
+        let s = default_init("/bin/sh", &[], None, &[]);
         assert!(s.contains("mknod /dev/console c 5 1"));
     }
 
@@ -750,6 +817,7 @@ mod tests {
             "/bin/sh",
             &["PATH=/usr/local/bin:/usr/bin".to_string()],
             None,
+            &[],
         );
         assert!(s.contains("export PATH='/usr/local/bin:/usr/bin'"), "{s}");
     }
@@ -758,7 +826,7 @@ mod tests {
     /// the kernel inherits nothing.
     #[test]
     fn an_image_with_no_env_still_gets_a_path() {
-        let s = default_init("/bin/sh", &[], None);
+        let s = default_init("/bin/sh", &[], None, &[]);
         assert!(s.contains("export PATH=/usr"), "{s}");
     }
 
@@ -795,13 +863,13 @@ mod tests {
 
     #[test]
     fn a_name_a_shell_cannot_hold_is_dropped_rather_than_mangled() {
-        let s = default_init("/bin/sh", &["BAD-NAME=x".to_string()], None);
+        let s = default_init("/bin/sh", &["BAD-NAME=x".to_string()], None, &[]);
         assert!(!s.contains("BAD-NAME"), "{s}");
     }
 
     #[test]
     fn a_working_directory_is_entered_before_the_entrypoint() {
-        let s = default_init("/bin/sh", &[], Some("/srv/app"));
+        let s = default_init("/bin/sh", &[], Some("/srv/app"), &[]);
         assert!(s.contains("cd '/srv/app'"), "{s}");
         assert!(
             s.find("cd '/srv/app'").unwrap() < s.find("exec /bin/sh").unwrap(),
@@ -908,10 +976,10 @@ mod tests {
     #[test]
     fn a_generated_init_parses_as_a_shell_script() {
         for (name, s) in [
-            ("plain", default_init("/bin/sh", &[], None)),
+            ("plain", default_init("/bin/sh", &[], None, &[])),
             (
                 "quoted entrypoint",
-                default_init("/bin/sh -c 'echo hello'", &[], None),
+                default_init("/bin/sh -c 'echo hello'", &[], None, &[]),
             ),
             (
                 "env and workdir",
@@ -922,6 +990,7 @@ mod tests {
                         "A=b c'd".to_string(),
                     ],
                     Some("/srv/app"),
+                    &[],
                 ),
             ),
         ] {
@@ -936,7 +1005,7 @@ mod tests {
         // It is reached both by re-entry under setsid and by the direct
         // fallback. Two copies would let a change land on only one of them,
         // and only one is the path anybody normally takes.
-        let s = default_init("/usr/local/bin/gunicorn", &[], None);
+        let s = default_init("/usr/local/bin/gunicorn", &[], None, &[]);
         assert_eq!(
             s.matches("exec /usr/local/bin/gunicorn").count(),
             1,
@@ -946,7 +1015,7 @@ mod tests {
 
     #[test]
     fn the_session_is_given_a_controlling_terminal() {
-        let s = default_init("/bin/sh", &[], None);
+        let s = default_init("/bin/sh", &[], None, &[]);
         // Deliberately matched against the invocation and not the word: the
         // script's own comments mention `setsid -c`, so a looser assertion
         // passes happily while the command has lost its flag. That is exactly
@@ -972,7 +1041,7 @@ mod tests {
         // `exec` is one-way. If the handover were exec'd, an image without a
         // working setsid would boot to nothing at all rather than to a shell
         // without job control.
-        let s = default_init("/bin/sh", &[], None);
+        let s = default_init("/bin/sh", &[], None, &[]);
         assert!(
             !s.contains("exec setsid"),
             "setsid must not be exec'd, or a failure leaves no fallback:\n{s}"
@@ -1001,7 +1070,7 @@ mod tests {
 
     #[test]
     fn re_entry_skips_the_setup_it_has_already_done() {
-        let s = default_init("/bin/sh", &[], None);
+        let s = default_init("/bin/sh", &[], None, &[]);
         let guard = s
             .find(r#"if [ "$1" = "--gimbal-session" ]"#)
             .expect("no re-entry guard");
@@ -1017,7 +1086,7 @@ mod tests {
         // A restated literal here would pass every test while putting the
         // guest on a different subnet from its own gateway -- a NIC that is
         // up, holds an address, and reaches nothing.
-        let s = default_init("/bin/sh", &[], None);
+        let s = default_init("/bin/sh", &[], None, &[]);
         let d = |v: [u8; 4]| format!("{}.{}.{}.{}", v[0], v[1], v[2], v[3]);
         assert!(
             s.contains(&format!(
@@ -1042,7 +1111,7 @@ mod tests {
         assert_eq!(prefix_to_netmask(32), [255, 255, 255, 255]);
         assert_eq!(prefix_to_netmask(0), [0, 0, 0, 0]);
 
-        let s = default_init("/bin/sh", &[], None);
+        let s = default_init("/bin/sh", &[], None, &[]);
         let mask = prefix_to_netmask(GUEST_PREFIX_LEN);
         assert!(
             s.contains(&format!(
@@ -1057,7 +1126,7 @@ mod tests {
     fn a_guest_with_no_nic_is_left_alone() {
         // The same image is booted with and without --net, so this has to be a
         // runtime test in the script and not a build-time decision.
-        let s = default_init("/bin/sh", &[], None);
+        let s = default_init("/bin/sh", &[], None, &[]);
         assert!(
             s.contains("if [ -e /sys/class/net/eth0 ]; then"),
             "configuring a NIC that was never attached would print errors on \
@@ -1072,7 +1141,7 @@ mod tests {
         // print a refusal -- on the *mainstream* case, since node:22 and
         // node:22-slim ship neither `ip` nor `ifconfig`. chm now carries its
         // own configurator, so there is a third rung before giving up.
-        let s = default_init("/bin/sh", &[], None);
+        let s = default_init("/bin/sh", &[], None, &[]);
         let nicfg = super::super::nicfg::GUEST_PATH;
 
         assert!(
@@ -1110,8 +1179,11 @@ mod tests {
         // time inside a guest, where a mismatch is invisible: the loop simply
         // finds nothing and the clock silently stays at 1970.
         let key = EPOCH_KEY;
-        let s = default_init("/bin/sh", &[], None);
-        assert!(s.contains(&format!("{key}=*)")), "init does not match {key}");
+        let s = default_init("/bin/sh", &[], None, &[]);
+        assert!(
+            s.contains(&format!("{key}=*)")),
+            "init does not match {key}"
+        );
         assert!(
             s.contains(&format!("${{__a#{key}=}}")),
             "init does not strip {key}"
@@ -1125,7 +1197,7 @@ mod tests {
 
     #[test]
     fn the_clock_is_set_before_anything_needs_it() {
-        let s = default_init("/bin/sh", &[], None);
+        let s = default_init("/bin/sh", &[], None, &[]);
         let clock = s.find("date -s").expect("no clock rung");
         // Ordering is the property, not presence. Every one of these fails or
         // misbehaves against a 1970 clock -- TLS most obviously -- so setting
@@ -1143,7 +1215,7 @@ mod tests {
         // An explicit --cmdline carries no key, and a wrong guess would be
         // worse than the epoch: a clock confidently set to the wrong time is
         // harder to diagnose than one obviously stuck in 1970.
-        let s = default_init("/bin/sh", &[], None);
+        let s = default_init("/bin/sh", &[], None, &[]);
         let script = s
             .split("for __a in")
             .nth(1)
@@ -1157,4 +1229,146 @@ mod tests {
         );
     }
 
+    /// The order the caller resolved is the order the guest loads in.
+    ///
+    /// This is not cosmetic. `virtio_net` loaded before `virtio_mmio` returns
+    /// *success* -- it registers a driver against a bus that is not there --
+    /// and the guest comes up with no interface and no error. Sorting these,
+    /// or de-duplicating them into a set, would silently reintroduce exactly
+    /// the bug the bundling exists to fix.
+    #[test]
+    fn modules_are_loaded_in_the_order_they_were_given() {
+        let mods: Vec<String> = ["virtio_mmio", "failover", "net_failover", "virtio_net"]
+            .iter()
+            .map(|m| format!("/{}/{m}.ko", super::super::modules::GUEST_DIR))
+            .collect();
+        let s = default_init("/bin/sh", &[], None, &mods);
+        let mut at = 0usize;
+        for m in &mods {
+            let found = s[at..]
+                .find(m.as_str())
+                .unwrap_or_else(|| panic!("`{m}` not loaded at all:\n{s}"));
+            at += found + 1;
+        }
+    }
+
+    /// The NIC block tests `/sys/class/net/eth0`, which does not exist until
+    /// the driver providing it is in. Loading after it would configure an
+    /// interface that is not there yet, and the modules would arrive just too
+    /// late to be any use.
+    #[test]
+    fn modules_load_before_the_interface_is_configured() {
+        let mods = vec![format!(
+            "/{}/virtio_net.ko",
+            super::super::modules::GUEST_DIR
+        )];
+        let s = default_init("/bin/sh", &[], None, &mods);
+        let load = s.find("virtio_net.ko").expect("no module load");
+        let nic = s.find("/sys/class/net/eth0").expect("no NIC block");
+        assert!(
+            load < nic,
+            "modules load at {load} but the NIC is configured at {nic}:\n{s}"
+        );
+    }
+
+    /// An image that needs no modules must not carry the machinery for them:
+    /// a guest printing a warning about a loader it does not have is a bug
+    /// report waiting to be filed.
+    #[test]
+    fn no_modules_means_no_module_block_at_all() {
+        let s = default_init("/bin/sh", &[], None, &[]);
+        assert!(!s.contains(super::super::modules::GUEST_DIR), "{s}");
+        assert!(!s.contains(super::super::modload::GUEST_PATH), "{s}");
+    }
+
+    /// The generated init is a shell script, and a module path is data from a
+    /// module tree we did not write.
+    #[test]
+    fn a_module_block_still_parses_as_a_shell_script() {
+        let mods = vec![
+            "/gimbal-modules/virtio_mmio.ko".to_string(),
+            "/gimbal-modules/virtio net;touch /tmp/chm-modpwned.ko".to_string(),
+        ];
+        let s = default_init("/bin/sh", &[], None, &mods);
+        if let Err(e) = sh_parses(&s) {
+            panic!("generated init does not parse: {e}");
+        }
+    }
+
+    /// Every file in a cpio needs its parent directory to have an entry of its
+    /// own. `init/initramfs.c` does not create missing parents -- `openat`
+    /// fails with ENOENT and the kernel drops the file **silently**.
+    ///
+    /// This is not hypothetical: the first hardware run of #222 put all five
+    /// modules in the cpio, and the guest had none of them and said nothing.
+    /// The unpacker is the authority here, so the test walks the emitted
+    /// archive the way the unpacker does rather than trusting the builder.
+    #[test]
+    fn every_entry_has_a_parent_directory_ahead_of_it() {
+        let mut r = Rootfs::default();
+        for d in ["gimbal-modules", "usr", "usr/lib"] {
+            r.insert(
+                d.to_string(),
+                EntryKind::Directory { mode: 0o755 },
+                Vec::new(),
+            );
+        }
+        for f in [
+            "gimbal-modules/virtio_mmio.ko",
+            "gimbal-modules/virtio_net.ko",
+            "usr/lib/libc.so",
+            "init",
+        ] {
+            r.insert(
+                f.to_string(),
+                EntryKind::File {
+                    mode: 0o644,
+                    size: 1,
+                },
+                vec![0u8],
+            );
+        }
+        let cpio = write_cpio(&r);
+
+        let mut seen_dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for (name, is_dir) in walk_cpio(&cpio) {
+            let path = name.trim_start_matches("./");
+            if let Some((parent, _)) = path.rsplit_once('/') {
+                assert!(
+                    seen_dirs.contains(parent),
+                    "`{path}` is unpacked before its parent `{parent}` exists, so the \
+                     kernel drops it without a word"
+                );
+            }
+            if is_dir {
+                seen_dirs.insert(path.to_string());
+            }
+        }
+    }
+
+    /// Read an emitted newc archive back the way the kernel's unpacker does.
+    fn walk_cpio(d: &[u8]) -> Vec<(String, bool)> {
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i + 110 <= d.len() {
+            assert_eq!(&d[i..i + 6], b"070701", "not a newc header at {i}");
+            let f = |k: usize| {
+                usize::from_str_radix(
+                    std::str::from_utf8(&d[i + 6 + k * 8..i + 6 + (k + 1) * 8]).unwrap(),
+                    16,
+                )
+                .unwrap()
+            };
+            let mode = f(1);
+            let filesize = f(6);
+            let namesize = f(11);
+            let name = String::from_utf8_lossy(&d[i + 110..i + 110 + namesize - 1]).into_owned();
+            if name == "TRAILER!!!" {
+                break;
+            }
+            out.push((name, mode & 0o170000 == 0o040000));
+            i += (110 + namesize).div_ceil(4) * 4 + filesize.div_ceil(4) * 4;
+        }
+        out
+    }
 }
