@@ -17,6 +17,7 @@ use std::{env, fs, io, thread};
 use crate::bundle;
 use crate::checkpoint;
 use crate::livesnap;
+use crate::kernelimage;
 use crate::runs;
 use crate::create::create_main;
 use crate::oci::image::image_main;
@@ -1038,6 +1039,7 @@ pub fn main() -> ExitCode {
         Some("ctl") => serve::ctl_main(&raw[1..]),
         Some("exec") => serve::exec_main(&raw[1..]),
         Some("ps") => runs::ps_main(&raw[1..]),
+        Some("kernel") => kernelimage::kernel_main(&raw[1..]),
         Some("spec") => spec::spec_main(&raw[1..]),
         Some("image") => image_main(&raw[1..]),
         Some("fork") => match fork(&raw[1..]) {
@@ -1147,7 +1149,8 @@ fn usage() -> String {
          chm spec <COMMAND> [OPTIONS]          (describe a sandbox in a file)\n\
      \n\
      BUILD AN IMAGE\n    \
-         chm image build <REF> --kernel <I>    (bootable rootfs from a container)\n\
+         chm image build <REF> --kernel <I>    (bootable rootfs from a container)\n    \
+         chm kernel probe <PATH> [--json]      (can this host boot this kernel?)\n\
      \n\
      SNAPSHOTS AND LINEAGE\n    \
          chm workspace <IMAGE_DIR> <WS_DIR>    (isolated sandbox workspace)\n    \
