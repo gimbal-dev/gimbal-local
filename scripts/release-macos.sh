@@ -198,8 +198,8 @@ cargo test -p hypervisor --release --no-default-features \
 cargo test -p gimbal-local --release \
     || die "chm tests failed in release configuration. Do not ship this."
 
-swift test --package-path app/GimbalLocal \
-    || die "app tests failed."
+swift test -c release --package-path app/GimbalLocal \
+    || die "app tests failed in release configuration. Do not ship this."
 
 # ---------------------------------------------------------------------------
 

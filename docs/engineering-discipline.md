@@ -285,6 +285,30 @@ The Swift numbers are two suites: XCTest and swift-testing report separately.
 | Lints | `make clippy` | **0** |
 | Format | `cargo +nightly fmt --all` | see below |
 
+### Debug is not evidence about release
+
+Every gate above is a **debug** gate. That is a real limitation, not a
+technicality: the first signed release **hung on every boot**, and correct
+tests for the behaviour existed and passed the whole time — in debug, where
+the garbage `fcntl` read off the stack happened to be a zero.
+
+| `fn fcntl(fd, cmd, arg: i32)` | result |
+| --- | --- |
+| `opt-level=0` | `flags=0x0` — benign, tests pass |
+| `opt-level=s` | `flags=0x4000c0` — garbage, every vCPU parks |
+
+```bash
+make test-release      # chm + hypervisor + app, all in release
+```
+
+Run it **before any milestone that claims a gate**, not only before a release.
+Finding a release-only failure at release time is the worst possible moment:
+highest pressure, least slack. `scripts/release-macos.sh` runs the same suites
+itself, so a release still cannot ship on debug-only evidence.
+
+Green in release as of 08-07: chm **629**, hypervisor **216**, app **244**
+(#214).
+
 ### rustfmt drift is measured against HEAD, not against zero
 
 Several files in this fork already differ from rustfmt's opinion. Running
