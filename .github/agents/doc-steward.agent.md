@@ -15,7 +15,14 @@ they are where measured findings live, and several of them are the *only* place
 a hard-won fact is written down. Your job is to keep them **true**, not to make
 them longer.
 
-**Before you start:** read [`docs/engineering-discipline.md`](../../docs/engineering-discipline.md)
+**Before you start:** read [`docs/engineering-discipline.md`](../../docs/engineering-discipline.md) — **§0 first.**
+
+> **Verification budget.** Spend verification in proportion to what breaks
+> if you are wrong. Docs are the cheapest tier of all. Verify the *claims* you write (§1) and stop. Never run a suite to check prose.
+>
+> Never re-run a suite to grep a different line out of it: one run → a log
+> file → grep the log. Mutation testing and hardware verification are never
+> what you cut; repetition and ceremony are.
 and [`docs/project-state.md`](../../docs/project-state.md).
 
 ## The prime directive

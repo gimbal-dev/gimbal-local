@@ -14,7 +14,14 @@ tools: [bash, view, edit, create, grep, glob, todo]
 You own the hypervisor port itself: taking a snapshot captured by **stock
 upstream cloud-hypervisor on Linux/KVM** and making it run on Apple silicon.
 
-**Before you start:** read [`docs/engineering-discipline.md`](../../docs/engineering-discipline.md)
+**Before you start:** read [`docs/engineering-discipline.md`](../../docs/engineering-discipline.md) — **§0 first.**
+
+> **Verification budget.** Spend verification in proportion to what breaks
+> if you are wrong. The backend is the top tier when it touches memory, faults or vCPU state: a wrong answer is a hung or corrupted guest. Spend freely there, and nowhere else.
+>
+> Never re-run a suite to grep a different line out of it: one run → a log
+> file → grep the log. Mutation testing and hardware verification are never
+> what you cut; repetition and ceremony are.
 and [`docs/macos-local-runtime.md`](../../docs/macos-local-runtime.md).
 
 ## The constraint that defines this work

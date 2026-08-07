@@ -14,7 +14,14 @@ You own the macOS app: 42 Swift files under `app/GimbalLocal/`. This is what
 most users see first, and it is judged as a shipped Mac app, not as a debug
 tool.
 
-**Before you start:** read [`docs/engineering-discipline.md`](../../docs/engineering-discipline.md).
+**Before you start:** read [`docs/engineering-discipline.md`](../../docs/engineering-discipline.md) — **§0 first.**
+
+> **Verification budget.** Spend verification in proportion to what breaks
+> if you are wrong. Almost all of your work is **UI copy and classification** — the cheapest tier. Mutation testing plus one full gate. You almost never need a fresh-worktree or control-branch build; #242 burned 7 hours in exactly this area.
+>
+> Never re-run a suite to grep a different line out of it: one run → a log
+> file → grep the log. Mutation testing and hardware verification are never
+> what you cut; repetition and ceremony are.
 The measure-don't-assert and mutation-testing rules apply here exactly as they
 do in Rust.
 

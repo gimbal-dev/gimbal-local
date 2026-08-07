@@ -9,6 +9,64 @@ Read this before your first change. The domain guides in
 
 ---
 
+## 0. Spend verification in proportion to blast radius
+
+**Read this first, because it moderates everything below it.** Every rule in
+this document is worth following. None of them is worth following at any cost,
+and the failure mode is real: **#242 was a ~40-minute fix that took 7 hours.**
+The bug was not hard. The verification budget was miscalibrated — chosen for
+checkpoint-format work, where a green suite twice hid genuinely broken
+checkpoints, and never re-calibrated for a one-branch UI classification fix.
+
+Before a long verification loop, ask what breaks if this change is wrong:
+
+| Blast radius | Examples | What it earns |
+| --- | --- | --- |
+| **Silent data loss / unbootable artefact** | checkpoint or bundle format, `fcntl`-class release-only behaviour, anything that writes to disk a user cannot re-derive | Everything. Per-commit builds, control-branch comparison, release-config runs, hardware on both sides |
+| **Guest won't boot / feature dead** | boot path, virtio wiring, init generation | Mutation testing + hardware verification. One full gate |
+| **Wrong message, wrong classification, UI copy** | this file's own §5 refusals, image discovery, help text | Mutation testing + one full gate. **Nothing else** |
+
+### The specific waste, so it is recognisable
+
+These are the three that cost the most, in order:
+
+1. **Re-running an entire suite to grep a different line out of it.** Done
+   twice in one session. A suite run is minutes; a grep is free.
+   **One run → a log file → grep the log as many times as you like.**
+   ```bash
+   swift test > /tmp/x.log 2>&1; grep -E "error: -\[|Executed .* tests" /tmp/x.log
+   ```
+   This also fixes the #243 lesson from the other direction: a summary line
+   cannot name the test that failed, so never keep only the summary.
+
+2. **Cold-building a fresh worktree per commit.** ~45 minutes for three
+   commits. "Each commit builds and tests alone" is a *nice* property, not one
+   this repo requires. Do it when the commits will be reviewed or reverted
+   independently, or when bisectability actually matters — and **say so first.**
+
+3. **Building a control branch to prove a before/after** when a mutation
+   already proves the same thing. If reintroducing the bug fails a test, the
+   test is load-bearing; a second build of `main` adds no information.
+
+### What never gets cut
+
+Efficiency is not a licence to assert instead of measure. These stay, always:
+
+- **Mutation testing** (§2). In #242 the mutation that *didn't* fire is the
+  entire reason the fix is correct rather than merely green.
+- **Hardware verification** (§1) of the actual user-visible behaviour, once.
+- **The gates** (§8), once, at the end.
+
+Cut repetition and ceremony. Never cut the measurement itself.
+
+### Report progress on long loops
+
+If a task passes ~30 minutes with nothing failing, that is the signal to stop
+and reassess, not to continue. Nothing failing is exactly when over-verification
+hides: there is no error to interrupt you. Say where you are and what is left.
+
+---
+
 ## 1. Measure, don't assert
 
 The single rule this project is built on. A claim about behaviour is worth
@@ -214,13 +272,16 @@ word for anything.
 
 ## 8. The gates
 
-Run these before every PR. All must be green.
+Run these **once, at the end**, before every PR. All must be green.
+Redirect each to a log file and grep the log — see §0.
+
+The Swift numbers are two suites: XCTest and swift-testing report separately.
 
 | Gate | Command | Current baseline |
 | --- | --- | --- |
-| chm suite | `cd chm && cargo test` | **537** passed, 3 ignored |
+| chm suite | `cd chm && cargo test` | **629** passed, 3 ignored |
 | hypervisor suite | `cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib` | **216** passed |
-| Swift suite | `cd app/GimbalLocal && swift test` | **216** passed, 3 skipped |
+| Swift suite | `cd app/GimbalLocal && swift test` | **244** XCTest (3 skipped) + **35** swift-testing |
 | Lints | `make clippy` | **0** |
 | Format | `cargo +nightly fmt --all` | see below |
 
