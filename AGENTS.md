@@ -1,8 +1,39 @@
 ## For Humans
 
-This is a compact [AGENTS.md](https://agents.md/) file for Cloud Hypervisor.
-It is meant to help automated coding agents make useful changes that stay safe,
-reviewable, and compatible with the project's normal engineering constraints.
+This is a compact [AGENTS.md](https://agents.md/) file for Gimbal Local, a
+macOS fork of Cloud Hypervisor. It is meant to help automated coding agents make
+useful changes that stay safe, reviewable, and compatible with the project's
+normal engineering constraints.
+
+## Start here
+
+Three documents carry the context you need, in this order:
+
+1. **[`docs/project-state.md`](docs/project-state.md)** — where the project
+   actually is: what works and the evidence for it, the measured limitations,
+   the current gate numbers, and what is being worked on now.
+2. **[`docs/engineering-discipline.md`](docs/engineering-discipline.md)** — how
+   we work here. Measure don't assert; mutation-test every guard; never restate
+   a constant; fail honestly; plus the build traps that have each cost real
+   hours. **Read this before your first change.**
+3. **[`docs/agents.md`](docs/agents.md)** — the eight specialist agents in
+   [`.github/agents/`](.github/agents/). Pick the one matching your area
+   (`guest-boot`, `hvf-backend`, `chm-cli`, `gimbal-app`, `snapshot-capture`,
+   `release-engineer`, `acceptance-tester`, `doc-steward`) and read its file; it
+   carries the traps and verification loops for that surface.
+
+The five rules that matter most, if you read nothing else:
+
+- **Measure, don't assert.** Be able to name the command that produced any claim
+  you write down.
+- **A guard that has never failed is worth nothing.** Prove every new test fails
+  when the thing it guards is broken, and put the mutation table in the PR body.
+- **Every `cargo build` strips the hypervisor entitlement.** Re-sign, or you get
+  `HV_DENIED` and think the hypervisor is broken.
+- **Never `git checkout` to restore a file** — it has destroyed uncommitted work
+  here five or more times. Back up to `/tmp`, `cp` back, `md5 -q` to verify.
+- **Don't be a hero — file the issue.** If a normal user would hit friction and
+  you routed around it because you know the codebase, that is a defect.
 
 ## For LLMs
 
