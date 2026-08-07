@@ -117,18 +117,40 @@ A disk-backed variant for images too large to unpack into RAM is
 
 **Use a glibc image for agent workloads.** `node:22-slim`, `debian`, `ubuntu`.
 
-Musl images (`*-alpine`) boot and run general workloads fine, but the GitHub
-Copilot CLI downloads a prebuilt `linuxmusl-arm64` runtime at first use and that
-binary currently fails to load its own Node-API symbols:
+`chm image build` classifies the rootfs it just unpacked and says so, so you
+find this out at build time rather than several minutes into a guest:
+
+```
+libc:       musl
+NOTE: this image uses musl. Prebuilt Node-API addons are linked against
+      glibc and fail here with `napi_* has not been loaded` — the GitHub
+      Copilot CLI among them.
+```
+
+Musl images (`*-alpine`) boot and run general workloads fine. The problem is
+specific: the GitHub Copilot CLI downloads a prebuilt `linuxmusl-arm64` runtime
+at first use, and that binary fails to load its own Node-API symbols:
 
 ```
 Node-API symbol napi_create_function has not been loaded
-Failed to load package index: …/linuxmusl-arm64/1.0.78/index.js
+Node-API symbol napi_create_int32 has not been loaded
 ```
 
 `npm i -g @github/copilot` itself succeeds — the failure is at first run.
-Measured against Copilot CLI 1.0.78; the acceptance run that proved the agent
-end-to-end used glibc and 1.0.77.
+
+Measured as a controlled pair, same kernel, same `chm` build, same egress
+allow-list, same node version (v22.23.2), **libc the only variable**:
+
+| base | libc | `npm i -g @github/copilot` | `copilot --version` |
+| --- | --- | --- | --- |
+| `node:22-slim` | glibc 2.36 | rc=0 | **1.0.78, rc=0** |
+| `node:22-alpine` | musl | rc=0 | **`napi_*` unloaded, rc=1** |
+
+An image carrying **both** loaders is reported as `not identified` and draws no
+warning. Both readings are real — a Debian image with `musl-dev` runs a glibc
+`node` whose addons load, an Alpine image with `gcompat` runs a musl one whose
+addons do not — and nothing at build time can tell them apart. A warning that
+fires on a working image is worse than a missing one.
 
 Tracking: [#224](https://github.com/gimbal-dev/gimbal-local/issues/224).
 
@@ -171,6 +193,44 @@ entrypoint directly. You then get the older behaviour, and it says so:
 
 That is a working shell without Ctrl-C, not a failure.
 
+## The guest is told what time it is
+
+`chm` attaches a PL031 real-time clock, but reading it is the guest's half of
+the bargain — and a container rootfs ships **no `/lib/modules`**, while Ubuntu's
+arm64 generic kernel builds `rtc-pl031` as a module in `linux-modules-extra`. So
+`/dev/rtc0` is simply absent and the guest would start at the Unix epoch.
+
+That breaks much more than a timestamp. **Every TLS certificate is "not yet
+valid" in 1970**, so `apt`, `pip`, `npm` and `git clone` all fail with errors
+that read like a broken network:
+
+```
+ERR=CERT_NOT_YET_VALID
+```
+
+So `chm create` passes the host's wall clock on the kernel command line as
+`gimbal.epoch=<unix seconds>`, and the generated init reads `/proc/cmdline` and
+runs `date -s` before anything that could need it — before `/etc/resolv.conf`,
+before the NIC, before your entrypoint. `date` ships in coreutils (Debian
+Essential) and in busybox, and the init is a shell script, so any image it runs
+in has one; verified on GNU coreutils and BusyBox 1.36.1.
+
+You do not need to do anything. To check:
+
+```
+date -u        # within a second or two of your Mac
+```
+
+**A guest given an explicit `--cmdline` is not given a clock**, deliberately.
+That flag is honoured exactly as written and never appended to — use
+`--cmdline-extra` if you want both. A clock confidently set to the wrong time is
+harder to diagnose than one obviously stuck in 1970.
+
+> **Images built before this need rebuilding.** Older `image.json` files carry a
+> `cmdline` field, which takes the explicit path and therefore gets no clock.
+> Current builds omit it. `chm image build` again over the same output directory
+> is enough.
+
 ## Networking, once the drivers are there
 
 The guest sits at `192.168.249.2/24` behind gateway `192.168.249.1` (see
@@ -189,20 +249,25 @@ ip route              # default via 192.168.249.1 dev eth0
 
 ### If the image has neither `ip` nor `ifconfig`
 
-Configuring an interface needs an ioctl, and no shell builtin makes one — so
-if an image ships neither tool there is nothing the init can do, and it says so
-rather than leaving you a silent NIC:
+Configuring an interface needs an ioctl, and no shell builtin makes one. Rather
+than leave you a silent NIC, `chm` installs a small static `aarch64` helper into
+the initramfs and the init falls back to it — so **an image with no networking
+tools at all still comes up configured**. `node:22-slim` is the case that
+motivated it: it ships neither `ip` nor `ifconfig`, and it needs no intervention.
+
+The order is `ip`, then `ifconfig`, then the bundled helper. Only if all three
+fail does the init say so, and it names the addresses you would need:
 
 ```
-gimbal: eth0 is present but this image has no working 'ip' or
-gimbal: 'ifconfig', so it cannot be configured. Use an image that
-gimbal: has iproute2 or busybox, or configure it yourself:
+gimbal: eth0 is present but could not be configured: this image
+gimbal: has no working 'ip' or 'ifconfig', and chm's own
+gimbal: configurator did not run. Configure it yourself with:
+gimbal:   <tool> addr add 192.168.249.2/24 dev eth0
+gimbal:   <tool> route add default via 192.168.249.1
 ```
 
-**The guest still boots and you still get a shell** — only the NIC is
-unconfigured. `node:22-slim` is a real example. This is a chicken-and-egg you
-cannot solve from inside: installing `iproute2` needs the network. Either start
-from a fuller base image, or bake the tool in before you build.
+**The guest still boots and you still get a shell** — only the NIC would be
+unconfigured.
 
 Kernel-side `ip=` autoconfiguration does **not** rescue this — the Ubuntu
 generic kernel is built without `CONFIG_IP_PNP` and prints
@@ -220,16 +285,26 @@ allow-list.
 
 ### TLS from a bare `alpine` rootfs
 
-A bare `alpine` image has no `curl` and no `openssl`, so busybox `wget` falls
-back to its own minimal built-in TLS. That handshake fails against real-world
-certificate chains with `Connection reset by peer` — measured identically
-against `example.com`, `github.com` and `registry.npmjs.org`, while
-`--no-check-certificate` against the same host succeeds with `rc=0`.
+This used to fail, and the reason was not what it looked like. Busybox `wget`
+returned `Connection reset by peer` against `example.com`, `github.com` and
+`registry.npmjs.org` alike, while `--no-check-certificate` succeeded — which
+reads like busybox's minimal built-in TLS being unable to verify real-world
+certificate chains.
 
-So **this error is not the sandbox's network**, and `--no-check-certificate` is
-the one-line way to prove that before you go looking. For real work install
-`ca-certificates` and a proper client (`apk add curl`), or start from a fuller
-base image.
+**It was the clock.** Every certificate is outside its validity window when the
+guest thinks it is 1970, and that is indistinguishable from a chain it cannot
+verify. Re-measured on a bare `alpine:3.20` rootfs once the guest is told the
+time:
+
+```
+CLK=2026-08-07
+PLAIN=0     # wget, certificate checking on
+NOCHK=0     # --no-check-certificate, for comparison
+```
+
+`--no-check-certificate` is still the fastest way to split "the sandbox's
+network" from "this guest's TLS" in one command, and it remains worth trying
+before going looking. But it should now succeed either way.
 
 If a tool inside the guest must trust the credential proxy, note that **Node
 ignores the system trust store** — set `NODE_EXTRA_CA_CERTS` as well as
