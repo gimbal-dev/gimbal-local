@@ -76,7 +76,35 @@ pub const GUEST_DIR: &str = "gimbal-modules";
 /// that driver built in, which is the outcome we want and the one that needs no
 /// help. Measured: Ubuntu's `generic` arm64 kernel ships none of these as
 /// modules, because all three are builtin.
-pub const VIRTIO_ROOTS: [&str; 4] = ["virtio_mmio", "virtio_net", "virtio_blk", "virtio_pci"];
+/// The drivers a cold-booted guest needs to see the devices chm attaches.
+///
+/// `virtio_mmio` is the transport and has to come first — loading `virtio_net`
+/// without it returns success and still leaves no interface, because the driver
+/// registers against a bus that is not there. Ordering is derived from
+/// `depends=` rather than from this list; this is only where to start looking.
+///
+/// A root that is not found here is **not** an error: it means the kernel has
+/// that driver built in, which is the outcome we want and the one that needs no
+/// help. Measured: Ubuntu's `generic` arm64 kernel ships none of the virtio
+/// entries as modules, because they are all builtin.
+///
+/// `rtc_pl031` is here for a reason that is not obvious: chm attaches a PL031
+/// RTC, and without a driver for it the guest's clock starts at the epoch.
+/// Nothing says so — the first symptom is that **every TLS handshake fails**
+/// with `certificate is not yet valid`, because 1970 predates every certificate
+/// the guest will ever be shown. That reads as a network fault and is a clock
+/// fault, so `npm install` is impossible and the cause is nowhere in the error.
+/// Measured on Ubuntu's `generic` arm64 kernel: no `/dev/rtc*`, guest clock
+/// `1970-01-01`, npm refusing the registry's certificate. Alpine's `virt`
+/// kernel has PL031 builtin, so this root resolves to nothing there — which is
+/// exactly the no-op the "absent means builtin" rule above describes.
+pub const MODULE_ROOTS: [&str; 5] = [
+    "virtio_mmio",
+    "virtio_net",
+    "virtio_blk",
+    "virtio_pci",
+    "rtc_pl031",
+];
 
 /// One module, with the metadata read out of its own `.modinfo`.
 pub struct Module {
@@ -756,6 +784,41 @@ mod tests {
         let r = resolve(&idx, &["virtio_net", "virtio_blk"], REL).unwrap();
         assert_eq!(r.modules.len(), 1);
         assert_eq!(r.builtin_or_absent, ["virtio_blk"]);
+    }
+
+    /// A guest with no RTC driver has no clock, and a guest with no clock fails
+    /// every TLS handshake with `certificate is not yet valid` -- an error that
+    /// names the network and means the clock. So when a kernel ships the PL031
+    /// driver as a module, it has to be bundled like any other device driver.
+    ///
+    /// Exercised through `resolve` against a real tree rather than asserted
+    /// against the constant, so this fails if the root is dropped *or* if the
+    /// resolver stops finding it.
+    #[test]
+    fn the_rtc_driver_is_bundled_when_the_kernel_has_it_as_a_module() {
+        let d = tmp("rtc");
+        let t = tree_with(
+            &d,
+            &[
+                (
+                    "virtio_mmio.ko",
+                    fake_module(&["name=virtio_mmio", "depends=", &magic()]),
+                ),
+                // The kernel writes `rtc-pl031.ko` and calls the module
+                // `rtc_pl031`; a lookup that does not normalise misses it.
+                (
+                    "rtc-pl031.ko",
+                    fake_module(&["name=rtc_pl031", "depends=", &magic()]),
+                ),
+            ],
+        );
+        let idx = Index::build(&t).unwrap();
+        let r = resolve(&idx, &MODULE_ROOTS, REL).unwrap();
+        let names: Vec<&str> = r.modules.iter().map(|m| m.name.as_str()).collect();
+        assert!(
+            names.contains(&"rtc_pl031"),
+            "no RTC driver bundled; guest would boot at the epoch. got {names:?}"
+        );
     }
 
     /// A *dependency* is different: something present names it, so its absence

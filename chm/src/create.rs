@@ -343,12 +343,26 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     if !cmdline_explicit && let Some(extra) = coldboot::implied_root_args(&cfg) {
         cfg.cmdline = format!("{} {extra}", cfg.cmdline);
     }
-    // The guest's wall clock, for the same reason and under the same guard. A
-    // guest that boots at the epoch fails every TLS handshake with "certificate
-    // is not yet valid", which reads as a broken network rather than a wrong
-    // clock. An explicit `--cmdline` is still honoured exactly as written; the
-    // init simply finds no key and leaves the clock alone.
-    if !cmdline_explicit && let Some(extra) = coldboot::epoch_arg(SystemTime::now()) {
+    // The guest's wall clock. Deliberately **not** under the `cmdline_explicit`
+    // guard above, and that difference is the whole point: `root=` is a choice a
+    // caller can make differently, so appending ours could contradict theirs.
+    // The wall clock is not a choice — it is a fact about the moment this guest
+    // is booting, and there is no command line for which "and therefore the year
+    // is 1970" is the caller's intent.
+    //
+    // Suppressing it here was a real, measured bug rather than a hypothetical:
+    // the app emits `--cmdline console=ttyAMA0` on every cold boot, so every
+    // app-started guest took this branch. On a kernel with PL031 builtin the
+    // guest reads the RTC and nobody notices; on one without — Ubuntu's arm64
+    // generic kernel — the guest silently starts at the epoch and *every* TLS
+    // handshake fails with "certificate is not yet valid", which reads as a
+    // broken network. So the safety net was disabled in precisely the
+    // configuration where it was the only thing that could work.
+    //
+    // A caller who writes `gimbal.epoch=` themselves is taken at their word.
+    let epoch_set = coldboot::mentions_epoch(&cfg.cmdline)
+        || cmdline_extra.iter().any(|e| coldboot::mentions_epoch(e));
+    if !epoch_set && let Some(extra) = coldboot::epoch_arg(SystemTime::now()) {
         cfg.cmdline = format!("{} {extra}", cfg.cmdline);
     }
     for extra in &cmdline_extra {
@@ -1255,7 +1269,13 @@ mod tests {
         assert_eq!(a.cfg.vcpus, 4);
         assert_eq!(a.cfg.memory_mib, 2048);
         assert_eq!(a.max_seconds, 7);
-        assert_eq!(a.cfg.cmdline, "console=ttyAMA0 quiet");
+        // The caller's words, in order and unaltered. The clock is appended
+        // after them, so this asserts the prefix rather than equality.
+        assert!(
+            a.cfg.cmdline.starts_with("console=ttyAMA0 quiet"),
+            "cmdline was {:?}",
+            a.cfg.cmdline
+        );
         assert!(a.dry_run);
     }
 
@@ -1367,6 +1387,68 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_cmdline_still_gets_a_clock() {
+        // The bug this exists to prevent: the app emits `--cmdline
+        // console=ttyAMA0` on every cold boot, and the epoch used to be
+        // suppressed whenever a cmdline was given -- so the safety net was off
+        // in exactly the case that needed it. A guest at the epoch fails every
+        // TLS handshake with "certificate is not yet valid", which reads as a
+        // network fault.
+        let a = parse(&args(&[
+            "--kernel",
+            "/tmp/Image",
+            "--cmdline",
+            "console=ttyAMA0",
+        ]))
+        .unwrap();
+        let key = crate::coldboot::EPOCH_KEY;
+        let secs = a
+            .cfg
+            .cmdline
+            .split_whitespace()
+            .find_map(|w| w.strip_prefix(&format!("{key}=")))
+            .unwrap_or_else(|| panic!("no {key} on {:?}", a.cfg.cmdline))
+            .parse::<u64>()
+            .expect("epoch is a decimal number");
+        let now = SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(secs.abs_diff(now) < 60, "cmdline says {secs}");
+        // The caller's own words survive untouched.
+        assert!(a.cfg.cmdline.contains("console=ttyAMA0"));
+    }
+
+    #[test]
+    fn a_caller_who_sets_the_clock_themselves_keeps_it() {
+        let a = parse(&args(&[
+            "--kernel",
+            "/tmp/Image",
+            "--cmdline",
+            "console=ttyAMA0 gimbal.epoch=42",
+        ]))
+        .unwrap();
+        let key = crate::coldboot::EPOCH_KEY;
+        let mine: Vec<_> = a
+            .cfg
+            .cmdline
+            .split_whitespace()
+            .filter(|w| w.starts_with(&format!("{key}=")))
+            .collect();
+        // Exactly one, and theirs. Two keys would leave which one wins to the
+        // init's parse order, which is not a thing a caller should have to know.
+        assert_eq!(mine, ["gimbal.epoch=42"], "on {:?}", a.cfg.cmdline);
+    }
+
+    #[test]
+    fn a_console_argument_is_not_mistaken_for_a_clock() {
+        assert!(!crate::coldboot::mentions_epoch("console=ttyAMA0 root=/dev/vda"));
+        assert!(crate::coldboot::mentions_epoch("console=ttyAMA0 gimbal.epoch=7"));
+        // A key that merely ends with ours is a different key.
+        assert!(!crate::coldboot::mentions_epoch("not.gimbal.epoch=7"));
+    }
+
+    #[test]
     fn a_cold_guest_is_told_what_time_it_is() {
         let a = parse(&args(&["--kernel", "/tmp/Image"])).unwrap();
         let key = crate::coldboot::EPOCH_KEY;
@@ -1392,24 +1474,11 @@ mod tests {
     }
 
     #[test]
-    fn an_explicit_cmdline_is_not_given_a_clock_either() {
-        // The clock is worth having, but not worth contradicting a command
-        // line the caller wrote deliberately. `--cmdline-extra` is the way to
-        // have both, and it stays available.
-        let a = parse(&args(&[
-            "--kernel",
-            "/tmp/Image",
-            "--cmdline",
-            "console=ttyAMA0 root=/dev/vda2 ro",
-        ]))
-        .unwrap();
-        assert_eq!(a.cfg.cmdline, "console=ttyAMA0 root=/dev/vda2 ro");
-    }
-
-    #[test]
-    fn an_explicit_cmdline_is_never_appended_to() {
+    fn an_explicit_cmdline_is_never_given_a_second_root() {
         // The caller may have chosen a different root deliberately; appending
-        // a second root= would silently override it.
+        // a second root= would silently override it. The clock is appended
+        // (it is a fact, not a choice -- see the parse site), so this asserts
+        // the property that actually matters rather than exact equality.
         let a = parse(&args(&[
             "--kernel",
             "/tmp/Image",
@@ -1419,7 +1488,14 @@ mod tests {
             "console=ttyAMA0 root=/dev/vda2 ro",
         ]))
         .unwrap();
-        assert_eq!(a.cfg.cmdline, "console=ttyAMA0 root=/dev/vda2 ro");
+        let roots: Vec<_> = a
+            .cfg
+            .cmdline
+            .split_whitespace()
+            .filter(|w| w.starts_with("root="))
+            .collect();
+        assert_eq!(roots, ["root=/dev/vda2"], "on {:?}", a.cfg.cmdline);
+        assert!(a.cfg.cmdline.starts_with("console=ttyAMA0 root=/dev/vda2 ro"));
     }
 
     #[test]
