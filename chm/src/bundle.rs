@@ -54,12 +54,16 @@
 //! command and loses nothing, because the deduplication has already happened.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::env::current_dir;
+use std::env::{self, current_dir};
 use std::ffi::CString;
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::FileExt;
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{LazyLock, Mutex};
+use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use ring::digest::{SHA256, digest};
@@ -864,30 +868,25 @@ fn set_mtime(path: &Path, mtime_ns: u128) -> Result<(), String> {
 ///
 /// `wanted` decides which indices are candidates at all, so the clone path can
 /// reuse this for "only the chunks that differ from the donor".
-fn fill_sparse<F: Fn(usize) -> bool>(
+fn fill_sparse<F: Fn(usize) -> bool + Sync>(
     bundle: &Path,
-    mut out: &File,
+    out: &File,
     dest: &Path,
     file: &ExportedFile,
     wanted: F,
 ) -> Result<u64, String> {
-    let mut written = 0u64;
     let mut accounted = 0u64;
-    for (i, hex) in file.chunks.iter().enumerate() {
+    let mut todo = Vec::new();
+    for i in 0..file.chunks.len() {
         if !wanted(i) {
             accounted += chunk_len(file, i);
-            continue;
+        } else if is_zero_chunk(file, i) {
+            // `set_len` already left a hole here, and a hole reads as zeros.
+            accounted += CHUNK as u64;
+        } else {
+            accounted += chunk_len(file, i);
+            todo.push(i);
         }
-        let bytes = load_chunk(bundle, hex, &file.path)?;
-        accounted += bytes.len() as u64;
-        if bytes.iter().all(|b| *b == 0) {
-            continue;
-        }
-        out.seek(SeekFrom::Start((i * CHUNK) as u64))
-            .map_err(|e| format!("seek {}: {e}", dest.display()))?;
-        out.write_all(&bytes)
-            .map_err(|e| format!("write {}: {e}", dest.display()))?;
-        written += bytes.len() as u64;
     }
     if accounted != file.len {
         return Err(format!(
@@ -895,7 +894,110 @@ fn fill_sparse<F: Fn(usize) -> bool>(
             file.path, file.len
         ));
     }
-    Ok(written)
+    place_chunks(bundle, out, dest, file, &todo, false)
+}
+
+/// How many chunk reads to keep in flight.
+///
+/// The cost being paid here is device *latency*, not bandwidth: a chunk is its
+/// own small file, so the kernel cannot read ahead from one into the next, and
+/// a serial loop waits out a full round trip per chunk with a queue depth of
+/// one. Measured on this Mac, 8,193 cold 64 KiB chunk files take 40.8 s read
+/// one at a time and 2.5 s once they are in the page cache -- the work is
+/// identical, so the 38 s is pure waiting.
+///
+/// More threads than cores is deliberate: they are asleep on I/O, not
+/// computing, and the flash wants a deep queue to have anything to overlap.
+///
+/// The default comes from a sweep over that same 4 GiB / 8,193-chunk file,
+/// emitting it cold each time (load average 13-17, so these are pessimistic):
+/// 1 reader 47.8 s, 4 → 19.9 s, 16 → 13.9 s, 32 → 10.5 s, 64 → 9.0 s. The
+/// curve is still falling at the cap, so the cap is a memory bound rather than
+/// a measured knee -- each worker holds one 64 KiB chunk, so 64 costs 4 MiB.
+fn import_readers() -> usize {
+    readers_from(env::var("CHM_IMPORT_READERS").ok().as_deref())
+}
+
+/// The pure half of [`import_readers`], so the clamping can be tested without a
+/// process-global environment variable that every other test shares.
+fn readers_from(v: Option<&str>) -> usize {
+    v.and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(32)
+        .min(64)
+}
+
+/// Read `todo`'s chunks and put each at its own offset in `out`.
+///
+/// Safe to do concurrently because the destinations are disjoint by
+/// construction -- chunk `i` owns bytes `i * CHUNK ..` and nothing else -- and
+/// each worker writes positionally rather than seeking a shared cursor. That is
+/// what `write_at` buys over `seek` + `write`: with one file offset shared
+/// between threads, two workers would interleave a seek and a write and land
+/// bytes in the wrong place.
+///
+/// `zeros_are_written` is the difference between the two callers. A file just
+/// sized with `set_len` is already holes, so an all-zero chunk needs nothing; a
+/// clone starts as a copy of its donor, so a chunk that is zero here and
+/// something else there is a difference that must be applied.
+fn place_chunks(
+    bundle: &Path,
+    out: &File,
+    dest: &Path,
+    file: &ExportedFile,
+    todo: &[usize],
+    zeros_are_written: bool,
+) -> Result<u64, String> {
+    let next = AtomicUsize::new(0);
+    let written = AtomicU64::new(0);
+    let failure: Mutex<Option<String>> = Mutex::new(None);
+    let workers = import_readers().min(todo.len().max(1));
+
+    thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| {
+                loop {
+                    if failure.lock().is_ok_and(|f| f.is_some()) {
+                        return;
+                    }
+                    let at = next.fetch_add(1, Ordering::Relaxed);
+                    let Some(&i) = todo.get(at) else { return };
+                    let step = (|| -> Result<u64, String> {
+                        let bytes = if zeros_are_written && is_zero_chunk(file, i) {
+                            vec![0u8; CHUNK]
+                        } else {
+                            load_chunk(bundle, &file.chunks[i], &file.path)?
+                        };
+                        if !zeros_are_written && bytes.iter().all(|b| *b == 0) {
+                            return Ok(0);
+                        }
+                        out.write_all_at(&bytes, (i * CHUNK) as u64)
+                            .map_err(|e| format!("write {}: {e}", dest.display()))?;
+                        Ok(bytes.len() as u64)
+                    })();
+                    match step {
+                        Ok(n) => {
+                            written.fetch_add(n, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            if let Ok(mut slot) = failure.lock() {
+                                slot.get_or_insert(e);
+                            }
+                            return;
+                        }
+                    }
+                }
+            });
+        }
+    });
+
+    match failure.into_inner() {
+        Ok(Some(e)) => Err(e),
+        Ok(None) => Ok(written.into_inner()),
+        // A worker panicked while holding the lock. Refusing is the only honest
+        // answer: the file is half written and we cannot say which half.
+        Err(_) => Err(format!("{}: a chunk writer failed", dest.display())),
+    }
 }
 
 /// How long chunk `i` of `file` is: every chunk is full but the last.
@@ -938,6 +1040,30 @@ fn verify_overlay_fingerprint(staging: &Path, id: &str) -> Result<(), String> {
 }
 
 /// Read one chunk out of the bundle and prove it is what its name claims.
+/// The sha256 of one full chunk of zeros.
+///
+/// A snapshot disk is mostly holes, so this one name accounts for the large
+/// majority of a bundle's chunk *references* while being a single stored chunk.
+/// Recognising it by name lets the emit path skip the read, the hash and the
+/// write for every one of them.
+static ZERO_CHUNK: LazyLock<String> = LazyLock::new(|| sha256_hex(&vec![0u8; CHUNK]));
+
+/// Is chunk `i` of `file` a full chunk of zeros, knowable from its name alone?
+///
+/// Length matters: the final chunk of a file is short, so its digest is over
+/// fewer bytes and cannot be compared against the full-chunk constant.
+///
+/// Answering this from the envelope rather than from the bundle is not a
+/// weakening of the integrity check. The claim a chunk name makes is "these
+/// 64 KiB hash to this", and writing zeros for the zero digest satisfies it by
+/// construction -- there is no byte sequence the bundle could hold that would
+/// make a different answer correct. What is genuinely given up is noticing that
+/// the bundle's *stored* zero chunk is damaged, and that is a file this path no
+/// longer reads.
+fn is_zero_chunk(file: &ExportedFile, i: usize) -> bool {
+    chunk_len(file, i) == CHUNK as u64 && file.chunks[i] == *ZERO_CHUNK
+}
+
 fn load_chunk(bundle: &Path, hex: &str, for_file: &str) -> Result<Vec<u8>, String> {
     if !is_sha256_hex(hex) {
         return Err(format!("{for_file}: chunk name `{hex}` is not a sha256"));
@@ -948,7 +1074,7 @@ fn load_chunk(bundle: &Path, hex: &str, for_file: &str) -> Result<Vec<u8>, Strin
     let actual = sha256_hex(&bytes);
     if actual != *hex {
         return Err(format!(
-            "chunk {hex} is corrupt: its content hashes to {actual}"
+            "{for_file}: chunk {hex} is corrupt: its content hashes to {actual}"
         ));
     }
     Ok(bytes)
@@ -971,22 +1097,14 @@ fn patch_clone(
     file: &ExportedFile,
     donor: &ExportedFile,
 ) -> Result<u64, String> {
-    let mut f = fs::OpenOptions::new()
+    let f = fs::OpenOptions::new()
         .write(true)
         .open(dest)
         .map_err(|e| format!("open {}: {e}", dest.display()))?;
-    let mut written = 0u64;
-    for (i, hex) in file.chunks.iter().enumerate() {
-        if donor.chunks[i] == *hex {
-            continue;
-        }
-        let bytes = load_chunk(bundle, hex, &file.path)?;
-        f.seek(SeekFrom::Start((i * CHUNK) as u64))
-            .map_err(|e| format!("seek {}: {e}", dest.display()))?;
-        f.write_all(&bytes)
-            .map_err(|e| format!("write {}: {e}", dest.display()))?;
-        written += bytes.len() as u64;
-    }
+    let todo: Vec<usize> = (0..file.chunks.len())
+        .filter(|&i| donor.chunks[i] != file.chunks[i])
+        .collect();
+    let written = place_chunks(bundle, &f, dest, file, &todo, true)?;
     drop(f);
     let len = fs::metadata(dest)
         .map_err(|e| format!("stat {}: {e}", dest.display()))?
@@ -1287,6 +1405,8 @@ pub(crate) fn describe(bundle: &Path) -> Result<Vec<String>, String> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::{Seek, SeekFrom};
+
     use super::*;
 
     fn tmp(name: &str) -> PathBuf {
@@ -1961,5 +2081,166 @@ mod tests {
             mine,
             "a carried base must never overwrite one that is already here"
         );
+    }
+
+    /// Scratch benchmark for #211: absorb and emit one sparse file the shape of
+    /// a snapshot disk, so the import cost is measured without a guest.
+    #[test]
+    #[ignore]
+    fn bench_211() {
+        let root = tmp("bench211");
+        let snap = root.join("snap");
+        fs::create_dir_all(&snap).unwrap();
+        let big = snap.join("big.raw");
+        {
+            let f = File::create(&big).unwrap();
+            f.set_len(4 * 1024 * 1024 * 1024).unwrap();
+            let mut f = f;
+            let mut seed = 0x243f_6a88_85a3_08d3u64;
+            for i in 0..16384u64 {
+                if i % 2 == 0 {
+                    continue;
+                }
+                let mut buf = vec![0u8; 64 * 1024];
+                for b in buf.iter_mut() {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    *b = (seed >> 33) as u8;
+                }
+                f.seek(SeekFrom::Start(i * 64 * 1024)).unwrap();
+                f.write_all(&buf).unwrap();
+            }
+        }
+        let bundle = root.join("b");
+        fs::create_dir_all(&bundle).unwrap();
+        let mut have = BTreeSet::new();
+        let mut stored = 0u64;
+        let t0 = SystemTime::now();
+        let ef = absorb_file(&bundle, &snap, Path::new("big.raw"), &mut have, &mut stored).unwrap();
+        eprintln!(
+            "absorb: {:?}, {} chunks, {} distinct stored",
+            t0.elapsed().unwrap(),
+            ef.chunks.len(),
+            have.len()
+        );
+
+        let out = root.join("out");
+        fs::create_dir_all(&out).unwrap();
+        let t1 = SystemTime::now();
+        emit_file(&bundle, &out, &ef, None).unwrap();
+        eprintln!("emit: {:?}", t1.elapsed().unwrap());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_short_final_chunk_is_never_mistaken_for_a_hole() {
+        // The zero digest is over a *full* chunk, so a short final chunk can
+        // only be compared against it by accident. Treating one as a hole
+        // would also mis-account it -- `fill_sparse` credits a skipped chunk
+        // the full CHUNK bytes -- and the file would be refused as the wrong
+        // length rather than written wrong.
+        let file = ExportedFile {
+            path: "short.raw".into(),
+            len: CHUNK as u64 + 17,
+            chunks: vec![ZERO_CHUNK.clone(), ZERO_CHUNK.clone()],
+            mtime_ns: 0,
+        };
+        assert!(is_zero_chunk(&file, 0), "a full zero chunk is a hole");
+        assert_eq!(chunk_len(&file, 1), 17);
+        assert!(
+            !is_zero_chunk(&file, 1),
+            "a 17-byte tail must not be read as a 64 KiB hole"
+        );
+    }
+
+    #[test]
+    fn a_many_chunk_file_round_trips_byte_for_byte_through_the_workers() {
+        // Every chunk is distinct, so each worker must land its own bytes at
+        // its own offset. Sharing one file cursor between threads instead of
+        // writing positionally scrambles this.
+        let root = tmp("parallel");
+        let snap = root.join("s");
+        fs::create_dir_all(&snap).unwrap();
+        let mut want = Vec::new();
+        for i in 0..40u64 {
+            want.extend(std::iter::repeat_n(
+                (i as u8).wrapping_mul(37).wrapping_add(1),
+                CHUNK,
+            ));
+        }
+        want.truncate(40 * CHUNK - 9);
+        fs::write(snap.join("many.raw"), &want).unwrap();
+
+        let bundle = root.join("b");
+        fs::create_dir_all(&bundle).unwrap();
+        let mut have = BTreeSet::new();
+        let mut stored = 0u64;
+        let ef = absorb_file(
+            &bundle,
+            &snap,
+            Path::new("many.raw"),
+            &mut have,
+            &mut stored,
+        )
+        .unwrap();
+        assert_eq!(ef.chunks.len(), 40);
+
+        let out = root.join("o");
+        fs::create_dir_all(&out).unwrap();
+        emit_file(&bundle, &out, &ef, None).unwrap();
+        assert_eq!(fs::read(out.join("many.raw")).unwrap(), want);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn one_bad_chunk_fails_the_whole_file_rather_than_being_skipped() {
+        // A worker that hits a damaged chunk must stop the emit. Reporting
+        // success for a file we could not reassemble is the one outcome that
+        // cannot be recovered from later, because nothing downstream re-reads
+        // the bundle to check.
+        let root = tmp("badchunk");
+        let snap = root.join("s");
+        fs::create_dir_all(&snap).unwrap();
+        let mut want = Vec::new();
+        for i in 0..12u64 {
+            want.extend(std::iter::repeat_n((i as u8) | 0x80, CHUNK));
+        }
+        fs::write(snap.join("v.raw"), &want).unwrap();
+
+        let bundle = root.join("b");
+        fs::create_dir_all(&bundle).unwrap();
+        let mut have = BTreeSet::new();
+        let mut stored = 0u64;
+        let ef = absorb_file(&bundle, &snap, Path::new("v.raw"), &mut have, &mut stored).unwrap();
+        // Corrupt one chunk in the middle rather than the first, so a worker
+        // other than the one that starts must be the one to notice.
+        fs::write(chunk_path(&bundle, &ef.chunks[7]), b"not the bytes").unwrap();
+
+        let out = root.join("o");
+        fs::create_dir_all(&out).unwrap();
+        let err = emit_file(&bundle, &out, &ef, None).err().expect("refused");
+        assert!(
+            err.contains("v.raw") && err.contains(&ef.chunks[7]),
+            "the refusal should name the file and the chunk: {err}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_reader_count_is_clamped_rather_than_trusted() {
+        assert_eq!(readers_from(None), 32, "the measured default");
+        assert_eq!(readers_from(Some("1")), 1, "serial is a legitimate ask");
+        assert_eq!(readers_from(Some("64")), 64);
+        assert_eq!(
+            readers_from(Some("100000")),
+            64,
+            "a huge value must not spawn a thread per chunk"
+        );
+        assert_eq!(
+            readers_from(Some("0")),
+            32,
+            "zero workers would never finish"
+        );
+        assert_eq!(readers_from(Some("-4")), 32);
+        assert_eq!(readers_from(Some("lots")), 32);
     }
 }
