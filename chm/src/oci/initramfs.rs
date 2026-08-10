@@ -36,7 +36,10 @@ use crate::coldboot::CA_SENT_KEY;
 use crate::credproxy::cli::{CA_PATH, ENV_PATH};
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
+use std::fs;
 use std::iter;
+use std::path::Path;
+use std::str;
 
 use super::entry::EntryKind;
 use crate::coldboot::EPOCH_KEY;
@@ -572,6 +575,20 @@ if [ -e /sys/class/net/eth0 ]; then
     fi
 fi
 
+# {CA_INSTALL_MARKER}
+#
+# A deliberate, machine-read marker, not a comment. The installer below lives in
+# the generated init, which is written once at `chm image build` -- so an image
+# built before the installer existed has no installer, nothing at run time
+# notices, and the user meets `certificate verify failed` with the CA sitting on
+# disk beside them (#266). `create` reads this line back out of the archive it is
+# about to hand the kernel and says so when it is missing.
+#
+# Stated as a capability rather than a version because only the bytes going to
+# the kernel can answer "will this guest install the CA". A version number is a
+# claim about an init; this line is placed by the code that does the work, and
+# `the_marker_is_present_exactly_when_the_installer_is` keeps them together.
+#
 # The credential proxy's CA, if chm staged one into this rootfs.
 #
 # Tested at runtime, not at build time: the same image boots both with and
@@ -711,6 +728,78 @@ fn prefix_to_netmask(prefix: u8) -> [u8; 4] {
 
 fn sh_quote(v: &str) -> String {
     format!("'{}'", v.replace('\'', r"'\''"))
+}
+
+/// The line [`init`] emits to declare that it installs the credential proxy CA.
+///
+/// Read back by `create` so a stale image is named rather than silently
+/// producing a certificate error (#266).
+pub const CA_INSTALL_MARKER: &str = "gimbal-capability: proxy-ca-install";
+
+/// Does the init inside this initramfs install the credential proxy CA?
+///
+/// Answered from the archive's own bytes, for the reason
+/// [`crate::oci::modules::bundled_in_initramfs`] gives: a sidecar recording what
+/// a build did is a claim, and a stale one the moment anybody rebuilds an
+/// initramfs in place.
+///
+/// Best-effort in the *safe* direction is the opposite of that function's: an
+/// unreadable or unfamiliar archive returns `true`, suppressing the warning. A
+/// warning shown to someone whose image is fine would send them to rebuild a
+/// working image, and the population that reaches an unparseable archive is
+/// mostly people supplying their own initramfs -- who never had our installer
+/// and are not the ones this warns.
+pub fn installs_proxy_ca(path: &Path) -> bool {
+    let Ok(d) = fs::read(path) else {
+        return true;
+    };
+    match read_cpio_file(&d, "init") {
+        Some(init) => init
+            .windows(CA_INSTALL_MARKER.len())
+            .any(|w| w == CA_INSTALL_MARKER.as_bytes()),
+        // No `init` entry at all is not our generated image.
+        None => true,
+    }
+}
+
+/// The contents of one file in a `newc` cpio, by name, ignoring a `./` prefix.
+///
+/// Deliberately tolerant: a truncated or unfamiliar archive yields `None`
+/// rather than an error, because every caller's question is about what the
+/// guest will do, and "cannot tell" and "no" are different answers.
+fn read_cpio_file(d: &[u8], want: &str) -> Option<Vec<u8>> {
+    let mut i = 0usize;
+    while i + 110 <= d.len() {
+        if &d[i..i + 6] != b"070701" {
+            return None;
+        }
+        let field = |k: usize| -> Option<usize> {
+            let raw = d.get(i + 6 + k * 8..i + 6 + (k + 1) * 8)?;
+            usize::from_str_radix(str::from_utf8(raw).ok()?, 16).ok()
+        };
+        let (filesize, namesize) = (field(6)?, field(11)?);
+        if namesize == 0 {
+            return None;
+        }
+        let name = String::from_utf8_lossy(d.get(i + 110..i + 110 + namesize - 1)?).into_owned();
+        if name == "TRAILER!!!" {
+            return None;
+        }
+        // Name is padded to 4 bytes from the start of the header; data follows.
+        let data_at = i + (110 + namesize).next_multiple_of(4);
+        if name.trim_start_matches("./") == want {
+            return d.get(data_at..data_at + filesize).map(<[u8]>::to_vec);
+        }
+        let next = (110 + namesize)
+            .checked_next_multiple_of(4)
+            .and_then(|h| h.checked_add(filesize.checked_next_multiple_of(4)?))
+            .and_then(|step| i.checked_add(step))?;
+        if next <= i {
+            return None;
+        }
+        i = next;
+    }
+    None
 }
 
 #[cfg(test)]
@@ -1009,6 +1098,79 @@ mod tests {
             body.find("proxy-ca.env").expect("no env") < body.find("exec ").expect("no exec"),
             "it must be sourced before the entrypoint, or the entrypoint cannot see it"
         );
+    }
+
+    /// The marker exists to be read back, so it is worthless if it can drift
+    /// away from the installer it describes. Pinned in both directions: an init
+    /// with the installer carries the marker, and an init without it does not.
+    #[test]
+    fn the_marker_is_present_exactly_when_the_installer_is() {
+        let s = default_init("/bin/sh", &[], None, &[]);
+        let installs = s.contains("if [ -r /etc/gimbal/proxy-ca.crt ]; then");
+        let marked = s.contains(CA_INSTALL_MARKER);
+        assert!(installs, "the installer is what the marker claims");
+        assert_eq!(
+            installs, marked,
+            "an init that installs the CA must say so, or #266 comes back silently:\n{s}"
+        );
+    }
+
+    /// `create` decides whether to warn by reading the archive it is about to
+    /// hand the kernel, so the read has to work on an archive this module wrote.
+    /// A hand-built fixture and a hand-written reader agree by construction --
+    /// this repo's recorded #178/#180 failure -- so the real writer builds it.
+    #[test]
+    fn an_init_we_generated_is_recognised_as_installing_the_ca() {
+        let dir = std::env::temp_dir().join(format!("chm-ca-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let mut r = Rootfs::default();
+        let body = default_init("/bin/sh", &[], None, &[]);
+        r.insert(
+            "init".to_string(),
+            EntryKind::File {
+                mode: 0o755,
+                size: body.len() as u64,
+            },
+            body.clone().into_bytes(),
+        );
+        let good = dir.join("good.cpio");
+        std::fs::write(&good, write_cpio(&r)).unwrap();
+        assert!(
+            installs_proxy_ca(&good),
+            "an init we just generated must be recognised"
+        );
+
+        // A pre-#238 init: same shape, installer absent.
+        let mut r2 = Rootfs::default();
+        let stale = body
+            .replace(CA_INSTALL_MARKER, "")
+            .replace("if [ -r /etc/gimbal/proxy-ca.crt ]; then", "if false; then");
+        r2.insert(
+            "init".to_string(),
+            EntryKind::File {
+                mode: 0o755,
+                size: stale.len() as u64,
+            },
+            stale.into_bytes(),
+        );
+        let old = dir.join("old.cpio");
+        std::fs::write(&old, write_cpio(&r2)).unwrap();
+        assert!(
+            !installs_proxy_ca(&old),
+            "an init with no installer must be reported, or #266 stays silent"
+        );
+
+        // Cannot tell => do not warn: sending someone to rebuild a working
+        // image is the worse error, and a foreign archive never had our init.
+        let junk = dir.join("junk.bin");
+        std::fs::write(&junk, b"not a cpio at all").unwrap();
+        assert!(installs_proxy_ca(&junk), "unparseable must not warn");
+        assert!(
+            installs_proxy_ca(&dir.join("does-not-exist")),
+            "unreadable must not warn"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// An image that names its own bundle made an explicit choice.

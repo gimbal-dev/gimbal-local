@@ -53,6 +53,7 @@ use crate::imp::{
     CpuPowerSlot, PL011_BASE, PL011_SIZE, PsciCoordinator, apply_psci_cpu_on_state,
     egress_posture_line, wait_for_cpu_on_request,
 };
+use crate::oci::initramfs::installs_proxy_ca;
 use crate::oci::modules;
 use crate::runs;
 use crate::spec::{Overrides, SandboxSpec, resolve, spec_file_for};
@@ -496,6 +497,25 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     // boot, and by the time the proxy starts the kernel has already unpacked
     // the archive it was given.
     let ca_cpio = ca_archive_for(args)?;
+    if ca_cpio.is_some()
+        && let Some(initramfs) = args.cfg.initramfs.as_deref()
+        && !installs_proxy_ca(initramfs)
+    {
+        // The installer lives in the generated init, which is written once at
+        // `chm image build` (#266). We are staging a CA into an image whose init
+        // predates it: the file will be there and nothing will install it, and
+        // the user meets `certificate verify failed` -- the exact error the
+        // installer exists to prevent -- with no message either way.
+        //
+        // Said here rather than left to the guest because the guest cannot know:
+        // the code that would have reported it is the code that is missing.
+        eprintln!(
+            "chm: warning: this image's init predates the proxy CA installer, so the CA \n\
+             chm: will be staged at {} and never trusted. HTTPS through the proxy will \n\
+             chm: fail a certificate check. Rebuild the image with `chm image build` to fix it.",
+            credproxy::cli::CA_PATH,
+        );
+    }
 
     let t_build = Instant::now();
     // The only field that differs from `args.cfg`, and the only consumer of it
@@ -1716,6 +1736,23 @@ mod tests {
             src.contains(&flagged),
             "the command line must say a CA was sent, or the init cannot tell \
              `no proxy was asked for` from `the archive was lost in the boot`"
+        );
+    }
+
+    /// The stale-image warning (#266) is a side effect, so no assertion about a
+    /// return value can see it stop happening. This repo has lost that exact
+    /// bet seven times now, so the call site itself is the thing pinned.
+    ///
+    /// The needle is assembled from parts so it cannot match this test's own
+    /// text and pass by reading itself.
+    #[test]
+    fn create_still_checks_whether_the_image_installs_the_ca() {
+        let src = include_str!("create.rs");
+        let needle = format!("{}{}", "installs_proxy", "_ca(initramfs)");
+        assert!(
+            src.contains(&format!("!{needle}")),
+            "create must still ask the archive whether its init installs the CA, and act \
+             on the answer; without it a pre-#238 image fails a certificate check in silence"
         );
     }
 }
