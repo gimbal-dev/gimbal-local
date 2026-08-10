@@ -44,6 +44,7 @@ three ways:
 | Container image pulled from Docker Hub, cold-booted | Worked on a *different* kernel — proving the two paths share nothing |
 | The app cold-booting a guest from its own emitted command | Worked, RTC correct at boot |
 | A container-derived guest reaching the internet | `alpine:3.20` → `wget https://registry.npmjs.org/` rc 0; `debian:12-slim` → TCP to `deb.debian.org:443`, both with virtio bundled by `chm image build --modules` |
+| A coding agent working inside a guest | GitHub Copilot CLI installed, authenticated, wrote and ran JS, holding no credential — **on a cold-booted guest** (V7.1). See the limitation below before reading this as covering rehydrated snapshots. |
 
 ### Known, measured limitations
 
@@ -53,6 +54,7 @@ three ways:
 | **105 of 238 CPU registers** restore faithfully | See [`cpu-feature-deltas.md`](cpu-feature-deltas.md). The one real bug is a register HVF restores *perfectly*: the guest still believes it can run 32-bit binaries, and doing so wedges the vCPU. |
 | **Max guest RAM on cold boot is 3008 MiB** | Guest RAM starts at `0x40000000` and a single region must end by `0xfc000000`. `chm` refuses larger with the exact maximum in the message. |
 | **Demand-faulting from the state CDN is not implemented** | See [`state-cdn-memory-plane.md`](state-cdn-memory-plane.md). |
+| **A coding agent has been proven on a cold-booted guest, not on a rehydrated snapshot** | The two halves of the dream — *rehydrate a cloud snapshot* and *run an agent in it* — have each been proven, and **not yet in the same guest**. A cold-booted guest reads this Mac's own `CTR_EL0` and is immune by construction to the DIC delta that makes JITs execute stale code, so V7.1's result says nothing about a rehydrated one. Measured 2026-08-08 on a rehydrated Graviton capture: `npm i -g @github/copilot` exits 0, `npm` fails 10 of 10 without `NODE_OPTIONS=--jitless` and succeeds 5 of 5 with it, and `copilot --version` has not yet returned cleanly on a guest that had not already been wedged by repeated resumes (#257). Tracked as #260; the first-resume walls are in [`first-resume.md`](first-resume.md). |
 
 ---
 
