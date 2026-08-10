@@ -12,6 +12,8 @@
 //! restored. Restoring is just a matter of seeding `next_avail`/`next_used` from
 //! the live ring indices (see [`Queue::restore`]).
 
+use std::sync::atomic::{self, Ordering};
+
 use super::{GuestMemError, GuestMemory};
 
 /// `VIRTQ_DESC_F_NEXT`: the descriptor continues via its `next` field.
@@ -134,6 +136,13 @@ impl Queue {
         if self.next_avail == self.avail_idx(mem)? {
             return Ok(None);
         }
+        // The driver wrote the descriptor table and the ring entry *before* it
+        // bumped `avail.idx`, and published the index with a release store. We
+        // have just observed that index, so acquire here to make its prior
+        // writes visible to the loads below. Without this the device can walk a
+        // descriptor chain that still holds the previous request's address and
+        // length, and then read or write the wrong guest pages entirely.
+        atomic::fence(Ordering::Acquire);
         let head = self.avail_ring(mem, self.next_avail)?;
         let segments = self.collect_chain(mem, head)?;
         self.next_avail = self.next_avail.wrapping_add(1);
@@ -214,8 +223,18 @@ impl Queue {
         mem.write_u32(elem, head as u32)?;
         mem.write_u32(elem + 4, len)?;
         self.next_used = self.next_used.wrapping_add(1);
-        // Publish the new index last so the driver never sees a half-written
-        // element (single-threaded host, but keep the ordering honest).
+        // Publish the new index last, behind a release fence.
+        //
+        // The consumer is a guest vCPU on a *different physical core*, not this
+        // thread, so source order is not the order it observes: aarch64 is
+        // weakly ordered and the stores above may still be in this core's store
+        // buffer when the index lands. A driver that sees the new index may then
+        // read a stale used element, or — far worse for virtio-blk — read the
+        // destination buffer before the data this request was supposed to put
+        // there is visible, and cache the *previous tenant* of those pages as
+        // file content. The fence is what makes "written before published"
+        // true for the reader rather than merely true in this source file.
+        atomic::fence(Ordering::Release);
         mem.write_u16(self.used + 2, self.next_used)?;
         Ok(())
     }
