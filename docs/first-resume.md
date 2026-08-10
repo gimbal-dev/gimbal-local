@@ -33,13 +33,23 @@ unused, so the guest's root filesystem is smaller than the disk it sits on ...
 Fix it once, inside the guest:
 
 ```sh
-sudo sgdisk -e /dev/vda && sudo partx -u /dev/vda \
-  && sudo growpart /dev/vda 1 && sudo resize2fs /dev/vda1
+sudo sgdisk -e /dev/vda && sudo growpart /dev/vda 1 \
+  && sudo partx -u /dev/vda && sudo resize2fs /dev/vda1
 ```
 
 `sgdisk -e` is first and is the step nobody guesses: the backup GPT header is no
 longer at the end of a device that grew, and `growpart` refuses until it is
 moved there.
+
+**`partx -u` comes after `growpart`, not before**, and that ordering is the
+whole difference between this working and silently doing nothing. `growpart`
+rewrites the table on disk; `partx -u` is the only step that carries a new table
+into a kernel that is already running. Put it first and it publishes the
+geometry you are trying to leave behind, `growpart` then changes the GPT with
+nothing left to announce it, and `resize2fs` grows the filesystem to fill the
+kernel's unchanged view -- reporting `Nothing to do!` while being entirely
+correct. All four commands exit 0 and the disk is still full. This is
+[#284](https://github.com/gimbal-dev/gimbal-local/issues/284).
 
 **Why `chm` does not do this for you.** Growing the partition means rewriting the
 partition table and resizing a *mounted* ext4 filesystem underneath a kernel
@@ -159,8 +169,8 @@ run was a cold boot.
 ## In short
 
 ```sh
-sudo sgdisk -e /dev/vda && sudo partx -u /dev/vda \
-  && sudo growpart /dev/vda 1 && sudo resize2fs /dev/vda1
+sudo sgdisk -e /dev/vda && sudo growpart /dev/vda 1 \
+  && sudo partx -u /dev/vda && sudo resize2fs /dev/vda1
 echo "nameserver 192.168.249.1" | sudo tee /etc/resolv.conf
 echo 'export NODE_OPTIONS=--jitless' | sudo tee /etc/profile.d/jitless.sh
 ```
