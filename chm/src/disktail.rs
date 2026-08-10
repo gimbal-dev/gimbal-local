@@ -128,6 +128,32 @@ fn overlay_touched_gpt(path: &Path) -> bool {
     off >= 0 && (off as u64) < PRIMARY_GPT_BYTES
 }
 
+/// The sequence that works, in the one order that works.
+///
+/// Order is load-bearing and was wrong until #284. `growpart` rewrites the GPT
+/// on disk; `partx -u` is the step that carries a new table into an *already
+/// running* kernel. Run `partx -u` first and it publishes the geometry the user
+/// is trying to leave behind, `growpart` then changes the GPT with nothing left
+/// to announce it, and `resize2fs` grows the filesystem to the kernel's
+/// unchanged view and correctly reports `Nothing to do!`. Every step "succeeds"
+/// and the disk is still full -- a silent no-op at the first thing a user does
+/// with a rehydrated capture.
+///
+/// Measured on `graviton-vanilla-2cpu-net`: in this order the four commands take
+/// `/` from 2.4G with 224M free to 6.8G with 4.6G free in a single pass, and
+/// `partx -u` exits 0.
+///
+/// Kept as a function rather than restated at each call site so that the advice
+/// `chm` prints and the sequence `docs/first-resume.md` documents cannot drift
+/// apart -- a restated constant is how this repo has shipped disagreeing halves
+/// before.
+pub(crate) fn grow_sequence(dev: &str) -> String {
+    format!(
+        "sudo sgdisk -e {dev} && sudo growpart {dev} 1 \\\n\
+         \x20 && sudo partx -u {dev} && sudo resize2fs {dev}1"
+    )
+}
+
 /// The advice, kept in one place so a test can hold it to naming every command
 /// the sequence actually needs.
 pub(crate) fn grow_advice(dev: &str, tail: &UnusedTail) -> String {
@@ -139,13 +165,16 @@ pub(crate) fn grow_advice(dev: &str, tail: &UnusedTail) -> String {
          chm cannot grow it from here -- rewriting the partition table and resizing a \
          mounted filesystem has to happen inside the guest. Run this there, once:\n\
          \n\
-             sudo sgdisk -e {dev} && sudo partx -u {dev} \\\n\
-             \x20 && sudo growpart {dev} 1 && sudo resize2fs {dev}1\n\
+         \x20   {seq}\n\
          \n\
          `sgdisk -e` comes first because the backup GPT header is no longer at the end \
-         of the device, and `growpart` refuses until it is. See docs/first-resume.md.",
+         of the device, and `growpart` refuses until it is. `partx -u` comes last of the \
+         three because it is what tells the running kernel the table changed -- run \
+         earlier it announces the old geometry and `resize2fs` finds nothing to do. \
+         See docs/first-resume.md.",
         human_bytes(tail.unused_bytes()),
         human_bytes(tail.device_bytes),
+        seq = grow_sequence(dev).replace('\n', "\n    "),
     )
 }
 
@@ -268,6 +297,54 @@ mod tests {
         assert!(
             a.contains("chm cannot grow it from here"),
             "say who has to act"
+        );
+    }
+
+    /// Order is the whole of #284, and the test above stayed green through it:
+    /// a check that every command is *named* structurally cannot see the one
+    /// arrangement of those same four commands that silently does nothing.
+    ///
+    /// `growpart` changes the table, `partx -u` announces the change to a
+    /// running kernel, `resize2fs` grows into what the kernel now believes. Any
+    /// other order leaves a step talking about geometry that no longer -- or
+    /// does not yet -- exist.
+    #[test]
+    fn the_advice_tells_the_kernel_after_it_changes_the_table() {
+        let s = grow_sequence("/dev/vda");
+        let at = |needle: &str| s.find(needle).unwrap_or_else(|| panic!("{needle}: {s}"));
+        let (sgdisk, growpart, partx, resize) = (
+            at("sgdisk -e"),
+            at("growpart"),
+            at("partx -u"),
+            at("resize2fs"),
+        );
+        assert!(
+            sgdisk < growpart,
+            "growpart refuses until the backup header moves: {s}"
+        );
+        assert!(
+            growpart < partx,
+            "partx -u before growpart publishes the geometry being replaced, and \
+             resize2fs then reports `Nothing to do!`: {s}"
+        );
+        assert!(
+            partx < resize,
+            "resize2fs grows into the kernel's view, so the kernel has to be told first: {s}"
+        );
+    }
+
+    /// The guest-facing documentation prints the same four commands, and a user
+    /// following the doc instead of the notice must not get a different answer.
+    /// Comparing against the function rather than against a copied literal is
+    /// what makes that true by construction: this repo has shipped an app and an
+    /// engine disagreeing about a restated constant more than once.
+    #[test]
+    fn the_documented_sequence_is_the_one_chm_prints() {
+        let doc = include_str!("../../docs/first-resume.md");
+        let seq = grow_sequence("/dev/vda");
+        assert!(
+            doc.contains(&seq),
+            "docs/first-resume.md must carry this sequence verbatim:\n{seq}"
         );
     }
 
