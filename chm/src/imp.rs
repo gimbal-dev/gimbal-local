@@ -475,6 +475,15 @@ pub(crate) fn aarch32_guard(snap: &Snapshot) -> Result<(), String> {
 /// bring — Node tooling — the untreated failure rate is total, and one
 /// environment variable is the difference between unusable and working.
 ///
+/// It is not, however, the difference for every *program* Node tooling installs.
+/// `NODE_OPTIONS` reaches node; a package that ships a compiled binary and execs
+/// it keeps its own JIT and its own exposure. The GitHub Copilot CLI is exactly
+/// that shape, and with `--jitless` set its platform binary still died 5 runs out
+/// of 5 (#261) — while reporting the crash as a missing platform package, which
+/// sends the reader to reinstall something that is already installed. The
+/// warning says so, because a mitigation quoted without its limit is the more
+/// expensive kind of wrong.
+///
 /// The kernel side cannot be fixed at rehydrate time: the NOPs are baked into
 /// the kernel text inside the snapshot, and we have no way to write into the
 /// guest filesystem from here either, so the mitigation has to be something the
@@ -510,10 +519,19 @@ pub(crate) fn icache_detail() -> &'static str {
              export NODE_OPTIONS=--jitless\n\
          \n\
          The same `npm --version` then succeeded 5 times out of 5. Put that in \
-         /etc/profile.d/ inside the guest to make it stick. Non-JIT workloads are \
-         unaffected, and a cold-booted guest is immune because its kernel reads this \
-         Mac's own CTR_EL0. Set CHM_STRICT_ICACHE=1 to refuse to start instead of \
-         warning. See docs/cpu-feature-deltas.md."
+         /etc/profile.d/ inside the guest to make it stick.\n\
+         \n\
+         That variable reaches node and nothing else, so it does not cover a tool \
+         that runs its own compiled binary. The GitHub Copilot CLI installs a 174 MiB \
+         native platform package and execs it; measured here with \
+         NODE_OPTIONS=--jitless set, that binary died 5 runs out of 5 (4 SIGILL, 1 \
+         SIGBUS), and the CLI reported the crash as `no platform package found. \
+         Reinstall with npm install -g @github/copilot` -- advice that cannot help, \
+         because the package is installed and was found. `taskset -c 0` recovered it \
+         2 runs out of 3. Non-JIT workloads are unaffected, and a cold-booted guest \
+         is immune because its kernel reads this Mac's own CTR_EL0. Set \
+         CHM_STRICT_ICACHE=1 to refuse to start instead of warning. See \
+         docs/cpu-feature-deltas.md."
 }
 
 pub(crate) fn icache_dic_guard(snap: &Snapshot) -> Result<(), String> {
@@ -873,15 +891,19 @@ fn resolve_egress_policy(overlay_dir: &Path, cli_override: Option<&Path>) -> Egr
     }
 }
 
-/// Parse a `CHM_EGRESS_POLICY` JSON document into an [`EgressPolicy`]. Returns
-/// `None` when the document is not valid JSON — a malformed policy is logged but
-/// must not silently *tighten* or crash the boot; the runner already verified
-/// the digest before setting it.
+/// Parse a control-plane policy document into an [`EgressPolicy`], for tests.
+///
+/// Production reads every document through [`parse_egress_policy_labelled`], so
+/// that the label reported by the posture line is the authority that actually
+/// wrote the document rather than a hardcoded guess. This wrapper only pins the
+/// control-plane fallback, and is `cfg(test)` so it cannot quietly become a
+/// second production entry point with a different default.
+#[cfg(test)]
 fn parse_egress_policy(raw: &str) -> Option<EgressPolicy> {
     parse_egress_policy_labelled(raw, "control-plane")
 }
 
-/// As [`parse_egress_policy`], but the caller names the label to use when the
+/// Parse a policy document, with the caller naming the label to use when the
 /// document carries neither a `digest` nor a `label` of its own.
 ///
 /// Every member is read defensively, because a policy document is hand-edited
@@ -4150,6 +4172,19 @@ mod tests {
         assert!(
             d.contains("5 times out of 5"),
             "the measured rate under the workaround"
+        );
+        // #261: the workaround's limit is part of the workaround. A reader who
+        // sets NODE_OPTIONS and then watches a native binary SIGILL -- while
+        // being told to reinstall a package that is already installed -- is
+        // worse off than one who was never given the variable, because the
+        // message they get next points away from the real cause.
+        assert!(
+            d.contains("reaches node and nothing else"),
+            "the warning must say what NODE_OPTIONS does not cover: {d}"
+        );
+        assert!(
+            d.contains("SIGILL"),
+            "the measured outcome for a native platform binary: {d}"
         );
         assert!(
             !d.contains("1 run in 7"),

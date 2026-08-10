@@ -128,6 +128,34 @@ echo 'export NODE_OPTIONS=--jitless' | sudo tee /etc/profile.d/jitless.sh
 `chm` warns about this on every affected resume. The full measurement is in
 `docs/cpu-feature-deltas.md`; a cold-booted guest is immune.
 
+### What that variable does not cover
+
+`NODE_OPTIONS` reaches `node`. It does not reach a program `node` runs, and a
+package that ships a compiled binary and execs it keeps its own JIT and its own
+exposure to this.
+
+The GitHub Copilot CLI is that shape: `npm i -g @github/copilot` installs a
+174 MiB native binary alongside the JavaScript, and running `copilot` execs it.
+Measured on a rehydrated capture **with `NODE_OPTIONS=--jitless` already set**,
+that binary died 5 runs out of 5 (4 `SIGILL`, 1 `SIGBUS`). `taskset -c 0`
+recovered it 2 runs out of 3, consistent with the stale-line mechanism.
+
+The failure is worth recognising because the CLI does not report it as a crash:
+
+```
+GitHub Copilot CLI: no platform package found.
+Reinstall with `npm install -g @github/copilot`
+```
+
+The package **is** installed and **was** found — you can see it under
+`/usr/local/lib/node_modules/@github/copilot/node_modules/@github/`. Reinstalling
+cannot help. See [#261](https://github.com/gimbal-dev/gimbal-local/issues/261).
+
+**Today the answer for a native agent binary is to cold-boot instead of
+rehydrating.** A cold-booted guest reads this Mac's own `CTR_EL0`, keeps its
+`ic ivau`, and is immune by construction — which is why V7.1's end-to-end agent
+run was a cold boot.
+
 ## In short
 
 ```sh
@@ -138,4 +166,5 @@ echo 'export NODE_OPTIONS=--jitless' | sudo tee /etc/profile.d/jitless.sh
 ```
 
 Three lines, once, and a rehydrated cloud capture behaves like a machine you can
-work in.
+work in — for anything that runs on `node` itself. A tool that ships its own
+compiled binary is still exposed; see *What that variable does not cover* above.
