@@ -236,7 +236,9 @@ struct RevisionHistoryCard: View {
     /// The directory whose revisions to show (a sandbox workspace, or an image).
     /// `nil` when the sandbox has not run yet (no workspace).
     let dirPath: String?
-    var emptyHint = "No saved revisions yet. Suspend a running sandbox (close its terminal, or Stop it) to save its live state as a revision here."
+    /// The lead sentence of the empty state. How points *arrive* is appended
+    /// from the cadence rather than written here, so the two cannot disagree.
+    var emptyLead = "No saved points yet."
 
     private var revisions: [RevisionSummary] {
         guard let dirPath else { return [] }
@@ -250,7 +252,7 @@ struct RevisionHistoryCard: View {
             systemImage: "clock.arrow.circlepath"
         ) {
             if revisions.isEmpty {
-                Text(emptyHint)
+                Text(emptyLead + " " + model.snapshotCadence.howPointsArrive)
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
@@ -262,7 +264,21 @@ struct RevisionHistoryCard: View {
                             .foregroundStyle(rev.isHead ? Theme.green : Theme.cyan)
                         VStack(alignment: .leading, spacing: 1) {
                             HStack(spacing: 6) {
-                                Text(rev.origin).font(.callout.weight(.medium))
+                                Text(rev.originEntryPoint).font(.callout.weight(.medium))
+                                // chm has always distinguished a point the
+                                // cadence took from one a person asked for; the
+                                // app has never shown it. They answer different
+                                // questions, so rolling back to one is a
+                                // different decision from rolling back to the
+                                // other.
+                                if rev.isAutomatic {
+                                    Text("auto")
+                                        .font(.caption2.weight(.semibold))
+                                        .foregroundStyle(Theme.cyan)
+                                        .padding(.horizontal, 5)
+                                        .padding(.vertical, 1)
+                                        .background(Theme.cyan.opacity(0.16), in: Capsule())
+                                }
                                 Text(rev.shortId)
                                     .font(.caption2.monospaced())
                                     .foregroundStyle(.tertiary)
@@ -334,7 +350,10 @@ struct RevisionHistoryCard: View {
 /// tree. Today a snapshot has at most one revision (HEAD); the layout is built
 /// for the fork future (see docs/gimbal-local-fork-model.md), where a revision
 /// branches into several child sandboxes/revisions.
-private struct LineageCard: View {
+// Not `private`: `revisionSubtitle` is the one place the `-auto` marker turns
+// into words, and a rule about what the user reads should be reachable by a
+// test rather than only by rendering a view.
+struct LineageCard: View {
     @EnvironmentObject private var model: AppModel
     let snapshotName: String
 
@@ -364,7 +383,7 @@ private struct LineageCard: View {
                         symbol: "clock.arrow.circlepath",
                         color: Theme.cyan,
                         title: "revision \(rev.shortId)",
-                        subtitle: "saved \(Self.age(rev.createdAt)) · via \(rev.origin)"
+                        subtitle: Self.revisionSubtitle(rev, createdAt: rev.createdAt)
                             + (rev.parent == nil ? "" : " · has parent"),
                         badge: "revision"
                     )
@@ -434,6 +453,18 @@ private struct LineageCard: View {
         case ..<86400: return "\(Int(seconds / 3600))h ago"
         default: return "\(Int(seconds / 86400))d ago"
         }
+    }
+
+    /// The lineage row's one-line description of a revision.
+    ///
+    /// Extracted so the `-auto` marker is a value the tests can ask for rather
+    /// than a string assembled inside a `ViewBuilder`, where it is only
+    /// reachable by rendering.
+    static func revisionSubtitle(_ rev: some RevisionOrigin, createdAt: Date) -> String {
+        var parts = ["saved \(age(createdAt))", "via \(rev.originEntryPoint)"]
+        if rev.isAutomatic { parts[1] += " (auto)" }
+
+        return parts.joined(separator: " · ")
     }
 }
 

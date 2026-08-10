@@ -41,11 +41,30 @@ private struct GeneralSettingsTab: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
+
+            Section("Saving a running sandbox") {
+                Picker("Save live state", selection: $model.snapshotCadence) {
+                    ForEach(SnapshotCadence.allCases) { cadence in
+                        Text(cadence.label).tag(cadence)
+                    }
+                }
+                Text(SnapshotCadence.explanation)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                Text("Applies to sandboxes you open from now on — a session already running keeps the cadence it started with.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
         }
         .formStyle(.grouped)
         .onChange(of: model.localOnly) { _, _ in
             model.saveLocalOnly()
             Task { await model.refreshAll() }
+        }
+        .onChange(of: model.snapshotCadence) { _, _ in
+            model.saveSnapshotCadence()
         }
     }
 }

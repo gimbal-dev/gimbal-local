@@ -159,6 +159,12 @@ final class AppModel: ObservableObject {
     /// when the key is absent, so the default falls out of the read.
     @Published var localOnly = UserDefaults.standard.bool(forKey: "gimbal.localOnly")
 
+    /// How often a running sandbox saves its live state (#174). Off by default:
+    /// each save freezes the guest to capture RAM, so it is a trade the user
+    /// makes rather than one the app makes for them.
+    @Published var snapshotCadence = SnapshotCadence.stored(
+        in: .standard, key: SnapshotCadence.defaultsKey)
+
     /// The last security posture we were able to read, and why we could not.
     ///
     /// Held as an optional rather than defaulting to an empty report on
@@ -765,7 +771,8 @@ final class AppModel: ObservableObject {
             runPath: runPath,
             socketPath: settings.socketPath,
             lockPath: lockPath,
-            workdir: FileManager.default.currentDirectoryPath
+            workdir: FileManager.default.currentDirectoryPath,
+            cadence: snapshotCadence
         )
         try openTerminal(runningShellCommand: command)
     }
@@ -1686,6 +1693,14 @@ final class AppModel: ObservableObject {
         if localOnly, selection == .cloudHome {
             selection = .sandboxesHome
         }
+    }
+
+    /// Persist the snapshot cadence. Takes effect on the **next** session: the
+    /// flag is fixed when `chm connect` is launched, and reaching into a
+    /// running guest to change how often it freezes is the kind of unannounced
+    /// action #192 and #195 both refused. The settings copy says so.
+    func saveSnapshotCadence() {
+        UserDefaults.standard.set(snapshotCadence.rawValue, forKey: SnapshotCadence.defaultsKey)
     }
 
     /// Restore the paths the user chose, honouring the precedence in
