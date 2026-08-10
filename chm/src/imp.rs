@@ -744,10 +744,10 @@ fn spawn_icache_reporter() {
     thread::spawn(|| {
         loop {
             thread::sleep(Duration::from_secs(30));
-            let (exec, write, dma, bytes) = icache_wx::stats();
+            let (exec, write, relaxed, dma, bytes) = icache_wx::stats();
             eprintln!(
                 "chm: [icache] exec_faults={exec} write_faults={write} \
-                 dma_invalidations={dma} dma_MiB={}",
+                 relaxed_pages={relaxed} dma_invalidations={dma} dma_MiB={}",
                 bytes / (1024 * 1024)
             );
         }
