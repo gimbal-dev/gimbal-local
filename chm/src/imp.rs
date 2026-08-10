@@ -464,18 +464,57 @@ pub(crate) fn aarch32_guard(snap: &Snapshot) -> Result<(), String> {
 /// (`mmap(RW)` → write → `mprotect(RX)` → call — exactly what a JIT does):
 /// **955 of 1,000 executions fetched stale instructions**. Adding an explicit
 /// `ic ivau` took it to 0/1,000, so the hardware and EL0 maintenance are sound;
-/// only the kernel's elided copy is wrong. `npm --version` on Node 22 dies with
-/// `Illegal instruction (core dumped)` roughly one run in seven, and never once
-/// under `--jitless`.
+/// only the kernel's elided copy is wrong.
 ///
-/// Nothing can be fixed at rehydrate time — the NOPs are baked into the kernel
-/// text inside the snapshot — so this warns rather than refuses, matching
-/// [`aarch32_guard`]. A cold-booted guest is unaffected: its kernel reads this
-/// Mac's real `CTR_EL0` and patches correctly. `CHM_STRICT_ICACHE=1` refuses.
+/// How bad this is in practice was understated for a long time. The figure used
+/// to be "roughly one run in seven"; measured on a rehydrated Graviton guest
+/// running Node 22.11.0, `npm --version` died with `Illegal instruction (core
+/// dumped)` **10 times out of 10**. Under `NODE_OPTIONS=--jitless` the same
+/// command succeeded **5 times out of 5**. So for the workload people actually
+/// bring — Node tooling — the untreated failure rate is total, and one
+/// environment variable is the difference between unusable and working.
+///
+/// The kernel side cannot be fixed at rehydrate time: the NOPs are baked into
+/// the kernel text inside the snapshot, and we have no way to write into the
+/// guest filesystem from here either, so the mitigation has to be something the
+/// user applies. This warns rather than refuses, matching [`aarch32_guard`], and
+/// the warning carries the workaround so it is read at the moment the problem
+/// is. A cold-booted guest is unaffected: its kernel reads this Mac's real
+/// `CTR_EL0` and patches correctly. `CHM_STRICT_ICACHE=1` refuses.
 ///
 /// The comparison is against the capture alone. Every Apple part measured
 /// reports `DIC = 0` (`hvf_host_cache_identity_registers` prints the live
 /// value); a Mac that reported 1 would make this a false positive.
+/// The text of the i-cache warning, split out so the workaround it offers can
+/// be asserted. The measured numbers in it are the point of the message, so a
+/// test pins them rather than trusting prose to stay true.
+pub(crate) fn icache_detail() -> &'static str {
+    "this snapshot's guest kernel skips the instruction-cache maintenance this \
+         Mac requires, so JIT compilers in the guest will intermittently execute stale \
+         code.\n\
+         \n\
+         The capture host reported CTR_EL0.DIC = 1, and Linux latched that at boot by \
+         patching `ic ivau` out of `caches_clean_inval_pou()`. Apple silicon reports \
+         DIC = 0, so that elision is unsound here. Measured in a rehydrated guest, \
+         executing freshly written code (mmap RW, write, mprotect RX, call — what every \
+         JIT does): 955 of 1000 executions fetched stale instructions. An explicit \
+         `ic ivau` took the same test to 0 of 1000, so only the kernel's copy is wrong.\n\
+         \n\
+         Expect `Illegal instruction (core dumped)` from Node, npm, Java, .NET and any \
+         other JIT. Measured on a rehydrated Graviton guest running Node 22.11.0, \
+         `npm --version` died 10 times out of 10.\n\
+         \n\
+         Work around it by turning the JIT off:\n\
+         \n\
+             export NODE_OPTIONS=--jitless\n\
+         \n\
+         The same `npm --version` then succeeded 5 times out of 5. Put that in \
+         /etc/profile.d/ inside the guest to make it stick. Non-JIT workloads are \
+         unaffected, and a cold-booted guest is immune because its kernel reads this \
+         Mac's own CTR_EL0. Set CHM_STRICT_ICACHE=1 to refuse to start instead of \
+         warning. See docs/cpu-feature-deltas.md."
+}
+
 pub(crate) fn icache_dic_guard(snap: &Snapshot) -> Result<(), String> {
     /// `CTR_EL0` is `S3_3_C0_C0_1`, packed as
     /// `(op0<<14)|(op1<<11)|(CRn<<7)|(CRm<<3)|op2`.
@@ -492,23 +531,7 @@ pub(crate) fn icache_dic_guard(snap: &Snapshot) -> Result<(), String> {
         return Ok(());
     }
 
-    let detail = "this snapshot's guest kernel skips the instruction-cache maintenance this \
-         Mac requires, so JIT compilers in the guest will intermittently execute stale \
-         code.\n\
-         \n\
-         The capture host reported CTR_EL0.DIC = 1, and Linux latched that at boot by \
-         patching `ic ivau` out of `caches_clean_inval_pou()`. Apple silicon reports \
-         DIC = 0, so that elision is unsound here. Measured in a rehydrated guest, \
-         executing freshly written code (mmap RW, write, mprotect RX, call — what every \
-         JIT does): 955 of 1000 executions fetched stale instructions. An explicit \
-         `ic ivau` took the same test to 0 of 1000, so only the kernel's copy is wrong.\n\
-         \n\
-         Expect `Illegal instruction (core dumped)` from Node, npm, Java, .NET and any \
-         other JIT; roughly 1 run in 7 for `npm --version`, and 0 in 15 under \
-         `node --jitless`. Non-JIT workloads are unaffected, and a cold-booted guest is \
-         immune because its kernel reads this Mac's own CTR_EL0. Set \
-         CHM_STRICT_ICACHE=1 to refuse to start instead of warning. See \
-         docs/cpu-feature-deltas.md.";
+    let detail = icache_detail();
 
     if env::var_os("CHM_STRICT_ICACHE").is_some() {
         return Err(format!(
@@ -3939,6 +3962,53 @@ mod tests {
         assert!(icache_dic_guard(&snap_with_ctr(0x9444_c004)).is_ok());
         // No CTR_EL0 recorded at all: nothing to judge, so do not guess.
         assert!(icache_dic_guard(&snap_with_no_sysregs()).is_ok());
+    }
+
+    /// The warning exists to change what the user does next, so it has to carry
+    /// the workaround and the measured numbers behind it. Both were wrong for a
+    /// long time -- the message claimed "1 run in 7" while the measured rate on
+    /// a rehydrated Graviton guest was 10 of 10 -- so pin them.
+    #[test]
+    fn the_icache_warning_hands_over_the_workaround_and_not_just_the_diagnosis() {
+        let d = icache_detail();
+        // Assembled from parts so this cannot match its own assertion text.
+        let opt = format!("NODE_{}", "OPTIONS=--jitless");
+        assert!(
+            d.contains(&opt),
+            "the warning must name the env var that fixes it: {d}"
+        );
+        assert!(
+            d.contains("10 times out of 10"),
+            "the measured untreated failure rate"
+        );
+        assert!(
+            d.contains("5 times out of 5"),
+            "the measured rate under the workaround"
+        );
+        assert!(
+            !d.contains("1 run in 7"),
+            "the old understated figure must not come back"
+        );
+        assert!(
+            d.contains("profile.d"),
+            "telling the user how to make it stick is the difference between \
+             a one-shot and a fix"
+        );
+    }
+
+    /// Asserting on `icache_detail()` says nothing about what the guard actually
+    /// prints -- re-inlining the old string would leave the test above perfectly
+    /// green and unused. This repo has been bitten by that call-site class four
+    /// times, so read the source. The needle is assembled from parts or it
+    /// matches its own assertion text.
+    #[test]
+    fn the_guard_prints_the_text_the_test_above_checks() {
+        let src = include_str!("imp.rs");
+        let needle = format!("let detail = icache_{}();", "detail");
+        assert!(
+            src.contains(&needle),
+            "icache_dic_guard must emit icache_detail(), not its own literal"
+        );
     }
 
     /// The bit position is the whole guard, so pin it against the two measured

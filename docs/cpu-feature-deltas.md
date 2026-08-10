@@ -263,6 +263,29 @@ The user-visible symptom, on Node 22.23.2:
 | `npm --version`, pinned with `taskset -c 0` | **10/15 runs** |
 | `npm --version` under `node --jitless` | 0/15 |
 
+**Re-measured 2026-08-08, and the rate above understates it badly.** The 2/15
+figure was taken on a guest built for this investigation. On a plain rehydrated
+`graviton-vanilla-2cpu-net` capture running Node 22.11.0 — the path a user
+actually takes — `npm --version` failed **10 times out of 10**. Under
+`NODE_OPTIONS=--jitless` the same command succeeded **5 times out of 5**.
+
+| | rate |
+| --- | --- |
+| `npm --version`, untreated, rehydrated Graviton guest | **10/10 failed** |
+| `npm --version`, `NODE_OPTIONS=--jitless` | **5/5 succeeded** |
+
+So treat the intermittency in the table above as an artifact of one guest, not
+as the expected experience: for Node tooling on a rehydrated capture, assume it
+does not work until the JIT is off.
+
+```sh
+echo 'export NODE_OPTIONS=--jitless' | sudo tee /etc/profile.d/jitless.sh
+```
+
+That is the mitigation `chm`'s own warning now hands you, because it is the only
+one that can be applied from inside the guest. It costs interpreter-speed
+JavaScript, which for `npm install` and the Copilot CLI is a trade worth making.
+
 Pinning making it **worse** is the confirmation: a cross-vCPU coherency problem
 would improve when the work stays on one core. Staying on one core instead
 maximises the chance that core's I-cache still holds the *stale* line, which is
@@ -270,8 +293,10 @@ the signature of missing invalidation rather than missing broadcast.
 
 **Upgraded from latent to confirmed.** `chm` now warns at load, and
 `CHM_STRICT_ICACHE=1` refuses (`icache_dic_guard`). Nothing can be repaired at
-rehydrate time — the NOPs are baked into the kernel text inside the snapshot.
-Two things do fix it properly:
+rehydrate time — the NOPs are baked into the kernel text inside the snapshot,
+and `chm` has no way to write into the guest filesystem either, so the
+`--jitless` workaround has to be applied by the user inside the guest. Two
+things fix it properly rather than working around it:
 
 - **Cold boot.** A guest whose kernel boots here reads this Mac's own
   `CTR_EL0`, sees `DIC = 0`, and keeps its `ic ivau`. Immune by construction.

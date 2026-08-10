@@ -1802,6 +1802,12 @@ rather than a missing broadcast. Only then did the kernel half come into view.
 | `--predictable` (single-threaded V8) | 2/15 |
 | `--jitless` | **0/15** |
 
+> **Corrected 2026-08-08.** These rates were taken on the guest built for this
+> investigation and understate the problem. On a plain rehydrated
+> `graviton-vanilla-2cpu-net` capture, `npm --version` failed **10 of 10**
+> untreated and succeeded **5 of 5** under `NODE_OPTIONS=--jitless`. See
+> `docs/cpu-feature-deltas.md` finding 2.
+
 ### Shipped
 
 `icache_dic_guard` warns at load on both the `run` and `serve` paths, and
