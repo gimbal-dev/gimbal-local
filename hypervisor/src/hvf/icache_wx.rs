@@ -80,7 +80,7 @@
 //!    Feasibility of both halves is proved on hardware by
 //!    `hvf_can_trap_a_guest_instruction_fetch_and_grant_execute_afterwards`.
 //!    This is the route the 955/1000 probe measures, and it is the one that is
-//!    **off by default** — see the granule livelock below.
+//!    **off by default** — see the granule section below.
 //!
 //! 2. **We write it, for a device** — a virtio-blk read landing file content in
 //!    the page cache. Invisible to stage 2: the host stores into its own
@@ -96,12 +96,12 @@
 //! Neither subsumes the other, and only one of them is on by default. Why is
 //! the next section, and it was measured rather than reasoned.
 //!
-//! # Why stage-2 W^X is opt-in: the granule livelocks
+//! # The granule livelock, and the bound that ends it
 //!
 //! `hv_vm_protect` works in *host* pages, and Apple silicon pages in 16 KiB
 //! while the guest pages in 4 KiB. One host page therefore covers four guest
 //! pages, and a thread whose code and data land in the same 16 KiB — which
-//! costs only 4 KiB of separation — makes **no forward progress at all**:
+//! costs only 4 KiB of separation — made **no forward progress at all**:
 //!
 //! ```text
 //! fetch  -> page not executable -> grant X, revoke W -> retry
@@ -115,14 +115,26 @@
 //! resumed and before any load was applied. The other vCPU ran normally, which
 //! is the signature — this traps a *thread*, not a machine.
 //!
-//! Splitting W from X is only sound when the granule can separate them, so
-//! this half stays behind `CHM_ICACHE_WX_STRICT=1` until it carries a
-//! progress guarantee (promote a thrashing page to RWX and re-arm it at a
-//! synchronisation point, rather than bouncing it forever). It is kept, rather
-//! than deleted, because it is the only mechanism that can reach the *kernel*
-//! side of the same hazard — module loading, ftrace, BPF and static-key
-//! patching — which is the leading suspect for the permanent resume wedge in
-//! #257.
+//! Splitting W from X is only sound when the granule can separate them, and no
+//! amount of care makes a 16 KiB `hv_vm_protect` separate two things 4 KiB
+//! apart. So the fix is not to be cleverer about which pages to split; it is to
+//! **bound how long we are willing to try**. Each page carries a write-fault
+//! count, and after [`bounce_limit`] of them the page is handed back as RWX and
+//! never faults again. The total number of W^X faults over a VM's life is then
+//! at most `bounce_limit() × pages` — a termination proof rather than a hope.
+//!
+//! What that costs is exactness, and the cost is real: a relaxed page can
+//! execute stale instruction lines, exactly as it would with this module
+//! switched off. It is never *worse* than not arming, and [`stats`] reports how
+//! many pages ended up there, so "is this still doing anything?" is a
+//! measurement rather than an assumption. See [`Page`] for the full argument.
+//!
+//! This half stays behind `CHM_ICACHE_WX_STRICT=1` regardless, because what it
+//! buys has not yet been measured on hardware — the bound makes it *safe to
+//! run*, not *known to help*. It is kept, rather than deleted, because it is
+//! the only mechanism that can reach the *kernel* side of the same hazard —
+//! module loading, ftrace, BPF and static-key patching — which is the leading
+//! suspect for the permanent resume wedge in #257.
 //!
 //! The DMA half has no such problem: it does no permission changes and cannot
 //! livelock. That is the default — see above for the honest accounting of what
@@ -162,9 +174,12 @@ impl Region {
     }
 }
 
-/// Which way a page is currently usable. A page is never both, which is the
-/// whole point: the transition between them is the only moment we get to do
-/// the maintenance.
+/// Which way a page is currently usable.
+///
+/// The first two are the mechanism: a page is never both writable and
+/// executable, and the transition between them is the only moment we get to do
+/// the maintenance. The third is the escape hatch that makes the mechanism
+/// terminate — see [`Page`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum PageState {
     /// Writable, not executable. Every page starts here.
@@ -172,6 +187,44 @@ enum PageState {
     /// Executable, not writable. Its instruction cache was invalidated at the
     /// moment it was granted execute.
     Executable,
+    /// Read/write/execute: we gave up on this page.
+    ///
+    /// Reached after [`bounce_limit`] write faults. The page is then exactly as
+    /// exposed as it would be with this module switched off — it can execute
+    /// stale instruction lines — and it never faults again.
+    Relaxed,
+}
+
+/// A page we manage, and how much patience it has left.
+///
+/// The bounce count is what makes this terminate. `hv_vm_protect` works in
+/// *host* pages — 16 KiB on Apple silicon — while the guest pages in 4 KiB, so
+/// one host page can hold both a thread's code and its data. Splitting W from X
+/// on such a page is not merely inexact, it is unsatisfiable: the fetch fault
+/// grants X and takes W, the store fault grants W and takes X, and neither
+/// retires an instruction. Measured on a rehydrated Graviton capture: a soft
+/// lockup at 21 s, climbing past 558 s, from the instant of resume.
+///
+/// Counting the bounces and giving up bounds the whole mechanism: a page can
+/// take at most `bounce_limit()` write faults before it goes [`Relaxed`] and
+/// stops faulting, so the total number of W^X faults over a VM's life is at
+/// most `bounce_limit() × pages`. That is a termination proof rather than a
+/// hope, which is the only kind of answer worth having here.
+///
+/// The cost is exactness. A page that alternates legitimately — a JIT writing
+/// and running code in a tight loop — is indistinguishable from a livelocking
+/// one at this level, so it is relaxed too, and loses the maintenance. That is
+/// a real loss and it is strictly better than a wedged vCPU: a relaxed page is
+/// no worse off than it would be with this module never armed. How often it
+/// happens is a measurement, not a guess — [`stats`] reports it.
+///
+/// [`Relaxed`]: PageState::Relaxed
+#[derive(Clone, Copy, Debug)]
+struct Page {
+    state: PageState,
+    /// Write faults taken since arming. Never reset: the bound has to hold over
+    /// the VM's whole life, and a counter that resets does not bound anything.
+    bounces: u32,
 }
 
 /// Process-global, deliberately.
@@ -182,8 +235,11 @@ enum PageState {
 /// threading down to every vCPU that takes a fault.
 struct State {
     regions: Vec<Region>,
-    pages: HashMap<u64, PageState>,
+    pages: HashMap<u64, Page>,
     page_size: usize,
+    /// Cached once at arm time: [`bounce_limit`] reads the environment, and the
+    /// fault paths must not do that per fault.
+    bounce_limit: u32,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -192,8 +248,56 @@ static WX_ENFORCED: AtomicBool = AtomicBool::new(false);
 
 static EXEC_FAULTS: AtomicU64 = AtomicU64::new(0);
 static WRITE_FAULTS: AtomicU64 = AtomicU64::new(0);
+static RELAXED_PAGES: AtomicU64 = AtomicU64::new(0);
 static DMA_INVALIDATIONS: AtomicU64 = AtomicU64::new(0);
 static DMA_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// How many write faults a page may take before we give up on it.
+///
+/// Four, because the failure this bounds is instant and total — the livelock
+/// wedges a vCPU from the moment of resume — while the thing being protected is
+/// probabilistic. Riding out a few genuine write/execute alternations is worth
+/// having; riding out four hundred is not, because by then the page is either
+/// livelocking or churning hard enough that the maintenance is not paying for
+/// itself either way.
+///
+/// `CHM_ICACHE_WX_LIMIT` overrides it so the trade can be measured rather than
+/// argued about. `0` means never give up, which reproduces the livelock — it is
+/// there to make the comparison possible, not as a setting anyone should use.
+fn bounce_limit() -> u32 {
+    std::env::var("CHM_ICACHE_WX_LIMIT")
+        .ok()
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(4)
+}
+
+/// What a page becomes when the guest fetches an instruction from it.
+///
+/// Pure, and deliberately so. The fault paths it serves cannot run in a unit
+/// test — `hv_vm_protect` needs a VM, and only the signed integration test can
+/// make one — so a policy left inline there would be reachable only on
+/// hardware, and the termination argument would be untested prose. Here it can
+/// be driven to exhaustion by [`tests::the_state_machine_cannot_bounce_forever`]
+/// with no hypervisor at all.
+fn exec_grant(bounces: u32, limit: u32) -> PageState {
+    if limit != 0 && bounces >= limit {
+        PageState::Relaxed
+    } else {
+        PageState::Executable
+    }
+}
+
+/// The stage-2 permissions a page in this state must be given.
+///
+/// `Relaxed` is the only one that is both writable and executable, which is the
+/// whole of what "given up on" means.
+fn flags_for(state: PageState) -> u64 {
+    match state {
+        PageState::Writable => HV_MEMORY_READ | HV_MEMORY_WRITE,
+        PageState::Executable => HV_MEMORY_READ | HV_MEMORY_EXEC,
+        PageState::Relaxed => HV_MEMORY_READ | HV_MEMORY_WRITE | HV_MEMORY_EXEC,
+    }
+}
 
 /// Is host-side maintenance switched on for this VM?
 ///
@@ -273,6 +377,7 @@ pub fn arm(regions: &[(u64, usize, usize)]) -> Result<(), String> {
         regions: regs,
         pages: HashMap::new(),
         page_size,
+        bounce_limit: bounce_limit(),
     });
     WX_ENFORCED.store(strict, Ordering::SeqCst);
     ARMED.store(true, Ordering::SeqCst);
@@ -325,11 +430,29 @@ pub fn on_exec_fault(ipa: u64) -> bool {
         return false;
     };
     let page = ipa & !(page_size as u64 - 1);
+
+    // Do the maintenance either way: this is the last moment before the guest
+    // executes from the page, and it is the whole reason the fault was taken.
+    // A page on its way to Relaxed still deserves one final invalidation --
+    // giving up on future faults is not a reason to skip the one in hand.
     invalidate(region.host_of(page), page_size);
-    if protect(page, page_size, HV_MEMORY_READ | HV_MEMORY_EXEC).is_err() {
+
+    let entry = state.pages.entry(page).or_insert(Page {
+        state: PageState::Writable,
+        bounces: 0,
+    });
+    let granted = exec_grant(entry.bounces, state.bounce_limit);
+    if protect(page, page_size, flags_for(granted)).is_err() {
         return false;
     }
-    state.pages.insert(page, PageState::Executable);
+
+    // Only count the transition into Relaxed, not every fetch afterwards --
+    // this is a population count of pages given up on, and it would be useless
+    // as a fault count.
+    if granted == PageState::Relaxed && entry.state != PageState::Relaxed {
+        RELAXED_PAGES.fetch_add(1, Ordering::Relaxed);
+    }
+    entry.state = granted;
     EXEC_FAULTS.fetch_add(1, Ordering::Relaxed);
     true
 }
@@ -358,14 +481,23 @@ pub fn on_write_fault(ipa: u64) -> bool {
     let page = ipa & !(page_size as u64 - 1);
     // A page we have never granted execute to is already writable, so a fault
     // on it is not ours — say so rather than silently absorbing a fault the
-    // guest needs to see reported.
-    if state.pages.get(&page) != Some(&PageState::Executable) {
+    // guest needs to see reported. A Relaxed page is writable too, and if one
+    // ever faults, the stage-2 entry disagrees with our bookkeeping and
+    // claiming it would spin.
+    let Some(entry) = state.pages.get_mut(&page) else {
+        return false;
+    };
+    if entry.state != PageState::Executable {
         return false;
     }
-    if protect(page, page_size, HV_MEMORY_READ | HV_MEMORY_WRITE).is_err() {
+    if protect(page, page_size, flags_for(PageState::Writable)).is_err() {
         return false;
     }
-    state.pages.insert(page, PageState::Writable);
+    entry.state = PageState::Writable;
+    // Saturating, so a page that survives four billion bounces stays given up
+    // on rather than wrapping to zero and livelocking again — a bound that can
+    // wrap is not a bound.
+    entry.bounces = entry.bounces.saturating_add(1);
     WRITE_FAULTS.fetch_add(1, Ordering::Relaxed);
     true
 }
@@ -394,15 +526,20 @@ pub fn on_device_write(dst: *mut u8, len: usize) {
     DMA_BYTES.fetch_add(len as u64, Ordering::Relaxed);
 }
 
-/// `(exec faults, write faults, device invalidations, bytes invalidated)`.
+/// `(exec faults, write faults, pages given up on, device invalidations, bytes
+/// invalidated)`.
 ///
-/// Exposed so the cost can be reported rather than guessed: the ping-pong a
-/// 16 KiB granule can cause on a mixed code/data page is visible here as write
-/// faults climbing with exec faults.
-pub fn stats() -> (u64, u64, u64, u64) {
+/// Exposed so the cost can be reported rather than guessed. The third field is
+/// the one that says whether this is doing anything: it counts pages that hit
+/// the bounce limit and were relaxed to RWX, which are pages the maintenance
+/// has stopped covering. If it climbs to most of the guest's text, the
+/// mechanism has quietly turned itself off and the number is how you find out
+/// instead of assuming it is working.
+pub fn stats() -> (u64, u64, u64, u64, u64) {
     (
         EXEC_FAULTS.load(Ordering::Relaxed),
         WRITE_FAULTS.load(Ordering::Relaxed),
+        RELAXED_PAGES.load(Ordering::Relaxed),
         DMA_INVALIDATIONS.load(Ordering::Relaxed),
         DMA_BYTES.load(Ordering::Relaxed),
     )
@@ -494,5 +631,93 @@ mod tests {
         // Must not panic, and must do nothing.
         let mut byte = 0u8;
         on_device_write(&raw mut byte, 1);
+    }
+
+    /// **The defect this module shipped with.**
+    ///
+    /// A thread whose code and data share one 16 KiB host page drives exactly
+    /// this loop, and before the bounce limit it never left it: the guest took
+    /// a soft lockup at 21 s and was still climbing at 558 s. Drive the state
+    /// machine the way that thread does — fetch, store, fetch, store — and
+    /// require it to stop demanding faults.
+    ///
+    /// Bounded by construction rather than by a timeout: if the page has not
+    /// reached `Relaxed` within `limit + 2` rounds the loop exits and the
+    /// assertion fails, so a regression reports a livelock instead of becoming
+    /// one.
+    #[test]
+    fn the_state_machine_cannot_bounce_forever() {
+        for limit in 1..=8u32 {
+            let mut page = Page {
+                state: PageState::Writable,
+                bounces: 0,
+            };
+            let mut rounds = 0;
+            while page.state != PageState::Relaxed && rounds < limit + 2 {
+                // The fetch: whatever exec_grant says, which is the decision
+                // under test.
+                page.state = exec_grant(page.bounces, limit);
+                // The store: only a page holding execute can take a write
+                // fault, exactly as in on_write_fault.
+                if page.state == PageState::Executable {
+                    page.state = PageState::Writable;
+                    page.bounces = page.bounces.saturating_add(1);
+                }
+                rounds += 1;
+            }
+            assert_eq!(
+                page.state,
+                PageState::Relaxed,
+                "limit {limit}: still bouncing after {rounds} rounds — this is \
+                 the livelock, and a vCPU would be wedged"
+            );
+            assert!(
+                rounds <= limit + 1,
+                "limit {limit}: took {rounds} rounds, so the bound is not the \
+                 bound it claims to be"
+            );
+        }
+    }
+
+    /// A relaxed page must be handed back *both* writable and executable.
+    ///
+    /// Getting this wrong is the subtle way to reintroduce the livelock: a
+    /// "relaxed" page that is still missing one of the two permissions faults
+    /// again on the very next access, and the give-up path becomes another
+    /// spin rather than an exit from one.
+    #[test]
+    fn giving_up_on_a_page_grants_both_write_and_execute() {
+        let f = flags_for(PageState::Relaxed);
+        assert!(f & HV_MEMORY_WRITE != 0, "a relaxed page must be writable");
+        assert!(f & HV_MEMORY_EXEC != 0, "a relaxed page must be executable");
+        assert!(f & HV_MEMORY_READ != 0, "a relaxed page must be readable");
+
+        // And the other two must stay mutually exclusive, or there is no W^X
+        // left to enforce and the maintenance never gets its moment.
+        let w = flags_for(PageState::Writable);
+        let x = flags_for(PageState::Executable);
+        assert_eq!(w & HV_MEMORY_EXEC, 0, "the writable state must not execute");
+        assert_eq!(
+            x & HV_MEMORY_WRITE,
+            0,
+            "the executable state must not write"
+        );
+    }
+
+    /// `CHM_ICACHE_WX_LIMIT=0` reproduces the original livelock on purpose, so
+    /// the bound's benefit can be measured against its absence. It is the one
+    /// value that must *not* terminate, and encoding that here stops a future
+    /// tidy-up from "fixing" the zero case and silently deleting the control.
+    #[test]
+    fn a_zero_limit_means_never_give_up() {
+        assert_eq!(exec_grant(0, 0), PageState::Executable);
+        assert_eq!(exec_grant(u32::MAX, 0), PageState::Executable);
+        // And any real limit does give up, at exactly the limit, not before.
+        assert_eq!(
+            exec_grant(3, 4),
+            PageState::Executable,
+            "3 < 4: keep trying"
+        );
+        assert_eq!(exec_grant(4, 4), PageState::Relaxed, "4 >= 4: give up");
     }
 }

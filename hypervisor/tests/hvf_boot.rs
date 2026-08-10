@@ -20,7 +20,7 @@ use std::{env, fs};
 
 use hypervisor::arch::aarch64::gic::{GicState, Vgic, VgicConfig};
 use hypervisor::hvf::gic::{inject_lpi_via_lr, GICD_TYPER, HvfGicV3};
-use hypervisor::hvf::{HvfVcpu, VtimerClock};
+use hypervisor::hvf::{icache_wx, HvfVcpu, VtimerClock};
 use hypervisor::{CpuState, HypervisorVmConfig, HypervisorVmError, Vcpu, Vm, VmExit, VmOps};
 
 type VmOpsResult<T> = Result<T, HypervisorVmError>;
@@ -3941,5 +3941,156 @@ fn hvf_host_mmu_feature_register() {
         graviton > host,
         "a Graviton capture is only hazardous because its ASID width exceeds \
          this host's; if that stopped being true the guard is now noise"
+    );
+}
+
+/// A thread whose code and data share one host page: the shape that livelocked.
+///
+/// `adr x11, #0x100` points 256 bytes past the entry, which is past this code
+/// but comfortably inside the same **16 KiB** host page — and a 16 KiB page is
+/// the smallest thing `hv_vm_protect` can talk about. The loop then stores to
+/// that word and branches back, so every iteration needs the page to be
+/// writable *and* the instruction re-fetched from it.
+///
+/// That is the whole defect in nine instructions. Under W^X the store takes a
+/// data abort, we grant write and withdraw execute, the retry re-fetches the
+/// same instruction, that takes an instruction abort, we grant execute and
+/// withdraw write, and the store aborts again. The store never retires.
+///
+/// Reports `0x5a` and powers off if -- and only if -- it gets out.
+#[rustfmt::skip]
+const SELF_WRITING_LOOP: [u8; 48] = [
+    0x0b, 0x08, 0x00, 0x10, // adr  x11, #0x100          -- our own page
+    0x0c, 0x01, 0x80, 0x52, // movz w12, #8
+    0x6c, 0x01, 0x00, 0xb9, // str  w12, [x11]           -- the store that stalls
+    0x8c, 0x05, 0x00, 0x71, // subs w12, w12, #1
+    0xc1, 0xff, 0xff, 0x54, // b.ne -8                   -- re-fetch, and again
+    0x0a, 0x00, 0xa2, 0xd2, // movz x10, #0x1000, lsl #16 (MMIO_TX)
+    0x49, 0x0b, 0x80, 0x52, // movz w9, #0x5a
+    0x49, 0x01, 0x00, 0xb9, // str  w9, [x10]            -- "I got out"
+    0x00, 0x01, 0x80, 0xd2, // movz x0, #0x8
+    0x00, 0x80, 0xb0, 0xf2, // movk x0, #0x8400, lsl #16 (PSCI SYSTEM_OFF)
+    0x02, 0x00, 0x00, 0xd4, // hvc  #0
+    0x00, 0x00, 0x00, 0x14, // b    .
+];
+
+/// Run [`SELF_WRITING_LOOP`] with stage-2 W^X armed at `limit`.
+///
+/// Returns what the guest managed to report, why it stopped, and how many W^X
+/// faults were taken while it ran.
+///
+/// `run_to_shutdown` panics after 10 000 vCPU entries, which is what makes this
+/// safe to run at all: a regression that reinstates the livelock fails the test
+/// in a few seconds instead of hanging the suite the way it hung the guest. The
+/// panic message is returned rather than swallowed, because "ran out of steps"
+/// and "the vCPU errored" are very different results and a test that cannot
+/// tell them apart would call a broken guest a livelock.
+fn wx_selfwrite_run(limit: &str) -> (Vec<u32>, Option<String>, u64, u64) {
+    let ram = HostRam::new(RAM_SIZE);
+    ram.load(0, &SELF_WRITING_LOOP);
+    let vm_ops = Arc::new(RecordingVmOps {
+        writes: Mutex::new(Vec::new()),
+    });
+    let (_vm, mut vcpu) = build_vm(&ram, vm_ops.clone());
+    vcpu.setup_regs(0, RAM_BASE, 0).expect("setup_regs");
+
+    // SAFETY: the suite runs single-threaded (`--test-threads=1`), and both are
+    // read by `arm` on the next line.
+    unsafe {
+        env::set_var("CHM_ICACHE_WX_STRICT", "1");
+        env::set_var("CHM_ICACHE_WX_LIMIT", limit);
+    }
+    icache_wx::arm(&[(RAM_BASE, ram.ptr as usize, RAM_SIZE)]).expect("arm W^X");
+    // SAFETY: as above. Cleared immediately so nothing downstream inherits them
+    // -- `arm` has already cached the limit.
+    unsafe {
+        env::remove_var("CHM_ICACHE_WX_STRICT");
+        env::remove_var("CHM_ICACHE_WX_LIMIT");
+    }
+    let (exec_before, write_before, ..) = icache_wx::stats();
+
+    // The livelock case is *expected* to blow the step budget, so keep the
+    // panic out of the test output rather than printing a backtrace for a
+    // result we asked for.
+    let prior = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_to_shutdown(vcpu.as_mut())
+    }));
+    std::panic::set_hook(prior);
+
+    let (exec_after, write_after, ..) = icache_wx::stats();
+    icache_wx::disarm();
+
+    let why = match outcome {
+        Ok(VmExit::Shutdown) => None,
+        Ok(other) => Some(format!("unexpected exit: {other:?}")),
+        Err(p) => Some(
+            p.downcast_ref::<String>()
+                .cloned()
+                .or_else(|| p.downcast_ref::<&str>().map(|s| (*s).to_string()))
+                .unwrap_or_else(|| "non-string panic".to_string()),
+        ),
+    };
+    let vals = vm_ops.writes.lock().unwrap().clone();
+    (
+        vals,
+        why,
+        exec_after - exec_before,
+        write_after - write_before,
+    )
+}
+
+/// **The livelock in #280, and the bound that ends it.**
+///
+/// `hv_vm_protect` works in 16 KiB host pages while the guest pages in 4 KiB, so
+/// W and X cannot be separated for a thread that keeps both within one host
+/// page. Before the bounce limit this wedged a real guest from the instant of
+/// resume -- `soft lockup - CPU#0 stuck for 21s`, still climbing at 558 s -- and
+/// the fix is not to split more cleverly (16 KiB cannot separate things 4 KiB
+/// apart) but to bound how long we are willing to try.
+///
+/// Both halves are asserted, because only the pair is evidence:
+///
+///   1. with `CHM_ICACHE_WX_LIMIT=0` -- give up never -- the guest must fail to
+///      get out, *and must fail by exhausting the step budget*. If it escapes
+///      anyway, or dies some other way, then this guest is not reproducing the
+///      livelock and part 2 proves nothing at all.
+///   2. with the limit at 2 it must reach its marker and power off, having
+///      actually taken W^X faults on the way -- a run where the mechanism was
+///      silently inert would otherwise pass and mean nothing.
+#[test]
+fn a_thread_writing_its_own_page_escapes_wx_instead_of_wedging() {
+    let (vals, why, exec, write) = wx_selfwrite_run("0");
+    assert_eq!(
+        vals,
+        Vec::<u32>::new(),
+        "with the bound disabled the guest got out, so it is not exercising the \
+         livelock and the escape below would be measuring nothing"
+    );
+    let why = why.expect("the unbounded run must not reach shutdown");
+    assert!(
+        why.contains("step budget"),
+        "the unbounded run had to end by running out of steps -- that is what a \
+         livelock looks like from outside. It ended with: {why}"
+    );
+    assert!(
+        exec > 100 && write > 100,
+        "only {exec} exec / {write} write faults: the guest stopped for some \
+         reason other than bouncing between them"
+    );
+
+    let (vals, why, exec, write) = wx_selfwrite_run("2");
+    assert_eq!(why, None, "the bounded run must reach shutdown");
+    assert_eq!(
+        vals,
+        vec![0x5a],
+        "the guest never reached its marker: a thread whose code and data share \
+         a host page is still wedged under stage-2 W^X"
+    );
+    assert!(
+        exec > 0 && write > 0,
+        "the guest escaped without taking any W^X faults ({exec} exec, {write} \
+         write), so stage-2 enforcement was inert and this proves nothing"
     );
 }
