@@ -80,6 +80,9 @@ pub(crate) const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(120);
 /// still booting.
 const PROBE_INTERVAL: Duration = Duration::from_millis(500);
 
+/// `ETX`, the byte Ctrl-C puts on the wire. See [`send_line`].
+const ETX: u8 = 0x03;
+
 /// What an operator asked to happen inside the guest once it is up.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Plan {
@@ -122,7 +125,17 @@ pub(crate) enum Report {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Failure {
     /// No shell answered the probe before the deadline.
-    NeverReady { waited: Duration },
+    ///
+    /// `echoed` records whether the console ever produced *any* output while we
+    /// were probing. It is the difference between two failures that look
+    /// identical from outside and need opposite fixes: nothing is reading the
+    /// console at all (no getty, or still booting), versus something is reading
+    /// it and cannot answer.
+    NeverReady {
+        waited: Duration,
+        probes: usize,
+        echoed: bool,
+    },
     /// A step was sent and the guest never finished it.
     NoVerdict { step: String, detail: String },
     /// The step ran and reported failure.
@@ -141,12 +154,31 @@ impl Failure {
     /// One line, written for whoever has to fix it.
     pub(crate) fn message(&self) -> String {
         match self {
-            Self::NeverReady { waited } => format!(
-                "no shell answered on the console within {}s, so `env` and `postBootCommand` \
-                 could not be delivered. The guest may have no shell on its serial console, \
-                 or may still be booting.",
-                waited.as_secs()
-            ),
+            Self::NeverReady {
+                waited,
+                probes,
+                echoed,
+            } => {
+                let base = format!(
+                    "no shell answered on the console within {}s ({probes} probes sent), so \
+                     `env` and `postBootCommand` could not be delivered.",
+                    waited.as_secs()
+                );
+                if *echoed {
+                    format!(
+                        "{base} The console did produce output, so something is reading it -- \
+                         it accepted every probe and answered none. A shell left mid-command \
+                         (an unterminated quote, or a pager or editor holding the terminal) \
+                         does exactly this."
+                    )
+                } else {
+                    format!(
+                        "{base} The console produced no output at all, so most likely nothing \
+                         is listening on it: the guest may have no getty on its serial console, \
+                         or may still be booting."
+                    )
+                }
+            }
             Self::NoVerdict { step, detail } => {
                 format!("{step}: no result came back from the guest ({detail})")
             }
@@ -295,8 +327,17 @@ pub(crate) fn deliver(
 }
 
 /// Probe until a shell answers, or the deadline passes.
+///
+/// Records enough to *diagnose* the failure rather than merely report it: how
+/// many probes went out, and whether the console ever produced any output at
+/// all. The transcript is compared against its length at entry, so growth means
+/// the guest emitted something — an echo of our own probe is enough, and is
+/// exactly the signal that separates "nothing is listening on this console"
+/// from "something is listening and cannot answer" (#273).
 fn wait_ready(console: &dyn Console, timeout: Duration) -> Result<(), Failure> {
     let began = Instant::now();
+    let at_entry = console.transcript().len();
+    let mut probes = 0usize;
     loop {
         if console.stopped() {
             return Err(Failure::GuestStopped {
@@ -314,6 +355,7 @@ fn wait_ready(console: &dyn Console, timeout: Duration) -> Result<(), Failure> {
         let line = exec::frame(&nonce, "true").map_err(Failure::Unsendable)?;
         let mark = console.transcript().len();
         send_line(console, &line);
+        probes += 1;
         let until = Instant::now() + PROBE_INTERVAL;
         while Instant::now() < until {
             let full = console.transcript();
@@ -327,6 +369,8 @@ fn wait_ready(console: &dyn Console, timeout: Duration) -> Result<(), Failure> {
         if began.elapsed() >= timeout {
             return Err(Failure::NeverReady {
                 waited: began.elapsed(),
+                probes,
+                echoed: console.transcript().len() > at_entry,
             });
         }
     }
@@ -391,7 +435,35 @@ fn run_step(
 
 /// A carriage return is what a real terminal sends; the guest tty's ICRNL turns
 /// it into the newline that completes the line.
+/// Send one framed line to the guest console, after clearing whatever state the
+/// last line left behind.
+///
+/// The frame assumes it lands on a shell at `PS1`. That assumption failed
+/// (#273): a probe arrived truncated mid-quote --- `# ecf0' 'BEG'; ...` --- and
+/// the unbalanced quote put the shell into a `PS2` continuation, where the next
+/// 60 probes were read as *more of that same command* rather than executed. One
+/// mangled write cost the entire run, and the probe loop could not recover,
+/// because every recovery attempt became continuation text too.
+///
+/// So lead with `ETX` --- what a person pressing Ctrl-C sends. The line
+/// discipline turns it into `SIGINT` for the foreground process group, and a
+/// shell sitting at `PS2` abandons the whole compound command and returns to
+/// `PS1`. It is the only reset that works *without knowing the current state*:
+/// sending a quote character would close an open quote but open one if none was
+/// open, which is a coin flip, and a bare newline at `PS2` is simply more
+/// continuation.
+///
+/// It is sent as its own line, not as a prefix to the frame, for the case where
+/// the console has `ISIG` disabled and `ETX` arrives as an ordinary byte. Then
+/// it is a garbage command on a line of its own --- the shell complains and
+/// moves on --- rather than a garbage byte inside our frame.
+///
+/// Nothing of ours is ever running when this is sent: `send_line` is only called
+/// to *begin* a step, and every step is awaited before the next is sent. The
+/// signal can therefore only reach a process the guest started on its own
+/// console, which is precisely the state we are trying to clear.
 fn send_line(console: &dyn Console, line: &str) {
+    console.send(&[ETX, b'\r']);
     let mut bytes = line.as_bytes().to_vec();
     bytes.push(b'\r');
     console.send(&bytes);
@@ -520,6 +592,12 @@ mod tests {
         /// Ignore this many lines before answering anything, to model a guest
         /// that is still booting.
         deaf_for: Mutex<usize>,
+        /// Deliver this many of the next writes only half-written, to model the
+        /// console truncation behind #273.
+        truncate_next: Mutex<usize>,
+        /// Set when a truncated write left the shell mid-command. While it is
+        /// set every further line is swallowed as continuation text.
+        continuation: Mutex<bool>,
         stopped: Mutex<bool>,
     }
 
@@ -530,11 +608,18 @@ mod tests {
                 seen: Mutex::new(Vec::new()),
                 transcript: Mutex::new(String::new()),
                 deaf_for: Mutex::new(0),
+                truncate_next: Mutex::new(0),
+                continuation: Mutex::new(false),
                 stopped: Mutex::new(false),
             }
         }
         fn deaf(mut self, n: usize) -> Self {
             self.deaf_for = Mutex::new(n);
+            self
+        }
+        /// Truncate the next `n` writes, so they leave the shell mid-command.
+        fn truncating(mut self, n: usize) -> Self {
+            self.truncate_next = Mutex::new(n);
             self
         }
         fn commands(&self) -> Vec<String> {
@@ -544,6 +629,22 @@ mod tests {
 
     impl Console for FakeGuest {
         fn send(&self, bytes: &[u8]) {
+            // Ctrl-C. A real shell abandons whatever line it was assembling,
+            // prints a fresh prompt, and answers no frame. Modelled before
+            // anything else because that is the point of it: it must work
+            // regardless of what state the shell is in.
+            //
+            // A console nobody is listening to loses the signal exactly as it
+            // loses everything else -- and without consuming `deaf_for`, which
+            // counts *commands* swallowed, not writes.
+            if bytes.contains(&ETX) {
+                if *self.deaf_for.lock().unwrap() > 0 {
+                    return;
+                }
+                *self.continuation.lock().unwrap() = false;
+                self.transcript.lock().unwrap().push_str("^C\n$ ");
+                return;
+            }
             let line = String::from_utf8_lossy(bytes).to_string();
             self.seen.lock().unwrap().push(line.clone());
             let mut deaf = self.deaf_for.lock().unwrap();
@@ -552,6 +653,32 @@ mod tests {
                 // A shell that is not listening loses the bytes entirely.
                 return;
             }
+            drop(deaf);
+
+            // #273: the console accepted only part of the write. The shell has
+            // half a command line and is waiting for the rest of it, so this
+            // line and every line after it is continuation text, not a command.
+            //
+            // Deliberately modelled as "the write was cut" rather than by
+            // counting quotes: `shell_quote` legitimately emits an odd number
+            // of `'` when escaping an apostrophe, so a quote-counting fake
+            // would invent a failure the real shell does not have.
+            let mut trunc = self.truncate_next.lock().unwrap();
+            if *trunc > 0 {
+                *trunc -= 1;
+                drop(trunc);
+                *self.continuation.lock().unwrap() = true;
+                let half = line.len() / 2;
+                self.transcript.lock().unwrap().push_str(&line[..half]);
+                return;
+            }
+            drop(trunc);
+            if *self.continuation.lock().unwrap() {
+                // Swallowed as more of the unfinished command: echoed, never run.
+                self.transcript.lock().unwrap().push_str(&line);
+                return;
+            }
+
             // Recover the nonce from the line we were just sent and answer it
             // exactly as a real shell would: echo, then the joined markers.
             let nonce = line
@@ -773,5 +900,72 @@ mod tests {
         sorted.sort();
         sorted.dedup();
         assert_eq!(sorted.len(), nonces.len(), "a nonce was reused: {nonces:?}");
+    }
+
+    // -- recovering from a mangled write (#273) --------------------------------
+
+    /// **The bug in #273.** One probe arrived truncated, its unbalanced quote
+    /// put the shell into a `PS2` continuation, and all 60+ later probes were
+    /// swallowed as more of that unfinished command. The run spent its whole
+    /// life probing a shell that could never answer, and the state that made it
+    /// impossible was created by the very first probe.
+    ///
+    /// The guard is that recovery must not depend on the *next* write being
+    /// clean, because the next write lands in the same poisoned state. It has to
+    /// clear the state first.
+    #[test]
+    fn a_truncated_probe_cannot_poison_the_probes_after_it() {
+        let guest = FakeGuest::new(vec![0]).truncating(1);
+        wait_ready(&guest, Duration::from_secs(3)).expect(
+            "the first probe was cut mid-line and every probe after it was swallowed as \
+             continuation text -- one mangled write cost the whole run (#273)",
+        );
+    }
+
+    /// The mirror: a console that stays broken must still *fail*, or the test
+    /// above would pass with a `wait_ready` that never checks anything.
+    #[test]
+    fn a_console_that_never_stops_mangling_still_fails() {
+        let guest = FakeGuest::new(vec![0]).truncating(usize::MAX);
+        let e = wait_ready(&guest, Duration::from_millis(600)).unwrap_err();
+        assert!(
+            matches!(e, Failure::NeverReady { .. }),
+            "expected NeverReady, got {e:?}"
+        );
+    }
+
+    /// Two silences that need opposite fixes must not read the same.
+    ///
+    /// "the guest has no getty on this console" and "a shell is here and is
+    /// stuck mid-command" are one message today, and it names only the first.
+    /// Whoever hits the second is told to check something that is already fine.
+    #[test]
+    fn a_silent_console_is_diagnosed_by_whether_it_ever_spoke() {
+        // Nothing listening: the bytes are lost, so the transcript never grows.
+        let quiet = FakeGuest::new(vec![0]).deaf(usize::MAX);
+        let e = wait_ready(&quiet, Duration::from_millis(600)).unwrap_err();
+        let Failure::NeverReady { echoed, probes, .. } = &e else {
+            panic!("expected NeverReady, got {e:?}");
+        };
+        assert!(!echoed, "a console that lost every byte cannot have echoed");
+        assert!(*probes >= 1, "no probe was counted");
+        let m = e.message();
+        assert!(
+            m.contains("no output at all") && m.contains("getty"),
+            "a console nothing is listening to must say so: {m}"
+        );
+
+        // Listening but wedged: our own bytes come back, no frame ever does.
+        let wedged = FakeGuest::new(vec![0]).truncating(usize::MAX);
+        let e = wait_ready(&wedged, Duration::from_millis(600)).unwrap_err();
+        let Failure::NeverReady { echoed, .. } = &e else {
+            panic!("expected NeverReady, got {e:?}");
+        };
+        assert!(echoed, "the guest echoed the truncated line back");
+        let m = e.message();
+        assert!(
+            m.contains("did produce output") && m.contains("mid-command"),
+            "a wedged shell must be named as one: {m}"
+        );
     }
 }
