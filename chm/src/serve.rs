@@ -1368,6 +1368,10 @@ fn run_guest_usgic(
         checkpoint_source: "daemon",
         // The daemon does not own a terminal: no raw mode, no stdin pump.
         interactive: false,
+        // No flag reaches here: `chm ctl start` names a snapshot, not a run
+        // shape. The daemon takes the cadence from its own environment, which
+        // is the one an operator sets when starting the service.
+        snapshot_every: None,
     };
 
     let outcome = run_usgic_engine(&cfg, loaded, &mut |s| supervise_daemon(s, opts, inner))?;

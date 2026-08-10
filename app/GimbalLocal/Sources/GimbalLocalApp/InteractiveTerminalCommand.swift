@@ -65,12 +65,18 @@ enum InteractiveTerminalCommand {
     /// optional session lock). Every interpolated path is validated and quoted.
     ///
     /// Throws `BuildError.invalidPath` if any path carries a control character.
+    /// `cadence` has **no default**, deliberately. A default here would let a
+    /// call site forget to pass it and still compile, which is the exact class
+    /// of bug this repo has now been caught by five times: every assertion
+    /// about the value stays green because nobody asks for it any more. Making
+    /// the omission a compile error is cheaper than another guard.
     static func shellCommand(
         chmPath: String,
         runPath: String,
         socketPath: String,
         lockPath: String?,
-        workdir: String
+        workdir: String,
+        cadence: SnapshotCadence
     ) throws -> String {
         var paths = [chmPath, runPath, socketPath, workdir]
         if let lockPath { paths.append(lockPath) }
@@ -82,6 +88,11 @@ enum InteractiveTerminalCommand {
             shellQuote(chmPath), "connect", shellQuote(runPath),
             "--socket", shellQuote(socketPath),
             "--checkpoint", "--idle-exit", "0",
+            // Always passed, including `0`. See `SnapshotCadence.seconds`: the
+            // flag outranks `CHM_SNAPSHOT_INTERVAL_SECS`, so omitting it when
+            // the user chose "off" would hand them a cadence from an
+            // environment they never set.
+            "--snapshot-every", String(cadence.seconds),
         ]
         if let lockPath {
             connect.append(contentsOf: ["--session-lock", shellQuote(lockPath)])

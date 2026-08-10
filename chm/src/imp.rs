@@ -1016,6 +1016,13 @@ struct Args {
     /// `CHM_EGRESS_POLICY` env binding and any per-workspace `egress-policy.json`.
     /// `None` falls back to that resolution order. See [`resolve_egress_policy`].
     egress_policy: Option<PathBuf>,
+    /// Checkpoint the *running* guest every N seconds (`--snapshot-every`).
+    /// `Some(0)` is a deliberate "off" that outranks the environment, which is
+    /// the whole reason this is an `Option<u64>` rather than a `u64`: a caller
+    /// that has to be able to say "not for this run" cannot do it with a
+    /// sentinel that also means "unset". `None` defers to
+    /// `CHM_SNAPSHOT_INTERVAL_SECS`. See [`snapshot_interval`].
+    snapshot_every: Option<u64>,
     /// Credential-proxy rules for this run, overriding `CHM_PROXY_RULES` and any
     /// per-workspace `proxy-rules.json`. See [`credproxy::cli::resolve_rules`].
     proxy_rules: Option<PathBuf>,
@@ -1221,6 +1228,14 @@ fn usage() -> String {
          (0 = disabled; default 600). Console silence is a proxy: a\n                        \
          guest doing silent compute looks idle. Expiry suspends\n                        \
          rather than stops, so being wrong costs a resume.\n    \
+         --snapshot-every <N>  Checkpoint the *running* guest every N\n                        \
+         seconds without stopping it, so a session that ends badly is\n                        \
+         not a session whose work is gone (0 = off; default off). Each\n                        \
+         one freezes the guest to capture RAM — 0.9–2.1s for 2 GiB — and\n                        \
+         chm prints the freeze it measured, so the interval is a trade\n                        \
+         you make on your own numbers. Overrides\n                        \
+         `CHM_SNAPSHOT_INTERVAL_SECS`, `0` to turn it off for one run.\n                        \
+         Retention bounds how far back this travels (`chm revisions`).\n    \
          --quiet             Suppress the informational banner on stderr.\n    \
          --egress-policy <FILE>  Govern this run's outbound network with a local\n                        \
          egress policy (see `chm firewall`); overrides any per-workspace\n                        \
@@ -1296,6 +1311,7 @@ fn parse(raw: &[String]) -> Parsed {
     let mut proxy_rules: Option<PathBuf> = None;
     let mut limits_file: Option<PathBuf> = None;
     let mut allow_local_egress = env_flag("CHM_ALLOW_LOCAL_EGRESS");
+    let mut snapshot_every: Option<u64> = None;
 
     let mut i = 0;
     // A leading `run`/`restore` subcommand is accepted but optional; `resume`
@@ -1336,7 +1352,7 @@ fn parse(raw: &[String]) -> Parsed {
                 };
                 limits_file = Some(PathBuf::from(v));
             }
-            "--max-seconds" | "--idle-exit" => {
+            "--max-seconds" | "--idle-exit" | "--snapshot-every" => {
                 i += 1;
                 let Some(v) = raw.get(i) else {
                     return Parsed::Error(format!("{a} requires a value"));
@@ -1344,10 +1360,10 @@ fn parse(raw: &[String]) -> Parsed {
                 let Ok(n) = v.parse::<u64>() else {
                     return Parsed::Error(format!("{a}: `{v}` is not a number"));
                 };
-                if a == "--max-seconds" {
-                    max_seconds = n;
-                } else {
-                    idle_exit_secs = n;
+                match a.as_str() {
+                    "--max-seconds" => max_seconds = n,
+                    "--idle-exit" => idle_exit_secs = n,
+                    _ => snapshot_every = Some(n),
                 }
             }
             other if other.starts_with('-') => {
@@ -1375,6 +1391,7 @@ fn parse(raw: &[String]) -> Parsed {
             proxy_rules,
             limits_file,
             allow_local_egress,
+            snapshot_every,
         }),
         None => Parsed::Error("missing <SNAPSHOT_DIR>".to_string()),
     }
@@ -1393,6 +1410,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
     let mut proxy_rules: Option<PathBuf> = None;
     let mut limits_file: Option<PathBuf> = None;
     let mut allow_local_egress = env_flag("CHM_ALLOW_LOCAL_EGRESS");
+    let mut snapshot_every: Option<u64> = None;
 
     let mut i = 0;
     while i < raw.len() {
@@ -1405,7 +1423,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
             "--checkpoint" => checkpoint = true,
             "--allow-local-egress" => allow_local_egress = true,
             "--socket" | "--max-seconds" | "--idle-exit" | "--session-lock"
-            | "--egress-policy" | "--limits" => {
+            | "--egress-policy" | "--proxy-rules" | "--limits" | "--snapshot-every" => {
                 i += 1;
                 let Some(v) = raw.get(i) else {
                     return Parsed::Error(format!("{a} requires a value"));
@@ -1416,14 +1434,14 @@ fn parse_connect(raw: &[String]) -> Parsed {
                     "--egress-policy" => egress_policy = Some(PathBuf::from(v)),
                     "--proxy-rules" => proxy_rules = Some(PathBuf::from(v)),
                     "--limits" => limits_file = Some(PathBuf::from(v)),
-                    "--max-seconds" | "--idle-exit" => {
+                    "--max-seconds" | "--idle-exit" | "--snapshot-every" => {
                         let Ok(n) = v.parse::<u64>() else {
                             return Parsed::Error(format!("{a}: `{v}` is not a number"));
                         };
-                        if a == "--max-seconds" {
-                            max_seconds = n;
-                        } else {
-                            idle_exit_secs = n;
+                        match a.as_str() {
+                            "--max-seconds" => max_seconds = n,
+                            "--idle-exit" => idle_exit_secs = n,
+                            _ => snapshot_every = Some(n),
                         }
                     }
                     _ => unreachable!(),
@@ -1455,6 +1473,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
                 proxy_rules,
                 limits_file,
                 allow_local_egress,
+                snapshot_every,
             },
             socket_path,
             no_stop_daemon,
@@ -2238,6 +2257,7 @@ fn run_usgic(args: &Args, loaded: Loaded, kind: runs::Kind) -> Result<ExitCode, 
         limits_file: args.limits_file.as_deref(),
         checkpoint_source: "connect",
         interactive: true,
+        snapshot_every: args.snapshot_every,
     };
     let outcome = run_usgic_engine(&cfg, loaded, &mut |s| {
         run_console(s.uart, s.running, args, s.limits, s.overlay_dir)
@@ -2282,6 +2302,9 @@ pub(crate) struct UsgicConfig<'a> {
     /// guest's PL011. The daemon's console is read-only and its stdin belongs to
     /// the service manager, so it opts out.
     pub interactive: bool,
+    /// Live-snapshot cadence in seconds, from `--snapshot-every`. `None` defers
+    /// to `CHM_SNAPSHOT_INTERVAL_SECS`; see [`snapshot_interval`].
+    pub snapshot_every: Option<u64>,
 }
 
 /// The live handles a supervisor needs while the guest runs.
@@ -2875,6 +2898,7 @@ pub(crate) fn run_usgic_engine(
         // the entry point stays visible.
         origin: format!("{}-auto", cfg.checkpoint_source),
         quiet: cfg.quiet,
+        every: cfg.snapshot_every,
         taken: live_taken.clone(),
     });
 
@@ -3092,6 +3116,9 @@ struct LiveSnapshotter {
     vcpus: usize,
     origin: String,
     quiet: bool,
+    /// The `--snapshot-every` value this run was started with, if any. See
+    /// [`snapshot_interval`] for why a flag has to be able to say zero.
+    every: Option<u64>,
     /// How many live checkpoints have landed, shared with teardown. Teardown
     /// needs to know whether HEAD is *this run's dying breath* or a point
     /// captured earlier from a healthy guest, because the two deserve opposite
@@ -3129,18 +3156,37 @@ fn retire_or_clear_head(dir: &Path, live_taken: &Arc<AtomicU64>, quiet: bool) {
     }
 }
 
+/// Resolve the live-snapshot cadence from the flag and the environment.
+///
+/// The flag wins, including when it says zero, and that is the whole point of
+/// the function. `CHM_SNAPSHOT_INTERVAL_SECS` is how a wrapper — a shell
+/// profile, a CI job, the app's own environment — turns the cadence on for
+/// everything it launches. Without a flag that can say *off*, a caller inside
+/// that environment has no way to run one guest without it, and the only
+/// remedy would be to unset a variable it does not own.
+///
+/// So `Some(0)` is a deliberate refusal and returns `None`, while a `None`
+/// flag defers. An unparsable or zero environment value is off, because there
+/// is no reading of `CHM_SNAPSHOT_INTERVAL_SECS=nonsense` under which freezing
+/// someone's guest on an invented cadence is the helpful answer.
+fn snapshot_interval(flag: Option<u64>, env_value: Option<String>) -> Option<Duration> {
+    let secs = match flag {
+        Some(n) => n,
+        None => env_value
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0),
+    };
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
 /// Checkpoint a running guest on a cadence, without stopping it (#148).
 ///
-/// Returns `None` unless `CHM_SNAPSHOT_INTERVAL_SECS` asks for it. Off by
-/// default deliberately: a checkpoint freezes the guest for as long as it takes
-/// to dump RAM, so turning it on is a trade the operator makes, not one we make
-/// for them.
+/// Returns `None` unless `--snapshot-every` or `CHM_SNAPSHOT_INTERVAL_SECS`
+/// asks for it. Off by default deliberately: a checkpoint freezes the guest for
+/// as long as it takes to dump RAM, so turning it on is a trade the operator
+/// makes, not one we make for them.
 fn spawn_live_snapshotter(s: LiveSnapshotter) -> Option<thread::JoinHandle<()>> {
-    let interval = env::var("CHM_SNAPSHOT_INTERVAL_SECS")
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|secs| *secs > 0)
-        .map(Duration::from_secs)?;
+    let interval = snapshot_interval(s.every, env::var("CHM_SNAPSHOT_INTERVAL_SECS").ok())?;
 
     // Say up front how far back this actually lets you travel. The cadence is
     // the visible knob but retention is the binding one: at 30 s and the default
@@ -3176,6 +3222,7 @@ fn spawn_live_snapshotter(s: LiveSnapshotter) -> Option<thread::JoinHandle<()>> 
                 vcpus,
                 origin,
                 quiet,
+                every: _,
                 taken: taken_total,
             } = s;
 
@@ -4306,6 +4353,124 @@ mod tests {
             }
             _ => panic!("expected Parsed::Connect with a session lock"),
         }
+    }
+
+    /// The flag has to be able to say *off*, or a caller inside an environment
+    /// that sets `CHM_SNAPSHOT_INTERVAL_SECS` cannot run one guest without the
+    /// cadence except by unsetting a variable it does not own.
+    #[test]
+    fn a_flag_can_turn_the_cadence_off_even_when_the_environment_turns_it_on() {
+        let env_on = Some("60".to_string());
+
+        assert_eq!(
+            snapshot_interval(None, env_on.clone()),
+            Some(Duration::from_secs(60))
+        );
+        assert_eq!(
+            snapshot_interval(Some(15), env_on.clone()),
+            Some(Duration::from_secs(15))
+        );
+        assert_eq!(
+            snapshot_interval(Some(0), env_on),
+            None,
+            "--snapshot-every 0 must beat the environment"
+        );
+        assert_eq!(snapshot_interval(None, None), None);
+    }
+
+    /// There is no reading of `CHM_SNAPSHOT_INTERVAL_SECS=nonsense` under which
+    /// freezing someone's guest on an invented cadence is the helpful answer.
+    #[test]
+    fn an_unusable_environment_value_leaves_the_cadence_off() {
+        for bad in ["nonsense", "", "  ", "-5", "12s", "0"] {
+            assert_eq!(
+                snapshot_interval(None, Some(bad.to_string())),
+                None,
+                "`{bad}` should not start a cadence"
+            );
+        }
+        assert_eq!(
+            snapshot_interval(Some(30), Some("nonsense".to_string())),
+            Some(Duration::from_secs(30)),
+            "a usable flag should not be spoiled by an unusable environment"
+        );
+    }
+
+    #[test]
+    fn both_entry_points_take_snapshot_every() {
+        let argv = |extra: &[&str]| -> Vec<String> {
+            let mut v: Vec<String> = vec!["snap".to_string()];
+            v.extend(extra.iter().map(|s| (*s).to_string()));
+            v
+        };
+
+        match parse(&argv(&["--snapshot-every", "45"])) {
+            Parsed::Run(a) => assert_eq!(a.snapshot_every, Some(45)),
+            _ => panic!("run: expected Parsed::Run"),
+        }
+        match parse(&argv(&[])) {
+            Parsed::Run(a) => assert_eq!(
+                a.snapshot_every, None,
+                "absent means defer to the environment"
+            ),
+            _ => panic!("run: expected Parsed::Run"),
+        }
+        match parse_connect(&argv(&["--snapshot-every", "0"])) {
+            Parsed::Connect(a) => assert_eq!(
+                a.run.snapshot_every,
+                Some(0),
+                "zero must survive parsing as a value, not vanish"
+            ),
+            _ => panic!("connect: expected Parsed::Connect"),
+        }
+        assert!(
+            matches!(
+                parse(&argv(&["--snapshot-every", "soon"])),
+                Parsed::Error(_)
+            ),
+            "a non-number should be refused rather than read as off"
+        );
+    }
+
+    /// `chm connect` had a `--proxy-rules` arm the outer guard never routed to,
+    /// so the flag that carries credential-injection rules — and, since #163,
+    /// the egress allowance that goes with them — was refused as unknown on the
+    /// one entry point the app uses.
+    #[test]
+    fn connect_accepts_the_proxy_rules_flag_it_has_an_arm_for() {
+        let raw: Vec<String> = ["snap", "--proxy-rules", "/tmp/rules.json"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        match parse_connect(&raw) {
+            Parsed::Connect(a) => assert_eq!(
+                a.run.proxy_rules.as_deref(),
+                Some(Path::new("/tmp/rules.json"))
+            ),
+            _ => panic!("expected Parsed::Connect"),
+        }
+    }
+
+    /// A flag that parses and is never read is the failure this repo has now
+    /// been caught by five times, and every assertion above stays green through
+    /// it. So read the source and require that the cadence resolver is actually
+    /// asked for the run's own value.
+    ///
+    /// The needle is assembled from parts because a literal here would match
+    /// this test's own text (#241).
+    #[test]
+    fn the_snapshotter_asks_the_run_for_its_cadence() {
+        let src = include_str!("imp.rs");
+        let call = format!("snapshot_interval(s.{}, env::var(", "every");
+        assert!(
+            src.contains(&call),
+            "spawn_live_snapshotter must pass the run's --snapshot-every to the resolver"
+        );
+        let wiring = format!("every: cfg.{},", "snapshot_every");
+        assert!(
+            src.contains(&wiring),
+            "the LiveSnapshotter must be built with the config's cadence"
+        );
     }
 
     #[test]

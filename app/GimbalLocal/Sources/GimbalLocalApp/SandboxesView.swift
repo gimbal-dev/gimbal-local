@@ -385,7 +385,7 @@ struct SandboxDetailPage: View {
                         WorkspaceLocationCard(sandbox: sandbox)
                         RevisionHistoryCard(
                             dirPath: sandbox.workspacePath,
-                            emptyHint: "Run this sandbox (Open terminal), then end the session to save its live state as a revision here — isolated from other sandboxes of the same image."
+                            emptyLead: "No saved points yet for this sandbox — its state is isolated from other sandboxes of the same image."
                         )
                         ConsoleExpander()
                     }

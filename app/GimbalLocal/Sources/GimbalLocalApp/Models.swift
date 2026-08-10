@@ -388,7 +388,44 @@ struct RevisionSummary: Codable, Identifiable, Equatable, Hashable {
     var shortId: String {
         String(id.split(separator: "-").last ?? Substring(id))
     }
+
 }
+
+/// Anything that records which entry point wrote it.
+///
+/// A protocol rather than two copies because `Revision` (the HEAD manifest) and
+/// `RevisionSummary` (the store view) both carry `origin` and both render it,
+/// and two readings of what `-auto` means would eventually disagree — with the
+/// disagreement showing up as one timeline row disagreeing with another about
+/// the same point.
+protocol RevisionOrigin {
+    /// The entry point that wrote this point, as `chm` recorded it: `connect`
+    /// or `daemon`, suffixed `-auto` when the cadence took it rather than a
+    /// person.
+    var origin: String { get }
+}
+
+extension RevisionOrigin {
+    /// True when the cadence wrote this point rather than a person.
+    ///
+    /// `chm` has always drawn the distinction — `spawn_live_snapshotter`
+    /// suffixes the entry point — and the app has never shown it. It matters
+    /// because the two answer different questions: a manual point is somewhere
+    /// you chose to be able to come back to, an automatic one is insurance you
+    /// did not have to think about, and rolling back to one is a different
+    /// decision from rolling back to the other.
+    var isAutomatic: Bool { origin.hasSuffix("-auto") }
+
+    /// The entry point with the `-auto` marker taken off, so the origin reads
+    /// the same whichever wrote it. Carrying the marker separately is what
+    /// stops the UI having to un-parse a string it also displays.
+    var originEntryPoint: String {
+        isAutomatic ? String(origin.dropLast("-auto".count)) : origin
+    }
+}
+
+extension Revision: RevisionOrigin {}
+extension RevisionSummary: RevisionOrigin {}
 
 /// A sandbox's local egress firewall posture, as reported by
 /// `chm firewall show <dir> --json`. The same file (`egress-policy.json`) the

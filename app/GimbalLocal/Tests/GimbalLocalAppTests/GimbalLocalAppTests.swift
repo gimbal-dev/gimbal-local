@@ -552,7 +552,8 @@ final class GimbalLocalAppTests: XCTestCase {
             runPath: evil,
             socketPath: "/tmp/chm.sock",
             lockPath: nil,
-            workdir: "/work"
+            workdir: "/work",
+            cadence: .everyFiveMinutes
         )
         // The connect invocation carries the path single-quoted (embedded quote
         // becomes the `'\''` close/escape/reopen sequence).
@@ -583,7 +584,8 @@ final class GimbalLocalAppTests: XCTestCase {
             runPath: "/tmp/ws",
             socketPath: "/tmp/chm.sock",
             lockPath: nil,
-            workdir: "/work"
+            workdir: "/work",
+            cadence: .off
         )
         XCTAssertTrue(command.hasSuffix("; exit"), "session must exit the shell: \(command)")
         XCTAssertTrue(
@@ -592,7 +594,13 @@ final class GimbalLocalAppTests: XCTestCase {
         )
         // The chm invocation is reached with `&&` but the teardown uses `;` so it
         // runs regardless of how chm exits.
-        XCTAssertTrue(command.contains("--idle-exit 0; echo "), "teardown must be ;-joined: \(command)")
+        // Asserted against the notice rather than "whatever flag is last", so
+        // adding a flag to the connect invocation does not silently retarget
+        // this at a different property.
+        XCTAssertFalse(
+            command.contains("&& echo '-- Sandbox session ended."),
+            "teardown must not be &&-joined, or it is skipped when chm fails: \(command)"
+        )
     }
 
     func testInteractiveCommandRejectsControlCharacters() {
@@ -604,7 +612,8 @@ final class GimbalLocalAppTests: XCTestCase {
                 runPath: "/tmp/ws\nactivate\ndo script \"rm -rf ~\"",
                 socketPath: "/tmp/chm.sock",
                 lockPath: nil,
-                workdir: "/work"
+                workdir: "/work",
+                cadence: .everyMinute
             )
         ) { error in
             guard case InteractiveTerminalCommand.BuildError.invalidPath = error else {
@@ -1239,5 +1248,183 @@ final class LocalOnlyModeTests: XCTestCase {
         model.saveLocalOnly()
 
         XCTAssertEqual(model.selection, .securityHome)
+    }
+}
+
+/// #174 — the app can turn the continuous-snapshot cadence on.
+///
+/// Before this, `CHM_SNAPSHOT_INTERVAL_SECS` was the only way to enable it, so
+/// the app's timeline only ever filled from manual suspends and the app had no
+/// way to say otherwise.
+final class SnapshotCadenceTests: XCTestCase {
+    private func defaults(_ name: String) -> UserDefaults {
+        let suite = "gimbal.tests.cadence.\(name).\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suite)!
+        addTeardownBlock { UserDefaults.standard.removePersistentDomain(forName: suite) }
+        return defaults
+    }
+
+    func testAFirstLaunchIsOff() {
+        // An absent key reads as 0, which is also `.off`. That is the right
+        // answer while off is the default, and the doc comment on `stored`
+        // records where the distinction goes if the default ever changes — a
+        // presence check today could not change any answer, and this test
+        // deliberately does not claim one is there.
+        let store = defaults("absent")
+        XCTAssertEqual(SnapshotCadence.stored(in: store, key: "cadence"), .off)
+
+        store.set(SnapshotCadence.everyMinute.seconds, forKey: "cadence")
+        XCTAssertEqual(SnapshotCadence.stored(in: store, key: "cadence"), .everyMinute)
+
+        store.set(0, forKey: "cadence")
+        XCTAssertEqual(SnapshotCadence.stored(in: store, key: "cadence"), .off)
+    }
+
+    func testAnUnknownStoredValueFallsBackToOff() {
+        // A cadence written by a newer build must not resolve to some nearby
+        // value: freezing someone's guest on a cadence they never chose is a
+        // worse answer than not freezing it at all.
+        let store = defaults("unknown")
+        store.set(37, forKey: "cadence")
+        XCTAssertEqual(SnapshotCadence.stored(in: store, key: "cadence"), .off)
+    }
+
+    func testEveryCadenceRoundTrips() {
+        let store = defaults("roundtrip")
+        for cadence in SnapshotCadence.allCases {
+            store.set(cadence.seconds, forKey: "cadence")
+            XCTAssertEqual(
+                SnapshotCadence.stored(in: store, key: "cadence"), cadence,
+                "\(cadence.label) must survive a round trip through UserDefaults"
+            )
+        }
+    }
+
+    func testTheFlagIsPassedEvenWhenTheCadenceIsOff() throws {
+        // The load-bearing case. Omitting the flag when the user chose "off"
+        // would defer to `CHM_SNAPSHOT_INTERVAL_SECS` — an environment they
+        // never set — and hand them the cadence they just declined.
+        let off = try InteractiveTerminalCommand.shellCommand(
+            chmPath: "/usr/local/bin/chm",
+            runPath: "/tmp/ws",
+            socketPath: "/tmp/chm.sock",
+            lockPath: nil,
+            workdir: "/work",
+            cadence: .off
+        )
+        XCTAssertTrue(
+            off.contains("--snapshot-every 0"),
+            "off must be stated, not left to the environment: \(off)"
+        )
+
+        let on = try InteractiveTerminalCommand.shellCommand(
+            chmPath: "/usr/local/bin/chm",
+            runPath: "/tmp/ws",
+            socketPath: "/tmp/chm.sock",
+            lockPath: nil,
+            workdir: "/work",
+            cadence: .everyFiveMinutes
+        )
+        XCTAssertTrue(
+            on.contains("--snapshot-every 300"),
+            "a chosen cadence must reach chm: \(on)"
+        )
+    }
+
+    func testTheEmptyStateHintMovesWithTheSetting() {
+        // The hint used to say ending a session was the only way points appear.
+        // That is true only while the cadence is off, so the sentence has to
+        // come from the cadence rather than be a literal in a view.
+        let off = SnapshotCadence.off.howPointsArrive
+        XCTAssertTrue(off.contains("Settings"), "off must say where to turn it on: \(off)")
+
+        let on = SnapshotCadence.everyFifteenSeconds.howPointsArrive
+        XCTAssertFalse(
+            on.lowercased().contains("turn on"),
+            "an enabled cadence must not tell you to enable it: \(on)"
+        )
+        XCTAssertTrue(
+            on.contains(SnapshotCadence.everyFifteenSeconds.label.lowercased()),
+            "an enabled cadence must say how often: \(on)"
+        )
+    }
+
+    func testTheAutoMarkerIsReadFromTheOriginChmWrote() {
+        // chm suffixes the entry point with `-auto` when the cadence took the
+        // point. Both revision types must read it the same way, which is why
+        // it lives on one protocol.
+        func summary(_ id: String, _ origin: String) -> RevisionSummary {
+            RevisionSummary(
+                id: id, parent: nil, baseImage: "img", createdAtMs: 1_754_000_000_000,
+                origin: origin, label: nil, resumable: true, isHead: false
+            )
+        }
+        let auto = summary("rev-1", "connect-auto")
+        let manual = summary("rev-2", "daemon")
+        XCTAssertTrue(auto.isAutomatic)
+        XCTAssertEqual(auto.originEntryPoint, "connect")
+        XCTAssertFalse(manual.isAutomatic)
+        XCTAssertEqual(manual.originEntryPoint, "daemon")
+
+        let subtitle = LineageCard.revisionSubtitle(auto, createdAt: auto.createdAt)
+        XCTAssertTrue(subtitle.contains("via connect"), subtitle)
+        XCTAssertTrue(subtitle.contains("(auto)"), "an automatic point must be marked: \(subtitle)")
+        XCTAssertFalse(
+            subtitle.contains("connect-auto"),
+            "the raw suffix must not leak into the UI: \(subtitle)"
+        )
+    }
+}
+
+/// Guards on the wiring, not the values.
+///
+/// Every assertion above reads the *output* of a function. That is
+/// structurally blind to a call site that stops calling it — this repo has now
+/// been caught by exactly that four times (V9.5c, V9.11a M4, #222, #242). The
+/// `shellCommand` half is a compile error by construction, because `cadence`
+/// has no default. The Settings half cannot be, so it is read out of the
+/// source.
+final class SnapshotCadenceWiringTests: XCTestCase {
+    private func source(_ file: String) throws -> String {
+        let root = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // GimbalLocalAppTests
+            .deletingLastPathComponent()  // Tests
+            .deletingLastPathComponent()  // GimbalLocal
+            .appendingPathComponent("Sources/GimbalLocalApp/\(file)")
+        return try String(contentsOf: root, encoding: .utf8)
+    }
+
+    func testTheSettingsPickerPersistsWhatItChanges() throws {
+        // #142 was exactly this: a setting the user changed, that did not
+        // survive a relaunch. A Picker bound to a @Published property looks
+        // completely correct and persists nothing.
+        let settings = try source("SettingsView.swift")
+        XCTAssertTrue(
+            settings.contains("$model.snapshotCadence"),
+            "the picker must be bound to the model"
+        )
+        // Assembled from parts: a literal needle would match this assertion's
+        // own text if the guard and the source ever shared a file (#241).
+        let onChange = "onChange(of: model." + "snapshotCadence)"
+        XCTAssertTrue(settings.contains(onChange), "the picker must persist on change")
+        XCTAssertTrue(
+            settings.contains("model.saveSnapshot" + "Cadence()"),
+            "the change must reach the save"
+        )
+    }
+
+    func testTheStorageKeyIsWrittenOnce() throws {
+        // Read and write happen in different places, and the read is in a
+        // @Published initializer that cannot see `self`. A restated literal
+        // with a typo in one of them means the setting silently never persists.
+        let model = try source("AppModel.swift")
+        XCTAssertFalse(
+            model.contains("\"" + SnapshotCadence.defaultsKey + "\""),
+            "the key must come from SnapshotCadence.defaultsKey, not a literal"
+        )
+        XCTAssertEqual(
+            model.components(separatedBy: "SnapshotCadence.defaultsKey").count - 1, 2,
+            "both the read and the write must use the shared key"
+        )
     }
 }

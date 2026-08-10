@@ -7,16 +7,44 @@ command is issued inside the guest, and the guest keeps running afterwards. Turn
 it on with an interval:
 
 ```console
-$ CHM_SNAPSHOT_INTERVAL_SECS=60 chm resume ~/my-sandbox
+$ chm resume ~/my-sandbox --snapshot-every 60
 chm: continuous snapshots every 60s; roughly the last 5m stays resumable
      (raise CHM_MAX_RESUMABLE_REVISIONS, or pin a revision, to keep more)
 ...
 chm: live snapshot 1 written (froze 2.92s, barrier 163ms)
 ```
 
+`--snapshot-every` is accepted by `chm run`, `chm resume` and `chm connect`. In
+Gimbal Local it is **Settings › General › Save live state**, which passes the
+flag to every session the app opens from then on; a session already running
+keeps the cadence it started with, because reaching into a running guest to
+change how often it freezes is not something the app should do without being
+asked.
+
 It is **off by default**, and that is deliberate: a checkpoint costs a real
 freeze, so switching it on is a trade the operator makes rather than one made
 for them.
+
+## Turning it on for everything, and turning it off for one thing
+
+`CHM_SNAPSHOT_INTERVAL_SECS=<n>` sets the same cadence through the environment,
+which is how a wrapper or a service turns it on for everything it launches.
+
+**The flag outranks it, including `--snapshot-every 0`.** That is the whole
+reason the flag can say zero: without it, a caller running inside an environment
+somebody else set could only opt out by unsetting a variable it does not own.
+
+| | cadence |
+| --- | --- |
+| neither | off |
+| `CHM_SNAPSHOT_INTERVAL_SECS=60` | every 60s |
+| `CHM_SNAPSHOT_INTERVAL_SECS=60`, `--snapshot-every 15` | every 15s |
+| `CHM_SNAPSHOT_INTERVAL_SECS=60`, `--snapshot-every 0` | **off** |
+| `CHM_SNAPSHOT_INTERVAL_SECS=nonsense` | off |
+
+An unreadable environment value is off rather than a default cadence: there is
+no reading of `CHM_SNAPSHOT_INTERVAL_SECS=nonsense` under which freezing
+someone's guest on an invented interval is the helpful answer.
 
 ## What it costs
 
