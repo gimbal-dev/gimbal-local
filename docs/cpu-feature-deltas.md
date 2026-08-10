@@ -73,7 +73,7 @@ Every AArch64 identity and feature register is restored **exactly**:
 | `ID_AA64PFR1_EL1` | `0x20` | restored |
 | `ID_AA64ISAR0_EL1` | `0x100010211120` | restored |
 | `ID_AA64ISAR1_EL1` | `0x100001` | restored |
-| `ID_AA64MMFR0/1/2_EL1` | `0x101125` / `0x10212122` / `0x100000000000011` | restored |
+| `ID_AA64MMFR0/1/2_EL1` | `0x101125` / `0x10212122` / `0x100000000000011` | restored — and `MMFR0` is [Finding 6](#finding-6--asid-width-unrelated-processes-share-tlb-contexts-) |
 | `ID_AA64DFR0/1_EL1` | `0x10305408` / `0x0` | restored |
 
 This is the finding that explains the whole project: **HVF genuinely lets us
@@ -291,24 +291,17 @@ would improve when the work stays on one core. Staying on one core instead
 maximises the chance that core's I-cache still holds the *stale* line, which is
 the signature of missing invalidation rather than missing broadcast.
 
-### Measured 2026-08-10 — "non-JIT workloads are unaffected" was wrong 🔴
+### Measured 2026-08-10, RETRACTED 2026-08-11 — "non-JIT workloads are unaffected" was wrong, and so was its replacement ⚠️
 
-That sentence stood here until a rehydrated guest was put under a workload with
-**page-cache pressure** rather than a JIT. It is false, and the correction
-matters more than anything else on this page, because it moves the blast radius
-from "JavaScript tooling" to "running programs at all".
+This section used to claim that DIC also explained the userspace crashes a
+rehydrated guest suffers under ordinary IO load. **That attribution is false.**
+The observation was real and is kept below because it is what led to the actual
+root cause; the *explanation* is retracted, and the finding it belongs to is
+[Finding 6](#finding-6--asid-width-unrelated-processes-share-tlb-contexts-).
 
-`__sync_icache_dcache()` is not a JIT-only path. The kernel calls it whenever a
-page becomes executable for userspace — which includes **every `execve` and
-every shared-library mapping**, not just `mprotect(RX)` on a JIT buffer. A page
-that has just been written (by the loader, or by the page cache recycling a
-buffer some other process was writing a moment ago) and is then executed is the
-same hazard as row 3 of the table above. Ordinary `fork`/`exec` under IO load
-hits it constantly.
-
-Load: four `dd`/`sync`/`rm` loops churning the page cache, plus two spinners, on
-`graviton-vanilla-2cpu-net`. Cold-boot control: the same script, same host, same
-`chm` binary, on a cold-booted guest.
+The observation, unchanged. Load: four `dd`/`sync`/`rm` loops churning the page
+cache, plus two spinners, on `graviton-vanilla-2cpu-net`. Cold-boot control: the
+same script, same host, same `chm` binary, on a cold-booted guest.
 
 | | cold-booted | rehydrated |
 | --- | --- | --- |
@@ -317,42 +310,117 @@ Load: four `dd`/`sync`/`rm` loops churning the page cache, plus two spinners, on
 
 The crashes are not JITs and not one signal: `Segmentation fault` ×13,
 `stack smashing detected` ×10, `Aborted` ×8, `Bus error` ×3,
-`Illegal instruction` ×1 — the spread of a process executing whatever bytes
-happened to be in that physical page before. The victims were `rm`, `dd` and
-`sync`. **`rm` is not a JIT.** The cold guest ran at roughly *twice* the load
-average and did not crash once.
+`Illegal instruction` ×1. The victims were `rm`, `dd` and `sync`.
 
-The rehydrated guest never wedged and kept answering heartbeats throughout; it
-simply could not keep a child process alive. The load collapsed to 1.0 partway
-through the run because the `dd` loops had themselves been killed.
+The reasoning that read this as DIC was: `__sync_icache_dcache()` runs on every
+`execve` and every shared-library mapping, so a page written by the loader (or
+recycled by the page cache) and then executed is the same hazard as a JIT
+buffer. That is a true statement about the kernel and a false explanation of
+these crashes.
 
-One confound, named rather than resolved: the cold control ran a Debian-slim
-userland and the rehydrated guest runs the capture's Ubuntu. That is an
-implausible explanation for a 35-vs-0 split under identical load, but it is not
-a variable that was eliminated.
+#### Four measurements killed it
 
-Consequences for the mitigations below:
+| # | Test | Result |
+| --- | --- | --- |
+| 1 | Perform the maintenance host-side for the guest (invalidate every DMA destination as virtio-blk completes), instrumented | **1,277,598 invalidations / 266 MiB** in one short run, and the crash count did not move |
+| 2 | Prove the primitive rather than assume it: guest runs a routine, host overwrites it through the host mapping + `sys_icache_invalidate`, guest calls again | guest sees the **new** code — so the null in row 1 disconfirms the *hypothesis*, not the mechanism |
+| 3 | Run the identical load entirely in `tmpfs` — zero virtio-blk data traffic | **27 crashes**. Removing the I/O path did not help |
+| 4 | Re-run the cold-boot control with the *same* tmpfs load at load average **9.23** | **0 crashes** — so it is rehydration-specific, just not I-cache |
 
-- **`NODE_OPTIONS=--jitless` does not touch this.** It reaches `node`, and this
-  is `rm`. There is no in-guest workaround for exec-path corruption.
-- **Cold boot is still immune**, and is now the only honest recommendation for a
-  rehydrated capture that has to run real work.
-- The `chm` warning understates the problem by describing it as a JIT issue.
+Row 2 is the one that makes the rest mean anything: without it, row 1 reads as
+"the fix never reached the case" rather than "the hypothesis is wrong".
 
-**Upgraded from latent to confirmed.** `chm` now warns at load, and
-`CHM_STRICT_ICACHE=1` refuses (`icache_dic_guard`). Nothing can be repaired at
-rehydrate time — the NOPs are baked into the kernel text inside the snapshot,
-and `chm` has no way to write into the guest filesystem either, so the
-`--jitless` workaround has to be applied by the user inside the guest. Two
-things fix it properly rather than working around it:
+The signal composition argued against DIC all along and was misread: **18 of the
+35 are glibc data-integrity aborts** (stack smashing, malloc tcache) and exactly
+**1** is SIGILL. A stale instruction fetch presents as SIGILL. It does not
+present as a valid, correctly-executed code path discovering that its stack
+canary has been overwritten. That is memory belonging to another address space.
 
-- **Cold boot.** A guest whose kernel boots here reads this Mac's own
-  `CTR_EL0`, sees `DIC = 0`, and keeps its `ic ivau`. Immune by construction.
-- **A capture host with `DIC = 0`.** Graviton2 is Neoverse-N1, which reports 1;
-  this is a property of the capture host, not of the workload.
+Also worth recording: **the cold-boot control in the original run was not a
+control.** `agent-glibc4` is kernel + initramfs with **no disk**, so the
+"cold boot crashes zero" figure was measured with the load writing to a RAM
+filesystem and issuing zero virtio-blk requests. Row 4 above is the control that
+should have existed.
 
-Every acceptance test to date passed because none of them combined `fork`/`exec`
-with sustained page-cache pressure — not because non-JIT work is safe.
+#### What survives
+
+- DIC is real, and the 955/1000 `mprotect(RX)` measurement above stands. It
+  explains JIT and self-modifying-code failures — `npm`, Java, .NET.
+- **`NODE_OPTIONS=--jitless` still does not cover a native binary**, for the
+  reason given above.
+- **Cold boot is still the only complete answer** for a rehydrated capture — now
+  for two independent reasons rather than one.
+- Nothing can be repaired at rehydrate time: the NOPs are baked into the kernel
+  text inside the snapshot. `chm` warns at load and `CHM_STRICT_ICACHE=1`
+  refuses (`icache_dic_guard`).
+
+---
+
+## Finding 6 — ASID width: unrelated processes share TLB contexts 🔴
+
+**This is the cause of the crashes Finding 2 wrongly claimed.** It is the same
+*class* of bug — a CPU feature the guest kernel latched at boot on the capture
+host, faithfully restored, and wrong here — but a different register, and a
+worse failure mode: it corrupts memory rather than killing a fetch.
+
+### Measured
+
+| | value | `ASIDBits` | width |
+| --- | --- | --- | --- |
+| Graviton2 capture, `ID_AA64MMFR0_EL1` | `0x101125` | 2 | **16-bit** |
+| This Mac (Apple silicon) | `0xf100002` | 0 | **8-bit** |
+
+The guest confirms it latched the capture host's width, in its own words:
+
+```
+$ dmesg | grep -i asid
+ASID allocator initialised with 32768 entries
+```
+
+32768 = 2¹⁵, i.e. a 16-bit ASID space (bit 15 is the generation flag). A guest
+booted on this Mac says `256 entries`.
+
+The host's value could not be read with `hv_vcpu_get_sys_reg` — HVF refuses
+`ID_AA64MMFR0_EL1` with `0xfae94003`, exactly as it refuses `CTR_EL0`, `DCZID`
+and `CLIDR`. It was measured by executing a 7-instruction guest that `mrs`-es the
+register and stores it to MMIO (`hvf_host_mmu_feature_register` in
+`hypervisor/tests/hvf_boot.rs`, which pins this host at 8 bits so a future part
+that changes it fails a test rather than passing a guard silently).
+
+### Why it corrupts memory
+
+The TLB tags each entry with the ASID of the address space that created it, and
+compares **only the bits the hardware implements**. The guest allocates context
+ids across a 16-bit space; the hardware compares 8. Two processes whose ASIDs
+differ only above bit 7 — say `0x0142` and `0x0242` — are indistinguishable to
+the TLB, so one can hit an entry created by the other and read and write its
+pages.
+
+It needs more than 256 live address spaces to bite, which is why an idle guest
+looks perfect and a guest under fork pressure falls apart.
+
+Kernel mappings are global (TTBR1, `nG = 0`) and carry no ASID, which is exactly
+why **the guest never oopses while its userspace dies** — the observation that
+made this look like a userspace-only problem such as a stale I-cache.
+
+### What we do about it
+
+`chm` warns at load (`asid_width_guard`); `CHM_STRICT_ASID=1` refuses to start.
+There is no in-guest workaround: the width was latched before the snapshot was
+taken, and lowering the process count reduces the collision rate without
+removing it.
+
+Two things fix it properly:
+
+- **Cold boot.** The guest reads this Mac's own 8-bit width. Correct by
+  construction.
+- **A capture host with 8-bit ASIDs**, or a capture taken with the width capped
+  at boot (Linux's `idreg-override` machinery is the candidate; whether it
+  covers `id_aa64mmfr0.asidbits` is **unverified**).
+
+A runtime mitigation would mean trapping `TTBR0_EL1` writes and flushing the TLB
+on every context switch. Correct, brutally slow, and not known to be expressible
+under HVF. Unexplored.
 
 ---
 
@@ -403,10 +471,11 @@ uses comes from `CTR_EL0` (Finding 2), which matches.
 | # | Register | Verdict |
 | --- | --- | --- |
 | 1 | `ID_AA64PFR0_EL1.EL0` | 🔴 **Real bug.** 32-bit exec permanently wedges the vCPU. Warned at load; `CHM_STRICT_AARCH32=1` refuses. |
-| 2 | `CTR_EL0.DIC` | 🔴 The guest kernel elided `ic ivau`, so JITs in the guest execute stale code (955/1000 measured). Warned at load; `CHM_STRICT_ICACHE=1` refuses. Cold boot is immune. |
+| 2 | `CTR_EL0.DIC` | 🔴 The guest kernel elided `ic ivau`, so JITs in the guest execute stale code (955/1000 measured). Warned at load; `CHM_STRICT_ICACHE=1` refuses. Cold boot is immune. **Scope narrowed 2026-08-11**: it does *not* explain the crashes under ordinary IO load — that is #6. |
 | 3 | `DCZID_EL0` | ✅ Identical. Hazard closed by measurement. |
 | 4 | AArch32 ID block (20 regs) | ✅ Refused, harmless. |
 | 5 | `REVIDR`/`CLIDR`/`CCSIDR` | ✅ Cosmetic. |
+| 6 | `ID_AA64MMFR0_EL1.ASIDBits` | 🔴 **Real bug.** Guest uses 16-bit ASIDs, this Mac compares 8, so past ~256 live address spaces unrelated processes share TLB entries and corrupt each other. 27-30 processes killed in 16 min vs 0 cold-booted. Warned at load; `CHM_STRICT_ASID=1` refuses. Cold boot is immune. |
 | — | `CNTFRQ_EL0` | ✅ Known; corrected at runtime (V1.2/V1.3). |
 | — | all `ID_AA64*`, `MIDR`, `MPIDR` | ✅ Restored exactly — the reason this project works. |
 
@@ -416,9 +485,14 @@ uses comes from `CTR_EL0` (Finding 2), which matches.
 $ chm sysregs snapshots/graviton-1              # the audit, with analysis notes
 $ cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot \
       --test hvf_boot -- --exact hvf_host_cache_identity_registers --nocapture
+$ cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot \
+      --test hvf_boot -- --exact hvf_host_mmu_feature_register --nocapture
 ```
 
-The test reads `CTR_EL0`, `DCZID_EL0` and `CLIDR_EL1` from inside a minimal HVF
-guest and asserts the *invariants this document's safety argument rests on* —
-not the literal values — so a future Apple part with different cache geometry
-fails loudly instead of quietly invalidating what is written here.
+The first test reads `CTR_EL0`, `DCZID_EL0` and `CLIDR_EL1` from inside a
+minimal HVF guest and asserts the *invariants this document's safety argument
+rests on* — not the literal values — so a future Apple part with different cache
+geometry fails loudly instead of quietly invalidating what is written here. The
+second does the same for `ID_AA64MMFR0_EL1`, pinning this host at 8-bit ASIDs;
+both registers have to be read from inside a guest because
+`hv_vcpu_get_sys_reg` refuses them.

@@ -70,6 +70,8 @@ pub const EC_MSR_MRS_64: u64 = 0x18; // trapped AArch64 MSR/MRS/system-reg acces
 pub const EC_HVC64: u64 = 0x16;
 pub const EC_DATA_ABORT_LOWER: u64 = 0x24; // from a lower EL (the guest)
 pub const EC_DATA_ABORT_SAME: u64 = 0x25; // from the current EL
+pub const EC_INSTR_ABORT_LOWER: u64 = 0x20; // instruction fetch fault, lower EL
+pub const EC_INSTR_ABORT_SAME: u64 = 0x21; // instruction fetch fault, current EL
 
 // PSTATE for a cold EL1h boot with DAIF (D,A,I,F) masked.
 pub const PSTATE_EL1H_DAIF: u64 = 0x3c5;
@@ -203,6 +205,10 @@ unsafe extern "C" {
     pub fn hv_vm_destroy() -> i32;
     pub fn hv_vm_map(addr: *mut c_void, ipa: u64, size: usize, flags: u64) -> i32;
     pub fn hv_vm_unmap(ipa: u64, size: usize) -> i32;
+    /// Change stage-2 permissions on an already-mapped IPA range. `ipa` and
+    /// `size` must be host-page aligned. Used by `icache_wx` to hold guest RAM
+    /// writable-but-not-executable and grant execute one page at a time.
+    pub fn hv_vm_protect(ipa: u64, size: usize, flags: u64) -> i32;
     pub fn hv_vcpu_create(vcpu: *mut u64, exit: *mut *mut HvVcpuExit, config: *mut c_void) -> i32;
     pub fn hv_vcpu_destroy(vcpu: u64) -> i32;
     pub fn hv_vcpu_set_reg(vcpu: u64, reg: u32, value: u64) -> i32;

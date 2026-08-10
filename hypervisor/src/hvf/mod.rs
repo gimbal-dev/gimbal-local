@@ -61,6 +61,10 @@ pub mod coldgic;
 #[cfg(feature = "kvm-snapshot")]
 pub mod virtio;
 
+/// Host-side instruction-cache maintenance for guests whose kernel had its
+/// `ic ivau` alternative-patched out on a `CTR_EL0.DIC = 1` capture host.
+pub mod icache_wx;
+
 type CpuResult<T> = std::result::Result<T, HypervisorCpuError>;
 type VmResult<T> = std::result::Result<T, HypervisorVmError>;
 
@@ -3440,6 +3444,23 @@ impl Vcpu for HvfVcpu {
                 let ipa = exit.exception.physical_address;
                 let ec = (esr >> 26) & 0x3f;
                 match ec {
+                    EC_INSTR_ABORT_LOWER | EC_INSTR_ABORT_SAME
+                        if icache_wx::on_exec_fault(ipa) =>
+                    {
+                        // The guest fetched from a page we were holding
+                        // non-executable so that we could do the instruction-cache
+                        // maintenance its own kernel has had patched out. Done
+                        // now; re-enter and let the fetch retry.
+                        Ok(VmExit::Ignore)
+                    }
+                    EC_DATA_ABORT_LOWER | EC_DATA_ABORT_SAME
+                        if icache_wx::armed() && icache_wx::on_write_fault(ipa) =>
+                    {
+                        // A write to a page we had granted execute. Execute has
+                        // been withdrawn, so the next fetch faults and we get to
+                        // invalidate against the finished contents.
+                        Ok(VmExit::Ignore)
+                    }
                     EC_DATA_ABORT_LOWER | EC_DATA_ABORT_SAME => {
                         self.handle_data_abort(esr, ipa)?;
                         Ok(VmExit::Ignore)

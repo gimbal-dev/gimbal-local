@@ -3685,3 +3685,261 @@ fn hvf_host_vtimer_mask_is_invisible_to_the_guest_control_register() {
          'no timer armed' and would stop polling for the deadline"
     );
 }
+
+// SAFETY: see the note on the extern block above; the framework is already
+// linked by the `hypervisor` rlib this test binary depends on.
+#[link(name = "Hypervisor", kind = "framework")]
+unsafe extern "C" {
+    fn hv_vm_protect(ipa: u64, size: usize, flags: u64) -> i32;
+}
+
+const HV_MEM_READ: u64 = 1 << 0;
+const HV_MEM_WRITE: u64 = 1 << 1;
+const HV_MEM_EXEC: u64 = 1 << 2;
+
+/// Can the *host* do the instruction-cache maintenance the guest kernel skips?
+///
+/// A rehydrated capture whose kernel latched `CTR_EL0.DIC = 1` on the capture
+/// host has `ic ivau` patched out of `caches_clean_inval_pou()`, so any page
+/// that is written and then executed can run stale instructions (#274: 35
+/// crashes in `rm`/`dd`/`sync` under IO load, against zero on a cold boot).
+/// Nothing inside the guest can repair that — the NOPs are baked into the
+/// snapshot's kernel text.
+///
+/// The host still can, if HVF cooperates, because guest RAM is mapped into this
+/// process and `sys_icache_invalidate` reaches the same physical lines. The
+/// scheme is W^X in the hypervisor: keep guest RAM writable-but-not-executable,
+/// and when the guest first executes a page, invalidate that page's I-cache and
+/// grant execute. Whole-RAM invalidation is not an option — measured at 1.7-2.9 s
+/// for 8 GiB — so it has to be per page, on demand, which needs exactly two
+/// things from HVF.
+///
+/// This test asks for both:
+///   1. a stage-2 mapping without `HV_MEMORY_EXEC` must *trap* the guest's
+///      instruction fetch rather than executing it anyway; and
+///   2. `hv_vm_protect` must be able to grant execute afterwards, on a live VM,
+///      so the guest makes progress instead of faulting forever.
+///
+/// If either fails, the per-page approach is dead and #274 needs the expensive
+/// answers (refuse by default, rewrite guest kernel text, or recapture on a
+/// `DIC = 0` host).
+#[test]
+fn hvf_can_trap_a_guest_instruction_fetch_and_grant_execute_afterwards() {
+    let ram = HostRam::new(RAM_SIZE);
+    ram.load(0, &GUEST_CODE);
+    let vm_ops = Arc::new(RecordingVmOps {
+        writes: Mutex::new(Vec::new()),
+    });
+    let (_vm, mut vcpu) = build_vm(&ram, vm_ops.clone());
+    vcpu.setup_regs(0, RAM_BASE, 0).expect("setup_regs");
+
+    // Drop execute on the page the guest is about to run from.
+    // SAFETY: FFI; the region was mapped by build_vm and is still live.
+    let rc = unsafe { hv_vm_protect(RAM_BASE, RAM_SIZE, HV_MEM_READ | HV_MEM_WRITE) };
+    assert_eq!(rc, 0, "hv_vm_protect(RW) failed: {rc:#010x}");
+
+    // The guest should now be unable to fetch. Anything that is not a fault
+    // means stage-2 execute permission is not enforced for the guest, and the
+    // whole approach is unavailable.
+    let first = vcpu.run();
+    eprintln!("run with EXEC removed -> {first:?}");
+    assert!(
+        first.is_err() || matches!(first, Ok(VmExit::Ignore)),
+        "guest ran to completion with execute permission removed; \
+         stage-2 X is not enforced and per-page I-cache maintenance is impossible"
+    );
+    assert!(
+        vm_ops.writes.lock().unwrap().is_empty(),
+        "the guest reached its first MMIO store without execute permission"
+    );
+
+    // Now do what the fix would do: invalidate this page's I-cache from the
+    // host, then grant execute.
+    // SAFETY: FFI; `ram` covers this range and outlives the call.
+    unsafe { sys_icache_invalidate(ram.ptr as *mut c_void, RAM_SIZE) };
+    // SAFETY: FFI; same region.
+    let rc = unsafe { hv_vm_protect(RAM_BASE, RAM_SIZE, HV_MEM_READ | HV_MEM_WRITE | HV_MEM_EXEC) };
+    assert_eq!(rc, 0, "hv_vm_protect(RWX) failed: {rc:#010x}");
+
+    // Re-entering must now make progress and reach the guest's normal exit.
+    assert!(
+        matches!(run_to_shutdown(vcpu.as_mut()), VmExit::Shutdown),
+        "guest did not resume after execute was granted back"
+    );
+    let vals = vm_ops.writes.lock().unwrap().clone();
+    assert_eq!(
+        vals,
+        vec![1, 2, 3, 4, 5, 6],
+        "the guest must run correctly after the permission round-trip, not merely run"
+    );
+}
+
+// SAFETY: macOS libSystem; invalidates the instruction cache for a host VA range.
+unsafe extern "C" {
+    fn sys_icache_invalidate(start: *mut c_void, len: usize);
+}
+
+/// Offset of the "victim" routine the host rewrites mid-run. Far enough from
+/// the entry code to sit in its own 16 KiB host page.
+const VICTIM_OFF: usize = 0x8000;
+
+/// Calls the routine at [`VICTIM_OFF`], stores a 0xAA marker (which traps to the
+/// host and is where the host swaps the routine out from under it), calls the
+/// same routine again, and powers off.
+#[rustfmt::skip]
+const ICACHE_CALLER: [u8; 36] = [
+    0x0a, 0x00, 0xa2, 0xd2, // movz x10, #0x1000, lsl #16   (MMIO_TX)
+    0xff, 0x1f, 0x00, 0x94, // bl   +0x7ffc -> VICTIM_OFF
+    0x49, 0x15, 0x80, 0x52, // movz w9, #0xaa
+    0x49, 0x01, 0x00, 0xb9, // str  w9, [x10]               (host intervenes here)
+    0xfc, 0x1f, 0x00, 0x94, // bl   +0x7ff0 -> VICTIM_OFF
+    0x00, 0x01, 0x80, 0xd2, // movz x0, #0x8
+    0x00, 0x80, 0xb0, 0xf2, // movk x0, #0x8400, lsl #16    (PSCI SYSTEM_OFF)
+    0x02, 0x00, 0x00, 0xd4, // hvc  #0
+    0x00, 0x00, 0x00, 0x14, // b    .
+];
+
+/// The victim routine as first executed: reports 0x11.
+#[rustfmt::skip]
+const VICTIM_OLD: [u8; 12] = [
+    0x29, 0x02, 0x80, 0x52, // movz w9, #0x11
+    0x49, 0x01, 0x00, 0xb9, // str  w9, [x10]
+    0xc0, 0x03, 0x5f, 0xd6, // ret
+];
+
+/// What the host writes over it: reports 0x22.
+#[rustfmt::skip]
+const VICTIM_NEW: [u8; 12] = [
+    0x49, 0x04, 0x80, 0x52, // movz w9, #0x22
+    0x49, 0x01, 0x00, 0xb9, // str  w9, [x10]
+    0xc0, 0x03, 0x5f, 0xd6, // ret
+];
+
+/// Run the swap experiment; returns the values the guest reported.
+///
+/// The guest executes the victim routine once (populating the instruction cache
+/// for that physical line), traps to the host, and the host overwrites the
+/// routine through *its own* mapping of the same pages. `invalidate` decides
+/// whether the host then performs the cache maintenance the guest kernel would
+/// have done.
+fn icache_swap_run(invalidate: bool) -> Vec<u32> {
+    let ram = HostRam::new(RAM_SIZE);
+    ram.load(0, &ICACHE_CALLER);
+    ram.load(VICTIM_OFF, &VICTIM_OLD);
+    let vm_ops = Arc::new(RecordingVmOps {
+        writes: Mutex::new(Vec::new()),
+    });
+    let (_vm, mut vcpu) = build_vm(&ram, vm_ops.clone());
+    vcpu.setup_regs(0, RAM_BASE, 0).expect("setup_regs");
+
+    let mut swapped = false;
+    for _ in 0..10_000 {
+        match vcpu.run().expect("vcpu run") {
+            VmExit::Ignore => {}
+            VmExit::Shutdown => break,
+            other => panic!("unexpected exit {other:?}"),
+        }
+        if !swapped && vm_ops.writes.lock().unwrap().contains(&0xAA) {
+            swapped = true;
+            ram.load(VICTIM_OFF, &VICTIM_NEW);
+            if invalidate {
+                // SAFETY: FFI; this range is inside `ram`, which outlives the call.
+                unsafe {
+                    sys_icache_invalidate(ram.ptr.add(VICTIM_OFF) as *mut c_void, VICTIM_NEW.len())
+                };
+            }
+        }
+    }
+    assert!(swapped, "the guest never reached the swap point");
+    let v = vm_ops.writes.lock().unwrap().clone();
+    v
+}
+
+/// Does host-side `sys_icache_invalidate` actually reach the lines a *guest*
+/// fetches through stage 2?
+///
+/// Every host-side instruction-cache repair in `hypervisor::hvf::icache_wx`
+/// rests on this one assumption: guest RAM is our memory, the instruction cache
+/// is physically indexed, so invalidating by our virtual address reaches the
+/// same physical lines the guest fetches. That has been *reasoned*, never
+/// measured — and if it is false, every mechanism built on it is silently inert
+/// and no load test can tell the difference between "the fix does not work" and
+/// "the fix does not run".
+///
+/// The guest runs a routine, the host overwrites it in place and invalidates,
+/// and the guest calls it again. Seeing the new value proves the host's
+/// maintenance is guest-visible.
+#[test]
+fn host_side_icache_invalidation_is_visible_to_the_guest() {
+    let with = icache_swap_run(true);
+    assert_eq!(
+        with,
+        vec![0x11, 0xAA, 0x22],
+        "after a host-side sys_icache_invalidate the guest must fetch the new \
+         instructions; if it reported 0x11 again the host cannot do the guest's \
+         cache maintenance and icache_wx is inert"
+    );
+
+    // Informative, deliberately not asserted: without the invalidate the guest
+    // may or may not see the new code, because nothing stops the line being
+    // evicted naturally. A run that reports 0x11 here is a direct observation of
+    // the staleness the fix exists to prevent.
+    let without = icache_swap_run(false);
+    eprintln!("victim swap without host invalidate -> {without:x?}");
+}
+
+/// Reports this Mac's `ID_AA64MMFR0_EL1` by reading it at EL1 and storing it to
+/// MMIO_TX, then powering off. `hv_vcpu_get_sys_reg` refuses this register, so a
+/// tiny guest is the only way to see it.
+#[rustfmt::skip]
+const MMU_ID_PROBE: [u8; 28] = [
+    0x0a, 0x00, 0xa2, 0xd2, // movz x10, #0x1000, lsl #16 (MMIO_TX)
+    0x09, 0x07, 0x38, 0xd5, // mrs  x9, id_aa64mmfr0_el1
+    0x49, 0x01, 0x00, 0xb9, // str  w9, [x10]
+    0x00, 0x01, 0x80, 0xd2, // movz x0, #0x8
+    0x00, 0x80, 0xb0, 0xf2, // movk x0, #0x8400, lsl #16 (SYSTEM_OFF)
+    0x02, 0x00, 0x00, 0xd4, // hvc  #0
+    0x00, 0x00, 0x00, 0x14, // b    .
+];
+
+/// How many ASID bits does a *cold-boot* guest get on this Mac?
+///
+/// `ID_AA64MMFR0_EL1.ASIDBits` is latched by Linux at boot into `asid_bits`,
+/// exactly like `CTR_EL0.DIC`. A snapshot restores the capture host's value, so
+/// if Graviton advertises 16-bit ASIDs and this hardware implements 8, the
+/// rehydrated guest hands the TLB context ids it cannot tell apart -- two live
+/// processes sharing a TLB context, which corrupts userspace while leaving the
+/// global (TTBR1) kernel mappings untouched.
+#[test]
+fn hvf_host_mmu_feature_register() {
+    let ram = HostRam::new(RAM_SIZE);
+    ram.load(0, &MMU_ID_PROBE);
+    let vm_ops = Arc::new(RecordingVmOps {
+        writes: Mutex::new(Vec::new()),
+    });
+    let (_vm, mut vcpu) = build_vm(&ram, vm_ops.clone());
+    vcpu.setup_regs(0, RAM_BASE, 0).expect("setup_regs");
+    assert!(matches!(run_to_shutdown(vcpu.as_mut()), VmExit::Shutdown));
+
+    let v = vm_ops.writes.lock().unwrap()[0];
+    let bits = |e: u32| match e {
+        0 => 8,
+        2 => 16,
+        other => panic!("reserved ASIDBits encoding {other:#x} in {v:#x}"),
+    };
+    let host = bits((v >> 4) & 0xf);
+    let graviton = bits((0x101125u32 >> 4) & 0xf);
+    eprintln!("this Mac:  ID_AA64MMFR0_EL1 = {v:#x}  ASIDBits -> {host}-bit");
+    eprintln!("Graviton2: ID_AA64MMFR0_EL1 = 0x101125  ASIDBits -> {graviton}-bit");
+    assert_eq!(
+        host, 8,
+        "this Mac hands a cold-booted guest {host}-bit ASIDs, not the 8 that \
+         chm::imp::asid_warning_for assumes; that constant decides whether a \
+         rehydrated capture is warned about, so it has to track the hardware"
+    );
+    assert!(
+        graviton > host,
+        "a Graviton capture is only hazardous because its ASID width exceeds \
+         this host's; if that stopped being true the guard is now noise"
+    );
+}

@@ -49,6 +49,7 @@ use hypervisor::hvf::VtimerClock;
 use hypervisor::hvf::host_counter_hz;
 use hypervisor::hvf::UsgicSpiRouter;
 use hypervisor::hvf::virtio::GuestMemory;
+use hypervisor::hvf::icache_wx;
 use hypervisor::hvf::virtio::nat::{EgressPolicy, NatLimits};
 use hypervisor::hvf::virtio::net::NetKick;
 use hypervisor::hvf::virtio::pci::{MsiSink, MsiSpiInjector, VirtioPciDevice};
@@ -540,36 +541,135 @@ pub(crate) fn icache_detail() -> &'static str {
          NODE_OPTIONS=--jitless set, that binary died 5 runs out of 5 (4 SIGILL, 1 \
          SIGBUS), and the CLI reported the crash as `no platform package found. \
          Reinstall with npm install -g @github/copilot` -- advice that cannot help, \
-         because the package is installed and was found. `taskset -c 0` recovered it \
-         2 runs out of 3.\n\
+         because the package is installed and was found.\n\
          \n\
-         It is also not only a JIT problem. The kernel routine that was patched out \
-         runs whenever a page becomes executable -- which includes every exec and every \
-         shared library mapping, not just a JIT's mprotect. Under sustained IO, ordinary \
-         programs land on freshly written page-cache pages and execute stale lines. \
-         Measured here: four dd/sync/rm loops plus two spinners on a rehydrated capture \
-         produced 35 crashes -- 13 SIGSEGV, 10 stack-smashing aborts, 8 SIGABRT, 3 \
-         SIGBUS, 1 SIGILL -- in `rm`, `dd` and `sync`. A cold-booted guest running the \
-         same load at twice the load average crashed zero times. No in-guest variable \
-         covers this one; only cold boot does.\n\
+         This warning covers freshly written code only. It used to also claim the \
+         userspace crashes a rehydrated guest suffers under ordinary dd/sync/rm load, \
+         and that attribution was measured and found false: performing the guest's \
+         instruction-cache maintenance host-side (1,277,598 invalidations over 266 MiB, \
+         with the mechanism separately proven guest-visible) changed the crash count by \
+         nothing, and removing the block device from the load entirely did not help \
+         either. Those crashes are the ASID-width delta, warned about separately.\n\
          \n\
          Set CHM_STRICT_ICACHE=1 to refuse to start instead of warning. See \
          docs/cpu-feature-deltas.md."
 }
 
-pub(crate) fn icache_dic_guard(snap: &Snapshot) -> Result<(), String> {
+/// Did this capture's kernel boot on a host that let it skip `ic ivau`?
+///
+/// `CTR_EL0.DIC = 1` promises the instruction cache snoops the data side, so
+/// Linux alternative-patches the `ic ivau` out of `caches_clean_inval_pou()` at
+/// boot -- and those NOPs travel in the snapshot's kernel text. Apple silicon
+/// reports `DIC = 0`, so a guest rehydrated here performs no instruction-cache
+/// maintenance on a machine that requires it.
+///
+/// One predicate, two consumers: the warning the operator reads
+/// ([`icache_dic_guard`]) and the decision to take the maintenance over
+/// host-side. Two copies of this test would eventually disagree, and the
+/// disagreement would be a guest that is warned about but not repaired, or
+/// repaired without being told.
+pub(crate) fn snapshot_elides_ic_ivau(snap: &Snapshot) -> bool {
     /// `CTR_EL0` is `S3_3_C0_C0_1`, packed as
     /// `(op0<<14)|(op1<<11)|(CRn<<7)|(CRm<<3)|op2`.
     const CTR_EL0: u16 = 0xd801;
     /// `CTR_EL0.DIC`.
     const DIC: u64 = 1 << 29;
 
-    let elides_ic_ivau = snap.vcpus.iter().any(|v| {
+    snap.vcpus.iter().any(|v| {
         v.sysregs
             .iter()
             .any(|&(reg, val)| reg == CTR_EL0 && (val & DIC) != 0)
-    });
-    if !elides_ic_ivau {
+    })
+}
+
+/// The ASID-width hazard, in the words an operator needs.
+///
+/// Kept separate from [`asid_width_guard`] so the test that this text is what
+/// gets printed cannot pass against a second copy of the words.
+pub(crate) fn asid_detail() -> &'static str {
+    "this snapshot's guest uses more TLB context ids than this Mac can tell \
+         apart, so unrelated processes in the guest will silently corrupt each \
+         other's memory.\n\
+         \n\
+         The capture host advertised 16-bit ASIDs (ID_AA64MMFR0_EL1.ASIDBits = 2) \
+         and Linux latched that at boot -- the guest's own log says `ASID \
+         allocator initialised with 32768 entries`. Apple silicon implements \
+         8-bit ASIDs (measured here: ID_AA64MMFR0_EL1 = 0xf100002), so the \
+         hardware compares only the low 8 bits of every context id. Once the \
+         guest has more than 256 live address spaces, processes whose ASIDs \
+         differ only above bit 7 share TLB entries and read and write each \
+         other's pages.\n\
+         \n\
+         Kernel mappings are global and unaffected, which is why the guest stays \
+         up while its userspace dies. Measured on a rehydrated Graviton capture \
+         under four dd/sync/rm loops plus two spinners: 30 processes killed in 16 \
+         minutes -- SIGSEGV, SIGBUS, glibc `stack smashing detected` and \
+         `malloc(): unaligned tcache chunk detected` -- in `dd`, `rm` and `sync`. \
+         The identical load cold-booted on this host at more than twice the load \
+         average killed zero.\n\
+         \n\
+         Nothing inside the guest can undo it: the ASID width was latched before \
+         the snapshot was taken. Keeping the process count low reduces the \
+         collision rate but does not remove it. A cold-booted guest reads this \
+         Mac's own 8-bit width and is correct by construction.\n\
+         \n\
+         Set CHM_STRICT_ASID=1 to refuse to start instead of warning. See \
+         docs/cpu-feature-deltas.md."
+}
+
+/// Does this capture's guest believe it has more ASID bits than this host
+/// implements?
+///
+/// `ID_AA64MMFR0_EL1.ASIDBits` is one of the registers HVF restores faithfully,
+/// which is normally the point of the project and here is the whole problem: the
+/// guest latched the capture host's width at boot and cannot be told otherwise.
+/// Encoding is `0` = 8 bits, `2` = 16 bits.
+pub(crate) fn snapshot_asid_bits(snap: &Snapshot) -> Option<u32> {
+    /// `ID_AA64MMFR0_EL1` is `S3_0_C0_C7_0`, packed as
+    /// `(op0<<14)|(op1<<11)|(CRn<<7)|(CRm<<3)|op2`.
+    const ID_AA64MMFR0_EL1: u16 = 0xc038;
+
+    snap.vcpus.iter().find_map(|v| {
+        v.sysregs.iter().find_map(|&(reg, val)| {
+            (reg == ID_AA64MMFR0_EL1).then_some(if (val >> 4) & 0xf == 0 { 8 } else { 16 })
+        })
+    })
+}
+
+/// The warning this capture deserves, or `None` if its ASID width fits.
+///
+/// Split out from [`asid_width_guard`] so the decision is observable: the guard
+/// itself only warns, so a test that asserts it returns `Ok` passes just as
+/// happily when the predicate is broken.
+pub(crate) fn asid_warning_for(snap: &Snapshot) -> Option<&'static str> {
+    /// Every Apple M-series part implements 8-bit ASIDs; measured on hardware by
+    /// `hvf_host_mmu_feature_register`, which fails if that ever changes.
+    const HOST_ASID_BITS: u32 = 8;
+    (snapshot_asid_bits(snap)? > HOST_ASID_BITS).then(asid_detail)
+}
+
+/// Warn when the capture's ASID width exceeds this host's 8 bits.
+///
+/// Apple silicon's width is not a runtime question -- it is 8 on every M-series
+/// part, and the probe that established it lives in
+/// `hvf_host_mmu_feature_register` so a future part that changes it fails a test
+/// rather than passing this guard silently.
+pub(crate) fn asid_width_guard(snap: &Snapshot) -> Result<(), String> {
+    let Some(detail) = asid_warning_for(snap) else {
+        return Ok(());
+    };
+
+    if env::var_os("CHM_STRICT_ASID").is_some() {
+        return Err(format!(
+            "{detail}\n\nRefusing to start because CHM_STRICT_ASID is set."
+        ));
+    }
+    eprintln!("chm: warning: {detail}");
+    Ok(())
+}
+
+pub(crate) fn icache_dic_guard(snap: &Snapshot) -> Result<(), String> {
+    if !snapshot_elides_ic_ivau(snap) {
         return Ok(());
     }
 
@@ -582,6 +682,76 @@ pub(crate) fn icache_dic_guard(snap: &Snapshot) -> Result<(), String> {
     }
     eprintln!("chm: warning: {detail}");
     Ok(())
+}
+
+/// Take instruction-cache maintenance over from a guest kernel that cannot do
+/// it, once guest RAM holds its restored contents.
+///
+/// Deliberately *not* done for every guest. A cold-booted guest read this
+/// host's own `CTR_EL0`, saw `DIC = 0`, and kept its `ic ivau`: it is correct
+/// already, and arming would buy it nothing but stage-2 faults. Only a capture
+/// that elided the maintenance needs us to perform it, which is why this shares
+/// [`snapshot_elides_ic_ivau`] with the warning rather than testing again.
+///
+/// `CHM_ICACHE_WX=0` opts out, for measuring what the maintenance is worth: it
+/// restores the behaviour that produced the 35 crashes in #274, so it is a
+/// comparison, not a tuning knob.
+///
+/// A failure here is reported and not fatal. The guest still runs -- exactly as
+/// it did before this existed -- and refusing to start a rehydrated snapshot
+/// because an optimisation could not be armed would be a worse outcome than the
+/// hazard it guards.
+fn arm_icache_maintenance(snap: &Snapshot, guest_mem: &GuestMemory) {
+    if !snapshot_elides_ic_ivau(snap) {
+        return;
+    }
+    if env::var("CHM_ICACHE_WX").as_deref() == Ok("0") {
+        eprintln!(
+            "chm: host-side instruction-cache maintenance disabled by CHM_ICACHE_WX=0;              this guest can execute stale instructions (see docs/cpu-feature-deltas.md)"
+        );
+        return;
+    }
+    let regions = guest_mem.icache_regions();
+    let mapped: usize = regions.iter().map(|&(_, _, n)| n).sum();
+    match icache_wx::arm(&regions) {
+        Ok(()) => {
+            startup::stamp("icache maintenance armed");
+            eprintln!(
+                "chm: performing this guest's instruction-cache maintenance for it \
+                 ({} region(s), {} MiB)",
+                regions.len(),
+                mapped / (1024 * 1024)
+            );
+            spawn_icache_reporter();
+        }
+        Err(e) => eprintln!(
+            "chm: warning: could not take over instruction-cache maintenance ({e});              continuing without it"
+        ),
+    }
+}
+
+/// Report what the maintenance is actually doing, every 30 s, under
+/// `CHM_TRACE_ICACHE=1`.
+///
+/// Without this the mechanism is unfalsifiable from a run log: a hook that
+/// never fires and a hook that fires and does not help look identical. The
+/// counters are the difference between "the fix did not work" and "the fix did
+/// not run".
+fn spawn_icache_reporter() {
+    if env::var("CHM_TRACE_ICACHE").as_deref() != Ok("1") {
+        return;
+    }
+    thread::spawn(|| {
+        loop {
+            thread::sleep(Duration::from_secs(30));
+            let (exec, write, dma, bytes) = icache_wx::stats();
+            eprintln!(
+                "chm: [icache] exec_faults={exec} write_faults={write} \
+                 dma_invalidations={dma} dma_MiB={}",
+                bytes / (1024 * 1024)
+            );
+        }
+    });
 }
 
 /// Create the per-run overlay directory as a private `0700` dir that `chm`
@@ -2272,6 +2442,7 @@ fn run_as(args: &Args, kind: runs::Kind) -> Result<ExitCode, String> {
     // userspace and this Mac has none, so a 32-bit exec wedges the vCPU.
     aarch32_guard(&loaded.snap)?;
     icache_dic_guard(&loaded.snap)?;
+    asid_width_guard(&loaded.snap)?;
 
     // Room-to-grow check (#259): a capture sized for the cloud instance's
     // original volume arrives with a root filesystem that may have no space to
@@ -2622,6 +2793,7 @@ pub(crate) fn run_usgic_engine(
         .map_err(|e| format!("prepare userspace-GIC VM: {e}"))?;
     startup::stamp("VM created + guest RAM mapped");
     let guest_mem = prepared.guest_mem.clone();
+    arm_icache_maintenance(&snap, guest_mem.as_ref());
     let vm = prepared.vm.clone();
     let seed = prepared.seed();
     // ONE virtual-counter clock for the whole VM. Every vCPU programs the offset
@@ -4175,6 +4347,68 @@ mod tests {
         assert!(icache_dic_guard(&snap_with_no_sysregs()).is_ok());
     }
 
+    /// The ASID width is the one CPU-feature delta that corrupts memory rather
+    /// than killing a process, so the predicate behind the warning has to be
+    /// exact: 16-bit captures must be caught and 8-bit ones must stay silent,
+    /// or a user is either frightened for nothing or not warned at all.
+    #[test]
+    fn asid_guard_fires_only_when_the_capture_has_more_asid_bits_than_this_host() {
+        fn snap_with_mmfr0(v: u64) -> Snapshot {
+            Snapshot {
+                mem_mappings: Vec::new(),
+                vcpus: vec![hypervisor::hvf::VcpuHvfState {
+                    gpr: [0; 31],
+                    pc: 0,
+                    cpsr: 0,
+                    sp_el1: 0,
+                    // 0xc038 is ID_AA64MMFR0_EL1 (S3_0_C0_C7_0).
+                    sysregs: vec![(0xc038, v)],
+                    gic_icc: Vec::new(),
+                    mp_state_running: true,
+                }],
+                gic_dist: Vec::new(),
+                gic_rdist: Vec::new(),
+                num_irq: 0,
+                captured_cntfrq: None,
+                captured_realtime_ns: None,
+            }
+        }
+
+        // Graviton2's measured value: ASIDBits = 2 -> 16 bits, wider than the
+        // 8 this host implements.
+        assert_eq!(snapshot_asid_bits(&snap_with_mmfr0(0x10_1125)), Some(16));
+        assert!(
+            asid_warning_for(&snap_with_mmfr0(0x10_1125)).is_some(),
+            "a 16-bit capture must be warned about on this 8-bit host"
+        );
+        // This Mac's own measured value: ASIDBits = 0 -> 8 bits. Nothing to say.
+        assert_eq!(snapshot_asid_bits(&snap_with_mmfr0(0xf10_0002)), Some(8));
+        assert_eq!(
+            asid_warning_for(&snap_with_mmfr0(0xf10_0002)),
+            None,
+            "a capture that already matches this host must stay silent"
+        );
+        // Nothing recorded: do not guess a width the capture never stated.
+        assert_eq!(snapshot_asid_bits(&snap_with_no_sysregs()), None);
+        assert_eq!(asid_warning_for(&snap_with_no_sysregs()), None);
+    }
+
+    /// A warning nobody can act on is noise, so pin the parts an operator needs:
+    /// what was measured, why the guest cannot fix itself, and the escape hatch.
+    #[test]
+    fn the_asid_warning_carries_its_evidence() {
+        let d = asid_detail();
+        for needle in [
+            "ASID allocator initialised with 32768 entries",
+            "0xf100002",
+            "256 live address spaces",
+            "cold-booted",
+            "CHM_STRICT_ASID=1",
+        ] {
+            assert!(d.contains(needle), "asid_detail() must mention {needle:?}");
+        }
+    }
+
     /// The warning exists to change what the user does next, so it has to carry
     /// the workaround and the measured numbers behind it. Both were wrong for a
     /// long time -- the message claimed "1 run in 7" while the measured rate on
@@ -4218,29 +4452,29 @@ mod tests {
             "telling the user how to make it stick is the difference between \
              a one-shot and a fix"
         );
-        // Measured 2026-08-10: the exec path, not just the JIT path. A reader
-        // told "non-JIT workloads are unaffected" will reasonably conclude that
-        // a rehydrated capture is fine for anything that is not Node -- and
-        // then watch `rm` take a SIGSEGV. That sentence must not come back.
+        // Measured 2026-08-10, then re-measured and corrected 2026-08-11. The
+        // exec-path claim was the wrong conclusion from a real observation: the
+        // 35 crashes under dd/sync/rm load are the ASID-width delta, not this.
+        // Performing the maintenance host-side (mechanism separately proven
+        // guest-visible) changed the count by nothing, and removing virtio-blk
+        // from the load did not help either. A warning that keeps a falsified
+        // attribution sends the reader to a workaround that cannot work, so the
+        // retraction is pinned here rather than left to prose.
         assert!(
-            !d.contains("Non-JIT workloads are unaffected"),
-            "35 crashes in rm/dd/sync falsified that; it must not return: {d}"
+            !d.contains("only cold boot does"),
+            "the falsified exec-path attribution must not come back: {d}"
         );
         assert!(
-            d.contains("every exec and every"),
-            "the warning must say the exposure is the exec path, not only JITs: {d}"
+            !d.contains("35 crashes"),
+            "those crashes belong to asid_detail(), not here: {d}"
         );
         assert!(
-            d.contains("35 crashes"),
-            "the measured rehydrated crash count under IO load: {d}"
+            d.contains("changed the crash count by"),
+            "the warning must carry the null result that narrowed its scope: {d}"
         );
         assert!(
-            d.contains("crashed zero times"),
-            "the cold-boot control is what makes the number mean anything: {d}"
-        );
-        assert!(
-            d.contains("only cold boot does"),
-            "no in-guest variable covers the exec path; say so where it is read: {d}"
+            d.contains("ASID-width delta"),
+            "a reader whose guest is crashing must be sent to the right warning: {d}"
         );
     }
 
