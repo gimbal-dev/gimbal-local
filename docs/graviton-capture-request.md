@@ -91,6 +91,11 @@ Both must ship their **disk images**, and both must come back with a short
 
 If you can only do one, do **A**.
 
+> **⚠️ Rounds 1–3 are delivered. If you are reading this to plan the next
+> capture, start at [§13](#13-round-4--cap-the-guests-asid-width-new-and-it-is-now-the-headline).**
+> Everything above makes a capture rehydrate; §13 is what makes a rehydrated
+> capture safe to work in, and today's captures are not.
+
 ---
 
 ## 1. The host
@@ -310,6 +315,8 @@ Report it as:
 | **`CNTFRQ_EL0` (host, EL0)** | round 1: **121875000** | **The landmine — confirmed.** See §5. Re-confirm per instance type. |
 | **`cntfrq` in `state.json`** | `?` | Should equal the above. If it doesn't, that itself is a finding. |
 | Kernel version | `6.8.0-xx-generic` | Determines where the guest caches `arch_timer_rate`. |
+| **Host kernel version (`uname -r` on the metal host)** | `?` | **New for round 4.** Writable KVM ID registers need ≥ 6.7 — see §13. No round so far has reported this. |
+| **`dmesg \| grep -i 'ASID allocator'` (in the guest)** | want `256 entries` | **New for round 4, and the one that decides whether the capture is usable.** See §13. |
 | CH version + commit | *(must contain `69637dde6`)* | Snapshot format **and** whether the clock block is recorded — see §2. |
 | Instance type | round 1 was **Graviton2 / Neoverse-N1** (`MIDR 0x413fd0c1`) | Which Graviton generation — the counter rate may differ on G3/G4, so please report it. |
 | vCPUs / RAM | `1 / 1 GiB` | Cross-check against the manifest. |
@@ -627,3 +634,130 @@ A read-only base is a **feature** for us, not a limitation. We already do
 copy-on-write at the block layer: a live session's overlay on capture B measured
 **4.3 MB**. A small immutable base plus per-sandbox COW is the architecture we
 want, and the smaller the base, the more sandboxes we can hold and ship.
+
+---
+
+## 13. Round 4 — cap the guest's ASID width `[NEW, and it is now the headline]`
+
+> **This is the most important thing in this document.** Everything above makes a
+> capture *rehydrate*. This is what makes a rehydrated capture *trustworthy*.
+> Full evidence: [`cpu-feature-deltas.md` Finding 6](./cpu-feature-deltas.md),
+> issues #274 and #279.
+
+### What is wrong today
+
+Graviton2 reports `ID_AA64MMFR0_EL1 = 0x101125`, i.e. `ASIDBits = 2`, i.e.
+**16-bit ASIDs**. Apple silicon implements **8**. The guest kernel latches the
+width once, at boot, in `asids_init()` — an `early_initcall` — and there is
+nothing on the restore side that can change its mind afterwards:
+
+```
+$ dmesg | grep -i asid          # inside a rehydrated Graviton capture, on a Mac
+ASID allocator initialised with 32768 entries
+```
+
+32768 = 2¹⁵. A guest booted natively on this Mac says `256 entries`.
+
+The TLB compares only the bits the hardware implements. Past ~256 live address
+spaces, two processes whose ASIDs differ only above bit 7 share TLB entries and
+read and write each other's memory. Measured on a rehydrated `2cpu-net` capture
+under a 16-minute build-and-IO load: **30 core dumps** — 13 SIGSEGV, 10 glibc
+`stack smashing detected`, 8 SIGABRT, 3 SIGBUS, 1 SIGILL. The identical load
+cold-booted on the same Mac at a *higher* load average produced **0**.
+
+Kernel mappings are global (TTBR1, `nG = 0`) and carry no ASID, which is why the
+guest never oopses while its userspace dies. It looks like flaky software. It is
+silent cross-process memory corruption.
+
+We ship a warning and a `CHM_STRICT_ASID=1` refusal. Neither is a fix. **The only
+cure is at capture time, and it only ever applies to captures not yet made.**
+
+### What we are asking for
+
+Boot the capture guest with `ID_AA64MMFR0_EL1.ASIDBits` forced to `0` (8-bit),
+so the guest's allocator initialises at 256 entries and the resulting snapshot is
+portable to Apple silicon by construction.
+
+**Verification is one line, inside the guest, before you pause it:**
+
+```bash
+dmesg | grep -i 'ASID allocator'
+# want: ASID allocator initialised with 256 entries
+# today: ASID allocator initialised with 32768 entries
+```
+
+If that line says 256, the capture is portable. If it says 32768, it is not, and
+no amount of work on our side changes that.
+
+### Why this is possible, and what it costs you
+
+`ID_AA64MMFR0_EL1` is **userspace-writable through KVM** from Linux v6.7 onward.
+`arch/arm64/kvm/sys_regs.c`:
+
+```c
+	ID_WRITABLE(ID_AA64MMFR0_EL1, ~(ID_AA64MMFR0_EL1_RES0 |
+					ID_AA64MMFR0_EL1_TGRAN4_2 |
+					ID_AA64MMFR0_EL1_TGRAN64_2 |
+					ID_AA64MMFR0_EL1_TGRAN16_2)),
+```
+
+`ASIDBits` is not masked out, and `cpufeature.c` marks it `FTR_LOWER_SAFE`, so
+KVM accepts lowering `2 → 0`. The write must land via `KVM_SET_ONE_REG` **before
+the vCPU has run** — KVM refuses ID-register writes afterwards.
+
+Three things this depends on, in the order they will bite:
+
+| | Requirement | Why |
+| --- | --- | --- |
+| 1 | **The capture host's kernel is ≥ 6.7** | Writable ID registers landed there. Note this is the *host* kernel, which no round so far has reported — please include `uname -r` from the metal host in §4's metadata block. |
+| 2 | **The VMM must actually issue the write** | We grepped this tree's vendored cloud-hypervisor: `ID_AA64MMFR0_EL1` appears in `vmm/src/cpu.rs` only as a **read** (deriving the PA range for address translation). There is no write path, no `ASIDBits` handling, and no configuration surface for either. This does not exist as a flag today. |
+| 3 | Slightly more TLB pressure on the capture host | An 8-bit ASID space rolls over sooner, so the guest flushes more. Unmeasured, and it is paid on a guest that is about to be suspended. We think it is cheap; if it is not, tell us, because that changes the trade. |
+
+### The honest tension with §2
+
+§2 says *"stock upstream cloud-hypervisor, no fork, no patches"*, and that
+instruction has been load-bearing — it is what makes a capture proof that we
+rehydrate **vanilla** artifacts rather than something we co-designed. Point 2
+above conflicts with it.
+
+We think the conflict is narrower than it looks, and the distinction is the part
+worth arguing about rather than assuming:
+
+- What must stay vanilla is the **snapshot format and the guest**. Setting an ID
+  register changes neither: `state.json` is written by the same code, the guest
+  is the same stock Ubuntu kernel, and the only difference is that it read a
+  smaller number out of one field at boot — exactly as it would on real hardware
+  that implements 8-bit ASIDs.
+- What would *not* be acceptable is a patch that changes how the snapshot is
+  written, or that our restore path depends on. This does not.
+
+So: a minimal, reviewable patch that adds a pre-boot `KVM_SET_ONE_REG` is, we
+believe, compatible with the spirit of §2. **But it is your call, and if you
+disagree we would rather know than have it done quietly.** If a patch is off the
+table entirely, say so and we will treat warn-and-refuse as the ceiling and plan
+around it — that is a real answer and we can work with it.
+
+### If the clean route is unavailable
+
+`get_cpu_asid_bits()` in `arch/arm64/mm/context.c` switches on only `0` (8-bit)
+and `2` (16-bit); **every other value hits `default:`** and yields 8-bit with a
+`CPU0: Unknown ASID size (n); assuming 8-bit` warning. So a reserved value also
+works. We list it only so nobody rediscovers it and thinks it is preferable — it
+is worse, because it leans on a `default:` branch rather than an architected
+encoding, and it makes the guest print a line that reads like a hardware fault.
+
+Two routes that do **not** work, so nobody spends time on them:
+
+- **`idreg-override` on the kernel command line.** `id_aa64mmfr0` is not in the
+  descriptor table in `arch/arm64/kernel/idreg-override.c` at all, and even if it
+  were, `get_cpu_asid_bits()` uses `read_cpuid()` — a raw `MRS` — which bypasses
+  the sanitised registers the override mechanism feeds.
+- **Anything on the restore side.** The width is latched in an `early_initcall`
+  into a module-static before any code of ours could exist in the guest's world.
+
+### What we would do with it
+
+Run the #274 load — the one that produced 30 core dumps — against the round-4
+capture and expect **zero**. That result would take rehydrated captures from
+*"boots and logs in"* to *"you can actually work in it"*, which is the whole
+product.
