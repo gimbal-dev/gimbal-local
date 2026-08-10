@@ -3685,3 +3685,96 @@ fn hvf_host_vtimer_mask_is_invisible_to_the_guest_control_register() {
          'no timer armed' and would stop polling for the deadline"
     );
 }
+
+// SAFETY: see the note on the extern block above; the framework is already
+// linked by the `hypervisor` rlib this test binary depends on.
+#[link(name = "Hypervisor", kind = "framework")]
+unsafe extern "C" {
+    fn hv_vm_protect(ipa: u64, size: usize, flags: u64) -> i32;
+}
+
+const HV_MEM_READ: u64 = 1 << 0;
+const HV_MEM_WRITE: u64 = 1 << 1;
+const HV_MEM_EXEC: u64 = 1 << 2;
+
+/// Can the *host* do the instruction-cache maintenance the guest kernel skips?
+///
+/// A rehydrated capture whose kernel latched `CTR_EL0.DIC = 1` on the capture
+/// host has `ic ivau` patched out of `caches_clean_inval_pou()`, so any page
+/// that is written and then executed can run stale instructions (#274: 35
+/// crashes in `rm`/`dd`/`sync` under IO load, against zero on a cold boot).
+/// Nothing inside the guest can repair that — the NOPs are baked into the
+/// snapshot's kernel text.
+///
+/// The host still can, if HVF cooperates, because guest RAM is mapped into this
+/// process and `sys_icache_invalidate` reaches the same physical lines. The
+/// scheme is W^X in the hypervisor: keep guest RAM writable-but-not-executable,
+/// and when the guest first executes a page, invalidate that page's I-cache and
+/// grant execute. Whole-RAM invalidation is not an option — measured at 1.7-2.9 s
+/// for 8 GiB — so it has to be per page, on demand, which needs exactly two
+/// things from HVF.
+///
+/// This test asks for both:
+///   1. a stage-2 mapping without `HV_MEMORY_EXEC` must *trap* the guest's
+///      instruction fetch rather than executing it anyway; and
+///   2. `hv_vm_protect` must be able to grant execute afterwards, on a live VM,
+///      so the guest makes progress instead of faulting forever.
+///
+/// If either fails, the per-page approach is dead and #274 needs the expensive
+/// answers (refuse by default, rewrite guest kernel text, or recapture on a
+/// `DIC = 0` host).
+#[test]
+fn hvf_can_trap_a_guest_instruction_fetch_and_grant_execute_afterwards() {
+    let ram = HostRam::new(RAM_SIZE);
+    ram.load(0, &GUEST_CODE);
+    let vm_ops = Arc::new(RecordingVmOps {
+        writes: Mutex::new(Vec::new()),
+    });
+    let (_vm, mut vcpu) = build_vm(&ram, vm_ops.clone());
+    vcpu.setup_regs(0, RAM_BASE, 0).expect("setup_regs");
+
+    // Drop execute on the page the guest is about to run from.
+    // SAFETY: FFI; the region was mapped by build_vm and is still live.
+    let rc = unsafe { hv_vm_protect(RAM_BASE, RAM_SIZE, HV_MEM_READ | HV_MEM_WRITE) };
+    assert_eq!(rc, 0, "hv_vm_protect(RW) failed: {rc:#010x}");
+
+    // The guest should now be unable to fetch. Anything that is not a fault
+    // means stage-2 execute permission is not enforced for the guest, and the
+    // whole approach is unavailable.
+    let first = vcpu.run();
+    eprintln!("run with EXEC removed -> {first:?}");
+    assert!(
+        first.is_err() || matches!(first, Ok(VmExit::Ignore)),
+        "guest ran to completion with execute permission removed; \
+         stage-2 X is not enforced and per-page I-cache maintenance is impossible"
+    );
+    assert!(
+        vm_ops.writes.lock().unwrap().is_empty(),
+        "the guest reached its first MMIO store without execute permission"
+    );
+
+    // Now do what the fix would do: invalidate this page's I-cache from the
+    // host, then grant execute.
+    // SAFETY: FFI; `ram` covers this range and outlives the call.
+    unsafe { sys_icache_invalidate(ram.ptr as *mut c_void, RAM_SIZE) };
+    // SAFETY: FFI; same region.
+    let rc = unsafe { hv_vm_protect(RAM_BASE, RAM_SIZE, HV_MEM_READ | HV_MEM_WRITE | HV_MEM_EXEC) };
+    assert_eq!(rc, 0, "hv_vm_protect(RWX) failed: {rc:#010x}");
+
+    // Re-entering must now make progress and reach the guest's normal exit.
+    assert!(
+        matches!(run_to_shutdown(vcpu.as_mut()), VmExit::Shutdown),
+        "guest did not resume after execute was granted back"
+    );
+    let vals = vm_ops.writes.lock().unwrap().clone();
+    assert_eq!(
+        vals,
+        vec![1, 2, 3, 4, 5, 6],
+        "the guest must run correctly after the permission round-trip, not merely run"
+    );
+}
+
+// SAFETY: macOS libSystem; invalidates the instruction cache for a host VA range.
+unsafe extern "C" {
+    fn sys_icache_invalidate(start: *mut c_void, len: usize);
+}
