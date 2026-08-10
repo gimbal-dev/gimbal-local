@@ -184,8 +184,30 @@ impl GuestMemory {
         self.with_ptr(gpa, len, |p| {
             // SAFETY: as `with_slice`; the range is checked to lie in one region
             // and the device owns the buffer for the duration of the request.
-            f(unsafe { std::slice::from_raw_parts_mut(p, len) })
+            let r = f(unsafe { std::slice::from_raw_parts_mut(p, len) });
+            // The callback has just filled guest RAM from the host side -- for
+            // virtio-blk, with file content the guest is quite likely to
+            // execute. Stage 2 never saw the store, so this is the only place
+            // the instruction-cache maintenance can happen for it. No-op unless
+            // the guest is one that needs it.
+            crate::hvf::icache_wx::on_device_write(p, len);
+            r
         })
+    }
+
+    /// Guest RAM as `(guest physical base, host base, length)`, for
+    /// [`crate::hvf::icache_wx::arm`].
+    ///
+    /// This view holds the same pointers the hypervisor mapped into the guest,
+    /// so it is the natural place to ask: the alternative is reaching into
+    /// `Arc<dyn Vm>` for mappings that describe the very same pages.
+    pub fn icache_regions(&self) -> Vec<(u64, usize, usize)> {
+        self.regions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| (r.gpa, r.ptr as usize, r.size))
+            .collect()
     }
 
     /// Read `buf.len()` bytes starting at `gpa`.
@@ -205,6 +227,10 @@ impl GuestMemory {
             // SAFETY: `dst` is valid for `n` bytes (checked) and `buf` is a
             // distinct, valid source of length `n`.
             unsafe { std::ptr::copy_nonoverlapping(buf.as_ptr(), dst, n) };
+            // Every device write into guest RAM funnels through here, so this is
+            // the one hook that covers them all. See `with_slice_mut` for why
+            // stage 2 cannot do it for us.
+            crate::hvf::icache_wx::on_device_write(dst, n);
         })
     }
 
