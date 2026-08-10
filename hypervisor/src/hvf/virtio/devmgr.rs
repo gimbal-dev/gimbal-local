@@ -454,10 +454,16 @@ pub fn build_device(
             policy.set_allow_local_egress(allow_local_egress);
             if policy.is_restrictive() {
                 eprintln!(
-                    "chm: virtio-net {} governed by egress policy {} (default-deny \
-                     enforced at the NAT)",
+                    // Says *where* enforcement happens, and leaves *what* it
+                    // permits to `posture_summary`. This line used to claim
+                    // "default-deny" unconditionally, which is false for a
+                    // default-allow policy carrying deny rules — a restated
+                    // constant reporting a sandbox that was not running.
+                    "chm: virtio-net {} governed by egress policy {} — {} \
+                     (enforced at the NAT)",
                     desc.name,
-                    policy.label()
+                    policy.label(),
+                    policy.posture_summary()
                 );
             }
             if allow_local_egress {

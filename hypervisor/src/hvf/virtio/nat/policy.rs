@@ -177,6 +177,18 @@ pub struct EgressPolicy {
     allow_local_egress: bool,
 }
 
+/// Renders a rule list for a human, capped so a long allow-list stays a
+/// sentence rather than a wall.
+fn render_rules(rules: &[Rule]) -> String {
+    const SHOWN: usize = 4;
+    let shown: Vec<String> = rules.iter().take(SHOWN).map(|r| r.raw.clone()).collect();
+    if rules.len() > SHOWN {
+        format!("{} and {} more", shown.join(", "), rules.len() - SHOWN)
+    } else {
+        shown.join(", ")
+    }
+}
+
 impl EgressPolicy {
     /// An unrestricted policy: every flow is allowed. This is the M28.2 default
     /// (real networking, no gate) until `chm` supplies a real profile (M28.3).
@@ -253,6 +265,45 @@ impl EgressPolicy {
     /// with no deny rules is a no-op the caller can skip enforcing).
     pub fn is_restrictive(&self) -> bool {
         !self.default_allow || !self.deny.is_empty()
+    }
+
+    /// One sentence describing what this policy actually permits, for the line
+    /// a user reads when a sandbox starts.
+    ///
+    /// Rendered from the policy itself rather than from whatever the caller
+    /// believes it configured. A posture report assembled at the call site is a
+    /// second implementation of the rules, and the two drift silently — the
+    /// reader is then told about a sandbox that does not exist.
+    ///
+    /// Deliberately says "public internet" and not "everything": the
+    /// reserved-address guard (M31.1) denies the host's own networks, the LAN
+    /// and link-local metadata *regardless* of these rules unless local egress
+    /// was explicitly opted in, so a bare "unrestricted" would overstate the
+    /// exposure. That guard is reported separately when it has been lifted,
+    /// because lifting it is the part worth noticing.
+    pub fn posture_summary(&self) -> String {
+        let mut s = if self.default_allow {
+            if self.deny.is_empty() {
+                "the public internet is reachable".to_string()
+            } else {
+                format!(
+                    "the public internet is reachable except {}",
+                    render_rules(&self.deny)
+                )
+            }
+        } else if self.allow.is_empty() {
+            "nothing is reachable".to_string()
+        } else {
+            format!(
+                "only {} {} reachable",
+                render_rules(&self.allow),
+                if self.allow.len() == 1 { "is" } else { "are" }
+            )
+        };
+        if self.allow_local_egress {
+            s.push_str("; the host, this LAN and cloud metadata are reachable too");
+        }
+        s
     }
 
     /// The governing label (digest or `"allow-all"`), for tracing/audit.
@@ -552,5 +603,74 @@ mod tests {
         assert!(!p
             .decide_connect(Ipv4Addr::new(185, 199, 108, 133), 8443)
             .is_allow());
+    }
+}
+#[cfg(test)]
+mod posture_tests {
+    use super::*;
+
+    fn allowing(entries: &[&str]) -> EgressPolicy {
+        let owned: Vec<String> = entries.iter().map(|s| (*s).to_string()).collect();
+        EgressPolicy::from_profile("deny", &owned, &[], "t")
+    }
+
+    #[test]
+    fn a_default_allow_policy_is_never_described_as_denying() {
+        // The bug this guards: a hardcoded "default-deny enforced at the NAT"
+        // was printed for every restrictive policy, including one whose default
+        // is *allow* with a deny list. A reader was told their sandbox denied by
+        // default when it did the opposite.
+        let owned = vec!["telemetry.example.com:443".to_string()];
+        let deny_list = EgressPolicy::from_profile("allow", &[], &owned, "t");
+        let summary = deny_list.posture_summary();
+        assert!(
+            summary.contains("the public internet is reachable except"),
+            "{summary}"
+        );
+        assert!(summary.contains("telemetry.example.com:443"), "{summary}");
+
+        let allow_list = allowing(&["api.github.com:443"]);
+        assert!(
+            allow_list.posture_summary().starts_with("only "),
+            "{allow_list:?}"
+        );
+    }
+
+    #[test]
+    fn a_policy_that_permits_nothing_says_so_rather_than_listing_nothing() {
+        // "only  is reachable" would read as a rendering bug, and a reader who
+        // thinks the tool is broken does not believe what it says next.
+        assert_eq!(
+            EgressPolicy::from_profile("deny", &[], &[], "t").posture_summary(),
+            "nothing is reachable"
+        );
+    }
+
+    #[test]
+    fn an_unrestricted_policy_does_not_overstate_what_it_reaches() {
+        // M31.1 denies the host's own networks regardless of these rules, so
+        // "everything" would be wrong in the direction that matters.
+        let s = EgressPolicy::allow_all().posture_summary();
+        assert_eq!(s, "the public internet is reachable");
+        assert!(!s.contains("host"), "{s}");
+    }
+
+    #[test]
+    fn lifting_the_reserved_address_guard_is_reported_because_it_is_the_notable_part() {
+        let mut p = EgressPolicy::allow_all();
+        p.set_allow_local_egress(true);
+        let s = p.posture_summary();
+        assert!(
+            s.contains("host, this LAN and cloud metadata are reachable too"),
+            "{s}"
+        );
+    }
+
+    #[test]
+    fn a_long_allow_list_stays_a_sentence() {
+        let many: Vec<&str> = vec!["a:1", "b:2", "c:3", "d:4", "e:5", "f:6"];
+        let s = allowing(&many).posture_summary();
+        assert!(s.contains("and 2 more"), "{s}");
+        assert!(!s.contains("e:5"), "{s}");
     }
 }

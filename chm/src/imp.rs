@@ -660,6 +660,16 @@ pub(crate) fn wire_virtio(
         }
     };
 
+    // Report the posture once, and only when this run actually has a NIC:
+    // telling someone about egress on a sandbox with no network is noise that
+    // teaches them to skip the line that matters.
+    if descs
+        .iter()
+        .any(|d| matches!(d.backend, devmgr::BackendKind::Net))
+    {
+        eprintln!("chm: {}", egress_posture_line(enforced_policy.as_ref()));
+    }
+
     for desc in &descs {
         let kind = match &desc.backend {
             devmgr::BackendKind::Block { nsectors, .. } => {
@@ -792,9 +802,40 @@ enum EgressResolution {
 /// runner sets, then a per-workspace `egress-policy.json` a local user authored
 /// with `chm firewall`. A source that is present but unreadable/malformed yields
 /// [`EgressResolution::FailClosed`] rather than silently disabling the firewall.
+/// The sentence a user reads at session start about what their sandbox can
+/// reach.
+///
+/// `None` — no policy anywhere — is the case this exists for. Resuming a
+/// snapshot with no policy file runs with the public internet reachable, which
+/// is the right default (a rehydrated guest arrives expecting the network it
+/// was captured with, and denying it would train people to switch the firewall
+/// off wholesale) but is currently discoverable only by running `chm posture`,
+/// i.e. by someone who already knows the answer. So it says so unprompted, and
+/// says it is a default rather than something the user chose — and names the
+/// flag that changes it, because a warning with no remedy is just a worry.
+pub(crate) fn egress_posture_line(policy: Option<&EgressPolicy>) -> String {
+    match policy {
+        Some(p) => format!("[egress] {} ({})", p.posture_summary(), p.label()),
+        None => "[egress] the public internet is reachable — the default when no \
+                 policy is set, not a choice this sandbox recorded. The host, this \
+                 LAN and cloud metadata stay blocked. Restrict with `chm firewall \
+                 set`."
+            .to_string(),
+    }
+}
+
 fn resolve_egress_policy(overlay_dir: &Path, cli_override: Option<&Path>) -> EgressResolution {
     let from_raw = |raw: &str, what: String, who: credproxy::cli::Authority| {
-        match parse_egress_policy(raw) {
+        // An undigested, unlabelled policy still has to say where it came from.
+        // The authority is the only thing that knows, so it names the fallback
+        // rather than the parser guessing (it used to hardcode "control-plane",
+        // which attributed every `chm firewall set` to a cloud that may not
+        // exist — and V9.17 now prints that label to the operator).
+        let fallback = match who {
+            credproxy::cli::Authority::Local => "local",
+            credproxy::cli::Authority::ControlPlane => "control-plane",
+        };
+        match parse_egress_policy_labelled(raw, fallback) {
             Some(p) => EgressResolution::Policy(Box::new(p), who),
             None => EgressResolution::FailClosed(what),
         }
@@ -837,6 +878,12 @@ fn resolve_egress_policy(overlay_dir: &Path, cli_override: Option<&Path>) -> Egr
 /// must not silently *tighten* or crash the boot; the runner already verified
 /// the digest before setting it.
 fn parse_egress_policy(raw: &str) -> Option<EgressPolicy> {
+    parse_egress_policy_labelled(raw, "control-plane")
+}
+
+/// As [`parse_egress_policy`], but the caller names the label to use when the
+/// document carries neither a `digest` nor a `label` of its own.
+fn parse_egress_policy_labelled(raw: &str, fallback: &str) -> Option<EgressPolicy> {
     let v: serde_json::Value = match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(e) => {
@@ -855,7 +902,7 @@ fn parse_egress_policy(raw: &str) -> Option<EgressPolicy> {
         .get("digest")
         .and_then(|d| d.as_str())
         .or_else(|| v.get("label").and_then(|d| d.as_str()))
-        .unwrap_or("control-plane")
+        .unwrap_or(fallback)
         .to_string();
     Some(EgressPolicy::from_profile(
         default,
@@ -4202,6 +4249,39 @@ mod tests {
         assert!(parse_egress_policy("not json").is_none());
     }
 
+    #[test]
+    fn an_unlabelled_local_policy_is_not_attributed_to_a_control_plane() {
+        // `chm firewall set` writes a document with no digest and no label. The
+        // posture line (V9.17) prints whatever label it resolves to, so a
+        // hardcoded fallback would tell a Mac-only user their own policy came
+        // from a cloud they have never contacted.
+        let ws = std::env::temp_dir().join(format!("chm-lbl-{}", std::process::id()));
+        let overlay = ws.join(".chm-overlays");
+        fs::create_dir_all(&overlay).expect("mkdir");
+        fs::write(
+            ws.join("egress-policy.json"),
+            r#"{"default":"deny","allow":["api.github.com:443"]}"#,
+        )
+        .expect("write");
+        let p = resolved_policy(&overlay, None).expect("a policy");
+        assert_eq!(p.label(), "local", "a workspace file is the operator's");
+        assert!(
+            !egress_posture_line(Some(&p)).contains("control-plane"),
+            "the line the operator reads must not name a control plane"
+        );
+        // A document that *does* carry a digest still wins over the fallback.
+        fs::write(
+            ws.join("egress-policy.json"),
+            r#"{"digest":"sha256:pinned","default":"deny","allow":["a.test:443"]}"#,
+        )
+        .expect("write");
+        assert_eq!(
+            resolved_policy(&overlay, None).expect("a policy").label(),
+            "sha256:pinned"
+        );
+        let _ = fs::remove_dir_all(&ws);
+    }
+
     /// Test helper: resolve and return the enforceable policy, or None for an
     /// unrestricted resolution. Panics if the resolution fails closed.
     fn resolved_policy(overlay: &Path, cli: Option<&Path>) -> Option<EgressPolicy> {
@@ -4210,6 +4290,61 @@ mod tests {
             EgressResolution::Policy(p, _) => Some(*p),
             EgressResolution::FailClosed(r) => panic!("unexpected fail-closed: {r}"),
         }
+    }
+
+    /// Every entry point that attaches a NIC must actually emit the posture.
+    ///
+    /// Reads the sources, because the other tests here assert on what
+    /// `egress_posture_line` *returns* and an assertion about a return value
+    /// structurally cannot see a call that is no longer made. Proved necessary:
+    /// replacing the resume path's condition with `false` left all 673 tests
+    /// green. Sixth time this class has appeared in this repo — see V9.5c,
+    /// V9.11a M4, #222, #242.
+    #[test]
+    fn both_entry_points_still_report_the_posture() {
+        // Assembled from parts so the needle cannot match this assertion itself.
+        let call = format!("{}_posture_line(", "egress");
+        for (what, src) in [
+            ("the resume path", include_str!("imp.rs")),
+            ("the cold-boot path", include_str!("create.rs")),
+        ] {
+            assert!(
+                src.matches(call.as_str()).count() > if what == "the resume path" { 3 } else { 0 },
+                "{what} no longer reports the egress posture at session start"
+            );
+        }
+    }
+
+    #[test]
+    fn an_ungoverned_session_says_so_unprompted_and_names_the_remedy() {
+        // The whole of #170: resuming a snapshot with no policy runs with the
+        // public internet reachable, and today the only way to find that out is
+        // to run a command you would only run if you already knew.
+        let line = egress_posture_line(None);
+        assert!(line.contains("the public internet is reachable"), "{line}");
+        // It is a default, not a choice — otherwise the reader assumes someone
+        // decided this for them and stops asking.
+        assert!(line.contains("not a choice"), "{line}");
+        // A warning with no remedy is a worry.
+        assert!(line.contains("chm firewall set"), "{line}");
+        // And it must not overstate: M31.1 still holds here.
+        assert!(line.contains("stay blocked"), "{line}");
+    }
+
+    #[test]
+    fn a_governed_session_is_described_by_the_policy_and_not_by_the_caller() {
+        // Rendered through `posture_summary`, so this cannot drift from what the
+        // NAT actually enforces. Restating it here would be the defect the
+        // devmgr line had: a plausible sentence about a different sandbox.
+        let allow = vec!["api.github.com:443".to_string()];
+        let p = EgressPolicy::from_profile("deny", &allow, &[], "sha256:abc");
+        let line = egress_posture_line(Some(&p));
+        assert_eq!(
+            line,
+            format!("[egress] {} (sha256:abc)", p.posture_summary())
+        );
+        assert!(line.contains("api.github.com:443"), "{line}");
+        assert!(!line.contains("not a choice"), "{line}");
     }
 
     #[test]

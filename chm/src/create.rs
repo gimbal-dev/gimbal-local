@@ -51,7 +51,7 @@ use crate::coldboot::{ColdBootConfig, VirtioKind};
 use crate::console::RawConsole;
 use crate::imp::{
     CpuPowerSlot, PL011_BASE, PL011_SIZE, PsciCoordinator, apply_psci_cpu_on_state,
-    wait_for_cpu_on_request,
+    egress_posture_line, wait_for_cpu_on_request,
 };
 use crate::oci::modules;
 use crate::runs;
@@ -1291,6 +1291,10 @@ fn build_virtio(
                 // A credential rule's hosts are reachable by implication (V8.7),
                 // each entry carrying the attribution into its own decisions.
                 policy.allow_implied(implied_egress, "implied by --proxy-rules");
+                // Same sentence, same function as the resume path. Two renderings
+                // of one posture drift, and the drift is invisible: both look
+                // like a correct report of a sandbox that is not the one running.
+                eprintln!("chm: {}", egress_posture_line(Some(&policy)));
                 let responder =
                     NatResponder::new(GATEWAY_IP, GATEWAY_MAC, policy, NatLimits::default());
                 VirtioMmioDevice::new(
