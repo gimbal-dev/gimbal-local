@@ -292,6 +292,62 @@ fn assess(dir: &Path) -> Vec<Control> {
         },
     });
 
+    // #274 -- the ASID-width delta. The most severe of the correctness hazards
+    // in this group: unlike the AArch32 wedge (which stops the vCPU) and the
+    // stale icache (which raises SIGILL), this one lets unrelated processes
+    // read and write each other's memory while the guest keeps running.
+    let strict_asid = env::var("CHM_STRICT_ASID").is_ok();
+    out.push(Control {
+        invariant: "#274",
+        name: "ASID-width refusal",
+        state: if strict_asid {
+            State::Active
+        } else {
+            State::NotApplicable
+        },
+        detail: if strict_asid {
+            "CHM_STRICT_ASID — a snapshot whose guest latched more ASID bits than \
+             this host implements is refused"
+                .to_string()
+        } else {
+            "warn-only: a capture from 16-bit-ASID hardware runs on this host's \
+             8-bit ASIDs, so past ~256 live address spaces unrelated processes \
+             share TLB entries and corrupt each other's memory \
+             (docs/cpu-feature-deltas.md). CHM_STRICT_ASID=1 to refuse."
+                .to_string()
+        },
+    });
+
+    // V5.5 — guest counter rate correction. Unlike its three siblings above,
+    // this one is on by default and has a real weakened state, because turning
+    // the correction off is something a user does deliberately.
+    let cntfrq_off = env::var("CHM_GUEST_CNTFRQ")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        == Some(0);
+    out.push(Control {
+        invariant: "V5.5",
+        name: "guest clock rate correction",
+        state: if cntfrq_off {
+            State::Weakened
+        } else {
+            State::Active
+        },
+        detail: if cntfrq_off {
+            "CHM_GUEST_CNTFRQ=0 — a capture from a host with a different counter \
+             frequency will run its whole clock fast or slow by that ratio. \
+             CHM_STRICT_CNTFRQ=1 refuses such a snapshot instead."
+                .to_string()
+        } else {
+            "the guest counter is re-stepped to the captured frequency, at a \
+             measured 2.8% of wall time in stop-the-world barriers. Set \
+             CHM_GUEST_CNTFRQ=0 to turn it off and accept the dilation, or \
+             CHM_STRICT_CNTFRQ=1 to refuse an uncorrectable snapshot outright \
+             (docs/hvf-compatible-snapshots.md)."
+                .to_string()
+        },
+    });
+
     out
 }
 
@@ -464,5 +520,48 @@ mod tests {
             assert!(line.len() <= 20, "over-wide line: {line:?}");
         }
         assert_eq!(wrap("short", 20), vec!["short"]);
+    }
+
+    /// Every refusal `chm` can be asked for must appear in the posture report.
+    ///
+    /// This is the guard that was missing. `CHM_STRICT_ASID` shipped in #278 as
+    /// a warning and a refusal, and `chm posture` -- the one command whose whole
+    /// job is to answer "what can this sandbox do to me" -- did not mention the
+    /// most severe of the four hazards, because nothing required the two to stay
+    /// in step. Asserting the *outcome* (three rows exist) would not have caught
+    /// it either; the fourth guard has to be discovered from the source that
+    /// implements it.
+    #[test]
+    fn every_strict_refusal_is_reported_by_posture() {
+        // Read the guard layer's own source rather than restating a list here:
+        // a list would need updating by the same commit that adds a guard, which
+        // is exactly the step this test exists to make unnecessary.
+        let src = include_str!("imp.rs");
+        let needle = format!("env::var_os(\"{}", "CHM_STRICT_");
+
+        let mut vars: Vec<&str> = src
+            .match_indices(&needle)
+            .map(|(i, _)| {
+                let rest = &src[i + needle.len() - "CHM_STRICT_".len()..];
+                let end = rest.find('"').expect("unterminated env var name");
+                &rest[..end]
+            })
+            .collect();
+        vars.sort_unstable();
+        vars.dedup();
+
+        assert!(
+            vars.len() >= 4,
+            "found only {vars:?} -- the extraction is broken, not the report"
+        );
+
+        let controls = assess(Path::new("/nonexistent-workspace"));
+        for var in vars {
+            assert!(
+                controls.iter().any(|c| c.detail.contains(var)),
+                "{var} can refuse to start a guest, but `chm posture` never \
+                 mentions it. Add a row to assess()."
+            );
+        }
     }
 }
