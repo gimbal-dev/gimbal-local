@@ -421,13 +421,11 @@ fn intercept(
             .ok_or_else(|| io::Error::other("interception needs a destination address"))?,
         dest.port,
     );
-    let up_sock = TcpStream::connect_timeout(&addr, CONNECT_TIMEOUT)?;
-    up_sock.set_nodelay(true).ok();
-
     let mut pump = Pump {
         guest_sock,
         guest_tls,
-        up_sock,
+        up_sock: None,
+        up_addr: addr,
         up_tls,
         injector: Injector::new(
             header_name,
@@ -583,7 +581,9 @@ impl Injector {
 struct Pump {
     guest_sock: TcpStream,
     guest_tls: ServerConnection,
-    up_sock: TcpStream,
+    /// Dialled on demand, not up front. See [`Pump::dial_upstream`].
+    up_sock: Option<TcpStream>,
+    up_addr: SocketAddr,
     up_tls: ClientConnection,
     injector: Injector,
     audit: Arc<Audit>,
@@ -595,6 +595,28 @@ struct Pump {
 }
 
 impl Pump {
+    /// Opens the origin connection, which is deliberately deferred until there
+    /// are request bytes to send.
+    ///
+    /// Dialling up front is the obvious shape and it loses requests. The guest's
+    /// own TLS handshake with us takes seconds on a small sandbox — measured at
+    /// 5–10s for busybox on a 512 MiB guest — and an origin connection opened
+    /// before that handshake starts spends all of it idle. api.github.com closes
+    /// an idle connection that has sent no request in well under ten seconds
+    /// (measured 2026-08-08: a 5s guest handshake survived, 7s and 10s did not),
+    /// so the request was written into a connection the origin had already shut.
+    /// Dialling here means the connection is only ever as old as the request.
+    fn dial_upstream(&mut self) -> io::Result<()> {
+        if self.up_sock.is_some() {
+            return Ok(());
+        }
+        let sock = TcpStream::connect_timeout(&self.up_addr, CONNECT_TIMEOUT)?;
+        sock.set_nodelay(true).ok();
+        sock.set_nonblocking(true)?;
+        self.up_sock = Some(sock);
+        Ok(())
+    }
+
     /// Record which TLS version the origin settled on, once. We accept 1.2
     /// upstream because some origins still require it, and permitting something
     /// silently is not the same as permitting it — this is what makes a
@@ -619,7 +641,6 @@ impl Pump {
 
     fn run(&mut self) -> io::Result<()> {
         self.guest_sock.set_nonblocking(true)?;
-        self.up_sock.set_nonblocking(true)?;
 
         let mut pending_from_guest: Vec<u8> = Vec::new();
         let mut guest_closed = false;
@@ -645,8 +666,11 @@ impl Pump {
                     Err(e) => return Err(e),
                 }
             }
-            if !up_closed && self.up_tls.wants_read() {
-                match self.up_tls.read_tls(&mut self.up_sock) {
+            if let Some(sock) = self.up_sock.as_mut()
+                && !up_closed
+                && self.up_tls.wants_read()
+            {
+                match self.up_tls.read_tls(sock) {
                     Ok(0) => up_closed = true,
                     Ok(_) => {
                         self.up_tls
@@ -661,10 +685,19 @@ impl Pump {
             }
 
             // --- Guest plaintext in, rewritten, out to the origin.
+            //
+            // `Ok(0)` here is not "nothing to read": rustls returns `WouldBlock`
+            // for that. It means the peer sent close_notify, so it is the only
+            // notice we get that this direction is finished. Treating it as an
+            // empty read leaves the *other* side waiting for bytes that can
+            // never arrive — see the close propagation below.
             let mut buf = [0u8; COPY_BUF];
             loop {
                 match self.guest_tls.reader().read(&mut buf) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        guest_closed = true;
+                        break;
+                    }
                     Ok(n) => {
                         pending_from_guest.extend_from_slice(&buf[..n]);
                         progressed = true;
@@ -681,6 +714,7 @@ impl Pump {
                     .map_err(|e| io::Error::other(format!("guest sent a bad request: {e}")))?;
                 pending_from_guest.drain(..used);
                 if !rewritten.is_empty() {
+                    self.dial_upstream()?;
                     self.up_tls.writer().write_all(&rewritten)?;
                     progressed = true;
                 }
@@ -694,7 +728,10 @@ impl Pump {
             // --- Origin plaintext straight back to the guest, untouched.
             loop {
                 match self.up_tls.reader().read(&mut buf) {
-                    Ok(0) => break,
+                    Ok(0) => {
+                        up_closed = true;
+                        break;
+                    }
                     Ok(n) => {
                         self.guest_tls.writer().write_all(&buf[..n])?;
                         progressed = true;
@@ -705,12 +742,21 @@ impl Pump {
             }
 
             // --- Ciphertext out.
-            progressed |= flush(&mut self.up_tls, &mut self.up_sock)?;
+            if let Some(sock) = self.up_sock.as_mut() {
+                progressed |= flush(&mut self.up_tls, sock)?;
+            }
             progressed |= flush(&mut self.guest_tls, &mut self.guest_sock)?;
 
             // --- Half-close propagation.
             if guest_closed && !up_shutdown_sent && pending_from_guest.is_empty() {
-                self.up_tls.send_close_notify();
+                if self.up_sock.is_some() {
+                    self.up_tls.send_close_notify();
+                } else {
+                    // The guest finished without ever sending a request, so no
+                    // origin connection was opened and there is nothing to
+                    // half-close towards — nor anything that could still reply.
+                    up_closed = true;
+                }
                 up_shutdown_sent = true;
                 progressed = true;
             }
@@ -719,13 +765,15 @@ impl Pump {
                 guest_shutdown_sent = true;
                 progressed = true;
             }
-            if guest_closed
-                && up_closed
-                && !self.guest_tls.wants_write()
-                && !self.up_tls.wants_write()
-            {
+            // An origin that was never dialled has nothing buffered that can
+            // still go out, so its `wants_write` (the ClientHello, generated
+            // when the connection was built) must not hold the pump open.
+            let up_drained = self.up_sock.is_none() || !self.up_tls.wants_write();
+            if guest_closed && up_closed && !self.guest_tls.wants_write() && up_drained {
                 let _ = self.guest_sock.shutdown(Shutdown::Both);
-                let _ = self.up_sock.shutdown(Shutdown::Both);
+                if let Some(sock) = self.up_sock.as_ref() {
+                    let _ = sock.shutdown(Shutdown::Both);
+                }
                 return Ok(());
             }
 
@@ -744,6 +792,9 @@ impl Pump {
     fn wait(&mut self, guest_closed: bool, up_closed: bool) -> io::Result<()> {
         use std::os::fd::AsRawFd;
 
+        // A negative fd is ignored by poll(2), which is how an origin that has
+        // not been dialled yet takes part without a special case here.
+        let up_fd = self.up_sock.as_ref().map_or(-1, AsRawFd::as_raw_fd);
         let mut fds = [
             libc::pollfd {
                 fd: self.guest_sock.as_raw_fd(),
@@ -754,11 +805,15 @@ impl Pump {
                 revents: 0,
             },
             libc::pollfd {
-                fd: self.up_sock.as_raw_fd(),
-                events: poll_events(
-                    !up_closed && self.up_tls.wants_read(),
-                    self.up_tls.wants_write(),
-                ),
+                fd: up_fd,
+                events: if up_fd < 0 {
+                    0
+                } else {
+                    poll_events(
+                        !up_closed && self.up_tls.wants_read(),
+                        self.up_tls.wants_write(),
+                    )
+                },
                 revents: 0,
             },
         ];
@@ -839,6 +894,7 @@ pub(crate) fn preamble_bytes(ip: IpAddr, port: u16, host: Option<&str>) -> Vec<u
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
 
     use rustls::RootCertStore;
@@ -999,6 +1055,136 @@ mod tests {
             std::env::temp_dir().join(format!("chm-proxy-secret-{}-{tag}", std::process::id()));
         std::fs::write(&path, TOKEN).expect("write secret");
         path.to_string_lossy().replace('\\', "\\\\")
+    }
+
+    /// Builds a guest-side TLS client that has stated its destination but has
+    /// not yet spoken. Separate from [`guest_request`] because these tests care
+    /// about *when* things happen, not just the reply.
+    fn guest_connection(
+        proxy: &RunningProxy,
+        trust: &Arc<ProxyCa>,
+        origin_addr: SocketAddr,
+        name: &str,
+    ) -> (ClientConnection, TcpStream) {
+        let mut sock = TcpStream::connect(proxy.addr).expect("dial proxy");
+        write_preamble(&mut sock, origin_addr.ip(), origin_addr.port(), Some(name))
+            .expect("preamble");
+        let mut cfg = ClientConfig::builder_with_protocol_versions(&[&version::TLS13])
+            .with_root_certificates(roots_for(trust))
+            .with_no_client_auth();
+        cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+        let conn = ClientConnection::new(
+            Arc::new(cfg),
+            ServerName::try_from(name.to_string()).expect("name"),
+        )
+        .expect("client tls");
+        (conn, sock)
+    }
+
+    /// An origin that closes cleanly must leave the guest able to tell.
+    ///
+    /// A client that asked for `Connection: close` — busybox wget does, and it
+    /// is what a container image ships — waits for the connection to end. rustls
+    /// reports a received close_notify as `Ok(0)` from the plaintext reader and
+    /// `WouldBlock` when it is merely out of data, so reading `Ok(0)` as "no
+    /// bytes just now" silently drops the only notice that the exchange is over.
+    /// The guest then waits for its own timeout: measured 25s in issue #253.
+    #[test]
+    fn a_clean_origin_close_reaches_the_guest() {
+        let secret = secret_file("close");
+        let origin_ca = ProxyCa::ephemeral().expect("origin ca");
+        let origin = spawn_origin(&origin_ca, "origin.test", 1);
+        let rules = format!(
+            r#"{{"version":1,"rules":[{{"name":"r","hosts":["origin.test"],
+                "ports":[{}],"scheme":"bearer","file":"{secret}"}}]}}"#,
+            origin.addr.port()
+        );
+        let (proxy, proxy_ca) = start_proxy(&rules, &origin_ca);
+
+        let (conn, sock) = guest_connection(&proxy, &proxy_ca, origin.addr, "origin.test");
+        // Bounded, so a guest left waiting forever fails the test rather than
+        // hanging the suite. Generous enough that a slow machine is not the
+        // thing being measured.
+        sock.set_read_timeout(Some(Duration::from_secs(20)))
+            .expect("read timeout");
+        let mut tls = rustls::StreamOwned::new(conn, sock);
+        tls.write_all(b"GET / HTTP/1.1\r\nHost: origin.test\r\nConnection: close\r\n\r\n")
+            .expect("write");
+        tls.flush().expect("flush");
+
+        let mut reply = Vec::new();
+        let mut chunk = [0u8; 1024];
+        loop {
+            match tls.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => reply.extend_from_slice(&chunk[..n]),
+                Err(e) => panic!(
+                    "the guest must be told the origin closed, instead it waited: {e} \
+                     (read so far: {:?})",
+                    String::from_utf8_lossy(&reply)
+                ),
+            }
+        }
+        assert!(
+            String::from_utf8_lossy(&reply).starts_with("HTTP/1.1 200"),
+            "the reply itself must still arrive: {:?}",
+            String::from_utf8_lossy(&reply)
+        );
+        let seen = origin
+            .seen
+            .recv_timeout(Duration::from_secs(10))
+            .expect("the origin should have received the request");
+        assert!(seen.contains("Connection: close"), "{seen}");
+        proxy.stop();
+    }
+
+    /// The origin connection must not exist before there is something to send.
+    ///
+    /// Dialling it when the guest connects leaves it idle for the whole
+    /// guest-facing handshake — seconds on a small sandbox — and an origin is
+    /// entitled to close a connection that has asked for nothing. Measured
+    /// against api.github.com on 2026-08-08: a 5s guest handshake survived,
+    /// 7s and 10s did not, and the request was then written into a shut
+    /// connection.
+    #[test]
+    fn the_origin_is_not_dialled_before_there_is_a_request() {
+        let listener = TcpListener::bind((IpAddr::from([127, 0, 0, 1]), 0)).expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&accepted);
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                if stream.is_err() {
+                    break;
+                }
+                counter.fetch_add(1, Ordering::SeqCst);
+                std::thread::sleep(Duration::from_millis(500));
+            }
+        });
+
+        let secret = secret_file("lazy");
+        let origin_ca = ProxyCa::ephemeral().expect("origin ca");
+        let rules = format!(
+            r#"{{"version":1,"rules":[{{"name":"r","hosts":["origin.test"],
+                "ports":[{}],"scheme":"bearer","file":"{secret}"}}]}}"#,
+            addr.port()
+        );
+        let (proxy, proxy_ca) = start_proxy(&rules, &origin_ca);
+
+        let (mut conn, mut sock) = guest_connection(&proxy, &proxy_ca, addr, "origin.test");
+        conn.complete_io(&mut sock).expect("guest handshake");
+        assert!(
+            !conn.is_handshaking(),
+            "the guest-facing handshake must have finished, or this proves nothing"
+        );
+        // Long enough that a proxy which dials up front would have done so.
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            accepted.load(Ordering::SeqCst),
+            0,
+            "the origin was dialled before the guest had sent anything"
+        );
+        proxy.stop();
     }
 
     #[test]
