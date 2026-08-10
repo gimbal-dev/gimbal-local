@@ -296,6 +296,23 @@ impl Its {
         Ok(Some(((cte >> 16) & 0x7_ffff_ffff) as u32))
     }
 
+    /// Byte address of the ITE for `(device, event)`, or `None` if `event` lies
+    /// outside the device's ITT.
+    ///
+    /// Every ITE access goes through here — the reads in [`Its::translate`] and
+    /// the writes in [`Its::replay_commands`] alike. The write side previously
+    /// did no bounds check at all while the read side did, which meant a
+    /// `MAPTI`/`MOVI`/`DISCARD` carrying an out-of-range `EventID` would place
+    /// an 8-byte store at an arbitrary offset above the ITT, into whatever guest
+    /// page happened to live there. A device table entry allows up to 32 EventID
+    /// bits, so the reachable span is far wider than the table itself.
+    fn ite_addr(dev: &DeviceEntry, event: u64) -> Option<u64> {
+        if event >= (1u64 << dev.eventid_bits.min(32)) {
+            return None;
+        }
+        Some(dev.itt + event * ITE_SIZE)
+    }
+
     /// Translate an MSI `(DeviceID, EventID)` into its physical LPI, walking the
     /// device table, the device's ITT, and the collection table in guest RAM.
     /// Returns `None` for an unmapped device/event (no faulting LPI).
@@ -308,10 +325,10 @@ impl Its {
         let Some(dev) = self.device_entry(mem, device_id)? else {
             return Ok(None);
         };
-        if event_id >= (1u32 << dev.eventid_bits.min(31)) {
+        let Some(ite_addr) = Self::ite_addr(&dev, event_id as u64) else {
             return Ok(None);
-        }
-        let ite = Self::read_u64(mem, dev.itt + event_id as u64 * ITE_SIZE)?;
+        };
+        let ite = Self::read_u64(mem, ite_addr)?;
         let intid = ((ite >> 16) & 0xffff_ffff) as u32;
         let icid = (ite & 0xffff) as u16;
         if intid < GICV3_LPI_INTID_BASE {
@@ -484,8 +501,10 @@ impl Its {
                     let event = dw1 & 0xffff_ffff;
                     let intid = (dw1 >> 32) & 0xffff_ffff;
                     let icid = dw2 & 0xffff;
-                    if let Some(d) = self.device_entry(mem, dev)? {
-                        Self::write_u64(mem, d.itt + event * ITE_SIZE, (intid << 16) | icid)?;
+                    if let Some(d) = self.device_entry(mem, dev)?
+                        && let Some(addr) = Self::ite_addr(&d, event)
+                    {
+                        Self::write_u64(mem, addr, (intid << 16) | icid)?;
                     }
                 }
                 // MOVI: retarget (device,event) to a new collection.
@@ -493,8 +512,9 @@ impl Its {
                     let dev = (dw0 >> 32) as u32;
                     let event = dw1 & 0xffff_ffff;
                     let icid = dw2 & 0xffff;
-                    if let Some(d) = self.device_entry(mem, dev)? {
-                        let ite_addr = d.itt + event * ITE_SIZE;
+                    if let Some(d) = self.device_entry(mem, dev)?
+                        && let Some(ite_addr) = Self::ite_addr(&d, event)
+                    {
                         let ite = Self::read_u64(mem, ite_addr)?;
                         Self::write_u64(mem, ite_addr, (ite & !0xffff) | icid)?;
                     }
@@ -503,8 +523,10 @@ impl Its {
                 0x0f => {
                     let dev = (dw0 >> 32) as u32;
                     let event = dw1 & 0xffff_ffff;
-                    if let Some(d) = self.device_entry(mem, dev)? {
-                        Self::write_u64(mem, d.itt + event * ITE_SIZE, 0)?;
+                    if let Some(d) = self.device_entry(mem, dev)?
+                        && let Some(addr) = Self::ite_addr(&d, event)
+                    {
+                        Self::write_u64(mem, addr, 0)?;
                     }
                 }
                 // INV/INVALL/SYNC/CLEAR/INT/...: no cache to flush; no-op.
@@ -836,6 +858,50 @@ mod tests {
         assert_eq!(its.translate(&mem, 0x9, 0).unwrap(), None);
         // Device 0x8 only has 1 eventid bit -> events 0,1 valid, 2 out of range.
         assert_eq!(its.translate(&mem, 0x8, 2).unwrap(), None);
+    }
+
+    /// A `MAPTI` whose EventID is outside the device's ITT must write nothing.
+    ///
+    /// The read path has always bounds-checked; the write path did not, so a
+    /// command carrying a large EventID would store 8 bytes at `itt + event*8`
+    /// -- up to 32 GiB above the table -- into an unrelated guest page. The
+    /// synthetic devices declare 2 EventID bits, so events 0..=3 are legal and
+    /// event 7 is not.
+    #[test]
+    fn an_out_of_range_mapti_does_not_write_past_the_itt() {
+        let its = Its::new(
+            ItsConfig::parse_kvm(&serde_json::from_str::<Value>(KVM_ITS_STATE).unwrap()["Kvm"])
+                .unwrap(),
+        );
+        let mem = synthetic_mem();
+        // Device 0x8's ITT is the first one `synthetic_mem` lays out.
+        let itt = 0x4030_0000u64;
+        let stray = itt + 7 * ITE_SIZE;
+        let before = mem.read_u64(stray).unwrap();
+
+        let cq = 0x4023_0000u64;
+        mem.write_u64(cq, 0x0a | (0x8u64 << 32)).unwrap();
+        mem.write_u64(cq + 8, 7 | (9000u64 << 32)).unwrap();
+        mem.write_u64(cq + 16, 0).unwrap();
+        mem.write_u64(cq + 24, 0).unwrap();
+
+        let replayed = its.replay_commands(&mem, 0, 32).unwrap();
+        assert_eq!(
+            replayed,
+            vec![(0x8u32, 7u32, 9000u32, 0u16)],
+            "the decoder reports what the guest queued, verbatim"
+        );
+        its.apply_commands(&mem, 0, 32).unwrap();
+        assert_eq!(
+            mem.read_u64(stray).unwrap(),
+            before,
+            "the ITE past the device's declared EventID range was overwritten"
+        );
+        assert_eq!(
+            its.translate(&mem, 0x8, 7).unwrap(),
+            None,
+            "an out-of-range event must stay unmapped"
+        );
     }
 
     #[test]
