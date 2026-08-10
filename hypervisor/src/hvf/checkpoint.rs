@@ -119,8 +119,30 @@ pub struct UsgicCheckpoint {
     pub redist: super::softgic::Redistributor,
     /// INTIDs pending delivery at capture (drained FIFO on resume).
     pub pending: Vec<u32>,
-    /// The INTID acknowledged but not yet EOId at capture, if any.
+    /// The innermost INTID acknowledged but not yet deactivated at capture, if
+    /// any. Kept as the wire field an older build reads; [`Self::active_stack`]
+    /// is the whole truth.
     pub active: Option<u32>,
+    /// The full active-priority stack at capture, innermost last.
+    ///
+    /// Additive with a `serde` default, so an older checkpoint (which has no
+    /// such field, and whose writer only ever tracked one INTID anyway) restores
+    /// exactly as it did before — hence no `manifest_version` bump: an old build
+    /// reading a new checkpoint is incomplete, never wrong.
+    #[serde(default)]
+    pub active_stack: Vec<u32>,
+}
+
+impl UsgicCheckpoint {
+    /// The active-priority stack to restore: the recorded stack when present,
+    /// otherwise the legacy single INTID lifted into a one-deep stack.
+    pub fn active_stack(&self) -> Vec<u32> {
+        if self.active_stack.is_empty() {
+            self.active.into_iter().collect()
+        } else {
+            self.active_stack.clone()
+        }
+    }
 }
 
 impl CheckpointState {
@@ -339,6 +361,7 @@ mod tests {
             redist: super::super::softgic::Redistributor::new(),
             pending: vec![active],
             active: Some(active),
+            active_stack: vec![active],
         }
     }
 
@@ -481,6 +504,7 @@ mod tests {
             redist: redist.clone(),
             pending: vec![43, 27],
             active: Some(43),
+            active_stack: vec![43],
         };
         let cp = CheckpointState {
             version: CHECKPOINT_VERSION,

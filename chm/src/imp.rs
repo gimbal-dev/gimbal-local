@@ -873,15 +873,19 @@ fn resolve_egress_policy(overlay_dir: &Path, cli_override: Option<&Path>) -> Egr
     }
 }
 
-/// Parse a `CHM_EGRESS_POLICY` JSON document into an [`EgressPolicy`]. Returns
-/// `None` when the document is not valid JSON — a malformed policy is logged but
-/// must not silently *tighten* or crash the boot; the runner already verified
-/// the digest before setting it.
+/// Parse a control-plane policy document into an [`EgressPolicy`], for tests.
+///
+/// Production reads every document through [`parse_egress_policy_labelled`], so
+/// that the label reported by the posture line is the authority that actually
+/// wrote the document rather than a hardcoded guess. This wrapper only pins the
+/// control-plane fallback, and is `cfg(test)` so it cannot quietly become a
+/// second production entry point with a different default.
+#[cfg(test)]
 fn parse_egress_policy(raw: &str) -> Option<EgressPolicy> {
     parse_egress_policy_labelled(raw, "control-plane")
 }
 
-/// As [`parse_egress_policy`], but the caller names the label to use when the
+/// Parse a policy document, with the caller naming the label to use when the
 /// document carries neither a `digest` nor a `label` of its own.
 ///
 /// Every member is read defensively, because a policy document is hand-edited

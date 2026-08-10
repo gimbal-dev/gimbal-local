@@ -38,7 +38,7 @@ pub(crate) const POLICY_FILE: &str = "egress-policy.json";
 
 /// The on-disk shape of a local egress policy. Kept byte-compatible with the
 /// `CHM_EGRESS_POLICY` env document the cloud runner sets, so the same
-/// `imp::parse_egress_policy` consumes both: `default` is `allow`/`deny`, and
+/// `imp::parse_egress_policy_labelled` consumes both: `default` is `allow`/`deny`, and
 /// `allow`/`deny` are `host[:port]` rules.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct EgressPolicyDoc {
@@ -391,7 +391,7 @@ mod tests {
     #[test]
     fn json_document_is_parseable_by_the_enforcement_shape() {
         // The file `set` writes must round-trip through the same field names the
-        // enforcement path (`imp::parse_egress_policy`) reads.
+        // enforcement path (`imp::parse_egress_policy_labelled`) reads.
         let doc = EgressPolicyDoc {
             default: "deny".to_string(),
             allow: vec!["api.github.com:443".to_string()],
