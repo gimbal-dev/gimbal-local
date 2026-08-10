@@ -16,6 +16,7 @@ use std::{env, fs, io, thread};
 
 use crate::bundle;
 use crate::checkpoint;
+use crate::disktail;
 use crate::livesnap;
 use crate::kernelimage;
 use crate::runs;
@@ -2097,6 +2098,14 @@ fn run_as(args: &Args, kind: runs::Kind) -> Result<ExitCode, String> {
     // userspace and this Mac has none, so a 32-bit exec wedges the vCPU.
     aarch32_guard(&loaded.snap)?;
     icache_dic_guard(&loaded.snap)?;
+
+    // Room-to-grow check (#259): a capture sized for the cloud instance's
+    // original volume arrives with a root filesystem that may have no space to
+    // install anything. Never fatal -- the guest still runs, and the fix is the
+    // guest's to apply.
+    if let Some(n) = disktail::tail_notice(dir, &loaded.state_json) {
+        eprintln!("chm: note: {n}");
+    }
 
     // One interrupt path. Apple's managed GIC cannot deliver LPIs (proven on
     // hardware: ICH List Registers are EL2/nested-only, and no

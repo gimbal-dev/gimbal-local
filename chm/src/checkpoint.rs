@@ -59,6 +59,13 @@ const MEMORY_RANGES: &str = "memory-ranges";
 /// The live disk-overlay directory (CoW writes + bitmaps) at the snapshot root.
 const LIVE_OVERLAYS_DIR: &str = ".chm-overlays";
 
+/// The live overlay directory name, for readers outside this module. Read the
+/// constant, never infer the path -- `.chm-checkpoint/overlays/` is a different
+/// directory that produces plausible-looking wrong answers.
+pub(crate) fn live_overlays_dir_name() -> &'static str {
+    LIVE_OVERLAYS_DIR
+}
+
 /// Sidecar suffix `OverlayBackend` appends next to each CoW overlay. Must match
 /// that backend's suffix; see [`overlay_fingerprint`] for why these files are
 /// excluded from a checkpoint's overlay identity.

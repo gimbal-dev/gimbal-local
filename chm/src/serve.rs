@@ -23,6 +23,7 @@ use std::{env, fs, mem, ptr, thread};
 use crate::audit;
 use crate::capability;
 use crate::console::ConsoleInput;
+use crate::disktail;
 use crate::credproxy::cli;
 use crate::console_filter::ConsoleFilter;
 use crate::exec;
@@ -1118,6 +1119,12 @@ fn run_guest(dir: &Path, opts: &EngineOpts, inner: &Arc<Mutex<VmInner>>) -> Resu
     // userspace and this Mac has none, so a 32-bit exec wedges the vCPU.
     aarch32_guard(&loaded.snap)?;
     icache_dic_guard(&loaded.snap)?;
+
+    // Room-to-grow check (#259), same as `chm run`: a daemon-started guest hits
+    // the identical wall, and the console is where its operator is looking.
+    if let Some(n) = disktail::tail_notice(dir, &loaded.state_json) {
+        eprintln!("chm: note: {n}");
+    }
 
     // One interrupt path — see the note in `imp::run`. Apple's managed GIC
     // cannot deliver LPIs and cannot cold-boot, so it could never run a stock

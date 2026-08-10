@@ -131,6 +131,9 @@ mod startup;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod runs;
 
+/// Notice a capture whose partition table does not use the whole disk (#259).
+mod disktail;
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn main() -> ExitCode {
     imp::main()
