@@ -250,8 +250,18 @@ pub fn locate(
         if !dir.is_dir() {
             return Err(format!("--modules `{}` is not a directory", dir.display()));
         }
-        // Accept the versioned directory, or a parent holding it.
-        for candidate in [dir.to_path_buf(), dir.join("lib/modules").join(release)] {
+        // Accept the versioned directory, a parent holding it, or a
+        // `lib/modules` directory pointed at directly -- which is the most
+        // natural thing to pass to a flag called `--modules`, and the layout
+        // `describe_releases_present` already walks. Omitting it let the
+        // refusal enumerate the very release it had just called absent (#254);
+        // `every_layout_the_refusal_can_enumerate_is_one_locate_accepts` keeps
+        // the two in step.
+        for candidate in [
+            dir.to_path_buf(),
+            dir.join(release),
+            dir.join("lib/modules").join(release),
+        ] {
             if candidate.join("kernel").is_dir() {
                 return Ok(Some(Tree {
                     root: candidate,
@@ -971,6 +981,57 @@ mod tests {
         let kernel = d.join("Image");
         fs::write(&kernel, b"x").unwrap();
         assert!(locate(&kernel, None, REL).unwrap().is_none());
+    }
+
+    /// The refusal enumerates the releases a directory holds by walking
+    /// `<dir>/*/kernel` and `<dir>/lib/modules/*/kernel`. If `locate` accepts
+    /// fewer layouts than that walk can name, the message contradicts itself:
+    /// "holds no modules for X. It holds modules for: X." (#254).
+    ///
+    /// So this asserts the invariant rather than one layout: for every place
+    /// the enumerator looks, a tree for the *requested* release put there must
+    /// be accepted. Adding a base to the walk without teaching `locate` about
+    /// it fails here.
+    #[test]
+    fn every_layout_the_refusal_can_enumerate_is_one_locate_accepts() {
+        // The bases `describe_releases_present` scans, relative to `--modules`.
+        for base in ["", "lib/modules"] {
+            let d = tmp(&format!("enum{}", base.len()));
+            let tree = if base.is_empty() {
+                d.join(REL)
+            } else {
+                d.join(base).join(REL)
+            };
+            fs::create_dir_all(tree.join("kernel")).unwrap();
+            let kernel = d.join("Image");
+            fs::write(&kernel, b"x").unwrap();
+
+            // It is enumerable: the refusal would be able to name this release.
+            let named = describe_releases_present(&d);
+            assert!(named.contains(REL), "base `{base}` not enumerable: {named}");
+
+            // Therefore it must be locatable, or the two disagree.
+            let got = locate(&kernel, Some(&d), REL).unwrap_or_else(|e| {
+                panic!("base `{base}`: enumerated but refused -- {e}");
+            });
+            assert_eq!(got.expect("a tree").root, tree, "base `{base}`");
+            fs::remove_dir_all(&d).ok();
+        }
+    }
+
+    /// The literal #254 reproduction: pointing `--modules` at a `lib/modules`
+    /// directory, which is what the flag's name invites.
+    #[test]
+    fn a_lib_modules_directory_passed_directly_is_accepted() {
+        let d = tmp("libmod");
+        let lib_modules = d.join("lib/modules");
+        fs::create_dir_all(lib_modules.join(REL).join("kernel")).unwrap();
+        let kernel = d.join("Image");
+        fs::write(&kernel, b"x").unwrap();
+        let t = locate(&kernel, Some(&lib_modules), REL)
+            .expect("the layout the refusal used to enumerate")
+            .expect("a tree");
+        assert_eq!(t.root, lib_modules.join(REL));
     }
 
     /// A version mismatch is the likeliest reason to be here, so the refusal
