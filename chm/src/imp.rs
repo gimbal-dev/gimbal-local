@@ -484,6 +484,19 @@ pub(crate) fn aarch32_guard(snap: &Snapshot) -> Result<(), String> {
 /// warning says so, because a mitigation quoted without its limit is the more
 /// expensive kind of wrong.
 ///
+/// And it is not confined to JITs at all. `__sync_icache_dcache()` — which
+/// `caches_clean_inval_pou()` backs — runs whenever a page becomes executable
+/// for userspace, so **every `execve` and every shared-library mapping** takes
+/// the same elided path a JIT does. Under page-cache pressure, program text
+/// routinely lands on a page something else wrote moments ago, and the process
+/// executes whatever the I-cache still holds. Measured on a rehydrated capture
+/// under four `dd`/`sync`/`rm` loops plus two spinners: **35 crashes** spread
+/// across SIGSEGV (13), stack-smashing aborts (10), SIGABRT (8), SIGBUS (3) and
+/// SIGILL (1), in `rm`, `dd` and `sync`. A cold-booted guest under the same
+/// load — at roughly *twice* the load average — crashed **zero** times. So the
+/// warning no longer claims non-JIT workloads are safe: they are not, and no
+/// in-guest environment variable reaches this case.
+///
 /// The kernel side cannot be fixed at rehydrate time: the NOPs are baked into
 /// the kernel text inside the snapshot, and we have no way to write into the
 /// guest filesystem from here either, so the mitigation has to be something the
@@ -528,9 +541,19 @@ pub(crate) fn icache_detail() -> &'static str {
          SIGBUS), and the CLI reported the crash as `no platform package found. \
          Reinstall with npm install -g @github/copilot` -- advice that cannot help, \
          because the package is installed and was found. `taskset -c 0` recovered it \
-         2 runs out of 3. Non-JIT workloads are unaffected, and a cold-booted guest \
-         is immune because its kernel reads this Mac's own CTR_EL0. Set \
-         CHM_STRICT_ICACHE=1 to refuse to start instead of warning. See \
+         2 runs out of 3.\n\
+         \n\
+         It is also not only a JIT problem. The kernel routine that was patched out \
+         runs whenever a page becomes executable -- which includes every exec and every \
+         shared library mapping, not just a JIT's mprotect. Under sustained IO, ordinary \
+         programs land on freshly written page-cache pages and execute stale lines. \
+         Measured here: four dd/sync/rm loops plus two spinners on a rehydrated capture \
+         produced 35 crashes -- 13 SIGSEGV, 10 stack-smashing aborts, 8 SIGABRT, 3 \
+         SIGBUS, 1 SIGILL -- in `rm`, `dd` and `sync`. A cold-booted guest running the \
+         same load at twice the load average crashed zero times. No in-guest variable \
+         covers this one; only cold boot does.\n\
+         \n\
+         Set CHM_STRICT_ICACHE=1 to refuse to start instead of warning. See \
          docs/cpu-feature-deltas.md."
 }
 
@@ -4194,6 +4217,30 @@ mod tests {
             d.contains("profile.d"),
             "telling the user how to make it stick is the difference between \
              a one-shot and a fix"
+        );
+        // Measured 2026-08-10: the exec path, not just the JIT path. A reader
+        // told "non-JIT workloads are unaffected" will reasonably conclude that
+        // a rehydrated capture is fine for anything that is not Node -- and
+        // then watch `rm` take a SIGSEGV. That sentence must not come back.
+        assert!(
+            !d.contains("Non-JIT workloads are unaffected"),
+            "35 crashes in rm/dd/sync falsified that; it must not return: {d}"
+        );
+        assert!(
+            d.contains("every exec and every"),
+            "the warning must say the exposure is the exec path, not only JITs: {d}"
+        );
+        assert!(
+            d.contains("35 crashes"),
+            "the measured rehydrated crash count under IO load: {d}"
+        );
+        assert!(
+            d.contains("crashed zero times"),
+            "the cold-boot control is what makes the number mean anything: {d}"
+        );
+        assert!(
+            d.contains("only cold boot does"),
+            "no in-guest variable covers the exec path; say so where it is read: {d}"
         );
     }
 

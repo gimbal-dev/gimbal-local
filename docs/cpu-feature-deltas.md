@@ -291,6 +291,54 @@ would improve when the work stays on one core. Staying on one core instead
 maximises the chance that core's I-cache still holds the *stale* line, which is
 the signature of missing invalidation rather than missing broadcast.
 
+### Measured 2026-08-10 — "non-JIT workloads are unaffected" was wrong 🔴
+
+That sentence stood here until a rehydrated guest was put under a workload with
+**page-cache pressure** rather than a JIT. It is false, and the correction
+matters more than anything else on this page, because it moves the blast radius
+from "JavaScript tooling" to "running programs at all".
+
+`__sync_icache_dcache()` is not a JIT-only path. The kernel calls it whenever a
+page becomes executable for userspace — which includes **every `execve` and
+every shared-library mapping**, not just `mprotect(RX)` on a JIT buffer. A page
+that has just been written (by the loader, or by the page cache recycling a
+buffer some other process was writing a moment ago) and is then executed is the
+same hazard as row 3 of the table above. Ordinary `fork`/`exec` under IO load
+hits it constantly.
+
+Load: four `dd`/`sync`/`rm` loops churning the page cache, plus two spinners, on
+`graviton-vanilla-2cpu-net`. Cold-boot control: the same script, same host, same
+`chm` binary, on a cold-booted guest.
+
+| | cold-booted | rehydrated |
+| --- | --- | --- |
+| load average reached | **9.3** | 4.7 |
+| crashes | **0** | **35** |
+
+The crashes are not JITs and not one signal: `Segmentation fault` ×13,
+`stack smashing detected` ×10, `Aborted` ×8, `Bus error` ×3,
+`Illegal instruction` ×1 — the spread of a process executing whatever bytes
+happened to be in that physical page before. The victims were `rm`, `dd` and
+`sync`. **`rm` is not a JIT.** The cold guest ran at roughly *twice* the load
+average and did not crash once.
+
+The rehydrated guest never wedged and kept answering heartbeats throughout; it
+simply could not keep a child process alive. The load collapsed to 1.0 partway
+through the run because the `dd` loops had themselves been killed.
+
+One confound, named rather than resolved: the cold control ran a Debian-slim
+userland and the rehydrated guest runs the capture's Ubuntu. That is an
+implausible explanation for a 35-vs-0 split under identical load, but it is not
+a variable that was eliminated.
+
+Consequences for the mitigations below:
+
+- **`NODE_OPTIONS=--jitless` does not touch this.** It reaches `node`, and this
+  is `rm`. There is no in-guest workaround for exec-path corruption.
+- **Cold boot is still immune**, and is now the only honest recommendation for a
+  rehydrated capture that has to run real work.
+- The `chm` warning understates the problem by describing it as a JIT issue.
+
 **Upgraded from latent to confirmed.** `chm` now warns at load, and
 `CHM_STRICT_ICACHE=1` refuses (`icache_dic_guard`). Nothing can be repaired at
 rehydrate time — the NOPs are baked into the kernel text inside the snapshot,
@@ -303,8 +351,8 @@ things fix it properly rather than working around it:
 - **A capture host with `DIC = 0`.** Graviton2 is Neoverse-N1, which reports 1;
   this is a property of the capture host, not of the workload.
 
-Non-JIT workloads are unaffected, which is why every acceptance test to date
-passed: nothing in them generated code at runtime.
+Every acceptance test to date passed because none of them combined `fork`/`exec`
+with sustained page-cache pressure — not because non-JIT work is safe.
 
 ---
 
