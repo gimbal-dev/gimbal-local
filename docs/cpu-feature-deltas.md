@@ -414,9 +414,19 @@ Two things fix it properly:
 
 - **Cold boot.** The guest reads this Mac's own 8-bit width. Correct by
   construction.
-- **A capture host with 8-bit ASIDs**, or a capture taken with the width capped
-  at boot (Linux's `idreg-override` machinery is the candidate; whether it
-  covers `id_aa64mmfr0.asidbits` is **unverified**).
+- **A capture taken with the width already capped.** Route established
+  2026-08-10 by reading Linux v6.8 — the capture guest's own kernel version —
+  rather than by recollection:
+
+  | route | verdict |
+  | --- | --- |
+  | `idreg-override` on the guest command line | **dead, twice over.** `id_aa64mmfr0` is not in the descriptor table in `arch/arm64/kernel/idreg-override.c` at all; and `get_cpu_asid_bits()` in `arch/arm64/mm/context.c` uses `read_cpuid()` — a raw `MRS` — which bypasses the sanitised registers the override mechanism feeds. |
+  | `KVM_SET_ONE_REG` on `ID_AA64MMFR0_EL1` before the vCPU runs | **viable.** `ID_WRITABLE(ID_AA64MMFR0_EL1, …)` in `arch/arm64/kvm/sys_regs.c` masks out only `RES0` and the `TGRANx_2` fields, so `ASIDBits` is writable; `cpufeature.c` marks it `FTR_LOWER_SAFE`, so lowering `2 → 0` passes `arm64_check_features`. Needs host kernel ≥ 6.7, and a VMM that issues the write — cloud-hypervisor has no such path today (`vmm/src/cpu.rs` only *reads* the register, for the PA range). |
+
+  Written up as a capture-side ask in
+  [`graviton-capture-request.md` §13](./graviton-capture-request.md); tracked as
+  issue #279. **It only ever applies to captures not yet taken** — every capture
+  already held keeps its 16-bit belief permanently.
 
 A runtime mitigation would mean trapping `TTBR0_EL1` writes and flushing the TLB
 on every context switch. Correct, brutally slow, and not known to be expressible
