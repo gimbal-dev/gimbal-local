@@ -883,33 +883,96 @@ fn parse_egress_policy(raw: &str) -> Option<EgressPolicy> {
 
 /// As [`parse_egress_policy`], but the caller names the label to use when the
 /// document carries neither a `digest` nor a `label` of its own.
+///
+/// Every member is read defensively, because a policy document is hand-edited
+/// (`chm firewall set`) and machine-generated (a control plane) by turns. The
+/// rule for a member we cannot honour is the direction it would have moved the
+/// posture (#269):
+///
+/// * would have **restricted** traffic — a `deny` entry, or the `default`
+///   stance itself — refuse. Running on with a restriction we could not read is
+///   a sandbox weaker than its own description, and nothing says so.
+/// * would have **permitted** traffic — an `allow` entry — report it and carry
+///   on. That direction already fails closed; the only cost is a guest that
+///   cannot reach something, and the report is what turns an afternoon of
+///   network debugging into a sentence.
+///
+/// Returning `None` puts the caller on its fail-closed path, which denies all
+/// egress and prints why.
 fn parse_egress_policy_labelled(raw: &str, fallback: &str) -> Option<EgressPolicy> {
     let v: serde_json::Value = match serde_json::from_str(raw) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("chm: warning: ignoring malformed CHM_EGRESS_POLICY ({e})");
+            eprintln!("chm: warning: ignoring malformed egress policy ({e})");
             return None;
         }
     };
+
+    // Absent is a real choice and means allow. Present-but-not-a-string is not:
+    // `{"default": false}` used to read as "allow", so a document whose author
+    // plainly meant to restrict something produced an unrestricted sandbox in
+    // silence. We cannot tell which stance was meant, so we refuse to guess.
+    match v.get("default") {
+        None | Some(serde_json::Value::Null) => {}
+        Some(d) if d.is_string() => {}
+        Some(d) => {
+            eprintln!(
+                "chm: warning: egress policy: `default` is {d}, not \"allow\" or \"deny\" -- \
+                 refusing to guess which stance was meant"
+            );
+            return None;
+        }
+    }
     let default = v.get("default").and_then(|d| d.as_str()).unwrap_or("allow");
-    let strings = |key: &str| -> Vec<String> {
-        v.get(key)
-            .and_then(|a| a.as_array())
-            .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
-            .unwrap_or_default()
+
+    let mut unreadable_denies = false;
+    let mut strings = |key: &str, restricts: bool| -> Vec<String> {
+        let complain = |what: String| {
+            eprintln!("chm: warning: egress policy: {what}");
+        };
+        match v.get(key) {
+            None | Some(serde_json::Value::Null) => Vec::new(),
+            Some(serde_json::Value::Array(a)) => {
+                let mut out = Vec::new();
+                for (i, e) in a.iter().enumerate() {
+                    match e.as_str() {
+                        Some(t) => out.push(t.to_string()),
+                        None => {
+                            complain(format!(
+                                "`{key}[{i}]` is {e}, not a \"host[:port]\" string -- ignored"
+                            ));
+                            unreadable_denies |= restricts;
+                        }
+                    }
+                }
+                out
+            }
+            Some(other) => {
+                complain(format!(
+                    "`{key}` is {other}, not a list of \"host[:port]\" strings -- ignored"
+                ));
+                unreadable_denies |= restricts;
+                Vec::new()
+            }
+        }
     };
+    let allow = strings("allow", false);
+    let deny = strings("deny", true);
+    if unreadable_denies {
+        eprintln!(
+            "chm: warning: egress policy: a deny rule could not be read, so honouring \
+             this policy would permit traffic its author blocked"
+        );
+        return None;
+    }
+
     let label = v
         .get("digest")
         .and_then(|d| d.as_str())
         .or_else(|| v.get("label").and_then(|d| d.as_str()))
         .unwrap_or(fallback)
         .to_string();
-    Some(EgressPolicy::from_profile(
-        default,
-        &strings("allow"),
-        &strings("deny"),
-        label,
-    ))
+    Some(EgressPolicy::from_profile(default, &allow, &deny, label))
 }
 
 /// The result of wiring the virtio device tree: a human summary plus the net
@@ -4242,6 +4305,60 @@ mod tests {
         let p = parse_egress_policy(r#"{"digest":"sha256:x"}"#).expect("parse");
         assert!(!p.is_restrictive(), "no default/deny => allow-all");
         assert!(p.decide_dns("anything.test").is_allow());
+    }
+
+    /// #269. The direction a member would have moved the posture decides what
+    /// happens to it: a restriction we cannot read is refused, a permission we
+    /// cannot read is dropped and reported. Both directions pinned here,
+    /// because a rule that only ever refuses is indistinguishable from a parser
+    /// that refuses everything.
+    #[test]
+    fn an_unreadable_restriction_is_refused_and_an_unreadable_permission_is_not() {
+        // Permission we cannot read: tighter than written, so carry on. The
+        // readable entries must survive -- dropping the whole list would be a
+        // silent tightening of its own.
+        let p = parse_egress_policy(
+            r#"{"default":"deny","allow":["api.github.com:443",{"host":"b.test"},7]}"#,
+        )
+        .expect("a dropped allow entry must not fail the policy");
+        assert!(
+            p.decide_dns("api.github.com").is_allow(),
+            "readable entry kept"
+        );
+        assert!(
+            !p.decide_dns("b.test").is_allow(),
+            "unreadable entry not honoured"
+        );
+
+        // `allow` that is not a list at all: same direction, same treatment.
+        assert!(
+            parse_egress_policy(r#"{"default":"deny","allow":"api.github.com:443"}"#).is_some(),
+            "a mistyped allow list is still only a tightening"
+        );
+
+        // Restriction we cannot read: honouring the policy would permit traffic
+        // its author blocked, so refuse and let the caller fail closed.
+        assert!(
+            parse_egress_policy(r#"{"default":"allow","deny":[{"host":"evil.test"}]}"#).is_none(),
+            "an unreadable deny entry must not be quietly skipped"
+        );
+        assert!(
+            parse_egress_policy(r#"{"default":"allow","deny":"evil.test"}"#).is_none(),
+            "a mistyped deny list is a restriction we cannot honour"
+        );
+
+        // The stance itself. `{"default": false}` used to read as "allow", so a
+        // document that plainly meant to restrict produced an open sandbox.
+        assert!(
+            parse_egress_policy(r#"{"default":false,"allow":["a.test:443"]}"#).is_none(),
+            "a non-string stance must not silently become allow-all"
+        );
+        // Absent still means allow -- that is a real choice, not a typo.
+        assert!(
+            !parse_egress_policy(r#"{"allow":["a.test:443"]}"#)
+                .expect("absent default is fine")
+                .is_restrictive()
+        );
     }
 
     #[test]
