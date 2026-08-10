@@ -313,14 +313,30 @@ Green in release as of 08-07: chm **629**, hypervisor **216**, app **244**
 
 Several files in this fork already differ from rustfmt's opinion. Running
 `cargo fmt` blindly produces a diff full of unrelated churn. Measure *your*
-drift:
+drift by stashing, so both sides are produced by the identical command:
 
 ```bash
-git show HEAD:<path> | rustfmt --emit stdout --edition 2021 | diff - <(git show HEAD:<path>) | wc -l   # baseline
-rustfmt --emit stdout --edition 2021 < <path> | diff - <path> | wc -l                                   # live
+cargo +nightly fmt --all --check | grep -c '^[+-]'   # live
+git stash -q && cargo +nightly fmt --all --check | grep -c '^[+-]' && git stash pop -q   # baseline
 ```
 
-Your change is clean when `live` equals `baseline`. Formatting needs nightly:
+Your change is clean when `live` equals `baseline`. To find *which* lines are
+yours, save both diffs and compare their sorted `^[+-]` lines.
+
+**Do not measure this per file with a bare `rustfmt <path>`.** Two traps, and
+the second is silent:
+
+- `--edition 2024` is required. Under an older edition the parse differs and so
+  does the verdict.
+- **rustfmt formats submodules too.** Point it at a file with `mod foo;`
+  declarations — `hypervisor/src/hvf/mod.rs` is the obvious one — and the output
+  covers the whole subtree, so the count is not about your file at all. It is
+  also not fixable with `--skip-children`, which stable rustfmt rejects
+  outright (`Unrecognized option`) *after* you have already believed a number.
+  Measured once as 22893 "drift lines" on a five-line change.
+
+When a drift number moves by much more than your diff could explain, the
+measurement is wrong before the code is. Formatting needs nightly:
 `cargo +nightly fmt --all`.
 
 > **CI is billing-blocked.** Every gate above runs locally. This is known and

@@ -672,6 +672,25 @@ struct UserGic {
     /// "did the virtual timer just deactivate?" unanswerable exactly when a
     /// busy guest nested anything inside its own timer tick.
     active: Vec<u32>,
+    /// How many times a source tried to re-queue an INTID that was already
+    /// active *beneath* a nested handler, and was refused.
+    ///
+    /// This counts the exact save the active stack makes over the single slot
+    /// it replaced, and it is the measurement #262 asks for. The dominant
+    /// source is [`HvfVcpu::usgic_poll_vtimer`], which runs at every run entry
+    /// and re-asserts PPI 27 whenever the guest's armed deadline has passed —
+    /// including while the guest is still inside the timer handler it has not
+    /// yet answered by writing the next `CNTV_CVAL_EL0`. With a single slot the
+    /// dedup compared against the innermost INTID only, so a device interrupt
+    /// nesting inside the timer tick made this fail open and delivered PPI 27 a
+    /// second time, re-entrantly, desynchronizing the guest's EOI count — the
+    /// very thing [`Self::push_pending`] documents itself as preventing.
+    ///
+    /// A non-zero value on a real workload is therefore evidence that the
+    /// #257/#262 wedge had this mechanism available to it; a zero value across
+    /// hours of load is evidence that it did not, and that the fix is not the
+    /// cure. Reported under `CHM_TRACE_USGIC`.
+    nested_requeues_refused: u64,
     /// Last-written CPU-interface control values (bookkeeping so reads are
     /// coherent; they do not gate the raw-line delivery in this experiment).
     pmr: u64,
@@ -836,7 +855,17 @@ impl UserGic {
     /// both the run-entry poll and a residual `VTIMER_ACTIVATED`) delivers it
     /// exactly once — a second copy would desynchronize the guest's EOI count.
     fn push_pending(&mut self, intid: u32) {
-        if self.is_active(intid) || self.pending.contains(&intid) {
+        if self.is_active(intid) {
+            // Nested: active, but not the handler the guest is running now. A
+            // single-slot `active` could not see this and re-queued. Counted so
+            // a long run can say whether the case is real. See
+            // [`Self::nested_requeues_refused`].
+            if self.active_top() != Some(intid) {
+                self.nested_requeues_refused += 1;
+            }
+            return;
+        }
+        if self.pending.contains(&intid) {
             return;
         }
         self.pending.push(intid);
@@ -1503,6 +1532,36 @@ mod usgic_tests {
         assert!(
             g.pending.is_empty(),
             "27 is active beneath 79 and must not be queued again"
+        );
+        assert_eq!(
+            g.nested_requeues_refused, 1,
+            "the refusal is the measurement #262 asks for and must be counted"
+        );
+    }
+
+    /// The counter measures *nesting*, not every refusal. A source re-asserting
+    /// the INTID the guest is servicing right now is the ordinary case (the
+    /// run-entry vtimer poll does it on every entry until the handler arms the
+    /// next deadline), it was already handled correctly by the single slot, and
+    /// counting it would bury the rare case this exists to find under millions
+    /// of uninteresting ones.
+    #[test]
+    fn re_asserting_the_innermost_handlers_own_intid_is_not_counted_as_nesting() {
+        let mut g = UserGic {
+            enabled: true,
+            ..UserGic::default()
+        };
+        g.push_pending(27);
+        g.read_iar();
+        g.push_pending(27);
+        g.push_pending(27);
+        assert!(
+            g.pending.is_empty(),
+            "27 is active and must not be requeued"
+        );
+        assert_eq!(
+            g.nested_requeues_refused, 0,
+            "27 is the innermost handler, not nested beneath one"
         );
     }
 
@@ -2225,6 +2284,22 @@ impl HvfVcpu {
     /// at the `CNTV_CVAL` deadline (see [`wfi_park_ms`]), so this poll fires
     /// promptly on the re-entry after an idle park — restoring a steady tick.
     /// No-op unless the userspace GIC is enabled.
+    ///
+    /// This poll is also the reason [`UserGic::push_pending`]'s dedup has to ask
+    /// the whole active stack. It runs at *every* entry, and the guest's armed
+    /// deadline stays passed until the handler writes the next `CNTV_CVAL_EL0`
+    /// — so throughout the timer handler's own prologue, and throughout anything
+    /// that nests inside it, this function is asserting PPI 27 into a guest that
+    /// is already servicing PPI 27. Only the dedup stops that becoming a second,
+    /// re-entrant delivery. Refusals are counted; see
+    /// [`UserGic::nested_requeues_refused`].
+    ///
+    /// It is a live safety net, not a dormant one: Apple's host-side vtimer mask
+    /// is *not* visible in the guest's `CNTV_CTL_EL0`, so the `IMASK` check below
+    /// reads guest intent only and this function keeps running while HVF has the
+    /// timer masked — which is exactly when it is needed. That is measured by
+    /// `hvf_host_vtimer_mask_is_invisible_to_the_guest_control_register`, and it
+    /// had been an assumption until then.
     fn usgic_poll_vtimer(&self) {
         const CNTV_CTL_EL0: u16 = 0xDF19;
         const CNTV_CVAL_EL0: u16 = 0xDF1A;
@@ -2239,7 +2314,30 @@ impl HvfVcpu {
         let cval = self.get_sysreg(CNTV_CVAL_EL0).unwrap_or(u64::MAX);
         if cval <= self.current_cntvct() {
             let _ = self.usgic_assert_spi(VTIMER_PPI);
+            self.usgic_report_nested_requeues();
         }
+    }
+
+    /// Report the nested-requeue count when it crosses a power of two, under
+    /// `CHM_TRACE_USGIC`.
+    ///
+    /// Powers of two rather than a stored watermark: it needs no extra state,
+    /// self-limits to ~64 lines over any run, and still shows the shape of the
+    /// growth. This sits on a path that runs ~10^5 times a minute, so the env
+    /// lookup is behind the counter check, not the other way round.
+    fn usgic_report_nested_requeues(&self) {
+        let n = self.usgic.lock().unwrap().nested_requeues_refused;
+        if n == 0 || n & (n - 1) != 0 {
+            return;
+        }
+        if std::env::var_os("CHM_TRACE_USGIC").is_none() {
+            return;
+        }
+        eprintln!(
+            "[usgic] vcpu {}: refused {n} re-queue(s) of an INTID active beneath a \
+             nested handler (see #262)",
+            self.index,
+        );
     }
 
     /// Re-assert (or clear) the raw virtual IRQ line to match the emulated CPU

@@ -3588,3 +3588,100 @@ fn hvf_psci_reports_a_version_linux_will_accept() {
         vals[1]
     );
 }
+
+// SAFETY: declared here rather than reached through the crate's private `ffi`
+// module. The Hypervisor framework is already linked by the `hypervisor` rlib
+// this test binary depends on, so these resolve at link time.
+#[link(name = "Hypervisor", kind = "framework")]
+unsafe extern "C" {
+    fn hv_vcpu_set_vtimer_mask(vcpu: u64, masked: bool) -> i32;
+    fn hv_vcpu_get_sys_reg(vcpu: u64, reg: u16, value: *mut u64) -> i32;
+    fn hv_vcpu_set_sys_reg(vcpu: u64, reg: u16, value: u64) -> i32;
+}
+
+const CNTV_CTL_EL0_REG: u16 = 0xDF19;
+
+/// Does HVF's virtual-timer mask surface in the guest-visible `CNTV_CTL_EL0`?
+///
+/// This is load-bearing and was, until this test, an assumption. HVF auto-masks
+/// the virtual timer whenever it surfaces `HV_EXIT_REASON_VTIMER_ACTIVATED`,
+/// and three separate places in the backend decide what to do next by reading
+/// `CNTV_CTL_EL0` and treating bit 1 (`IMASK`) as *"the guest asked for no timer
+/// IRQs"*:
+///
+///   * `usgic_poll_vtimer` — the safety net that re-asserts PPI 27 when the
+///     deadline has passed, i.e. the one thing that recovers a vCPU whose timer
+///     was left masked.
+///   * `unmask_vtimer_after_cancel` — which exists *only* to clear a stuck host
+///     mask after a watchdog-forced exit.
+///   * `wfi_park_ms` — which falls back to the 100 ms cap rather than waking at
+///     the guest's real deadline.
+///
+/// If Apple's host-side mask were visible as `IMASK`, all three would read the
+/// mask they exist to clear, conclude the guest wants no timer, and return —
+/// each one disabled by exactly the condition it was written to handle. That
+/// would make the wedge in #257/#262 unrecoverable rather than merely likely.
+///
+/// So the question is not academic, and it is cheap to answer directly: enable
+/// the timer unmasked, apply the host mask, and read the register back.
+#[test]
+fn hvf_host_vtimer_mask_is_invisible_to_the_guest_control_register() {
+    let ram = HostRam::new(RAM_SIZE);
+    let vm_ops = Arc::new(RecordingVmOps {
+        writes: Mutex::new(Vec::new()),
+    });
+    let (_vm, mut vcpu) = build_vm(&ram, vm_ops);
+    let id = vcpu
+        .as_any_concrete_mut()
+        .downcast_mut::<HvfVcpu>()
+        .expect("HvfVcpu")
+        .vcpu_id();
+
+    // ENABLE=1, IMASK=0: the guest wants timer interrupts.
+    // SAFETY: FFI on the owning thread; the vCPU is out of `hv_vcpu_run`.
+    assert_eq!(unsafe { hv_vcpu_set_sys_reg(id, CNTV_CTL_EL0_REG, 1) }, 0);
+
+    let read = |what: &str| -> u64 {
+        let mut v = 0u64;
+        // SAFETY: FFI on the owning thread; `v` is a valid out-pointer.
+        let rc = unsafe { hv_vcpu_get_sys_reg(id, CNTV_CTL_EL0_REG, &mut v) };
+        assert_eq!(rc, 0, "reading CNTV_CTL_EL0 {what} failed: {rc:#010x}");
+        v
+    };
+
+    let before = read("before the host mask");
+    assert_eq!(
+        before & 1,
+        1,
+        "ENABLE did not stick; the rest of this test would prove nothing"
+    );
+    assert_eq!(before & 2, 0, "IMASK set before we masked anything");
+
+    // SAFETY: FFI on the owning thread. This is what HVF does to itself on a
+    // VTIMER_ACTIVATED exit.
+    assert_eq!(unsafe { hv_vcpu_set_vtimer_mask(id, true) }, 0);
+    let masked = read("with the host mask applied");
+
+    // SAFETY: FFI on the owning thread; restore the unmasked state.
+    assert_eq!(unsafe { hv_vcpu_set_vtimer_mask(id, false) }, 0);
+    let unmasked = read("after clearing the host mask");
+
+    eprintln!(
+        "CNTV_CTL_EL0: before={before:#x} host-masked={masked:#x} host-unmasked={unmasked:#x}"
+    );
+
+    assert_eq!(
+        masked & 2,
+        0,
+        "hv_vcpu_set_vtimer_mask(true) surfaced as CNTV_CTL_EL0.IMASK ({masked:#x}). \
+         Every backend path that reads IMASK as a guest intent — usgic_poll_vtimer, \
+         unmask_vtimer_after_cancel, wfi_park_ms — is then disabled by the very mask \
+         it exists to clear, and the #257/#262 wedge has no recovery path."
+    );
+    assert_eq!(
+        masked & 1,
+        1,
+        "the host mask cleared guest ENABLE ({masked:#x}); the backend reads that as \
+         'no timer armed' and would stop polling for the deadline"
+    );
+}
