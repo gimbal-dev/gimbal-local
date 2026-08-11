@@ -468,15 +468,22 @@ pub(crate) fn aarch32_guard(snap: &Snapshot) -> Result<(), String> {
 /// `ic ivau` took it to 0/1,000.
 ///
 /// That last number was read for a long time as "only the kernel's elided copy
-/// is wrong". It is not — see #290. The explicit `ic ivau` in that test ran at
-/// offset 0 of its page, and the guest reads `CTR_EL0.IminLine = 4096 B` while
-/// the granule this Mac actually invalidates is **64 B**. Every `ic ivau` loop
-/// that honours `IminLine` — libgcc's `__clear_cache`, V8's and JSC's own — so
-/// invalidates one line in every 4 KiB and leaves the other 63 stale. Repeating
-/// the test at offset 64 with the guest's own stride SIGILLs immediately, and
-/// only a 64 B stride returns 0/200. So both copies are wrong, and restoring
-/// the kernel's `ic ivau` (#287) does not help on its own: the restored loop
-/// would stride 4096 too.
+/// is wrong". It was not — see #290. The explicit `ic ivau` in that test ran at
+/// offset 0 of its page, the one offset a 4096-byte stride covers, and the
+/// guest was reading `CTR_EL0.IminLine = 4096 B` against a real 64 B granule.
+/// Every `ic ivau` loop that honours `IminLine` — libgcc's `__clear_cache`,
+/// V8's and JSC's own — invalidated one line in every 4 KiB and left the other
+/// 63 stale.
+///
+/// **That half is fixed**, in [`hypervisor::hvf::ctr_trap_fixup`]: the stride
+/// came from a kernel trap handler, not from the hardware, and restore now
+/// lets EL0 read this Mac's own `CTR_EL0`. Measured after the fix, all eight
+/// offsets return 0/200 and `npm --version` is 20/20.
+///
+/// What this warning still covers is the kernel's own elided copy (#287),
+/// which lives in kernel text and no register can reach. Measured *after* the
+/// stride fix, `mmap(RW)` → write → `mprotect(RX)` → call is stale 998 times
+/// in 1,000.
 ///
 /// How bad this is in practice was understated for a long time. The figure used
 /// to be "roughly one run in seven"; measured on a rehydrated Graviton guest
@@ -533,24 +540,29 @@ pub(crate) fn icache_detail() -> &'static str {
          executing freshly written code (mmap RW, write, mprotect RX, call — what every \
          JIT does): 955 of 1000 executions fetched stale instructions.\n\
          \n\
-         The guest's own cache maintenance is wrong too, for a second reason. It reads \
-         CTR_EL0.IminLine = 4096 bytes and strides its `ic ivau` loop by that, but the \
-         granule this Mac actually invalidates is 64 bytes. Measured at a fixed offset \
-         64 within a page, 200 rounds per stride: 64 B gave 0/200 stale, while 128 B, \
-         256 B and the advertised 4096 B each gave ~199/200. So a JIT under-invalidates \
-         by 64x, touching one line in every 4 KiB, and `npm --version` on a fresh \
-         rehydrate failed 15 times out of 20.\n\
+         A second defect used to compound this and is now corrected at restore. The \
+         capture also arrives with SCTLR_EL1.UCT clear, so EL0 reads of CTR_EL0 \
+         trapped to the kernel's erratum-1542419 handler, which answers with \
+         IminLine forced to 4096 bytes -- 64x the granule this Mac invalidates. \
+         Every JIT strided its own `ic ivau` loops by that and touched one line in \
+         every 4 KiB. Restore now sets UCT, so EL0 reads this Mac's real CTR_EL0 \
+         and userspace maintenance is correct: measured at eight offsets within a \
+         page, 200 rounds each, 0/200 stale everywhere, and `npm --version` \
+         succeeded 20 times out of 20 where it had failed 15 of 20 before. Setting \
+         CHM_KEEP_CTR_TRAP=1 restores the captured value and the failure with it.\n\
          \n\
-         Expect `Illegal instruction (core dumped)` from Node, npm, Java, .NET and any \
-         other JIT. Measured on a rehydrated Graviton guest running Node 22.11.0, \
-         `npm --version` died 10 times out of 10.\n\
+         What remains is the kernel's own elided maintenance (#287), which no \
+         register can reach because it is patched into the kernel text inside the \
+         snapshot. \
+         Measured after the UCT fix, mmap RW -> write -> mprotect RX -> call was \
+         stale 998 times in 1000. Node and npm do not take that path and now work; \
+         a runtime that relies on the kernel to synchronise the caches for it will \
+         still fetch stale code.\n\
          \n\
-         Work around it by turning the JIT off:\n\
+         If a JIT workload does still die with `Illegal instruction (core dumped)`, \
+         turn the JIT off:\n\
          \n\
              export NODE_OPTIONS=--jitless\n\
-         \n\
-         The same `npm --version` then succeeded 5 times out of 5. Put that in \
-         /etc/profile.d/ inside the guest to make it stick.\n\
          \n\
          `sudo` does not carry NODE_OPTIONS through -- it is not in env_keep -- so the \
          first command most people run next fails, and neither failure names the \
@@ -559,13 +571,17 @@ pub(crate) fn icache_detail() -> &'static str {
          \n\
              sudo env NODE_OPTIONS=--jitless npm i -g <package>\n\
          \n\
+         The same command with the variable set is what to put in \
+         /etc/profile.d/ inside the guest to make it stick.\n\
+         \n\
          That variable reaches node and nothing else, so it does not cover a tool \
-         that runs its own compiled binary. The GitHub Copilot CLI installs a 174 MiB \
-         native platform package and execs it; measured here with \
-         NODE_OPTIONS=--jitless set, that binary died 5 runs out of 5 (4 SIGILL, 1 \
-         SIGBUS), and the CLI reported the crash as `no platform package found. \
-         Reinstall with npm install -g @github/copilot` -- advice that cannot help, \
-         because the package is installed and was found.\n\
+         that runs its own compiled binary. The GitHub Copilot CLI installs a \
+         174 MiB native platform package and execs it; measured with \
+         NODE_OPTIONS=--jitless set, that binary died 5 runs out of 5 (4 SIGILL, \
+         1 SIGBUS) and the CLI blamed a missing platform package that was in fact \
+         installed. That measurement predates the stride correction above and has \
+         not been repeated since, so treat it as the last known state of a native \
+         binary here rather than as the current one.\n\
          \n\
          This warning covers freshly written code only. It used to also claim the \
          userspace crashes a rehydrated guest suffers under ordinary dd/sync/rm load, \
@@ -4519,7 +4535,14 @@ mod tests {
     #[test]
     fn the_icache_warning_carries_the_stride_that_is_actually_wrong() {
         let d = icache_detail();
-        for needle in ["IminLine", "4096 bytes", "64 bytes", "64x"] {
+        for needle in [
+            "IminLine",
+            "4096 bytes",
+            "SCTLR_EL1.UCT",
+            "CHM_KEEP_CTR_TRAP",
+            "998",
+            "#287",
+        ] {
             assert!(
                 d.contains(needle),
                 "icache_detail() must carry {needle:?}: {d}"
@@ -4528,6 +4551,10 @@ mod tests {
         assert!(
             !d.contains("only the kernel's copy is wrong"),
             "the retracted #290 conclusion must not come back: {d}"
+        );
+        assert!(
+            !d.contains("failed 15 times out of 20"),
+            "the stride failure is fixed; the warning must not present it as live: {d}"
         );
     }
 
@@ -4545,12 +4572,12 @@ mod tests {
             "the warning must name the env var that fixes it: {d}"
         );
         assert!(
-            d.contains("10 times out of 10"),
-            "the measured untreated failure rate"
+            d.contains("20 times out of 20"),
+            "the measured rate now that the stride is corrected at restore"
         );
         assert!(
-            d.contains("5 times out of 5"),
-            "the measured rate under the workaround"
+            d.contains("998 times in 1000"),
+            "the measured residual, which is what still justifies the workaround"
         );
         // #261: the workaround's limit is part of the workaround. A reader who
         // sets NODE_OPTIONS and then watches a native binary SIGILL -- while

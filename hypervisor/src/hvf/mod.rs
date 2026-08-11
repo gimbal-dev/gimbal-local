@@ -1937,6 +1937,51 @@ impl Drop for HvfVcpu {
     }
 }
 
+/// `SCTLR_EL1.UCT` — when clear, EL0 reads of `CTR_EL0` trap to EL1.
+pub const SCTLR_EL1_UCT: u64 = 1 << 15;
+
+/// Let EL0 read this host's real `CTR_EL0`, rather than the capture host's lie.
+///
+/// Graviton2 is a Neoverse-N1, so Linux applies erratum 1542419 at boot. That
+/// workaround clears `SCTLR_EL1.UCT` so every EL0 `mrs ctr_el0` traps into
+/// `ctr_read_handler`, which — deliberately, to keep the trap rate down —
+/// answers with `IminLine` forced to `PAGE_SHIFT - 2`, i.e. **4096 bytes**,
+/// and `DIC` cleared (`arch/arm64/kernel/traps.c`, v6.8).
+///
+/// That is sound on the capture host: N1 reports `DIC = 1`, so the i-cache is
+/// already coherent with data writes and the maintenance userspace performs is
+/// belt-and-braces. Covering one 64-byte line in every 4096 costs nothing when
+/// covering none would also have been correct.
+///
+/// It is not sound here. Apple silicon reports `DIC = 0`, so `ic ivau` is
+/// genuinely required for every line — and the restored kernel keeps handing
+/// userspace a 4096-byte stride, so 63 of every 64 lines are never invalidated.
+/// Measured in a rehydrated Graviton capture: a JIT-written page was stale at
+/// 199 of 200 attempts at any offset past the first line, and `npm --version`
+/// died with SIGILL 15 times in 20.
+///
+/// Setting `UCT` sends EL0 straight to the hardware, which answers
+/// `0x9444c004` — `IminLine = 4` (64 bytes) and `DIC = 0`, both true of this
+/// machine. Userspace then strides correctly and clears its own cache. It is
+/// strictly *more* maintenance than the trap handler asked for, never less, so
+/// it cannot weaken the erratum mitigation this bit belongs to.
+///
+/// EL1 is unaffected: `UCT` gates EL0 only, so the kernel's own `read_ctr`
+/// already reads the host value. The kernel's separate defect — `ic ivau`
+/// alternative-patched to a NOP at boot because the capture host advertised
+/// `DIC = 1` — lives in kernel text and is untouched by this. It is tracked as
+/// its own issue, and measured independently at 998/1000 stale via
+/// `mmap(RW) -> write -> mprotect(RX)` after this fix is applied.
+///
+/// Returns `None` when the capture already lets EL0 read `CTR_EL0`, so a guest
+/// that never trapped is never rewritten.
+pub fn ctr_trap_fixup(captured_sctlr_el1: u64) -> Option<u64> {
+    if captured_sctlr_el1 & SCTLR_EL1_UCT != 0 {
+        return None;
+    }
+    Some(captured_sctlr_el1 | SCTLR_EL1_UCT)
+}
+
 impl HvfVcpu {
     /// Return a clonable handle to this vCPU's WFI wakeup fd. A device/IRQ
     /// thread holds it (alongside the shared GIC) and `write()`s it right after
@@ -3288,6 +3333,16 @@ impl Vcpu for HvfVcpu {
                 // Read-only: not written as a sysreg. Its value seeds the vtimer
                 // offset below so the virtual counter resumes continuously.
                 snapshot_cntvct = Some(v);
+            } else if id == SYSREG_SCTLR_EL1 {
+                // See `ctr_trap_fixup`: a capture from Neoverse-N1 arrives with
+                // EL0 reads of CTR_EL0 trapped to a handler that reports a
+                // 4096-byte i-cache stride, which is 64x too coarse here.
+                let want = if std::env::var_os("CHM_KEEP_CTR_TRAP").is_some() {
+                    v
+                } else {
+                    ctr_trap_fixup(v).unwrap_or(v)
+                };
+                let _ = self.set_sysreg(id, want);
             } else {
                 let _ = self.set_sysreg(id, v);
             }
