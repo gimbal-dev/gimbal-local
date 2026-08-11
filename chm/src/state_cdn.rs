@@ -765,7 +765,7 @@ mod tests {
 
     #[test]
     fn peer_cache_serves_held_chunks_and_404s_misses() {
-        let cache = env::temp_dir().join(format!("chm-peer-{}", process::id()));
+        let cache = env::temp_dir().join(format!("chm-peercache-{}", process::id()));
         let _ = fs::remove_dir_all(&cache);
         let memory_ref = "sha256:deadbeef";
         let key = "sha256:cafe";
