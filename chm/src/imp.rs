@@ -552,6 +552,13 @@ pub(crate) fn icache_detail() -> &'static str {
          The same `npm --version` then succeeded 5 times out of 5. Put that in \
          /etc/profile.d/ inside the guest to make it stick.\n\
          \n\
+         `sudo` does not carry NODE_OPTIONS through -- it is not in env_keep -- so the \
+         first command most people run next fails, and neither failure names the \
+         variable: without sudo, `npm i -g` dies EACCES; with it, SIGILL. Install with \
+         the variable passed explicitly:\n\
+         \n\
+             sudo env NODE_OPTIONS=--jitless npm i -g <package>\n\
+         \n\
          That variable reaches node and nothing else, so it does not cover a tool \
          that runs its own compiled binary. The GitHub Copilot CLI installs a 174 MiB \
          native platform package and execs it; measured here with \
@@ -4424,6 +4431,24 @@ mod tests {
         ] {
             assert!(d.contains(needle), "asid_detail() must mention {needle:?}");
         }
+    }
+
+    /// #289: the warning names a variable that `sudo` throws away. A reader who
+    /// follows it hits `EACCES` without `sudo` and `SIGILL` with it, and neither
+    /// message mentions `NODE_OPTIONS`, so the workaround we hand over fails on
+    /// the very next command. The form that survives has to be the one printed.
+    #[test]
+    fn the_icache_warning_gives_a_form_that_survives_sudo() {
+        let d = icache_detail();
+        let form = format!("sudo env NODE_{}", "OPTIONS=--jitless npm i -g");
+        assert!(
+            d.contains(&form),
+            "the warning must print the sudo-safe install form: {d}"
+        );
+        assert!(
+            d.contains("env_keep"),
+            "and say why the plain form does not survive: {d}"
+        );
     }
 
     /// #290: the warning used to end "so only the kernel's copy is wrong",
