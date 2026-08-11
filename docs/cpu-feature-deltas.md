@@ -249,8 +249,16 @@ checking whether the value returned is the one just written:
 
 Row 3 is what every JIT does, and it is precisely the case
 `__sync_icache_dcache()` exists to make safe; on a sound kernel it is 0. Rows 2
-and 4 show the hardware and the EL0 maintenance instruction both work — only the
-kernel's elided copy is wrong.
+and 4 show the hardware and the EL0 maintenance instruction both work.
+
+> **⚠️ Correction, 2026-08-11 (#290).** This section used to conclude from rows 2
+> and 4 that the *kernel's* elision was the whole of the fault. **That is
+> retracted.** Every probe above writes at **offset 0** of its page, and the guest
+> reads `CTR_EL0.IminLine = 4096` — so a 4096-byte stride covers offset 0 and
+> nothing else in the page. Re-run at **offset 64** and row 4 fails immediately.
+> The guest's *own* maintenance loops are under-invalidating 63 of every 64
+> lines; the kernel's elision is a second, smaller fault on top. See
+> **Finding 5b** below.
 
 The user-visible symptom, on Node 22.23.2:
 
@@ -353,6 +361,71 @@ should have existed.
 - Nothing can be repaired at rehydrate time: the NOPs are baked into the kernel
   text inside the snapshot. `chm` warns at load and `CHM_STRICT_ICACHE=1`
   refuses (`icache_dic_guard`).
+
+> **⚠️ The last bullet is narrower than it reads (#290).** It is true of *this*
+> finding — the elided `ic ivau` is baked into kernel text. It is **not** true of
+> the i-cache problem as a whole: the larger fault is the advertised **stride**,
+> and that is a value the kernel reads from a variable at runtime, which a
+> restore-time repair can reach. See the next section.
+
+---
+
+## Finding 5b — `CTR_EL0.IminLine`: the stride is 64× too large 🔴
+
+**Filed as #290, 2026-08-11. This is the larger half of the i-cache problem, and
+it was hidden for three milestones by a measurement artefact.**
+
+A rehydrated guest reads `CTR_EL0 = 0x9444c00a`. `IminLine` is bits [3:0] as a
+log2 word count, so `0xa` = 2^10 words = **4096 bytes** — and `IminLine` is the
+stride *every* `ic ivau` loop in the guest uses, in the kernel and in userspace
+alike. The real granule on this host is **64 bytes**.
+
+So a maintenance loop written correctly against the architecture invalidates one
+line out of every 64 it believes it covered.
+
+Measured inside the guest, writing at a controlled offset within the page:
+
+| test | stale executions |
+| --- | --- |
+| `__clear_cache`, 1000 rounds, **offset 0** | 0 / 1000 |
+| no maintenance at all, 1000 rounds | 999 / 1000 |
+| `__clear_cache` at **offset 64** | SIGILL immediately |
+| manual `ic ivau`, stride **64 B**, offset 64 | **0 / 200** |
+| manual `ic ivau`, stride 128 B, offset 64 | 199 / 200 |
+| manual `ic ivau`, stride 256 B, offset 64 | 197 / 200 |
+| manual `ic ivau`, stride **4096 B**, offset 64 | 199 / 200 |
+| `npm --version` × 20 | **5 ok, 15 SIGILL** |
+
+Rows 4 and 7 are the whole finding: the *same* code at the *same* offset is
+perfect at a 64-byte stride and useless at the advertised one.
+
+**Why this stayed hidden.** Every earlier probe — including all four rows of
+Finding 2 — wrote at **offset 0**, which is the single offset in a 4 KiB page
+that a 4096-byte stride does cover. The old conclusion (*"the hardware and the
+instruction work, only the kernel's copy is wrong"*) was drawn from data that
+could not have shown otherwise. `--jitless` works because a program that never
+patches code never needs the maintenance to be correct.
+
+**It cannot be fixed by setting the register.** HVF refuses writes to `CTR_EL0`
+(along with `ID_AA64MMFR0_EL1`, `DCZID_EL0`, `CLIDR_EL1`).
+
+**A restore-time cure exists, and is not yet built.** Linux already carries
+`ARM64_MISMATCHED_CACHE_TYPE` for exactly this situation: `read_ctr` becomes a
+load from `arm64_ftr_reg_ctrel0 + ARM64_FTR_SYSVAL` rather than an `MRS`, and the
+capability's `.cpu_enable` clears `SCTLR_EL1.UCT` so EL0 reads trap to
+`ctr_read_handler`, which returns the same sanitised value. Writing
+`0xa444c004` (DIC=0, IDC=1, IminLine=4 → 64 B) there at restore corrects both
+privilege levels at once.
+
+> **Trap, recorded because it is the tempting half-measure:** clearing `UCT`
+> alone is **worse than doing nothing**. The value EL0 would then be handed is
+> the capture's own `0xb444c004`, whose `DIC=1` tells userspace to skip `ic ivau`
+> entirely — 999/1000 stale instead of 199/200. The two pieces have to land
+> together or not at all.
+
+The open problem is locating `arm64_ftr_reg_ctrel0` in guest RAM *with certainty*
+— recognise-or-decline, never best-effort — and each CPU's legitimate
+`cpuinfo_arm64.reg_ctr` copies are decoys that must not be written.
 
 ---
 
@@ -481,7 +554,8 @@ uses comes from `CTR_EL0` (Finding 2), which matches.
 | # | Register | Verdict |
 | --- | --- | --- |
 | 1 | `ID_AA64PFR0_EL1.EL0` | 🔴 **Real bug.** 32-bit exec permanently wedges the vCPU. Warned at load; `CHM_STRICT_AARCH32=1` refuses. |
-| 2 | `CTR_EL0.DIC` | 🔴 The guest kernel elided `ic ivau`, so JITs in the guest execute stale code (955/1000 measured). Warned at load; `CHM_STRICT_ICACHE=1` refuses. Cold boot is immune. **Scope narrowed 2026-08-11**: it does *not* explain the crashes under ordinary IO load — that is #6. |
+| 2 | `CTR_EL0.DIC` | 🔴 The guest kernel elided `ic ivau`, so JITs in the guest execute stale code (955/1000 measured). Warned at load; `CHM_STRICT_ICACHE=1` refuses. Cold boot is immune. **Scope narrowed 2026-08-11**: it does *not* explain the crashes under ordinary IO load — that is #6 — and it is the *smaller* half of the i-cache problem; see 5b. |
+| 5b | `CTR_EL0.IminLine` | 🔴 **Real bug, #290.** Advertised stride is **4096 B** against a real granule of **64 B**, so every `ic ivau` loop in the guest — kernel *and* userspace — under-invalidates 63 lines in 64. `npm --version` 5/20. Hidden until 2026-08-11 because every prior probe wrote at offset 0, the one offset a 4096 stride covers. HVF refuses the register; the cure is `ARM64_MISMATCHED_CACHE_TYPE` at restore, and is **not yet built**. |
 | 3 | `DCZID_EL0` | ✅ Identical. Hazard closed by measurement. |
 | 4 | AArch32 ID block (20 regs) | ✅ Refused, harmless. |
 | 5 | `REVIDR`/`CLIDR`/`CCSIDR` | ✅ Cosmetic. |

@@ -330,4 +330,48 @@ mod tests {
             "the retracted #290 claim must not come back: {note}"
         );
     }
+
+    /// The code retracted the #290 claim before the reference doc did, and the
+    /// doc is what the code's own warning tells a reader to go and consult --
+    /// so for one release the product pointed at a page still asserting the
+    /// thing it had just corrected. That is the failure this repo keeps
+    /// re-learning: a fact you established by hard work feels permanently
+    /// verified, and the renewal lives in the file, not in memory.
+    ///
+    /// This pins the retraction rather than the prose around it. Finding 2's
+    /// four-row table was measured entirely at offset 0 -- the one offset a
+    /// 4096-byte stride covers -- so it may keep its numbers, but it may not
+    /// keep the conclusion it drew from them.
+    ///
+    /// The guard cannot tell an assertion from a verbatim quotation of one, and
+    /// it fired on the retraction's own first draft, which quoted the sentence
+    /// it was withdrawing. The doc paraphrases instead. That is the right way
+    /// round: a reader following a link to a retracted claim should find the
+    /// correction, not the original wording sitting there to be skim-read.
+    #[test]
+    fn the_delta_doc_no_longer_blames_only_the_kernels_copy() {
+        let doc = include_str!("../../docs/cpu-feature-deltas.md");
+
+        // Prose wraps, so the claim can come back split across a line break and
+        // a substring search would sail straight past it. The first mutation of
+        // this guard did exactly that and the suite stayed green. Collapse
+        // runs of whitespace before looking.
+        let flat = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // Assembled from parts: a literal needle here would match this test's
+        // own source if the doc ever quoted it, and a guard that matches its
+        // own assertion text cannot fail.
+        let retracted = format!("only the {} elided copy is wrong", "kernel's");
+        assert!(
+            !flat.contains(&retracted),
+            "docs/cpu-feature-deltas.md still draws the conclusion #290 falsified"
+        );
+
+        for needle in ["IminLine", "offset 64", "#290"] {
+            assert!(
+                flat.contains(needle),
+                "the delta doc must record the stride finding: missing {needle:?}"
+            );
+        }
+    }
 }
