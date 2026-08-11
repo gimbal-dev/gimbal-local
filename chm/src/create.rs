@@ -26,7 +26,7 @@
 
 use std::collections::BTreeMap;
 use std::error::Error;
-use std::io::Write;
+use std::io::{stdin, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -150,8 +150,20 @@ struct CreateArgs {
     /// memory-image half is testable this way with no entitlement and no VM
     /// slot, which matters because `hv_vm_create` is process-global.
     dry_run: bool,
-    /// Stop after this many seconds. A cold boot that produces no output is
-    /// the normal early failure mode, so this is not optional.
+    /// Stop after this many seconds; `0` means no deadline.
+    ///
+    /// #305: this used to default to 30 unconditionally, so an operator sitting
+    /// at a console we had just told to "press Ctrl-A x to end the session" got
+    /// thirty seconds and then `stopped after 30s` — and asked another LLM what
+    /// had gone wrong, because the number was the only thing we said. The
+    /// principle was already written down one line from the default that broke
+    /// it: an interactive session ends when the guest powers off or the
+    /// operator asks, *not when a stopwatch the operator never set runs out*.
+    ///
+    /// So it now defaults by who is driving. A tty on stdin means a human is
+    /// there to end it; a pipe means a script or the daemon, where an
+    /// unattended cold boot that produces no output really is the normal early
+    /// failure mode and a deadline is what stops it hanging CI.
     max_seconds: u64,
     /// Hosts the guest may reach, as `host:port`. Empty means the default
     /// deny-all posture, which is what an unconfigured sandbox gets everywhere
@@ -226,10 +238,30 @@ fn usage() -> String {
         .to_string()
 }
 
+/// How long to run when nobody said, decided by who is driving.
+///
+/// A tty on stdin means an operator is sitting there and will end the session
+/// themselves -- which is exactly what the console tells them to do. Giving
+/// them a stopwatch as well contradicts our own message and, in the one report
+/// we have of it, ended a working exploratory session at thirty seconds (#305).
+///
+/// A pipe means a script, CI, or the daemon. There, an unattended cold boot
+/// that produces no output is the normal early failure mode and a deadline is
+/// the thing that stops it hanging forever, so the old default stands.
+///
+/// Split out from [`parse`] so the decision is testable without a terminal.
+fn default_max_seconds(stdin_is_tty: bool) -> u64 {
+    if stdin_is_tty {
+        0
+    } else {
+        30
+    }
+}
+
 fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     let mut cfg = ColdBootConfig::default();
     let mut dry_run = false;
-    let mut max_seconds = 30_u64;
+    let mut max_seconds = default_max_seconds(stdin().is_terminal());
     let mut kernel: Option<PathBuf> = None;
     let mut egress_allow: Vec<String> = Vec::new();
     let mut cmdline_explicit = false;
@@ -1142,7 +1174,12 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         }
         Some(Err(e)) => Err(e),
         None if timed_out => {
-            println!("\nchm create: stopped after {}s", args.max_seconds);
+            println!(
+                "\nchm create: stopped after {}s -- the --seconds deadline, not the \
+                 guest.\n  The guest was running and has been torn down. Use \
+                 `--seconds N` to allow longer, or `--seconds 0` for no deadline.",
+                args.max_seconds
+            );
             Ok(ExitCode::SUCCESS)
         }
         None => Ok(ExitCode::SUCCESS),
@@ -1396,6 +1433,53 @@ mod tests {
             a.cfg.cmdline
         );
         assert!(a.dry_run);
+    }
+
+    /// #305. Our first outside tester was exploring a working shell when the
+    /// session ended with `stopped after 30s`, and had to ask another LLM why.
+    /// The principle was already written down beside the deadline -- "not when
+    /// a stopwatch the operator never set runs out" -- and the default
+    /// contradicted it.
+    ///
+    /// A tty means someone is there and the console has already told them how
+    /// to leave. A pipe means CI or the daemon, where a silent cold boot really
+    /// does need a deadline; that case keeps the old default, so this cannot
+    /// hang an unattended run.
+    #[test]
+    fn an_operator_at_a_terminal_is_not_given_a_stopwatch_they_never_set() {
+        assert_eq!(
+            default_max_seconds(true),
+            0,
+            "0 means no deadline: an interactive session ends when the operator says"
+        );
+        assert_eq!(
+            default_max_seconds(false),
+            30,
+            "a script or the daemon still gets a deadline, or a silent boot hangs it"
+        );
+    }
+
+    /// The number alone is what sent the tester elsewhere for an answer, so the
+    /// message has to carry what they went looking for: that the deadline was
+    /// ours rather than the guest's, what became of the guest, and the flags
+    /// that change it.
+    ///
+    /// The bar is our own egress line, which they praised in the same session
+    /// and resolved unaided: it names the rule, the reason, and the flag.
+    #[test]
+    fn the_deadline_message_says_whose_deadline_it_was_and_how_to_change_it() {
+        let src = include_str!("create.rs");
+        let (_, after) = src
+            .split_once("chm create: stopped after {}s")
+            .expect("the deadline message is still here");
+        let msg = &after[..500.min(after.len())];
+
+        for needed in ["--seconds 0", "--seconds N", "torn down", "not the"] {
+            assert!(
+                msg.contains(needed),
+                "the deadline message must mention {needed:?}"
+            );
+        }
     }
 
     #[test]
