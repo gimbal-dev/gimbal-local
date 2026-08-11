@@ -2517,6 +2517,35 @@ fn chm_initiated_stop(coordinator: &Result<Outcome, String>) -> bool {
     matches!(coordinator, Ok(Outcome::MaxSeconds) | Ok(Outcome::Idle(_)))
 }
 
+/// The sentence printed beside a teardown checkpoint that replaced an earlier
+/// one, naming the revision it displaced and the command that gets back to it.
+///
+/// #288: a `chm ctl stop` on a guest that had stopped answering wrote a
+/// checkpoint of the wedge over the last good state, reported `ok  stopped`,
+/// and the next `start` came back still wedged. The state was never actually
+/// destroyed — `write_checkpoint` archives the HEAD it supersedes — but nothing
+/// at the moment of the mistake said so, and a user with no clone of the
+/// workspace had no reason to believe the sandbox was recoverable at all.
+///
+/// This deliberately does **not** try to decide whether the guest was healthy.
+/// The available signal is console silence, and a resumed guest emits nothing
+/// until it receives input — documented behaviour of this stack, and §49
+/// recorded a whole day lost to reading that silence as death. A heuristic here
+/// would refuse legitimate stops and still miss real wedges. State the fact,
+/// hand over the remedy, let the reader judge.
+pub(crate) fn superseded_note(superseded: Option<&str>, dir: &Path) -> String {
+    match superseded {
+        // A first checkpoint replaced nothing, so there is no way back to offer
+        // and saying so would be noise.
+        None => String::new(),
+        Some(id) => format!(
+            "chm: this replaced revision {id} as the resume point. If the guest was \
+             not healthy when it stopped, go back with `chm rollback {} {id}`.\n",
+            dir.display()
+        ),
+    }
+}
+
 pub(crate) enum Outcome {
     PoweredOff,
     MaxSeconds,
@@ -3321,7 +3350,7 @@ pub(crate) fn run_usgic_engine(
                 )
             });
             match written {
-                Ok(()) => {
+                Ok(superseded) => {
                     if !cfg.quiet {
                         let cores = if n == 1 { "1 vCPU" } else { &format!("{n} vCPUs") };
                         // A user who did not pass --checkpoint has just had one
@@ -3340,6 +3369,7 @@ pub(crate) fn run_usgic_engine(
                                  resume to continue."
                             );
                         }
+                        eprint!("{}", superseded_note(superseded.as_deref(), dir));
                     }
                 }
                 Err(e) => {
@@ -3649,7 +3679,11 @@ fn spawn_live_snapshotter(s: LiveSnapshotter) -> Option<thread::JoinHandle<()>> 
                 quiesce.resume();
 
                 match result {
-                    Ok(()) => {
+                    // The superseded id is for the teardown path, where a
+                    // checkpoint replaces the resume point unasked. A cadence
+                    // snapshot supersedes its own predecessor by design, every
+                    // interval, so naming it here would be noise (#288).
+                    Ok(_superseded) => {
                         taken += 1;
                         taken_total.store(taken, Ordering::Release);
                         if !quiet {
@@ -4112,6 +4146,31 @@ mod tests {
         assert!(!chm_initiated_stop(&Ok(Outcome::LimitExceeded("disk".into()))));
         // Not a choice at all — the session is not known to be sound.
         assert!(!chm_initiated_stop(&Err("supervisor failed".into())));
+    }
+
+    /// #288: `chm ctl stop` on a wedged guest wrote a checkpoint of the wedge
+    /// over the resume point and said `ok  stopped`. The previous state was
+    /// archived and recoverable the whole time; nothing said so, so it read as
+    /// destroyed. The remedy has to arrive at the moment of the overwrite.
+    #[test]
+    fn a_teardown_checkpoint_names_the_revision_it_displaced() {
+        let dir = Path::new("/tmp/ws");
+        let note = superseded_note(Some("rev-20260810-aaa"), dir);
+        assert!(
+            note.contains("rev-20260810-aaa"),
+            "the displaced revision must be named: {note}"
+        );
+        assert!(
+            note.contains("chm rollback /tmp/ws rev-20260810-aaa"),
+            "and the way back must be a command that can be pasted: {note}"
+        );
+    }
+
+    /// A first checkpoint replaces nothing. Offering a way back to a revision
+    /// that does not exist would be worse than silence.
+    #[test]
+    fn a_first_checkpoint_offers_no_way_back_because_there_is_none() {
+        assert_eq!(superseded_note(None, Path::new("/tmp/ws")), "");
     }
 
     #[test]
