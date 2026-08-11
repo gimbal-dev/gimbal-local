@@ -462,6 +462,16 @@ performs returns stale instructions **955 times in 1000**; the same test with an
 explicit `ic ivau` is **0 in 1000**. `node --version` works, `npm --version`
 dies with `Illegal instruction` about 2 runs in 15.
 
+> **⚠️ Narrowed 2026-08-11 by #290.** Both figures above are real and both were
+> measured **at offset 0 of the page**, which is the one offset a 4096-byte
+> stride covers — and the guest advertises `CTR_EL0.IminLine = 4096` against a
+> real granule of 64 B. Re-run the *same* explicit-`ic ivau` test at **offset
+> 64** and it fails immediately. So the elided kernel copy is real but is the
+> *smaller* half; the larger fault is that every maintenance loop in the guest,
+> including userspace's own, invalidates one line in 64. Unlike the elision,
+> that one is repairable at restore (`ARM64_MISMATCHED_CACHE_TYPE`) and is
+> tracked on #290. See `docs/cpu-feature-deltas.md` Finding 5b.
+
 **Two ways out, and only one is ours:**
 
 | Route | Ours? | Notes |
@@ -1780,6 +1790,13 @@ guest, no compiler required):
 
 Row 3 is the JIT path and must be 0 on a sound kernel. Rows 2 and 4 show the
 hardware and the instruction both work; only the kernel's elided copy is wrong.
+
+> **⚠️ That last clause is retracted (#290, 2026-08-11).** Every row above was
+> measured at **offset 0**, the one offset the guest's advertised 4096-byte
+> `IminLine` stride happens to cover. At offset 64 row 4 fails. The guest's own
+> maintenance is under-invalidating 63 lines in 64, so the kernel's elision is a
+> second fault on top of a larger one — and the larger one *is* repairable at
+> restore. `docs/cpu-feature-deltas.md` Finding 5b has the stride table.
 
 ### How it was found, and one wrong turn worth recording
 
