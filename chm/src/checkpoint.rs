@@ -264,13 +264,21 @@ pub(crate) fn read_checkpoint(snapshot_dir: &Path) -> Result<CheckpointState, St
 /// place so a crash mid-write never leaves a half-written checkpoint a resume
 /// would trust. The new revision's `parent` is the previous HEAD's id, so the
 /// lineage chain is preserved even though only HEAD is kept on disk today.
+/// Write a teardown or live checkpoint, returning the id of the revision it
+/// superseded (`None` if the snapshot had no HEAD yet).
+///
+/// The caller needs that id, not just a success: a checkpoint written at stop
+/// replaces the state the user would resume into, and if the guest was wedged
+/// when it was taken, the id is the only route back to the last good one
+/// (#288). The information exists exactly here and nowhere later — HEAD has
+/// already moved by the time the caller could go looking.
 pub(crate) fn write_checkpoint(
     snapshot_dir: &Path,
     state: &CheckpointState,
     guest_mem: &GuestMemory,
     mem_mappings: &[MemMapping],
     origin: &str,
-) -> Result<(), String> {
+) -> Result<Option<String>, String> {
     // The current HEAD (if any) becomes this revision's parent.
     let parent = read_revision(snapshot_dir).ok().map(|r| r.id);
     let created_at_ms = now_ms();
@@ -291,6 +299,7 @@ pub(crate) fn write_checkpoint(
         state: state.clone(),
     };
 
+    let superseded = revision.parent.clone();
     commit_checkpoint(snapshot_dir, &revision, |dest, parent_dump| {
         // Write against the previous HEAD's dump where there is one. Two
         // checkpoints seconds apart share almost all of their RAM -- measured at
@@ -300,7 +309,8 @@ pub(crate) fn write_checkpoint(
         // The returned shared-bytes count is a delta metric, not a result the
         // caller acts on -- the original `?;` discarded it too.
         dump_guest_ram(dest, guest_mem, mem_mappings, parent_dump).map(|_shared| ())
-    })
+    })?;
+    Ok(superseded)
 }
 
 /// Stage a checkpoint directory, swap it into place as the new HEAD, and prove

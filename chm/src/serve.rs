@@ -22,6 +22,7 @@ use std::{env, fs, mem, ptr, thread};
 
 use crate::audit;
 use crate::capability;
+use crate::checkpoint;
 use crate::console::ConsoleInput;
 use crate::disktail;
 use crate::credproxy::cli;
@@ -30,7 +31,7 @@ use crate::exec;
 use crate::imp::{
     Loaded, Outcome, UsgicConfig, UsgicSession, aarch32_guard, cntfrq_guard, icache_dic_guard,
     load_snapshot,
-    run_usgic_engine,
+    run_usgic_engine, superseded_note,
 };
 use crate::posture;
 
@@ -1045,10 +1046,16 @@ fn stop_vm(daemon: &Daemon) -> Result<String, String> {
     }
     // Wait briefly for the worker to observe the flag and halt, so `ctl stop`
     // returns only once the guest has actually stopped.
+    //
+    // Report the worker's own reason rather than a bare "stopped": on this path
+    // the teardown has just written a checkpoint over the resume point, and that
+    // string is the only place the displaced revision is named (#288). A user
+    // who stopped a guest that had gone quiet must not have to already know
+    // about `chm rollback` to find out their last good state still exists.
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
-        if matches!(vm.inner.lock().unwrap().status, RunStatus::Stopped(_)) {
-            return Ok(format!("stopped `{}`", vm.name));
+        if let RunStatus::Stopped(reason) = &vm.inner.lock().unwrap().status {
+            return Ok(format!("stopped `{}` — {reason}", vm.name));
         }
         thread::sleep(Duration::from_millis(50));
     }
@@ -1375,18 +1382,30 @@ fn run_guest_usgic(
     };
 
     let outcome = run_usgic_engine(&cfg, loaded, &mut |s| supervise_daemon(s, opts, inner))?;
+    // The daemon runs quiet, so the engine's own suspend message goes to a log
+    // nobody is reading. `ctl stop` is where the user finds out a checkpoint was
+    // written on their behalf, so the way back has to travel in this string
+    // (#288). HEAD's `parent` is exactly the revision this teardown displaced.
+    let displaced = checkpoint::read_revision(dir)
+        .ok()
+        .and_then(|r| r.parent)
+        .map_or_else(String::new, |id| {
+            format!(" — {}", superseded_note(Some(&id), dir).trim_end())
+        });
     Ok(match outcome {
         Outcome::PoweredOff => "guest powered off".to_string(),
         // The daemon always checkpoints, so a limit expiring here suspends the
         // guest rather than cutting its power. Say so: an operator reading
         // "reached --max-seconds limit" has no way to tell which happened, and
         // the difference is whether their work still exists.
-        Outcome::MaxSeconds => "suspended at the --max-seconds limit".to_string(),
+        Outcome::MaxSeconds => format!("suspended at the --max-seconds limit{displaced}"),
         Outcome::Idle(secs) => {
-            format!("suspended after {secs}s with no console output")
+            format!("suspended after {secs}s with no console output{displaced}")
         }
         Outcome::LimitExceeded(reason) => format!("resource limit hit ({reason})"),
-        Outcome::ConsoleClosed | Outcome::Interrupted => "stopped by request".to_string(),
+        Outcome::ConsoleClosed | Outcome::Interrupted => {
+            format!("stopped by request{displaced}")
+        }
     })
 }
 
@@ -2189,5 +2208,30 @@ mod tests {
             assert!(parsed["exit_code"].is_null(), "{req} -> {out}");
         }
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// #288 has a call-site failure mode no assertion about a *string* can see:
+    /// `superseded_note` can be perfectly correct and simply never consulted,
+    /// or `stop_vm` can go back to discarding the worker's reason, and every
+    /// test that examines the note's text stays green. This repo has banked
+    /// that class four times (V9.5c, V9.11a M4, #222, #242), so read the source.
+    ///
+    /// The needles are assembled from parts because a literal here would match
+    /// its own assertion text -- exactly how the #222 guard was born dead.
+    #[test]
+    fn the_stop_path_still_carries_the_way_back() {
+        let src = include_str!("serve.rs");
+        let consulted = format!("{}(Some(&id), dir)", "superseded_note");
+        assert!(
+            src.contains(&consulted),
+            "run_guest_usgic must consult superseded_note, or the daemon's stop \
+             message loses the displaced revision"
+        );
+        let reports = format!("stopped `{{}}` {} {{reason}}", "\u{2014}");
+        assert!(
+            src.contains(&reports),
+            "stop_vm must report the worker's own reason: a bare `stopped` is \
+             what #288 printed over a wedged guest"
+        );
     }
 }
