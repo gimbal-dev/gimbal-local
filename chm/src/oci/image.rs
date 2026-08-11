@@ -64,6 +64,16 @@ use zstd::stream::read::Decoder as ZstdDecoder;
 /// filling the disk before anything notices.
 const LAYER_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 
+/// The kernel package a first-run user needs, named in the `--kernel is
+/// required` error (#306) rather than left as a category.
+///
+/// Pinned to 6.8.0-71 because that is the release this project hardware-tests,
+/// and `the_kernel_hint_matches_the_documented_procedure` fails if this and
+/// `docs/container-images.md` ever disagree — a message that sends someone to a
+/// doc has to agree with it, or it is worse than saying nothing.
+const KERNEL_DEB_URL: &str = "http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/\
+                              linux-image-unsigned-6.8.0-71-generic_6.8.0-71.71_arm64.deb";
+
 /// Headroom over the rootfs for the kernel, page tables, and the guest actually
 /// doing something once it boots. Below this even a shell prompt is tight.
 const RAM_FLOOR_MIB: u64 = 512;
@@ -588,9 +598,22 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
         None => {
             let found = discover_kernels(&library);
             let hint = if found.is_empty() {
+                // #306: a first-run user has no image directory by definition,
+                // so "an existing image directory" is dead for exactly the
+                // person reading this, and "an Ubuntu arm64 kernel package" is
+                // a category rather than a next step. Our first outside tester
+                // reconstructed the four commands below via another LLM --
+                // which found them in `docs/container-images.md`, where they
+                // had been written down all along. Explaining the reason and
+                // withholding the remedy is what sent them there.
                 format!(
-                    "No `Image` found under {}. A cold-boot kernel comes from an \
-                     existing image directory, or from an Ubuntu arm64 kernel package.",
+                    "No `Image` found under {}, and one has to come from somewhere.\n\n\
+                     Get the kernel this project hardware-tests (Ubuntu arm64 generic \
+                     6.8.0-71):\n  \
+                     curl -LO {KERNEL_DEB_URL}\n  \
+                     ar x linux-image-unsigned-*.deb && tar -xf data.tar\n  \
+                     ...then pass --kernel ./boot/vmlinuz-6.8.0-71-generic\n\n\
+                     Or see docs/container-images.md.",
                     library.display()
                 )
             } else {
@@ -794,8 +817,11 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
         ram
     );
     println!("      or: pick it in Gimbal Local under New sandbox.");
+    for line in report.console_findings() {
+        println!("{line}");
+    }
     if report.has_findings() {
-        println!("See {}/BUILD.txt for what was refused.", out.display());
+        println!("Full detail in {}/BUILD.txt.", out.display());
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1475,6 +1501,40 @@ mod tests {
         assert!(!p.starts_with("usr/"), "{p}");
         assert!(!p.contains("/lib/"), "{p}");
         assert_eq!(p, "gimbal-modules/virtio_net.ko");
+    }
+
+    /// #306: on a clean machine `--kernel is required` explained the reason and
+    /// withheld the remedy. Our first outside tester recovered by asking
+    /// another LLM, which handed back *our own* four commands out of
+    /// `docs/container-images.md` -- so the procedure was never missing, only
+    /// unreachable from the place it was needed.
+    ///
+    /// Two things are pinned. First that the message carries the commands.
+    /// Second, and the reason this is a guard rather than an edit, that the URL
+    /// it prints still exists in the doc it is drawn from: a message telling
+    /// someone to fetch a specific kernel is worse than silence once that
+    /// kernel and the documented one differ, and nothing else would catch the
+    /// day one of them is bumped.
+    #[test]
+    fn the_kernel_hint_matches_the_documented_procedure() {
+        let doc = include_str!("../../../docs/container-images.md");
+        assert!(
+            doc.contains(KERNEL_DEB_URL),
+            "the URL in the --kernel hint is no longer in docs/container-images.md; \
+             bump both or the message sends people at a 404"
+        );
+
+        let src = include_str!("image.rs");
+        let (_, hint) = src
+            .split_once("No `Image` found under {}")
+            .expect("the empty-library branch is still here");
+        let hint = &hint[..900.min(hint.len())];
+        for needed in ["curl -LO", "ar x", "--kernel ./boot/vmlinuz", "container-images.md"] {
+            assert!(
+                hint.contains(needed),
+                "a first-run user needs {needed:?} in the hint, not a category name"
+            );
+        }
     }
 
     /// A driver chm has just bundled is one the guest will have, so the

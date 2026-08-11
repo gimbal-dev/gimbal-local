@@ -46,7 +46,88 @@ impl Report {
     pub fn has_findings(&self) -> bool {
         !self.refused.is_empty() || !self.sanitised.is_empty() || !self.skipped_nodes.is_empty()
     }
+
+    /// What to print on the console, one line per category that actually
+    /// happened.
+    ///
+    /// #304: the console used to answer `has_findings()` with a single "see
+    /// BUILD.txt for what was refused", which for `node:22-slim` — eleven
+    /// stripped setuid bits and **zero** refusals — named the one category that
+    /// was empty. Three things with very different weights had been carefully
+    /// separated in this struct and then flattened again on the way out.
+    ///
+    /// So they are reported apart, and a stripped setuid bit is reported by its
+    /// *consequence* rather than its count: `su` and `passwd` not elevating is
+    /// the thing a user needs to know, and it is knowable here without opening
+    /// a file.
+    pub fn console_findings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if !self.refused.is_empty() {
+            out.push(format!(
+                "REFUSED {} entr{} from this image — see BUILD.txt before booting it.",
+                self.refused.len(),
+                if self.refused.len() == 1 { "y" } else { "ies" }
+            ));
+        }
+        if !self.sanitised.is_empty() {
+            out.push(format!(
+                "Stripped {} setuid/setgid bit{} ({}) — those will not elevate in this guest.",
+                self.sanitised.len(),
+                if self.sanitised.len() == 1 { "" } else { "s" },
+                name_a_few(&self.sanitised)
+            ));
+        }
+        if !self.skipped_nodes.is_empty() {
+            out.push(format!(
+                "Skipped {} device node/FIFO entr{} an initramfs does not carry.",
+                self.skipped_nodes.len(),
+                if self.skipped_nodes.len() == 1 {
+                    "y"
+                } else {
+                    "ies"
+                }
+            ));
+        }
+        out
+    }
 }
+
+/// Name up to three of them by basename, then say how many more. Enough to
+/// recognise what was touched without turning a console line into the file it
+/// is summarising.
+///
+/// Recognisable ones first, deliberately. Taken in tar order, `node:22-slim`
+/// yields "chage, chfn, chsh, and 8 others" — alphabetically honest and
+/// useless, because the point of naming any of them is that the reader pictures
+/// the consequence, and nobody has ever run `chage`. The same eleven bits
+/// described as "su, passwd, mount" say what actually changed about the guest.
+fn name_a_few(items: &[Refusal]) -> String {
+    let mut names: Vec<&str> = items
+        .iter()
+        .filter_map(|r| match r {
+            Refusal::SuidStripped { path, .. } => {
+                Some(path.rsplit('/').next().unwrap_or(path.as_str()))
+            }
+            _ => None,
+        })
+        .collect();
+    // By recognisability rank, then alphabetically so the message is stable and
+    // reproducible for the same image.
+    names.sort_by_key(|n| (WELL_KNOWN.iter().position(|w| w == n).unwrap_or(usize::MAX), *n));
+    match names.len() {
+        0 => "see BUILD.txt".to_string(),
+        1..=3 => names.join(", "),
+        n => format!("{}, and {} others", names[..3].join(", "), n - 3),
+    }
+}
+
+/// setuid binaries whose absence a user will actually notice, so they lead the
+/// summary. Not a security classification — purely which names carry meaning at
+/// a glance.
+/// Ordered by how much the name tells a reader, not alphabetically: sorting
+/// these by name puts `gpasswd` first, which is the same failure as `chage` in
+/// a smaller costume.
+const WELL_KNOWN: &[&str] = &["su", "sudo", "passwd", "mount", "umount", "newgrp", "gpasswd"];
 
 /// Apply layers, bottom-first, to a fresh root filesystem.
 pub fn apply(layers: &[Layer]) -> (Rootfs, Report) {
@@ -292,6 +373,84 @@ mod tests {
         assert_eq!(r.sanitised.len(), 1);
         assert!(r.refused.is_empty());
         assert!(r.has_findings());
+    }
+
+    /// #304: `node:22-slim` -- the image a new user is most likely to try --
+    /// produced eleven stripped setuid bits and **zero** refusals, and the
+    /// console announced "see BUILD.txt for what was refused". It named the one
+    /// category that was empty.
+    ///
+    /// So the guard is that the summary reports the category that actually
+    /// happened, and carries the consequence rather than a count: `su` and
+    /// `passwd` not elevating is the fact a user needs, and it is knowable here
+    /// without opening a file.
+    #[test]
+    fn the_console_summary_names_what_happened_and_not_what_did_not() {
+        // In `node:22-slim`'s own tar order, so the guard sees what the tester
+        // saw: the recognisable names arrive last and must still lead.
+        let mut r = Report::default();
+        for f in ["usr/bin/chsh", "usr/bin/mount", "usr/bin/passwd", "usr/bin/su"] {
+            r.sanitised.push(Refusal::SuidStripped {
+                path: f.to_string(),
+                mode: 0o4755,
+            });
+        }
+
+        let lines = r.console_findings();
+        assert_eq!(lines.len(), 1, "one category happened, so one line: {lines:?}");
+        let line = &lines[0];
+
+        assert!(
+            !line.to_lowercase().contains("refus"),
+            "nothing was refused; saying so is the whole bug: {line}"
+        );
+        assert!(line.contains('4'), "the count is stated: {line}");
+        for named in ["su", "passwd", "mount"] {
+            assert!(line.contains(named), "{named} is named: {line}");
+        }
+        assert!(
+            line.contains("and 1 other"),
+            "the tail is counted, not listed: {line}"
+        );
+        assert!(
+            !line.contains("chsh"),
+            "`chsh` is the forgettable one and must not displace a name that \
+             carries the consequence: {line}"
+        );
+        assert!(
+            line.contains("(su, passwd, mount,"),
+            "ranked by what the name tells a reader, not alphabetically -- \
+             sorting by name puts `gpasswd` first and teaches nobody: {line}"
+        );
+        assert!(
+            line.contains("not elevate"),
+            "the consequence is stated, not just the fact: {line}"
+        );
+    }
+
+    /// The loud category stays loud, and stays separate. A refusal is a dropped
+    /// entry and is worth stopping for; a stripped bit is routine. Flattening
+    /// them is what produced #304, so they must not share a line again.
+    #[test]
+    fn a_refusal_is_reported_apart_from_a_stripped_bit() {
+        let mut r = Report::default();
+        r.refused.push(Refusal::Traversal("../etc/passwd".to_string()));
+        r.sanitised.push(Refusal::SuidStripped {
+            path: "usr/bin/su".to_string(),
+            mode: 0o4755,
+        });
+        r.skipped_nodes.push("`dev/null` is a device".to_string());
+
+        let lines = r.console_findings();
+        assert_eq!(lines.len(), 3, "three categories, three lines: {lines:?}");
+        assert!(lines[0].contains("REFUSED"), "{:?}", lines[0]);
+        assert!(lines[1].contains("setuid"), "{:?}", lines[1]);
+        assert!(lines[2].contains("Skipped"), "{:?}", lines[2]);
+
+        assert!(
+            Report::default().console_findings().is_empty(),
+            "a clean image says nothing at all"
+        );
     }
 
     #[test]
