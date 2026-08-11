@@ -2069,7 +2069,7 @@ mod tests {
     fn peer_uid_matches_this_user_over_a_local_socket() {
         // The peer-credential plumbing must report the connecting process's uid,
         // so the daemon can admit its own user and reject others (M30.2).
-        let base = env::temp_dir().join(format!("chm-peer-{}", process::id()));
+        let base = env::temp_dir().join(format!("chm-peeruid-{}", process::id()));
         let _ = fs::remove_dir_all(&base);
         fs::create_dir_all(&base).unwrap();
         let sock = base.join("chm.sock");

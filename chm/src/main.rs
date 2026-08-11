@@ -134,6 +134,9 @@ mod runs;
 /// Notice a capture whose partition table does not use the whole disk (#259).
 mod disktail;
 
+/// Properties of the test suite itself (#243).
+mod hygiene;
+
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 fn main() -> ExitCode {
     imp::main()
