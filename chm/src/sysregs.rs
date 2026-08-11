@@ -434,9 +434,10 @@ mod tests {
     /// The bit really is `UCT`, not a neighbour.
     ///
     /// `SCTLR_EL1.UCT` is bit 15. Bit 26 is `UCI`, which gates EL0 *cache
-    /// maintenance* rather than the `CTR_EL0` read — setting that instead
-    /// would stop the `ic ivau` traps without fixing the stride they use, so
-    /// the two are easy to transpose and produce opposite outcomes.
+    /// maintenance* rather than the `CTR_EL0` read, so the two are easy to
+    /// transpose — and transposing them fixes nothing at all, because the
+    /// erratum leaves `UCI` set and EL0 maintenance was never trapped. See
+    /// `the_captured_guest_already_runs_its_own_cache_maintenance` (#297).
     #[test]
     fn the_corrected_bit_is_uct_and_not_uci() {
         assert_eq!(hypervisor::hvf::SCTLR_EL1_UCT, 1 << 15);
@@ -457,5 +458,42 @@ mod tests {
             src.contains(&needle),
             "the SCTLR_EL1 restore arm must call ctr_trap_fixup: missing {needle:?}"
         );
+    }
+
+    /// #297, closed by a bit rather than a benchmark.
+    ///
+    /// The question was whether to set `SCTLR_EL1.UCI` as well, so EL0 cache
+    /// maintenance runs natively instead of trapping into the erratum handler
+    /// one line at a time -- a cost #296 looked to have multiplied by 64 when
+    /// it handed EL0 the true 64-byte stride.
+    ///
+    /// The premise was false. Erratum 1542419's workaround clears `UCT` and
+    /// leaves `UCI` alone, so those traps were never happening and there is no
+    /// saving to win. This is the measurement, taken out of a real Graviton2
+    /// capture's `state.json` rather than reasoned about: both vCPUs carry
+    /// `SCTLR_EL1 = 0x3454591d`.
+    ///
+    /// Kept as a guard rather than a note because the reasoning that opened
+    /// #297 was sound and only the capture could refute it. If a capture ever
+    /// arrives with `UCI` clear, this fails and the trade genuinely re-opens.
+    #[test]
+    fn the_captured_guest_already_runs_its_own_cache_maintenance() {
+        // Measured: /private/tmp/rculab-287/state.json, cpu-manager snapshots
+        // 0 and 1, sysreg encoding 0xc080.
+        let captured_on_graviton2 = 0x3454_591du64;
+
+        assert_eq!(
+            captured_on_graviton2 & hypervisor::hvf::SCTLR_EL1_UCI,
+            hypervisor::hvf::SCTLR_EL1_UCI,
+            "EL0 cache maintenance already runs on the hardware, so there are \
+             no traps for #297 to remove"
+        );
+        assert_eq!(
+            captured_on_graviton2 & hypervisor::hvf::SCTLR_EL1_UCT,
+            0,
+            "...while the CTR_EL0 read really was trapped -- the two bits move \
+             independently, which is the whole finding"
+        );
+        assert_eq!(hypervisor::hvf::SCTLR_EL1_UCI, 1 << 26);
     }
 }

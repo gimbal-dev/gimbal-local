@@ -2083,6 +2083,26 @@ pub fn ctr_trap_fixup(captured_sctlr_el1: u64) -> Option<u64> {
     Some(captured_sctlr_el1 | SCTLR_EL1_UCT)
 }
 
+/// #297, answered by measurement: **nothing to do.** `UCI` is the sibling of
+/// [`SCTLR_EL1_UCT`] — clear it and every EL0 `ic ivau` / `dc cvau` / `dc civac`
+/// traps to EL1 to be emulated one line at a time. The worry was that #296 had
+/// made that 64x worse: handing EL0 the true 64-byte stride turns one trap per
+/// 4 KiB page into sixty-four.
+///
+/// It never happened, because the erratum-1542419 workaround clears `UCT` and
+/// leaves `UCI` alone — Linux sets `UCI` in `INIT_SCTLR_EL1_MMU_ON` and the
+/// workaround only ever touches the `CTR_EL0` read. Read out of a real
+/// Graviton2 capture, both vCPUs: `SCTLR_EL1 = 0x3454591d`, `UCT` clear and
+/// **`UCI` set**. EL0 cache maintenance has been running natively on the
+/// hardware the whole time, so there are no traps for a second bit to remove.
+///
+/// Pinned by `the_captured_guest_already_runs_its_own_cache_maintenance` so the
+/// question is not reopened on the strength of the reasoning that opened it —
+/// the premise was plausible and simply false, and only the capture could say
+/// so. If a future capture ever arrives with `UCI` clear that guard fails, and
+/// the trade re-opens with the evidence already attached.
+pub const SCTLR_EL1_UCI: u64 = 1 << 26;
+
 impl HvfVcpu {
     /// Return a clonable handle to this vCPU's WFI wakeup fd. A device/IRQ
     /// thread holds it (alongside the shared GIC) and `write()`s it right after
