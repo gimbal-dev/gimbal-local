@@ -1194,8 +1194,10 @@ fn exec_json(daemon: &Daemon, arg: &str) -> String {
             exec::ExecOutcome::Pending => exec_error_json(
                 "timeout",
                 "the guest did not report completion before the timeout; \
-                 it may still be running the command, or it may not be at a shell prompt \
-                 (check with `chm ctl console`)",
+                 the command may still be running (raise `--timeout`), \
+                 the console may have no shell on it yet (still booting, or at a login prompt), \
+                 or the guest may have stopped executing \
+                 (`chm ctl console` shows which)",
                 elapsed,
             ),
             exec::ExecOutcome::Truncated => exec_error_json(
@@ -1263,11 +1265,24 @@ fn exec_run(daemon: &Daemon, arg: &str) -> Result<(exec::ExecOutcome, Duration),
         g.dropped + g.console.len()
     };
 
-    // A carriage return is what a real terminal sends; the guest tty's ICRNL
-    // turns it into the newline that completes the line.
-    let mut bytes = script.into_bytes();
-    bytes.push(b'\r');
-    input(&bytes);
+    // Clear whatever framing state the console was left in before writing the
+    // frame (#294). Without this, one truncated write or one abandoned
+    // interactive command parks the shell at `PS2` and *every* subsequent exec
+    // times out, each retry piling more continuation text onto the same
+    // unterminated line. `exec::console_writes` explains why the reset must be a
+    // separate write and why ETX is the only state-independent one.
+    //
+    // `postboot::send_line` justifies the SIGINT by step serialisation; here the
+    // argument is `EXEC_BUSY`, which we hold: no other exec can be running, so
+    // the signal can only reach something the guest started on its own console
+    // --- exactly the state being cleared.
+    //
+    // The reset lands inside the parse window, which is harmless: `exec::parse`
+    // locates the frame by nonce, so any `^C` echo or fresh prompt ahead of it is
+    // skipped like any other console noise.
+    for write in exec::console_writes(&script) {
+        input(&write);
+    }
 
     let began = Instant::now();
     let deadline = began + Duration::from_secs(secs);

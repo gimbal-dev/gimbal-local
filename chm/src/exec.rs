@@ -56,6 +56,54 @@ const BEGIN: &str = "BEG";
 /// Marker suffix printed after it, carrying the exit status.
 const END: &str = "END";
 
+/// `ETX`, the byte Ctrl-C puts on the wire.
+pub(crate) const ETX: u8 = 0x03;
+
+/// The bytes that return a guest console to a known state before anything is
+/// written to it.
+///
+/// Every framed write assumes it lands on a shell at `PS1`. That assumption
+/// fails whenever a previous write arrived truncated, or a human left an
+/// interactive command running, or a quote went unbalanced: the shell sits at
+/// `PS2` and reads the next framed line as *more of the same command*. Nothing
+/// recovers on its own, because each recovery attempt becomes continuation text
+/// too.
+///
+/// `ETX` is the only reset that works **without knowing the current state**. The
+/// line discipline turns it into `SIGINT` for the foreground process group, and a
+/// shell at `PS2` abandons the compound command and returns to `PS1`. A quote
+/// character would close an open quote but *open* one if none was open — a coin
+/// flip — and a bare newline at `PS2` is simply more continuation.
+pub(crate) const CONSOLE_RESET: [u8; 2] = [ETX, b'\r'];
+
+/// The two console writes that begin one framed command: the reset, then the
+/// frame.
+///
+/// **Two writes, deliberately — not one concatenated buffer.** When `ISIG` is on,
+/// the tty line discipline reacts to `INTR` by raising `SIGINT` *and flushing the
+/// input queue* (suppressed only by `NOFLSH`, which is off by default). Bytes
+/// arriving in the same input burst as the `ETX` are therefore liable to be
+/// discarded along with the line being abandoned. Concatenating the two would let
+/// the reset eat the very frame it exists to protect — an intermittent failure
+/// that would look exactly like the bug being fixed.
+///
+/// Sending the reset as its own line also covers the opposite case: if the
+/// console has `ISIG` disabled, `ETX` arrives as an ordinary byte, and it is then
+/// a garbage command on a line of its own — the shell complains and moves on —
+/// rather than a garbage byte inside our frame.
+///
+/// A carriage return terminates the frame because that is what a real terminal
+/// sends; the guest tty's `ICRNL` turns it into the newline that completes the
+/// line.
+///
+/// Both console writers go through here, so the divergence recorded in #294
+/// cannot recur: there is one implementation, not two that happen to agree.
+pub(crate) fn console_writes(frame: &str) -> [Vec<u8>; 2] {
+    let mut line = frame.as_bytes().to_vec();
+    line.push(b'\r');
+    [CONSOLE_RESET.to_vec(), line]
+}
+
 /// How much of the console a single exec may accumulate before we stop waiting
 /// and report [`ExecOutcome::Overflowed`]. Well below the daemon's 256 KiB ring
 /// so a large-output command is reported honestly rather than silently clipped
@@ -342,6 +390,63 @@ mod tests {
 
     fn argv(parts: &[&str]) -> Vec<String> {
         parts.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    // -- the console reset (#294) ---------------------------------------------
+
+    #[test]
+    fn a_framed_command_is_always_preceded_by_the_reset() {
+        // The whole of #294: a writer that skips this leaves every later command
+        // stranded behind a `PS2` continuation with no way back.
+        let writes = console_writes("echo hi");
+        assert_eq!(writes[0], vec![ETX, b'\r'], "the first write must be the reset");
+    }
+
+    #[test]
+    fn the_reset_is_a_separate_write_from_the_frame() {
+        // Not cosmetic. `INTR` makes the line discipline flush the input queue
+        // unless `NOFLSH` is set, so anything sharing the burst with the `ETX`
+        // can be discarded with the line being abandoned. Concatenating the two
+        // would let the reset eat the frame it exists to protect.
+        let writes = console_writes("echo hi");
+        assert!(
+            !writes[0].windows(4).any(|w| w == b"echo"),
+            "the reset write must not carry any of the frame"
+        );
+        assert!(!writes[1].contains(&ETX), "the frame write must not carry the reset byte");
+    }
+
+    #[test]
+    fn the_frame_is_terminated_the_way_a_terminal_terminates_it() {
+        // A carriage return, not a newline: the guest tty's ICRNL is what turns
+        // it into the line terminator. Sending `\n` skips that translation.
+        assert_eq!(console_writes("echo hi")[1], b"echo hi\r".to_vec());
+    }
+
+    #[test]
+    fn every_console_writer_goes_through_one_implementation() {
+        // #294 was not "exec forgot the reset". It was "the cure was written
+        // twice and only one copy was maintained" --- #273 taught `send_line`
+        // the reset and left `exec_run` behind, with a copied comment above the
+        // write to make the divergence look deliberate.
+        //
+        // So the guard is not "does exec send ETX" (a third copy would satisfy
+        // that too) but "is there exactly one writer". Both call sites are read
+        // from source, because that is the property that failed.
+        for (file, src) in
+            [("serve.rs", include_str!("serve.rs")), ("postboot.rs", include_str!("postboot.rs"))]
+        {
+            assert!(
+                src.contains("console_writes("),
+                "{file} writes to the guest console and must use exec::console_writes"
+            );
+            // A hand-rolled `push(b'\r')` beside a console write is how the
+            // second copy started last time.
+            assert!(
+                !src.contains("bytes.push(b'\\r');"),
+                "{file} appears to frame a console line by hand again"
+            );
+        }
     }
 
     #[test]

@@ -80,9 +80,6 @@ pub(crate) const DEFAULT_STEP_TIMEOUT: Duration = Duration::from_secs(120);
 /// still booting.
 const PROBE_INTERVAL: Duration = Duration::from_millis(500);
 
-/// `ETX`, the byte Ctrl-C puts on the wire. See [`send_line`].
-const ETX: u8 = 0x03;
-
 /// What an operator asked to happen inside the guest once it is up.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Plan {
@@ -445,28 +442,18 @@ fn run_step(
 /// mangled write cost the entire run, and the probe loop could not recover,
 /// because every recovery attempt became continuation text too.
 ///
-/// So lead with `ETX` --- what a person pressing Ctrl-C sends. The line
-/// discipline turns it into `SIGINT` for the foreground process group, and a
-/// shell sitting at `PS2` abandons the whole compound command and returns to
-/// `PS1`. It is the only reset that works *without knowing the current state*:
-/// sending a quote character would close an open quote but open one if none was
-/// open, which is a coin flip, and a bare newline at `PS2` is simply more
-/// continuation.
-///
-/// It is sent as its own line, not as a prefix to the frame, for the case where
-/// the console has `ISIG` disabled and `ETX` arrives as an ordinary byte. Then
-/// it is a garbage command on a line of its own --- the shell complains and
-/// moves on --- rather than a garbage byte inside our frame.
+/// So lead with `ETX`. Why that is the only reset that can work regardless of
+/// the shell's current state, and why it must be a separate write, is documented
+/// on [`exec::console_writes`].
 ///
 /// Nothing of ours is ever running when this is sent: `send_line` is only called
 /// to *begin* a step, and every step is awaited before the next is sent. The
 /// signal can therefore only reach a process the guest started on its own
 /// console, which is precisely the state we are trying to clear.
 fn send_line(console: &dyn Console, line: &str) {
-    console.send(&[ETX, b'\r']);
-    let mut bytes = line.as_bytes().to_vec();
-    bytes.push(b'\r');
-    console.send(&bytes);
+    for write in exec::console_writes(line) {
+        console.send(&write);
+    }
 }
 
 #[cfg(test)]
@@ -474,6 +461,7 @@ mod tests {
     use std::sync::Mutex;
 
     use super::*;
+    use crate::exec::ETX;
 
     // -- names and assignments ------------------------------------------------
 
