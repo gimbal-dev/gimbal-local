@@ -200,7 +200,9 @@ are here for the macOS port, you only need `chm/`, `hypervisor/src/hvf/`, and
 
 ## License
 
-Unchanged from upstream: dual-licensed under **Apache-2.0** and
-**BSD-3-Clause** (see [`LICENSES/`](LICENSES/)). See
+Unchanged from upstream: dual-licensed under
+**[Apache-2.0](LICENSE-APACHE)** and
+**[BSD-3-Clause](LICENSE-BSD-3-Clause)**. Additional license texts for
+third-party material are retained in [`LICENSES/`](LICENSES/). See
 [`CONTRIBUTING.md`](CONTRIBUTING.md) for contribution and commit conventions
 (including the `Assisted-by:` disclosure trailer used for AI-assisted changes).

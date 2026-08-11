@@ -2,15 +2,14 @@
 
 Gimbal Local is a macOS-focused fork of
 [Cloud Hypervisor](https://www.cloudhypervisor.org/), dual-licensed under the
-[Apache v2 License](https://opensource.org/licenses/Apache-2.0) and the [BSD 3
-Clause](https://opensource.org/licenses/BSD-3-Clause) license. Individual files
+[Apache v2 License](LICENSE-APACHE) and the
+[BSD 3-Clause License](LICENSE-BSD-3-Clause). Individual files
 contain details of their licensing and changes to that file are under the same
 license unless the contribution changes the license of the file. When importing
 code from a third party project (e.g. Firecracker or crosvm) please respect the
 license of those projects.
 
-New code should be under the [Apache v2
-License](https://opensource.org/licenses/Apache-2.0).
+New code should be under the [Apache v2 License](LICENSE-APACHE).
 
 Gimbal Local targets **macOS on Apple Silicon (`aarch64`)** via Apple's
 Hypervisor.framework; the product is `chm`, the `hypervisor/src/hvf/` backend,
