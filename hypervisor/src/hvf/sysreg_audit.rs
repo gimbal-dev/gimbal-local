@@ -133,13 +133,14 @@ impl SysregFinding {
         }
         Some(match (op0, op1, crn, crm, op2) {
             (3, 3, 0, 0, 1) => {
-                "Only CTR_EL0.DIC (bit 29) actually differs: Graviton2 says 1, \
-                 Apple says 0. Cache line sizes, CWG, ERG, L1Ip and IDC are \
-                 bit-identical, so cache maintenance strides stay correct. DIC=1 \
-                 made the guest kernel patch `ic ivau` out of its I-cache \
-                 maintenance at boot; on Apple that is architecturally unsound. \
-                 Stressed on hardware (module load/unload, jump-label patching, \
-                 ftrace) without fault, so the exposure is latent, not fatal."
+                "DIC (bit 29) differs — Graviton2 says 1, Apple says 0 — which made \
+                 the guest kernel patch `ic ivau` out of its I-cache maintenance at \
+                 boot; on Apple that is architecturally unsound. IminLine differs \
+                 too, and that one is worse: the guest reads 4096 B and strides its \
+                 `ic ivau` loops by it, while the granule this Mac actually \
+                 invalidates is 64 B, so every JIT under-invalidates by 64x. HVF \
+                 refuses this register and will not report the host's value — the \
+                 numbers here were measured from inside a running guest. See #290."
             }
             (3, 3, 0, 0, 7) => {
                 "DC ZVA block size. Measured identical (64 B) on Apple M3 and in \

@@ -297,4 +297,37 @@ mod tests {
         assert!(parse(&["snap".into(), "--vcpu".into()]).is_err());
         assert!(parse(&["snap".into(), "--nonsense".into()]).is_err());
     }
+
+    /// #290: the CTR_EL0 note used to say cache line sizes were "bit-identical,
+    /// so cache maintenance strides stay correct". Measured from inside a
+    /// running guest, `IminLine` reads 4096 B while the granule that actually
+    /// invalidates is 64 B, so the strides are precisely the part that is
+    /// wrong, and every JIT under-invalidates by 64x.
+    ///
+    /// The claim was never measurable by this command: HVF refuses CTR_EL0 and
+    /// reports no host value, which is why the report prints `(unreadable)`
+    /// next to it. A note that a tool cannot check is exactly the kind that
+    /// needs pinning. This guard lives here rather than beside `note()` because
+    /// the `hypervisor` crate's own tests cannot compile on macOS -- `kvm-ioctls`
+    /// is Linux-only -- so a test next to the code would never run.
+    #[test]
+    fn the_ctr_note_names_the_stride_and_not_just_dic() {
+        let note = SysregFinding {
+            reg: 0xd801,
+            captured: 0xb444_c004,
+            fate: SysregFate::Refused { host: None },
+        }
+        .note()
+        .expect("a refused CTR_EL0 diverges, so it must carry its note");
+        for needle in ["IminLine", "4096", "64 B"] {
+            assert!(
+                note.contains(needle),
+                "the CTR_EL0 note must carry {needle:?}: {note}"
+            );
+        }
+        assert!(
+            !note.contains("strides stay correct"),
+            "the retracted #290 claim must not come back: {note}"
+        );
+    }
 }

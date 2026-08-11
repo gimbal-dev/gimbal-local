@@ -465,8 +465,18 @@ pub(crate) fn aarch32_guard(snap: &Snapshot) -> Result<(), String> {
 /// Measured in a rehydrated guest, executing freshly written code 1,000 times
 /// (`mmap(RW)` → write → `mprotect(RX)` → call — exactly what a JIT does):
 /// **955 of 1,000 executions fetched stale instructions**. Adding an explicit
-/// `ic ivau` took it to 0/1,000, so the hardware and EL0 maintenance are sound;
-/// only the kernel's elided copy is wrong.
+/// `ic ivau` took it to 0/1,000.
+///
+/// That last number was read for a long time as "only the kernel's elided copy
+/// is wrong". It is not — see #290. The explicit `ic ivau` in that test ran at
+/// offset 0 of its page, and the guest reads `CTR_EL0.IminLine = 4096 B` while
+/// the granule this Mac actually invalidates is **64 B**. Every `ic ivau` loop
+/// that honours `IminLine` — libgcc's `__clear_cache`, V8's and JSC's own — so
+/// invalidates one line in every 4 KiB and leaves the other 63 stale. Repeating
+/// the test at offset 64 with the guest's own stride SIGILLs immediately, and
+/// only a 64 B stride returns 0/200. So both copies are wrong, and restoring
+/// the kernel's `ic ivau` (#287) does not help on its own: the restored loop
+/// would stride 4096 too.
 ///
 /// How bad this is in practice was understated for a long time. The figure used
 /// to be "roughly one run in seven"; measured on a rehydrated Graviton guest
@@ -521,8 +531,15 @@ pub(crate) fn icache_detail() -> &'static str {
          patching `ic ivau` out of `caches_clean_inval_pou()`. Apple silicon reports \
          DIC = 0, so that elision is unsound here. Measured in a rehydrated guest, \
          executing freshly written code (mmap RW, write, mprotect RX, call — what every \
-         JIT does): 955 of 1000 executions fetched stale instructions. An explicit \
-         `ic ivau` took the same test to 0 of 1000, so only the kernel's copy is wrong.\n\
+         JIT does): 955 of 1000 executions fetched stale instructions.\n\
+         \n\
+         The guest's own cache maintenance is wrong too, for a second reason. It reads \
+         CTR_EL0.IminLine = 4096 bytes and strides its `ic ivau` loop by that, but the \
+         granule this Mac actually invalidates is 64 bytes. Measured at a fixed offset \
+         64 within a page, 200 rounds per stride: 64 B gave 0/200 stale, while 128 B, \
+         256 B and the advertised 4096 B each gave ~199/200. So a JIT under-invalidates \
+         by 64x, touching one line in every 4 KiB, and `npm --version` on a fresh \
+         rehydrate failed 15 times out of 20.\n\
          \n\
          Expect `Illegal instruction (core dumped)` from Node, npm, Java, .NET and any \
          other JIT. Measured on a rehydrated Graviton guest running Node 22.11.0, \
@@ -4407,6 +4424,27 @@ mod tests {
         ] {
             assert!(d.contains(needle), "asid_detail() must mention {needle:?}");
         }
+    }
+
+    /// #290: the warning used to end "so only the kernel's copy is wrong",
+    /// which sends every reader towards a kernel-side fix. There is a second,
+    /// independent error -- the guest strides its `ic ivau` loops by an
+    /// advertised 4096 B when the granule that actually invalidates is 64 B --
+    /// and a reader who does not learn that will fix the kernel and still get
+    /// SIGILL, because the restored loop strides 4096 too.
+    #[test]
+    fn the_icache_warning_carries_the_stride_that_is_actually_wrong() {
+        let d = icache_detail();
+        for needle in ["IminLine", "4096 bytes", "64 bytes", "64x"] {
+            assert!(
+                d.contains(needle),
+                "icache_detail() must carry {needle:?}: {d}"
+            );
+        }
+        assert!(
+            !d.contains("only the kernel's copy is wrong"),
+            "the retracted #290 conclusion must not come back: {d}"
+        );
     }
 
     /// The warning exists to change what the user does next, so it has to carry
