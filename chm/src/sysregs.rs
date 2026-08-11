@@ -367,11 +367,95 @@ mod tests {
             "docs/cpu-feature-deltas.md still draws the conclusion #290 falsified"
         );
 
-        for needle in ["IminLine", "offset 64", "#290"] {
+        // The cure has to be here too: this page is where the product's own
+        // warning sends a reader, and a page that states the defect without
+        // stating the fix reads as an open hazard for as long as it stands.
+        //
+        // `SCTLR_EL1.UCT` is deliberately NOT one of these needles even though
+        // it is the mechanism. The doc names that register while describing the
+        // *problem* -- the erratum clears it -- so a needle on it matches
+        // whether or not the fix is stated, and a mutation removing the cure
+        // sailed straight past it. These two strings cannot appear anywhere but
+        // an account of what shipped.
+        for needle in [
+            "IminLine",
+            "offset 64",
+            "#290",
+            "ctr_trap_fixup",
+            "CHM_KEEP_CTR_TRAP",
+            "998",
+        ] {
             assert!(
                 flat.contains(needle),
                 "the delta doc must record the stride finding: missing {needle:?}"
             );
         }
+    }
+
+    /// A capture that trapped EL0's `CTR_EL0` read must be corrected.
+    ///
+    /// The measured Graviton2 value is `0x3454599d`, whose bit 15 (`UCT`) is
+    /// clear because Linux applied erratum 1542419 at boot. Left alone, EL0
+    /// reads a 4096-byte i-cache stride against a real 64-byte granule.
+    #[test]
+    fn a_trapped_ctr_read_is_handed_back_to_the_hardware() {
+        let captured_on_graviton2 = 0x3454_599du64;
+        assert_eq!(
+            captured_on_graviton2 & hypervisor::hvf::SCTLR_EL1_UCT,
+            0,
+            "this fixture is only meaningful while it has UCT clear"
+        );
+
+        let fixed = hypervisor::hvf::ctr_trap_fixup(captured_on_graviton2)
+            .expect("a capture with UCT clear must be corrected");
+
+        assert_eq!(
+            fixed & hypervisor::hvf::SCTLR_EL1_UCT,
+            hypervisor::hvf::SCTLR_EL1_UCT,
+            "EL0 must be allowed to read this host's own CTR_EL0"
+        );
+        assert_eq!(
+            fixed & !hypervisor::hvf::SCTLR_EL1_UCT,
+            captured_on_graviton2,
+            "no other SCTLR_EL1 bit may move; MMU and cache enables live here"
+        );
+    }
+
+    /// A guest that never trapped the read is never rewritten.
+    #[test]
+    fn a_capture_that_already_reads_the_hardware_is_left_alone() {
+        let untrapped = 0x3454_599du64 | hypervisor::hvf::SCTLR_EL1_UCT;
+        assert!(
+            hypervisor::hvf::ctr_trap_fixup(untrapped).is_none(),
+            "nothing to correct when EL0 already reaches the hardware"
+        );
+    }
+
+    /// The bit really is `UCT`, not a neighbour.
+    ///
+    /// `SCTLR_EL1.UCT` is bit 15. Bit 26 is `UCI`, which gates EL0 *cache
+    /// maintenance* rather than the `CTR_EL0` read — setting that instead
+    /// would stop the `ic ivau` traps without fixing the stride they use, so
+    /// the two are easy to transpose and produce opposite outcomes.
+    #[test]
+    fn the_corrected_bit_is_uct_and_not_uci() {
+        assert_eq!(hypervisor::hvf::SCTLR_EL1_UCT, 1 << 15);
+        assert_ne!(hypervisor::hvf::SCTLR_EL1_UCT, 1 << 26);
+    }
+
+    /// The restore path must actually consult the fixup.
+    ///
+    /// Every other test here asserts an *outcome* of the pure function, and an
+    /// outcome assertion structurally cannot see a call site that stopped
+    /// calling it -- this repo has lost that bet five times (V9.5c, V9.11a,
+    /// #222, #242, #244). So read the restore loop's own source.
+    #[test]
+    fn the_restore_path_still_corrects_the_captured_sctlr() {
+        let src = include_str!("../../hypervisor/src/hvf/mod.rs");
+        let needle = format!("{}(v).unwrap_or(v)", "ctr_trap_fixup");
+        assert!(
+            src.contains(&needle),
+            "the SCTLR_EL1 restore arm must call ctr_trap_fixup: missing {needle:?}"
+        );
     }
 }

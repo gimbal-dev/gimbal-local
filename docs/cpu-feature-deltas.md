@@ -406,26 +406,76 @@ instruction work, only the kernel's copy is wrong"*) was drawn from data that
 could not have shown otherwise. `--jitless` works because a program that never
 patches code never needs the maintenance to be correct.
 
-**It cannot be fixed by setting the register.** HVF refuses writes to `CTR_EL0`
+**It cannot be fixed by writing the register.** HVF refuses writes to `CTR_EL0`
 (along with `ID_AA64MMFR0_EL1`, `DCZID_EL0`, `CLIDR_EL1`).
 
-**A restore-time cure exists, and is not yet built.** Linux already carries
-`ARM64_MISMATCHED_CACHE_TYPE` for exactly this situation: `read_ctr` becomes a
-load from `arm64_ftr_reg_ctrel0 + ARM64_FTR_SYSVAL` rather than an `MRS`, and the
-capability's `.cpu_enable` clears `SCTLR_EL1.UCT` so EL0 reads trap to
-`ctr_read_handler`, which returns the same sanitised value. Writing
-`0xa444c004` (DIC=0, IDC=1, IminLine=4 → 64 B) there at restore corrects both
-privilege levels at once.
+### The value was never the hardware's — FIXED 2026-08-11 ✅
 
-> **Trap, recorded because it is the tempting half-measure:** clearing `UCT`
-> alone is **worse than doing nothing**. The value EL0 would then be handed is
-> the capture's own `0xb444c004`, whose `DIC=1` tells userspace to skip `ic ivau`
-> entirely — 999/1000 stale instead of 199/200. The two pieces have to land
-> together or not at all.
+**4096 is not a stale reading of anything. It is a number Linux invents.**
 
-The open problem is locating `arm64_ftr_reg_ctrel0` in guest RAM *with certainty*
-— recognise-or-decline, never best-effort — and each CPU's legitimate
-`cpuinfo_arm64.reg_ctr` copies are decoys that must not be written.
+Graviton2 is a Neoverse-N1, so the guest applies erratum 1542419 at boot
+(`dmesg`: *ARM erratum 1542419 (kernel portion)*). That workaround clears
+`SCTLR_EL1.UCT`, so every EL0 `mrs ctr_el0` traps into `ctr_read_handler`
+(`arch/arm64/kernel/traps.c`, v6.8), which answers:
+
+```c
+if (cpus_have_final_cap(ARM64_WORKAROUND_1542419)) {
+        val &= ~BIT(CTR_EL0_DIC_SHIFT);                    /* hide DIC   */
+        val &= ~CTR_EL0_IminLine_MASK;
+        val |= (PAGE_SHIFT - 2) & CTR_EL0_IminLine_MASK;   /* fake stride */
+}
+```
+
+`PAGE_SHIFT - 2` is `12 - 2` = 10 = **4096 bytes**, and the comment in the
+kernel says it plainly: *fake IminLine to reduce the number of traps*. The
+matching `SCTLR_EL1.UCI` clear sends EL0 `ic ivau` to
+`user_cache_maint_handler`, which emulates **one line per trap**.
+
+That is sound on the capture host and unsound here, and the reason is one bit
+of truth: **N1 reports `DIC = 1`**, so the i-cache is already coherent with
+data writes and covering 1 line in 64 is as correct as covering none. **Apple
+silicon reports `DIC = 0`**, so every line genuinely needs `ic ivau` — while
+the restored kernel keeps handing userspace the 4096-byte stride it invented
+for hardware that did not need it.
+
+**So the cure is one bit, in a register we already restore.** Setting
+`SCTLR_EL1.UCT` at restore sends EL0 straight to the hardware, which answers
+`0x9444c004` — `IminLine = 4` (64 B) and `DIC = 0`, both true of this machine.
+It is strictly *more* maintenance than the trap handler asked for, never less,
+so it cannot weaken the erratum mitigation the bit belongs to. EL1 is
+unaffected: `UCT` gates EL0 only.
+
+Shipped as `hypervisor::hvf::ctr_trap_fixup`; `CHM_KEEP_CTR_TRAP=1` opts out.
+
+| same binary, same revision, one env var | `CHM_KEEP_CTR_TRAP=1` | fix active |
+| --- | --- | --- |
+| EL0 `CTR_EL0` | `0x9444c00a`, `IminLine` 4096 B | `0x9444c004`, `IminLine` **64 B** |
+| offset 0 | 0/200 stale | 0/200 stale |
+| **offset 64** | **SIGILL, core dumped** | **0/200 stale** |
+| offsets 128 – 4160 | not reached | **0/200 stale** |
+| `npm --version` × 20 | 5 ok (measured pre-fix) | **20 ok** |
+
+> **The plan this replaces was wrong, and instructively so.** It proposed
+> emulating `ARM64_MISMATCHED_CACHE_TYPE` by locating `arm64_ftr_reg_ctrel0` in
+> guest RAM and writing a corrected `sys_val` there. That would not have worked:
+> the handler *overrides* `IminLine` unconditionally when the erratum capability
+> is set, so a patched `sys_val` would have been overwritten on every read. The
+> plan was built by reasoning about which value was wrong, when the question
+> that mattered was **who computes it**. Reading the handler settled in minutes
+> what a RAM-patching design could not have solved at all.
+
+> **The half-measure trap, now inverted.** The earlier plan warned that
+> *clearing* `UCT` alone was worse than nothing. That was correct for the design
+> it described. What ships does the opposite — it **sets** `UCT` — and the
+> warning does not transfer: the value EL0 then reads is the hardware's, with
+> `DIC = 0`, so userspace does more maintenance rather than skipping it.
+
+**What this does not fix.** The kernel's own `ic ivau`, alternative-patched to a
+NOP at boot because the capture host advertised `DIC = 1`, lives in kernel text
+and no register reaches it. Measured *after* this fix, `mmap(RW)` → write →
+`mprotect(RX)` → call was stale **998 times in 1000**. That is #287, and this
+finding shows it is genuinely independent rather than a second symptom of the
+stride — the opposite of what was recorded when the two were first linked.
 
 ---
 

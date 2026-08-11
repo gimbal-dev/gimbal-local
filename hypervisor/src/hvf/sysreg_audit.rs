@@ -135,12 +135,15 @@ impl SysregFinding {
             (3, 3, 0, 0, 1) => {
                 "DIC (bit 29) differs — Graviton2 says 1, Apple says 0 — which made \
                  the guest kernel patch `ic ivau` out of its I-cache maintenance at \
-                 boot; on Apple that is architecturally unsound. IminLine differs \
-                 too, and that one is worse: the guest reads 4096 B and strides its \
-                 `ic ivau` loops by it, while the granule this Mac actually \
-                 invalidates is 64 B, so every JIT under-invalidates by 64x. HVF \
-                 refuses this register and will not report the host's value — the \
-                 numbers here were measured from inside a running guest. See #290."
+                 boot; on Apple that is architecturally unsound, and it is baked \
+                 into the kernel text inside the snapshot. What EL0 sees is no \
+                 longer this captured value: the capture also arrives with \
+                 SCTLR_EL1.UCT clear, so userspace reads went to a kernel handler \
+                 that reported IminLine = 4096 B, and restore now sets UCT so EL0 \
+                 reads this Mac's own CTR_EL0 (0x9444c004 — 64 B, DIC 0) instead. \
+                 HVF refuses this register and will not report the host's value — \
+                 the numbers here were measured from inside a running guest. \
+                 See #290 for the stride and #287 for the kernel's own copy."
             }
             (3, 3, 0, 0, 7) => {
                 "DC ZVA block size. Measured identical (64 B) on Apple M3 and in \
