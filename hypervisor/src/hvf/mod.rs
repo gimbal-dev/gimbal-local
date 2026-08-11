@@ -894,17 +894,43 @@ impl UserGic {
     /// `ICC_DIR_EL1`. Keeping `active` set until DIR when `EOImode=1` is what
     /// prevents the next pending interrupt from being delivered while the
     /// current one is still active.
-    fn write_eoir(&mut self) {
+    fn write_eoir(&mut self, intid: u32) {
         let eoimode = (self.ctlr >> 1) & 1 != 0;
         if !eoimode {
-            self.active.pop();
+            self.deactivate(intid);
         }
     }
 
     /// Model an `ICC_DIR_EL1` write (deactivate interrupt), used with
     /// `EOImode=1` to complete the split priority-drop/deactivate cycle.
-    fn write_dir(&mut self) {
-        self.active.pop();
+    fn write_dir(&mut self, intid: u32) {
+        self.deactivate(intid);
+    }
+
+    /// Remove the innermost activation of `intid` from the active stack.
+    ///
+    /// The guest *names* the INTID in both `ICC_EOIR1_EL1` and `ICC_DIR_EL1`,
+    /// and honouring that name — rather than popping whatever happens to be on
+    /// top — is what makes an unmatched or out-of-order deactivate safe. Two
+    /// distinct failures come from popping the top instead, and the second one
+    /// is unrecoverable:
+    ///
+    /// 1. A deactivate for an INTID this model never made active (a residual
+    ///    from before restore, an interrupt HVF delivered on the managed path)
+    ///    silently deactivates an *unrelated* interrupt that is still live.
+    /// 2. The named INTID stays on the stack **forever**. That is permanent for
+    ///    the virtual timer specifically: [`Self::push_pending`] refuses to
+    ///    re-queue an INTID that is active at any depth, so once PPI 27 is
+    ///    buried, [`HvfVcpu::usgic_poll_vtimer`] asserts it at every single run
+    ///    entry and is refused every time. The vCPU's tick never returns, while
+    ///    its siblings — which have their own model — stay healthy. See #257.
+    ///
+    /// Searching from the top removes the innermost activation, which is the
+    /// one a correctly-nested guest is completing.
+    fn deactivate(&mut self, intid: u32) {
+        if let Some(pos) = self.active.iter().rposition(|&a| a == intid) {
+            self.active.remove(pos);
+        }
     }
 
     /// The innermost acknowledged INTID, or `None` outside any handler.
@@ -917,17 +943,22 @@ impl UserGic {
         self.active.contains(&intid)
     }
 
-    /// Whether deactivating `was` (the INTID on top before an EOI/DIR) has just
-    /// taken the virtual-timer PPI out of the active stack, i.e. whether HVF's
-    /// auto-masked vtimer must now be re-armed.
+    /// Whether an EOI/DIR naming `wrote` has just taken the virtual-timer PPI
+    /// out of the active stack, i.e. whether HVF's auto-masked vtimer must now
+    /// be re-armed.
     ///
     /// Call *after* the write. Both halves matter and neither is redundant:
     /// under `EOImode=1` the EOI drops priority without deactivating, so 27 is
     /// still active and re-arming would storm; and when 27 sits *underneath* a
-    /// nested handler the inner EOI must not re-arm it either. Asking the whole
-    /// stack is what makes the second case answerable at all.
-    fn vtimer_just_deactivated(&self, was: Option<u32>) -> bool {
-        was == Some(VTIMER_PPI) && !self.is_active(VTIMER_PPI)
+    /// nested handler, an inner handler's EOI names a different INTID and must
+    /// not re-arm it either. Asking the whole stack is what makes the second
+    /// case answerable at all.
+    ///
+    /// `wrote` is the INTID the guest named, not the top of the stack: those
+    /// coincide only for a perfectly nested guest, and the whole point of
+    /// [`Self::deactivate`] is that we no longer assume they do.
+    fn vtimer_just_deactivated(&self, wrote: Option<u32>) -> bool {
+        wrote == Some(VTIMER_PPI) && !self.is_active(VTIMER_PPI)
     }
 
     /// Whether the raw virtual IRQ line should be asserted before a run entry:
@@ -1402,7 +1433,7 @@ mod usgic_tests {
         g.push_pending(8192);
         g.push_pending(8193);
         assert_eq!(g.read_iar(), 8192);
-        g.write_eoir(); // EOImode=0: drops priority AND deactivates
+        g.write_eoir(8192); // EOImode=0: drops priority AND deactivates
         assert_eq!(g.active_top(), None);
         // Now the next pending one can be delivered.
         assert!(g.should_assert());
@@ -1415,13 +1446,13 @@ mod usgic_tests {
         g.push_pending(8192);
         g.push_pending(8193);
         assert_eq!(g.read_iar(), 8192);
-        g.write_eoir(); // EOImode=1: priority drop ONLY; stays active
+        g.write_eoir(8192); // EOImode=1: priority drop ONLY; stays active
         assert_eq!(g.active_top(), Some(8192), "EOImode=1 EOIR must not deactivate");
         assert!(
             !g.should_assert(),
             "next pending must be held while the first is still active"
         );
-        g.write_dir(); // now deactivate
+        g.write_dir(8192); // now deactivate
         assert_eq!(g.active_top(), None);
         assert!(
             g.should_assert(),
@@ -1461,21 +1492,23 @@ mod usgic_tests {
 
         // Inner EOI: the timer has NOT deactivated, so re-arming here would
         // storm the guest with an activation it cannot yet service.
-        let was = g.active_top();
-        g.write_eoir();
+        g.write_eoir(79);
         assert!(
-            !g.vtimer_just_deactivated(was),
+            !g.vtimer_just_deactivated(Some(79)),
             "the inner EOI must not re-arm the vtimer"
         );
 
         // Outer EOI: the timer really has gone, and this is the edge that must
         // re-arm. With a single `active` slot `was` was `None` here and the
         // vtimer stayed masked for the life of the guest.
-        let was = g.active_top();
-        assert_eq!(was, Some(VTIMER_PPI), "the outer INTID must still be known");
-        g.write_eoir();
+        assert_eq!(
+            g.active_top(),
+            Some(VTIMER_PPI),
+            "the outer INTID must still be known"
+        );
+        g.write_eoir(VTIMER_PPI);
         assert!(
-            g.vtimer_just_deactivated(was),
+            g.vtimer_just_deactivated(Some(VTIMER_PPI)),
             "the outer EOI must re-arm the vtimer"
         );
         assert!(g.active.is_empty(), "no interrupt is active any more");
@@ -1498,22 +1531,90 @@ mod usgic_tests {
         g.push_pending(VTIMER_PPI);
         assert_eq!(g.read_iar(), VTIMER_PPI);
 
-        let was = g.active_top();
-        g.write_eoir();
+        g.write_eoir(VTIMER_PPI);
         assert!(
             g.is_active(VTIMER_PPI),
             "EOImode=1 EOIR drops priority without deactivating"
         );
         assert!(
-            !g.vtimer_just_deactivated(was),
+            !g.vtimer_just_deactivated(Some(VTIMER_PPI)),
             "the priority drop must not re-arm the vtimer"
         );
 
-        let was = g.active_top();
-        g.write_dir();
+        g.write_dir(VTIMER_PPI);
         assert!(
-            g.vtimer_just_deactivated(was),
+            g.vtimer_just_deactivated(Some(VTIMER_PPI)),
             "the deactivate must re-arm the vtimer"
+        );
+    }
+
+    /// The #257 wedge, in the model: a deactivate must honour the INTID the
+    /// guest named, or the virtual timer can be buried in the active stack
+    /// permanently.
+    ///
+    /// `ICC_DIR_EL1` is written *with* an INTID. Popping the top of the stack
+    /// instead deactivates whatever happens to be innermost, so a guest that
+    /// completes the timer while a device handler is still active loses both
+    /// halves at once: the device IRQ is deactivated behind its handler's back,
+    /// and PPI 27 stays active forever. That second half never recovers --
+    /// [`UserGic::push_pending`] refuses to re-queue an INTID that is active at
+    /// any depth, so `usgic_poll_vtimer` asserts the timer at every run entry
+    /// and is refused every time. The vCPU's tick never returns while its
+    /// siblings, which have their own model, stay healthy.
+    #[test]
+    fn a_deactivate_out_of_order_cannot_strand_the_virtual_timer() {
+        const VTIMER_PPI: u32 = 27;
+        let mut g = eoimode1();
+
+        // The timer is taken, then a device IRQ nests on top of it.
+        g.push_pending(VTIMER_PPI);
+        assert_eq!(g.read_iar(), VTIMER_PPI);
+        g.push_pending(79);
+        assert_eq!(g.read_iar(), 79);
+        assert_eq!(g.active_top(), Some(79));
+
+        // The guest deactivates the *timer* while the nested handler is still
+        // active. The INTID it named is the one that must go.
+        g.write_dir(VTIMER_PPI);
+        assert!(
+            !g.is_active(VTIMER_PPI),
+            "the named INTID must be the one deactivated"
+        );
+        assert!(
+            g.is_active(79),
+            "a nested handler nobody named must stay active"
+        );
+
+        // And the property the wedge is actually about: the timer is
+        // deliverable again.
+        g.push_pending(VTIMER_PPI);
+        assert!(
+            g.pending.contains(&VTIMER_PPI),
+            "the vtimer must be re-queueable once deactivated"
+        );
+        assert_eq!(
+            g.nested_requeues_refused, 0,
+            "no assert should have been refused"
+        );
+    }
+
+    /// The other direction: a deactivate naming an INTID this model never
+    /// acknowledged must be a no-op, not a silent deactivate of an unrelated
+    /// live interrupt. Residual writes like this are reachable across a
+    /// restore, where the guest resumes holding state the model was rebuilt
+    /// without.
+    #[test]
+    fn a_deactivate_naming_an_unknown_intid_leaves_the_stack_alone() {
+        const VTIMER_PPI: u32 = 27;
+        let mut g = eoimode1();
+        g.push_pending(VTIMER_PPI);
+        assert_eq!(g.read_iar(), VTIMER_PPI);
+
+        g.write_dir(1022);
+
+        assert!(
+            g.is_active(VTIMER_PPI),
+            "an unmatched deactivate must not deactivate a live interrupt"
         );
     }
 
@@ -2786,8 +2887,9 @@ impl HvfVcpu {
                     // pending one (correctness the rubber-duck flagged).
                     (12, 12, 1) | (12, 8, 1) => {
                         name = "ICC_EOIR";
-                        let was = g.active_top();
-                        g.write_eoir();
+                        // The INTID lives in bits [23:0]; the rest is RES0.
+                        let wrote = (val & 0xff_ffff) as u32;
+                        g.write_eoir(wrote);
                         // If the virtual-timer PPI just deactivated, re-arm the
                         // HVF vtimer so the guest's next armed deadline fires.
                         // Asked of the whole active stack, not of a single slot:
@@ -2795,16 +2897,16 @@ impl HvfVcpu {
                         // deactivating, and a nested handler leaves 27 active
                         // underneath. Re-arming while it is still active would
                         // storm; not re-arming when it has gone is the wedge.
-                        if g.vtimer_just_deactivated(was) {
+                        if g.vtimer_just_deactivated(Some(wrote)) {
                             rearm_timer = true;
                         }
                     }
                     // ICC_DIR_EL1 (deactivate interrupt) — used with EOImode=1.
                     (12, 11, 1) => {
                         name = "ICC_DIR";
-                        let was = g.active_top();
-                        g.write_dir();
-                        if g.vtimer_just_deactivated(was) {
+                        let wrote = (val & 0xff_ffff) as u32;
+                        g.write_dir(wrote);
+                        if g.vtimer_just_deactivated(Some(wrote)) {
                             rearm_timer = true;
                         }
                     }
