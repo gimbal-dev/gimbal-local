@@ -408,9 +408,10 @@ fn intercept(
             .with_root_certificates(Arc::clone(&config.roots))
             .with_no_client_auth();
     client_cfg.alpn_protocols = vec![b"http/1.1".to_vec()];
+    let client_cfg = Arc::new(client_cfg);
     let server_name = ServerName::try_from(name.clone())
         .map_err(|_| io::Error::other(format!("'{name}' is not a valid TLS server name")))?;
-    let up_tls = ClientConnection::new(Arc::new(client_cfg), server_name)
+    let up_tls = ClientConnection::new(Arc::clone(&client_cfg), server_name.clone())
         .map_err(|e| io::Error::other(format!("TLS client setup failed: {e}")))?;
 
     // Connect to the address the NAT already admitted, not to a fresh lookup of
@@ -427,6 +428,10 @@ fn intercept(
         up_sock: None,
         up_addr: addr,
         up_tls,
+        up_cfg: client_cfg,
+        up_name: server_name,
+        unsent_request: Vec::new(),
+        retried: false,
         injector: Injector::new(
             header_name,
             header_value,
@@ -585,6 +590,17 @@ struct Pump {
     up_sock: Option<TcpStream>,
     up_addr: SocketAddr,
     up_tls: ClientConnection,
+    /// Kept so the origin connection can be rebuilt for the single retry in
+    /// [`Pump::redial_once`]; a `ClientConnection` that has seen a dead socket
+    /// cannot be reused.
+    up_cfg: Arc<ClientConfig>,
+    up_name: ServerName<'static>,
+    /// Request bytes handed to rustls before the origin handshake finished, and
+    /// therefore not yet delivered to anyone. Dropped the moment the handshake
+    /// completes, which is also the moment retrying stops being safe.
+    unsent_request: Vec<u8>,
+    /// At most one retry per connection, ever.
+    retried: bool,
     injector: Injector,
     audit: Arc<Audit>,
     destination: String,
@@ -617,6 +633,49 @@ impl Pump {
         Ok(())
     }
 
+    /// Redial the origin, once, when it closed before any request byte could
+    /// have reached it.
+    ///
+    /// Lazy dialling (#265) shrank the window between `connect` and `write` from
+    /// seconds to microseconds, but it cannot close it: an origin may drop a
+    /// connection in that gap, and keep-alive reuse — where the connection is
+    /// idle by definition between requests — will widen it again.
+    ///
+    /// **The safety condition is `is_handshaking()`, and it is the whole
+    /// argument.** TLS carries no application data until the handshake
+    /// completes, so an origin that dropped us mid-handshake provably never saw
+    /// a byte of the request. Replaying it is then indistinguishable from a
+    /// first attempt whatever the method, and no idempotence assumption is
+    /// needed. Once the handshake is up that guarantee is gone, so the retry
+    /// stops — this is not a general HTTP retry and must not become one.
+    ///
+    /// The retry is audited. A silent one hides a flaky origin behind an
+    /// occasional latency spike, which is precisely the thing an operator would
+    /// want to see.
+    fn redial_once(&mut self) -> io::Result<bool> {
+        if self.retried || !self.up_tls.is_handshaking() {
+            return Ok(false);
+        }
+        self.retried = true;
+        self.up_tls = ClientConnection::new(Arc::clone(&self.up_cfg), self.up_name.clone())
+            .map_err(|e| io::Error::other(format!("TLS client setup failed: {e}")))?;
+        self.up_sock = None;
+        self.dial_upstream()?;
+        if !self.unsent_request.is_empty() {
+            // Disjoint field borrows: the TLS state and the replay buffer are
+            // different fields, so no clone is needed to satisfy the borrow.
+            self.up_tls.writer().write_all(&self.unsent_request)?;
+        }
+        self.audit.record(AuditEvent {
+            at_unix: now_unix(),
+            destination: self.destination.clone(),
+            rule: Some(self.rule.clone()),
+            detail: "origin closed before the request was sent; redialled once".to_string(),
+            injected: false,
+        });
+        Ok(true)
+    }
+
     /// Record which TLS version the origin settled on, once. We accept 1.2
     /// upstream because some origins still require it, and permitting something
     /// silently is not the same as permitting it — this is what makes a
@@ -626,6 +685,9 @@ impl Pump {
             return;
         }
         self.upstream_version_logged = true;
+        // Application data can now flow, so the request is no longer replayable
+        // and the copy held for that purpose must go.
+        self.unsent_request = Vec::new();
         let version = self
             .up_tls
             .protocol_version()
@@ -671,7 +733,16 @@ impl Pump {
                 && self.up_tls.wants_read()
             {
                 match self.up_tls.read_tls(sock) {
-                    Ok(0) => up_closed = true,
+                    // An origin that vanishes here has either finished with us or
+                    // never started: `redial_once` tells the two apart by whether
+                    // the handshake had completed (#267).
+                    Ok(0) => {
+                        if self.redial_once()? {
+                            progressed = true;
+                        } else {
+                            up_closed = true;
+                        }
+                    }
                     Ok(_) => {
                         self.up_tls
                             .process_new_packets()
@@ -680,7 +751,14 @@ impl Pump {
                         progressed = true;
                     }
                     Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        // A reset is the other way an origin closes a connection
+                        // it had already given up on.
+                        if !self.redial_once()? {
+                            return Err(e);
+                        }
+                        progressed = true;
+                    }
                 }
             }
 
@@ -715,6 +793,12 @@ impl Pump {
                 pending_from_guest.drain(..used);
                 if !rewritten.is_empty() {
                     self.dial_upstream()?;
+                    // Hold a replayable copy only while the handshake is still
+                    // running, which is exactly the window in which replay is
+                    // provably safe. See `redial_once`.
+                    if self.up_tls.is_handshaking() {
+                        self.unsent_request.extend_from_slice(&rewritten);
+                    }
                     self.up_tls.writer().write_all(&rewritten)?;
                     progressed = true;
                 }
@@ -912,6 +996,19 @@ mod tests {
     }
 
     fn spawn_origin(ca: &Arc<ProxyCa>, name: &str, exchanges: usize) -> Origin {
+        spawn_origin_dropping_first(ca, name, exchanges, 0)
+    }
+
+    /// An origin that accepts and immediately drops its first `drops`
+    /// connections before behaving normally — a deterministic stand-in for one
+    /// that closed an idle keep-alive connection in the microseconds between our
+    /// `connect` and our first write (#267). No network, no guest boot.
+    fn spawn_origin_dropping_first(
+        ca: &Arc<ProxyCa>,
+        name: &str,
+        exchanges: usize,
+        drops: usize,
+    ) -> Origin {
         install_provider();
         let leaf = ca.leaf_for(name).expect("origin leaf");
         let mut cfg = ServerConfig::builder_with_protocol_versions(&[&version::TLS13])
@@ -932,6 +1029,15 @@ mod tests {
         let (tx, seen) = mpsc::channel();
 
         std::thread::spawn(move || {
+            for _ in 0..drops {
+                let Ok((sock, _)) = listener.accept() else {
+                    return;
+                };
+                // Close without reading a byte, and without a TLS alert: the
+                // client learns only that the socket is gone.
+                let _ = sock.shutdown(Shutdown::Both);
+                drop(sock);
+            }
             let Ok((sock, _)) = listener.accept() else {
                 return;
             };
@@ -1183,6 +1289,55 @@ mod tests {
             accepted.load(Ordering::SeqCst),
             0,
             "the origin was dialled before the guest had sent anything"
+        );
+        proxy.stop();
+    }
+
+    /// #267: an origin that closes between our `connect` and our first write
+    /// costs the guest a request that was never delivered. Lazy dialling (#265)
+    /// made that window microseconds wide instead of seconds, but keep-alive
+    /// reuse will widen it again, so the request has to survive it.
+    ///
+    /// The retry is safe *only* because it happens with the origin handshake
+    /// still incomplete: TLS carries no application data before then, so the
+    /// dropped origin provably saw nothing and a replay cannot duplicate a side
+    /// effect — no idempotence assumption required.
+    #[test]
+    fn a_request_survives_an_origin_that_closed_before_it_arrived() {
+        let secret = secret_file("redial");
+        let origin_ca = ProxyCa::ephemeral().expect("origin ca");
+        let origin = spawn_origin_dropping_first(&origin_ca, "upstream.test", 1, 1);
+
+        let rules = format!(
+            r#"{{"version":1,"rules":[{{"name":"upstream","hosts":["upstream.test"],
+                "ports":[{}],"scheme":"bearer","file":"{}"}}]}}"#,
+            origin.addr.port(),
+            secret
+        );
+        let (proxy, proxy_ca) = start_proxy(&rules, &origin_ca);
+
+        let request = "GET /retry HTTP/1.1\r\nHost: upstream.test\r\n\r\n";
+        let reply = guest_request(&proxy, &proxy_ca, origin.addr, "upstream.test", &[request])
+            .expect("the request must survive the first origin dropping it");
+        assert!(reply.starts_with("HTTP/1.1 200 OK"), "reply was {reply:?}");
+
+        // Delivered exactly once, not twice: the replay went to a connection
+        // that had never seen the request.
+        let seen = origin
+            .seen
+            .recv_timeout(Duration::from_secs(10))
+            .expect("origin should have received the replayed request");
+        assert!(seen.contains("GET /retry HTTP/1.1"), "{seen}");
+        assert!(
+            origin.seen.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the request was delivered more than once"
+        );
+
+        // A silent retry hides a flaky origin.
+        let recorded = proxy.audit.recent();
+        assert!(
+            recorded.iter().any(|e| e.detail.contains("redialled once")),
+            "the retry was not audited: {recorded:?}"
         );
         proxy.stop();
     }
