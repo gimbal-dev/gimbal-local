@@ -5,8 +5,8 @@ you are an agent starting a task — read this, then
 [`engineering-discipline.md`](engineering-discipline.md), then the domain guide
 for the area you are touching.
 
-**Last measured sweep:** 2026-08-13, against the
-`nebuk89-public-readiness-audit` working tree based on `7330fc727`.
+**Last measured sweep:** 2026-08-13, against `ee3e6dde4` — the `v0.2.2` release
+commit on `main`.
 **Issue-state refresh:** 2026-08-13, via `gh issue view` / `gh pr view`.
 
 Everything in this document was measured on this machine. Where something is
