@@ -2192,6 +2192,56 @@ mod tests {
     }
 
     #[test]
+    fn materialize_bundle_refuses_a_traversing_relpath() {
+        // `confined_join` is unit-tested above, but the property that actually
+        // matters is a composition one: `materialize_bundle` validates `rel`
+        // with `confined_join` *before* handing the same raw `rel` to
+        // `fetch_object`, whose `file://` branch joins it onto the object-store
+        // root without confining it. Nothing in the type system enforces that
+        // ordering, so this guards it end to end. If the two calls are ever
+        // reordered, a tampered manifest could copy an arbitrary host file into
+        // the guest-visible cache.
+        let root = env::temp_dir().join(format!("chm-cp-trav-{}", process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = root.join("store");
+        fs::create_dir_all(&store).unwrap();
+        // A decoy sitting *beside* the object store, reachable only by escaping it.
+        fs::write(root.join("secret.bin"), b"TENANT-KEY-MATERIAL").unwrap();
+
+        let cache = root.join("snap");
+        let uri = format!("file://{}", store.display());
+        for bad in ["../secret.bin", "../../secret.bin", "/etc/passwd"] {
+            let mut tree = BTreeMap::new();
+            // sha256("TENANT-KEY-MATERIAL"), so a digest check could not be what
+            // refuses this -- the path guard has to be what stops it.
+            tree.insert(
+                bad.to_string(),
+                "3839b0e0e2dc71dbfe744a02cc597a6eed06a90e9f9da8eddf43408a3a9ebed6".to_string(),
+            );
+            let err = materialize_bundle(&uri, &tree, &cache, None)
+                .expect_err(&format!("must refuse traversing bundle path {bad:?}"));
+            // Assert on *which* guard refused, not merely that something did.
+            // Weakening `confined_join` still makes these fail -- but with a
+            // checksum mismatch or a missing-source copy error, which would be
+            // refusal by accident rather than by containment. Pinning the
+            // message is what makes this test die when the guard is removed.
+            assert!(
+                err.contains("escapes the bundle root"),
+                "{bad:?} was refused by the wrong thing: {err}"
+            );
+        }
+        // Nothing escaped: the decoy was never copied in under any name.
+        let leaked = fs::read_dir(&cache)
+            .map(|d| {
+                d.filter_map(|e| e.ok())
+                    .any(|e| fs::read(e.path()).map(|b| b == b"TENANT-KEY-MATERIAL").unwrap_or(false))
+            })
+            .unwrap_or(false);
+        assert!(!leaked, "decoy contents reached the guest-visible cache");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
     fn parses_empty_body_with_status() {
         let raw = "\n__CHM_HTTP_STATUS__:204";
         let resp = parse_http_response(raw).unwrap();

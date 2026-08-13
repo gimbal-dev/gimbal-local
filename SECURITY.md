@@ -16,17 +16,22 @@ If you are testing `main`, say so in the report and include the commit SHA.
 
 ## Reporting a vulnerability
 
-For now, security coordination goes through this repository's GitHub issues. A
-dedicated private reporting channel is not offered at this stage.
+Please use GitHub's private vulnerability reporting, which is enabled on this
+repository: open the [Security tab](https://github.com/gimbal-dev/gimbal-local/security/advisories/new)
+and file a draft advisory. That keeps the report private until a fix ships.
 
-Because GitHub issues in a public repository are visible to everyone, do **not**
-include secrets, credentials, API tokens, private keys, personal data, or a
-working exploit / proof-of-concept. Describe the concern at a high level: the
-affected area, the type of issue, and the impact. If safely demonstrating it
-would require sensitive details, say so in the issue and wait for a maintainer to
-respond before sharing anything further.
+Do not open a public issue for a vulnerability. The repository is public, so an
+issue discloses the problem to everyone before there is anything to upgrade to.
 
-Include non-sensitive context where you can:
+There is no SLA. This is a preview built by one person, so expect a
+best-effort response rather than a committed timeline.
+
+In a private advisory a proof-of-concept is welcome and makes the report far
+easier to act on. Only if you are ever asked to move a discussion to a public
+issue, keep secrets, credentials, API tokens, private keys, personal data and
+working exploits out of it.
+
+Include context where you can:
 
 - the affected version or commit;
 - the host Mac model and macOS version;
@@ -34,7 +39,8 @@ Include non-sensitive context where you can:
 - the command line or app path used to start it;
 - the expected boundary and how it appeared to fail.
 
-Open the report at <https://github.com/gimbal-dev/gimbal-local/issues/new>.
+Open the report at
+<https://github.com/gimbal-dev/gimbal-local/security/advisories/new>.
 
 ## What is in scope
 
@@ -78,4 +84,4 @@ short version:
 
 Those are implemented security controls, not aspirations. They are also
 AI-authored and not human-reviewed. If you can produce a counterexample, please
-report it through the issue-tracker process above.
+report it through the private advisory process above.
