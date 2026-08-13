@@ -61,9 +61,9 @@ three ways:
 
 ## Shipping status
 
-- **Released:** `v0.1.1` — signed, notarized, stapled, and verified the way a
+- **Released:** `v0.2.0` — signed, notarized, stapled, and verified the way a
   stranger receives it.
-- **Version in tree:** `0.1.1`.
+- **Version in tree:** `0.2.0`.
 - **CI is billing-blocked.** Every gate runs locally. This is known and
   accepted — do not raise it as a finding.
 
@@ -82,8 +82,13 @@ three ways:
 of them, or say which you are quoting — a single number invites a false
 regression report.
 
-Tests have only ever run in **debug** — every gate we have quoted is a debug
-gate ([#214](https://github.com/gimbal-dev/gimbal-local/issues/214)).
+The release gate now runs the suite in the configuration it is about to ship
+([#214](https://github.com/gimbal-dev/gimbal-local/issues/214), closed) —
+`scripts/release-macos.sh` runs `cargo test --release` and `swift test -c
+release` **before** it builds anything. That guard exists because a suite that
+has only ever run in one build configuration reports safety it does not provide
+for any other: the `fcntl` variadic bug passed every debug test and hung every
+release binary. Day-to-day gates above are still debug; the release is not.
 
 ---
 

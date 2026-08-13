@@ -736,7 +736,7 @@ final class ConsoleInputEncodingTests: XCTestCase {
     {
       "source": "daemon",
       "assessed": "library-root",
-      "workspace": "/Users/nebuk89/v61/lib",
+      "workspace": "/tmp/gimbal-test/v61/lib",
       "weakened": 1,
       "controls": [
         {"invariant":"I10","control":"host-network isolation","state":"weakened","detail":"CHM_ALLOW_LOCAL_EGRESS is set — the guest can reach loopback, your LAN and link-local addresses including 169.254.169.254"},
@@ -922,7 +922,7 @@ final class ConsoleInputEncodingTests: XCTestCase {
         {
           "source": "daemon",
           "assessed": "library-root",
-        "configured":true,"origin":"/Users/nebuk89/v62lib/proxy-rules.json",        "label":"GitHub API for the agent sandbox",        "rules":[{"name":"github-api","hosts":"api.github.com","header":"Authorization",        "source":"env:V62_GH_TOKEN","credential":"present"}],        "passthrough":["pinned.example.com"]}
+        "configured":true,"origin":"/tmp/gimbal-test/v62lib/proxy-rules.json",        "label":"GitHub API for the agent sandbox",        "rules":[{"name":"github-api","hosts":"api.github.com","header":"Authorization",        "source":"env:V62_GH_TOKEN","credential":"present"}],        "passthrough":["pinned.example.com"]}
         """
         let config = try JSONDecoder().decode(
             ProxyConfiguration.self,
@@ -973,7 +973,7 @@ final class ConsoleInputEncodingTests: XCTestCase {
         {
           "source": "daemon",
           "assessed": "running-vm",
-          "scope_dir": "/Users/nebuk89/v62lib/graviton-agent",
+          "scope_dir": "/tmp/gimbal-test/v62lib/graviton-agent",
         "configured":false,"rules":[]}
         """
         let config = try JSONDecoder().decode(
@@ -984,7 +984,7 @@ final class ConsoleInputEncodingTests: XCTestCase {
         XCTAssertTrue(config.describesRunningVm)
         // The directory is the actionable part: rules left in the library root
         // are read by nothing, because a guest's workspace is its own folder.
-        XCTAssertEqual(config.scopeDir, "/Users/nebuk89/v62lib/graviton-agent")
+        XCTAssertEqual(config.scopeDir, "/tmp/gimbal-test/v62lib/graviton-agent")
     }
 
     /// An idle daemon reports the library root, which is *not* a live finding:
@@ -992,7 +992,7 @@ final class ConsoleInputEncodingTests: XCTestCase {
     func testAnIdleLibraryRootIsNotReportedAsALiveSandbox() throws {
         let json = """
         {"source":"daemon","assessed":"library-root",
-         "scope_dir":"/Users/nebuk89/v62lib","configured":false,"rules":[]}
+         "scope_dir":"/tmp/gimbal-test/v62lib","configured":false,"rules":[]}
         """
         let config = try JSONDecoder().decode(
             ProxyConfiguration.self,
@@ -1008,7 +1008,7 @@ final class ConsoleInputEncodingTests: XCTestCase {
     /// with, while the installer still reports success.
     func testTheCaComesFromTheProcessThatWillSignWithIt() throws {
         let json = #"{"source":"daemon","assessed":"running-vm","#
-            + #""scope_dir":"/Users/nebuk89/v62lib/graviton-agent","present":true,"#
+            + #""scope_dir":"/tmp/gimbal-test/v62lib/graviton-agent","present":true,"#
             + #""sha256":"79f85a28f5fabdf07634b9bef19b91ebfaa0a31abc43fc75fedf005bb28a2d33","#
             + #""pem":"-----BEGIN CERTIFICATE-----\nAA\n-----END CERTIFICATE-----\n","#
             + #""installer":"set -e\nsudo tee /usr/local/share/ca-certificates/x.crt\n"}"#
@@ -1018,7 +1018,7 @@ final class ConsoleInputEncodingTests: XCTestCase {
             ca.fingerprint,
             "79f85a28f5fabdf07634b9bef19b91ebfaa0a31abc43fc75fedf005bb28a2d33"
         )
-        XCTAssertEqual(ca.scopeDir, "/Users/nebuk89/v62lib/graviton-agent")
+        XCTAssertEqual(ca.scopeDir, "/tmp/gimbal-test/v62lib/graviton-agent")
         XCTAssertTrue(ca.installScript.contains("sudo tee"))
     }
 

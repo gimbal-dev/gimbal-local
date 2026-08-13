@@ -46,7 +46,7 @@
 > product.
 >
 > The disclosure runs all the way down. The AI also invented a human name and
-> signed 114 commits with it, and used a real third party's name on two more.
+> signed 112 commits with it, and used a real third party's name on two more.
 > Those `Signed-off-by:` attestations are void, and the whole account is in
 > [A defect in our own commit
 > history](CONTRIBUTING.md#a-defect-in-our-own-commit-history) rather than left
@@ -302,8 +302,30 @@ and preserve attribution, but they are not compiled into the shipped macOS app.
 
 ## Credits and upstream
 
-Placeholder: upstream attribution and public-credit wording are being prepared
-for the launch README.
+Gimbal Local exists because of
+[Cloud Hypervisor](https://github.com/cloud-hypervisor/cloud-hypervisor) and its
+contributors. The VMM, device model, snapshot and migration machinery this
+project rehydrates on Apple silicon are theirs; what is added here is the macOS
+runtime around them. Cloud Hypervisor in turn builds on
+[rust-vmm](https://github.com/rust-vmm),
+[Firecracker](https://firecracker-microvm.github.io/) and
+[crosvm](https://chromium.googlesource.com/chromiumos/platform/crosvm/), and
+that credit chain is preserved in full in [`CREDITS.md`](CREDITS.md).
+
+Two things worth saying plainly, because a fork can easily imply more than it
+should:
+
+- **Upstream did not review, endorse or approve any of this.** The Cloud
+  Hypervisor project is independent of this fork and is not responsible for its
+  issues, releases or support. Please do not take Gimbal Local bugs to them.
+  Which upstream files were modified, and the baseline they are compared
+  against, are recorded in [`UPSTREAM-CHANGES.md`](UPSTREAM-CHANGES.md).
+- **The HVF backend is given back, deliberately.**
+  [`hypervisor/src/hvf/`](hypervisor/src/hvf/) stays Apache-2.0 — it sits inside
+  an upstream crate, implements an upstream trait, and is the piece upstream
+  could most directly use. Restricting it would read as taking from the project
+  this one is built on. The commercial seam is elsewhere; see
+  [Licence](#licence).
 
 ## Licence
 

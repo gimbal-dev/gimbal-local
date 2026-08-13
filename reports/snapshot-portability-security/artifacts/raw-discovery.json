@@ -1,5 +1,5 @@
 {
-  "target": "/Users/nebuk89/StudioProjects/copilot-worktrees/cloud-hypervisor-mac/nebuk89-potential-fortnight",
+  "target": "<repo-root>",
   "repository": {
     "remote": "https://github.com/gimbal-dev/gimbal-local.git",
     "head": "f635e0f66eba56cfadb6bd9bdaf09b6e42c67795",

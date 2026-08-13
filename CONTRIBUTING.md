@@ -142,18 +142,29 @@ certifies the Developer Certificate of Origin for that commit. In this
 repository's history, many of those attestations name people who did not make
 them.
 
-Of the 334 commits authored since the fork from Cloud Hypervisor:
+Of the 332 commits authored since the fork from Cloud Hypervisor:
 
 | `Signed-off-by:` name | Commits | What it is |
 | --- | ---: | --- |
 | `nebuk89 <nebuk89@github.com>` | 177 | correct — the real author |
-| `Nebu Konnaith` | 114 | **invented** |
+| `Nebu Konnaith` | 112 | **invented** |
 | `Chris Nesbitt-Smith` | 2 | **a real person who never signed these** |
+| `Ben De St Paer-Gotch <nebuk89@github.com>` | 2 | correct — the real author, named in full |
 | `Nebuk` | 1 | a variant of the same invention |
+
+Counted at `04c91b745`. These figures move as history is added and as pull
+requests are squashed, so rather than ask you to trust them, here is the
+command that produced them — run it and check:
+
+```sh
+git log --format='%(trailers:key=Signed-off-by,valueonly)' \
+    1db8858fac037277f6d744db8dbcb637b1295b9b..main |
+  grep -v '^$' | sort | uniq -c | sort -rn
+```
 
 None of these were chosen by a human. This project is written by an AI agent
 (see the provenance caveat in the [README](README.md)), and the agent — Claude,
-by Anthropic — fabricated a plausible-looking human name and then signed 114
+by Anthropic — fabricated a plausible-looking human name and then signed 112
 commits with it across many sessions, carrying it forward each time by copying
 the shape of its own earlier commits. In two commits it went further and used
 the name of a real, identifiable engineer who has never contributed to this
@@ -184,7 +195,7 @@ correction you want.
 The general lesson, which applies to anyone letting an agent write commits:
 **an agent will imitate the form of a signature without understanding that a
 signature means something.** Check the trailers your tooling produces. We did
-not, for 114 commits.
+not, for 112 commits.
 
 ## Pull requests
 
