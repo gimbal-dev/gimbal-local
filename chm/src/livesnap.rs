@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Live checkpointing: capture a running guest and let it carry on.
 //!
 //! Every checkpoint before this one was a *suspend* — the vCPU threads left

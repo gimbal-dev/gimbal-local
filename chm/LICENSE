@@ -1,0 +1,8 @@
+The `chm` CLI and daemon source is licensed under FSL-1.1-ALv2.
+
+FSL-1.1-ALv2 is source available. It permits reading, auditing, modifying,
+patching, self-hosting, internal use, non-commercial use, and redistribution for
+non-competing uses. It restricts competing commercial use.
+
+Each release automatically converts to Apache-2.0 two years after it is made
+available. See `../LICENSES/FSL-1.1-ALv2.txt` for the full terms.

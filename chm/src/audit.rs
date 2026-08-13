@@ -1,6 +1,6 @@
-// Copyright © 2024 Cloud Hypervisor contributors
+// Copyright © 2026 Ben De St Paer-Gotch
 //
-// SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 //! Durable, append-only audit trail (M29, extended in V6.3).
 //!

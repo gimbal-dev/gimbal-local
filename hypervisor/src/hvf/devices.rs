@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! A minimal, real MMIO device model for the macOS rehydration path.
 //!
 //! When a rehydrated guest ([`crate::hvf::rehydrate`]) executes, every access

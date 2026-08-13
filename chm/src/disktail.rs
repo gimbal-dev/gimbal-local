@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Notice a capture whose partition table does not use the whole disk (#259).
 //!
 //! A real cloud capture arrives with its root filesystem sized for the cloud

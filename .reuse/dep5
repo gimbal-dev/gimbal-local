@@ -1,12 +1,33 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: cloud-hypervisor
+Upstream-Name: gimbal-local
 Upstream-Contact:  <>
-Source: https://www.cloudhypervisor.org
+Source: https://github.com/gimbal-dev/gimbal-local
 
 Files: docs/*.md *.md
-Copyright: 2024
+Copyright: 2024 Cloud Hypervisor contributors
 License: CC-BY-4.0
 
-Files: scripts/* test_data/* *.toml .git* .editorconfig fuzz/Cargo.lock fuzz/.gitignore resources/linux-config-* vmm/src/api/openapi/cloud-hypervisor.yaml CODEOWNERS Cargo.lock
-Copyright: 2024
+Files: LICENSE LICENSE-APACHE LICENSE-BSD-3-Clause NOTICE
+Copyright: 2026 Ben De St Paer-Gotch
+License: Apache-2.0
+
+Files: hypervisor/src/hvf/**/*.rs
+Copyright: 2026 Ben De St Paer-Gotch
+License: Apache-2.0
+
+Files: chm/Cargo.toml chm/LICENSE chm/src/oci/*.S chm/src/oci/*.bin
+ chm/testdata/* chm/tests/data/*
+Copyright: 2026 Ben De St Paer-Gotch
+License: FSL-1.1-ALv2
+
+Files: app/GimbalLocal/Package.swift app/GimbalLocal/LICENSE
+ app/GimbalLocal/.gitignore app/GimbalLocal/README.md
+ app/GimbalLocal/Resources/*
+Copyright: 2026 Ben De St Paer-Gotch
+License: LicenseRef-Gimbal-Proprietary
+
+Files: scripts/* test_data/* *.toml .git* .editorconfig fuzz/Cargo.lock
+ fuzz/.gitignore resources/linux-config-*
+ vmm/src/api/openapi/cloud-hypervisor.yaml CODEOWNERS Cargo.lock
+Copyright: 2024 Cloud Hypervisor contributors
 License: Apache-2.0

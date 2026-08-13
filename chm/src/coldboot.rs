@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Build a bootable guest from a kernel image, with no snapshot involved.
 //!
 //! Everything else in this binary *rehydrates*: guest RAM arrives from a

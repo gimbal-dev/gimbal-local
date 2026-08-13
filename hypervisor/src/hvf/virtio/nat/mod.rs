@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! The userspace egress NAT: real outbound networking for a resumed guest that
 //! has no tap, bridge, or host route — its only link is the virtio-net
 //! [`NetResponder`](super::net::NetResponder) seam.

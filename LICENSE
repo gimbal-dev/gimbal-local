@@ -1,0 +1,26 @@
+Gimbal Local licence map
+========================
+
+No single licence covers this repository. The applicable terms are determined by
+path and by each file's SPDX identifier.
+
+- Upstream-derived files: Apache-2.0 and/or BSD-3-Clause, preserving the
+  existing per-file SPDX identifiers and upstream notices.
+- `hypervisor/src/hvf/`: Apache-2.0. The Apple Hypervisor.framework backend is
+  deliberately contributed back on normal open-source terms.
+- `chm/`: FSL-1.1-ALv2. This is source available: reading, auditing, modifying,
+  patching, self-hosting, internal use, non-commercial use, and non-competing
+  redistribution are permitted. Competing commercial use is restricted. Each
+  release automatically converts to Apache-2.0 two years after it is made
+  available.
+- `app/GimbalLocal/`: LicenseRef-Gimbal-Proprietary. The app source is
+  proprietary. Third-party open-source rights are preserved. A separate app EULA
+  is still pending.
+- Documentation: CC-BY-4.0 unless otherwise marked in `.reuse/dep5`.
+
+Licence texts live in `LICENSES/`, `LICENSE-APACHE`, and
+`LICENSE-BSD-3-Clause`. Attribution and third-party notices live in
+`CREDITS.md`, `NOTICE`, and `THIRD_PARTY_NOTICES.md`.
+
+This repository is opening, not closing: no outside contributor's work is being
+relicensed out from under them.

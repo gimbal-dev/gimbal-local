@@ -13,6 +13,7 @@
 [package]
 authors = ["The Cloud Hypervisor Authors"]
 edition.workspace = true
+license = "FSL-1.1-ALv2"
 name = "gimbal-local"
 rust-version.workspace = true
 version = "0.1.1"

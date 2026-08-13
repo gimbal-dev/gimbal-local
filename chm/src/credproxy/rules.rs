@@ -1,6 +1,7 @@
-// Copyright © 2026 The Cloud Hypervisor Authors
+// Copyright © 2026 Ben De St Paer-Gotch
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //
 //! Which destinations get a credential attached, and what gets attached.
 //!

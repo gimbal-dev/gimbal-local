@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Recognising the kernel files distros actually ship.
 //!
 //! The arm64 boot protocol wants an uncompressed `Image` — 64-byte header,

@@ -1,6 +1,6 @@
-// Copyright © 2024 Cloud Hypervisor contributors
+// Copyright © 2026 Ben De St Paer-Gotch
 //
-// SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 //! Full-loop regression test for the macOS sandbox: bring a real
 //! HVF-compatible snapshot up under `chm`, log in over a pseudo-terminal, write

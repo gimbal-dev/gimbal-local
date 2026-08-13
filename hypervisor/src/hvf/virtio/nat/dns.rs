@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! A minimal DNS server for the userspace NAT: it parses the guest's query,
 //! lets the egress policy judge the name, resolves permitted names through the
 //! host resolver, and synthesizes an answer. This is deliberately small — it

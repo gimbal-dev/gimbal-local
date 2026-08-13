@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! A split-virtqueue engine over [`GuestMemory`].
 //!
 //! Implements the virtio 1.x split virtqueue layout (descriptor table, available

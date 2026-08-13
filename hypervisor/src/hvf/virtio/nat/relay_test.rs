@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! End-to-end proof of the userspace NAT: a second `smoltcp` stack plays the
 //! *guest*, opens a real TCP connection through the [`NatResponder`] to a
 //! localhost echo server, and gets its bytes echoed back — exercising the SYN

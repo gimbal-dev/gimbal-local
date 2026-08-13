@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Reconstruct the native virtio-pci device model from a cloud-hypervisor
 //! snapshot's `device-manager` state.
 //!

@@ -1,0 +1,6 @@
+The Gimbal Local macOS app source is proprietary Gimbal source, marked with
+`LicenseRef-Gimbal-Proprietary`.
+
+This does not limit rights in third-party open-source components shipped with or
+used by the app. The packaged app EULA is pending and must preserve those
+third-party rights. See `../../LICENSES/LicenseRef-Gimbal-Proprietary.txt`.

@@ -1,17 +1,42 @@
 # Gimbal Local
 
-> Rehydrate Cloud Hypervisor cloud snapshots on your Mac.
+[![Latest release](https://img.shields.io/github/v/release/gimbal-dev/gimbal-local?display_name=tag)](https://github.com/gimbal-dev/gimbal-local/releases/latest)
+![macOS](https://img.shields.io/badge/macOS-14%2B-555555)
+![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-required-555555)
+![Beta](https://img.shields.io/badge/status-beta-9467bd)
 
-**Gimbal Local** is a macOS (Apple Silicon) runtime that brings the `arm64`
-guests of [Cloud Hypervisor](https://www.cloudhypervisor.org/) to Apple's
-**Hypervisor.framework (HVF)**. Take a snapshot of a running cloud VM (captured
-on a Linux/KVM host with `ch-remote snapshot`) and **resume it on your Mac** —
-same guest RAM, vCPU state, GIC, and virtual timer — then watch it boot on into
-userspace.
+> A local agent sandbox for Apple Silicon, built from a macOS fork of Cloud
+> Hypervisor.
 
-Under the hood it is a single, standalone, code-signed engine CLI — **`chm`** —
-built as a macOS-focused fork of Cloud Hypervisor, with a native SwiftUI desktop
-app (**Gimbal Local**) on top. `chm run` prints the engine banner shown below.
+Gimbal Local runs `arm64` Linux guests on Apple Hypervisor.framework. It has two
+paths:
+
+- **Rehydrate a cloud snapshot.** Capture a running Cloud Hypervisor VM on an
+  `arm64` Linux/KVM host, bring the snapshot to a Mac, and resume it with guest
+  RAM, vCPU state, GIC state, virtual timer state, disk, and console intact.
+- **Cold-boot a local sandbox.** Turn an OCI/Docker image plus a Linux kernel
+  into a bootable local guest. This path needs no cloud host. It is the path
+  that has run a coding agent end to end.
+
+The shipped product is a signed macOS app (**Gimbal Local**) plus the `chm`
+engine CLI/daemon inside the app bundle.
+
+> **Provenance caveat.** This project is entirely AI-authored. The code was
+> written by an AI agent and has not had human line-by-line code review. Human
+> involvement has been PM-style: specification, direction, acceptance criteria,
+> prioritisation, and judgement calls about what is real versus fake. That
+> matters because a hypervisor is a security boundary, and this one has not been
+> human-reviewed. Do not use Gimbal Local to isolate untrusted or hostile
+> workloads, and do not treat it as hardened. The project is unusually
+> well-evidenced for something with no human code review — measured hardware
+> runs, mutation-tested guards, named refusals, and a standing rule against fake
+> demos — but evidence is not the same thing as review.
+>
+> One consequence is worth surfacing here rather than leaving to be discovered:
+> the AI agent fabricated a human name and signed 114 commits with it, and used
+> a real third party's name on two more. Those `Signed-off-by:` attestations are
+> void. See [A defect in our own commit
+> history](CONTRIBUTING.md#a-defect-in-our-own-commit-history).
 
 ```console
 $ chm run /path/to/ch-snapshot
@@ -27,230 +52,233 @@ chm: guest resumed — serial console follows.
 [  ...  ] cloud-init[754]: Cloud-init v. 26.1 running 'modules:config' ...
 ```
 
-> **Status: real, and honestly bounded.** Captured `arm64` KVM snapshots
-> rehydrate onto HVF, run multi-vCPU Linux guests, service native virtio
-> block/rng/net, and expose an interactive serial console. The default
-> **A vanilla upstream ITS/LPI-routed snapshot — the kind Apple's managed GIC
-> cannot run at all — boots to an interactive shell with no flags**: `chm` routes
-> it onto a userspace GICv3 automatically, from both `chm run` and `chm serve`.
-> The legacy managed-GIC path still takes GICv2M/message-SPI captures. See
-> [`docs/hvf-compatible-snapshots.md`](docs/hvf-compatible-snapshots.md).
-> There are no stubbed VMs or fake consoles here — everything streamed above is
-> the guest actually executing.
+> **Status: real, and honestly bounded.** A vanilla Graviton2 Cloud Hypervisor
+> snapshot has rehydrated on Apple silicon carrying `617849s` — 7.15 days — of
+> guest uptime. Container-derived guests have reached the internet and run the
+> GitHub Copilot CLI on a cold boot. The hard combined claim, "resume a cloud
+> snapshot and run a coding agent inside that same resumed guest", is still open
+> work. See [What works today](#what-works-today) and
+> [Known limits](#known-limits).
+
+> **Beta.** The current release is a public beta. Questions, bugs, support,
+> licensing questions, and security coordination go through
+> [GitHub issues](https://github.com/gimbal-dev/gimbal-local/issues) for now.
+> Issues are public: do not include secrets, credentials, personal data, or
+> working exploit details.
+
+There are no stubbed VMs or fake consoles here. If a command in this README says
+that a guest booted, the claim comes from a real guest on real Apple Silicon.
 
 ---
 
-## Install
-
-> **This repository is private, so the download needs access to it.** A browser
-> or a plain `curl` gets a 9-byte file containing `Not Found`, not a build. If
-> you can read this page you almost certainly have that access — use the `gh`
-> command below rather than clicking through, because an unauthenticated fetch
-> fails in a way that looks like a corrupt download.
+## Download
 
 Download the latest `GimbalLocal-<version>.zip` from
-[Releases](https://github.com/gimbal-dev/gimbal-local/releases), unzip it,
-and drag **Gimbal Local** to `/Applications`. The app is signed with a
-Developer ID certificate and notarized by Apple, so it opens without a
-Gatekeeper warning.
+[Releases](https://github.com/gimbal-dev/gimbal-local/releases/latest), unzip
+it, and drag **Gimbal Local** to `/Applications`.
 
 ```sh
-gh release download --repo gimbal-dev/gimbal-local --pattern '*.zip'
+# Optional CLI form, if you have GitHub CLI installed.
+gh release download --repo gimbal-dev/gimbal-local \
+  --pattern 'GimbalLocal-*.zip'
 unzip GimbalLocal-*.zip
 mv GimbalLocal.app /Applications/
 ```
 
-(Finder shows it as **Gimbal Local**; the bundle on disk is `GimbalLocal.app`.)
+The app is signed with a Developer ID certificate and notarized by Apple. Finder
+shows it as **Gimbal Local**; the bundle on disk is `GimbalLocal.app`.
 
-**What you need**
+### Requirements
 
-- An Apple Silicon Mac (M1 or later).
+- Apple Silicon Mac (M1 or later).
 - macOS 14 or newer.
-- Read access to this repository, until the release is published somewhere
-  public.
+- For snapshot rehydration: an `arm64` Cloud Hypervisor snapshot directory
+  containing `state.json` and `snapshot/memory-ranges`.
+- For cold boot: an `arm64` Linux kernel. A container image is a root
+  filesystem; it does not contain a kernel.
 
-**What you do not need** — worth stating plainly, because every comparable tool
-asks for at least one of them:
+You do **not** need a hosted control plane, an account, a Linux machine, KVM, a
+Rust toolchain, or Xcode to run the release.
 
-- No Linux host and no KVM machine. The Mac is the hypervisor.
-- No control plane, no account, no network connection. Everything is local.
-- No Rust toolchain, no Xcode, no source checkout. `chm` ships inside the app.
-
-To use the engine from a terminal, it is inside the bundle:
+To use the engine directly:
 
 ```sh
 /Applications/GimbalLocal.app/Contents/MacOS/chm --help
 ```
 
-Snapshots live in `~/gimbal-snapshots` and cold-boot images in
-`~/gimbal-images`; the app creates both on first launch. You need a Cloud
-Hypervisor **`arm64` snapshot** (`state.json` + `snapshot/memory-ranges`, from
-`ch-remote … snapshot` on a Linux host) to rehydrate — or nothing at all to
-cold-boot a stock kernel.
+Gimbal Local creates `~/gimbal-snapshots` and `~/gimbal-images` on first launch.
 
-## Requirements (building from source)
+---
 
-- Apple Silicon Mac (`macOS`, `aarch64`).
-- A Rust toolchain (edition 2024; Rust 1.89.0 or later — see the
-  `package.rust-version` in `Cargo.toml`).
-- The binary must be **code-signed with the `com.apple.security.hypervisor`
-  entitlement** before it can create a VM. `scripts/build-chm.sh` does this for
-  you.
-- A Cloud Hypervisor **`arm64` snapshot directory** (`state.json` +
-  `snapshot/memory-ranges`), produced by `ch-remote --api-socket … snapshot`
-  on the source host.
+## First things to try
 
-## Build & run
+### Resume a Cloud Hypervisor snapshot
+
+```sh
+CHM=/Applications/GimbalLocal.app/Contents/MacOS/chm
+"$CHM" run /path/to/ch-snapshot
+```
+
+A supported snapshot is an `arm64` Cloud Hypervisor snapshot captured on a
+Linux/KVM host. The recommended capture shape is **vanilla upstream Cloud
+Hypervisor with ITS/LPI routing**; `chm` routes it onto the userspace GICv3 path
+automatically. Legacy GICv2M/message-SPI captures still work.
+
+Read the exact contract before producing a capture:
+[`docs/hvf-compatible-snapshots.md`](docs/hvf-compatible-snapshots.md).
+
+### Cold-boot a container image
+
+`chm image build` writes a bootable local image from an OCI reference. You must
+provide a kernel, and many distro kernels need their matching modules too.
+
+```sh
+CHM=/Applications/GimbalLocal.app/Contents/MacOS/chm
+
+"$CHM" image build node:22-slim \
+  --kernel /path/to/vmlinuz-virt \
+  --modules /path/to/lib/modules/<kernel-release> \
+  --entrypoint /bin/sh \
+  --out ~/gimbal-images/node
+
+"$CHM" create \
+  --kernel ~/gimbal-images/node/Image \
+  --initramfs ~/gimbal-images/node/initramfs \
+  --cpus 2 --memory 3008 --net \
+  --egress-allow registry.npmjs.org:443 \
+  --egress-allow github.com:443 \
+  --egress-allow objects.githubusercontent.com:443 \
+  --egress-allow api.github.com:443
+```
+
+For images too large to unpack into RAM, add `--disk` to `image build` and boot
+`rootfs.img` instead of `initramfs`:
+
+```sh
+"$CHM" create \
+  --kernel ~/gimbal-images/node/Image \
+  --disk ~/gimbal-images/node/rootfs.img \
+  --cpus 2 --memory 512 --net
+```
+
+The measured agent path is in
+[`docs/running-agents.md`](docs/running-agents.md). The full image-builder
+guide, including working kernel/module combinations, is
+[`docs/container-images.md`](docs/container-images.md).
+
+---
+
+## What works today
+
+Measured project state lives in
+[`docs/project-state.md`](docs/project-state.md). The short version:
+
+| Capability | Current state |
+| --- | --- |
+| Vanilla Graviton2 snapshot rehydration | Works; one capture resumed with 7.15 days of carried guest uptime. |
+| Userspace GICv3 for ITS/LPI snapshots | Works automatically from `chm run` and `chm serve`. |
+| Cold boot from a stock Linux kernel | Works. |
+| Cold boot from OCI/Docker images | Works with a supplied kernel; `--modules` handles modular virtio kernels, and `--disk` handles larger root filesystems. |
+| Networking | Userspace NAT works; egress is allow-listed and fail-closed. |
+| Credential custody | The credential proxy can attach host-held credentials as traffic leaves the guest; the guest does not hold the secret. |
+| Desktop app | Starts and stops the daemon, lists snapshots, launches cold boots, and shows guests running on this Mac. |
+| Coding agent in a sandbox | Proven on a cold-booted guest. Rehydrated-cloud-snapshot acceptance remains open. |
+
+---
+
+## Known limits
+
+These are not footnotes. They decide whether Gimbal Local is the right tool for
+your workload today.
+
+| Limit | Detail |
+| --- | --- |
+| Rehydrated agent acceptance is not done | A coding agent has been proven in a cold-booted guest, not yet in a freshly rehydrated cloud capture on a clean machine. Tracked as [#286](https://github.com/gimbal-dev/gimbal-local/issues/286). |
+| Some rehydrated captures need JIT care | A guest captured on hardware with `CTR_EL0.DIC = 1` can run JITs that execute stale code on this Mac. `chm` warns; `NODE_OPTIONS=--jitless` fixes Node itself but not native agent binaries. See [`docs/first-resume.md`](docs/first-resume.md). |
+| 32-bit guest binaries can wedge a rehydrated guest | HVF reports the relevant register faithfully; the guest still believes AArch32 is available. `CHM_STRICT_AARCH32=1` refuses instead of warning. See [`docs/cpu-feature-deltas.md`](docs/cpu-feature-deltas.md). |
+| Old captures may need a counter-frequency override | Newer captures record the counter frequency and are corrected automatically. Older captures can need `CHM_GUEST_CNTFRQ=121875000`. See [`docs/hvf-compatible-snapshots.md`](docs/hvf-compatible-snapshots.md). |
+| Cold-boot RAM has a hard ceiling | Guest RAM starts at `0x40000000` and one region must end by `0xfc000000`, so this path tops out at 3008 MiB. Disk-backed rootfs images avoid the old initramfs-size wall, not the RAM ceiling. |
+| Demand-faulting memory from the state CDN is not implemented | The state-CDN memory plane can reconstruct a full RAM image locally; postcopy demand faulting is still future work. See [`docs/state-cdn-memory-plane.md`](docs/state-cdn-memory-plane.md). |
+| CI is not the source of truth today | CI is billing-blocked. Gates are run locally and recorded in the project-state document and PR bodies. |
+
+---
+
+## Documentation map
+
+Start with [`docs/README.md`](docs/README.md). It separates user guides,
+architecture notes, and the internal engineering log.
+
+Useful first reads:
+
+| If you want to… | Read |
+| --- | --- |
+| Run an agent in a disposable local VM | [`docs/running-agents.md`](docs/running-agents.md) |
+| Build a bootable sandbox from a container image | [`docs/container-images.md`](docs/container-images.md) |
+| Produce or inspect a rehydratable snapshot | [`docs/hvf-compatible-snapshots.md`](docs/hvf-compatible-snapshots.md) |
+| Understand the HVF port | [`docs/macos-local-runtime.md`](docs/macos-local-runtime.md) |
+| Understand networking and egress policy | [`docs/networking.md`](docs/networking.md) |
+| Understand the security boundary | [`docs/security-model.md`](docs/security-model.md) |
+| See the current measured state | [`docs/project-state.md`](docs/project-state.md) |
+| See how this project works | [`docs/engineering-discipline.md`](docs/engineering-discipline.md) |
+
+---
+
+## Build from source
+
+For release users, use the signed app. Build from source when you are changing
+`chm`, the HVF backend, or the Swift app.
 
 ```sh
 # Build and code-sign chm; prints the path to the signed binary.
 BIN=$(./scripts/build-chm.sh)
 
-# Resume a snapshot, streaming its serial console to your terminal.
+# Resume a snapshot, streaming its serial console.
 "$BIN" run /path/to/ch-snapshot
 
-# Or via make:
-make chm                     # build + sign
-make chm-run DIR=/path/to/ch-snapshot
-```
-
-Useful flags: `--max-seconds N` (wall-clock cap), `--idle-exit N` (stop after N
-seconds of console silence; default 10, `0` disables), `--quiet`. Run
-`chm --help` for the full surface.
-
-## Run it as a service (`chm serve`)
-
-`chm` can also run as a long-lived daemon hosting a **snapshot library** behind
-a Unix socket — the control plane a desktop app talks to:
-
-```sh
-# Host a library (a ch-snapshot dir, or a directory of them).
-"$BIN" serve /path/to/library &
-
-"$BIN" ctl list                 # enumerate snapshots
-"$BIN" ctl list --json          # machine-readable library state for an app
-"$BIN" ctl start <name>         # resume one
-"$BIN" ctl console              # stream its live console
-"$BIN" ctl status               # running / stopped + console bytes
-"$BIN" ctl status --json        # machine-readable VM state for an app
-"$BIN" ctl stop                 # stop the guest (forced, ~instant)
-"$BIN" ctl shutdown             # stop + exit the daemon
-```
-
-One guest runs at a time (HVF is one-VM-per-process today). This daemon is the
-foundation for a Docker-Desktop-style GUI — see the roadmap.
-
-## Run the desktop app (`Gimbal Local`)
-
-M23 adds a native macOS SwiftUI app over the daemon: **Gimbal Local**. It is a
-Docker Desktop-style dashboard for local sandboxes, with an optional
-`gimbal-cloud-control` status panel.
-
-```sh
-# Build the signed chm binary and a clickable app bundle.
+# Build the app bundle.
 APP=$(./scripts/build-gimbal-local-app.sh)
 open "$APP"
 ```
 
-The app can start/shutdown `chm serve`, list snapshots, start/stop a selected
-sandbox, attach to the serial console, show daemon state, and display control
-plane health/count/cost signals when `gctl server` is running. Source and app
-notes live in [`app/GimbalLocal/`](app/GimbalLocal/).
+Notes that save time:
 
-## How it works
+- Formatting currently needs nightly: `cargo +nightly fmt --all`.
+- A plain `cargo build` strips the hypervisor entitlement. Re-sign before trying
+  to run the binary, or use `./scripts/build-chm.sh`.
+- On macOS, build the hypervisor tests with
+  `--no-default-features --features hvf,kvm-snapshot`.
+- See [`CONTRIBUTING.md`](CONTRIBUTING.md) before sending a patch.
 
-`chm` is a thin front end over the in-tree `hypervisor` crate's `hvf` backend.
-The hard part — translating a KVM snapshot's CPU/GIC/timer state into HVF and
-re-executing it — lives in `hypervisor/src/hvf/`. A full architecture writeup is
-in **[`docs/macos-local-runtime.md`](docs/macos-local-runtime.md)**.
-
-| Area            | Where                                   |
-| --------------- | --------------------------------------- |
-| HVF backend     | `hypervisor/src/hvf/`                   |
-| KVM→HVF xlate   | `hypervisor/src/hvf/translate.rs`       |
-| Rehydration     | `hypervisor/src/hvf/rehydrate.rs`       |
-| Device bus + PL011 | `hypervisor/src/hvf/devices.rs`      |
-| `chm` CLI/daemon | `chm/`                                 |
-
-## Roadmap
-
-Milestones completed (all hardware-verified on Apple Silicon):
-
-| Milestone | What landed |
-| --------- | ----------- |
-| M1–M2 | Real in-tree HVF backend: vCPU, MMIO traps, managed GICv3, interrupt delivery, virtual timer, WFI idle + cross-thread wakeup. |
-| M3 | KVM→HVF register translation (the snapshot's `arm64` sys-regs ⇄ HVF). |
-| M4 | End-to-end rehydration of a real cloud snapshot. |
-| M5 | First real device: PL011 serial console on an MMIO bus. |
-| M6 | Virtual-timer continuity — rehydrated guest resumes into userspace. |
-| M7 | **`chm`**: standalone, signed, runnable executable. |
-| M8 | **`chm serve`**: daemon + control socket; forced stop via `hv_vcpus_exit`. |
-| M9 | Repo refocused as a standalone macOS local-runtime project. |
-| M10–M20 | Native virtio block/rng/net, interactive serial console, bidirectional net, and multi-vCPU snapshot resume. |
-| R3 | PSCI `CPU_ON` path hardware-proven; HVF SPI affinity routing remains unsupported, so message-SPI delivery deliberately uses the proven 1-of-N route. |
-| M23 | **Gimbal Local** native macOS app: local sandbox dashboard, daemon controls, console view, and optional gimbal-cloud-control health/cost panel. |
-| M25 | Live local lifecycle: suspend/resume live checkpoints, per-revision disk overlays, fork, and a durable single-slot session registry. |
-| M26/M27 | Faithful cloud rehydration through the control-plane runner; branchable image/checkpoint/sandbox lineage (`chm push`/`pull`/`revisions`/`rollback`). |
-| M28 | Consistent sandbox controls: userspace-NAT egress firewall (default-deny allow-list, `chm firewall`) enforced locally at DNS resolve + TCP connect. |
-| M29 | Durable per-sandbox audit trail (`audit.jsonl`: session start/stop, denied egress, bundle-verify), readable via `chm audit show`. |
-| M30 | Security hardening for untrusted snapshots + hostile guest agents: bundle/overlay confinement, daemon socket auth, no host-FS passthrough, resource + NAT limits, per-NIC fail-closed egress, CAS digest hardening, and Ed25519 signed-manifest verification. See [`docs/security-model.md`](docs/security-model.md). |
-| M31 | Network host-isolation: a reserved-address guard blocks the guest from reaching host loopback / private LAN / link-local metadata (`169.254.169.254`) regardless of policy (closing DNS rebinding), and new sandboxes default to firewall-on default-deny. |
-| M-USGIC | **Userspace GICv3:** a vanilla upstream ITS/LPI-routed snapshot — the kind Apple's managed GIC can't run — rehydrates onto a software GICv3 (distributor/redistributor + trapped CPU interface delivering SPIs/PPIs/SGIs/**LPIs**, live ITS, self-managed vtimer) and boots to an interactive Ubuntu shell. Both `chm run` and `chm serve` route such a capture there **automatically, with no flag**. Multi-vCPU, virtio disk/net and checkpoint/resume all work on this path. See [`docs/hvf-compatible-snapshots.md`](docs/hvf-compatible-snapshots.md). |
-
-Next:
-
-- **Living Workspaces:** bake a Git-transparent, content-addressed workspace
-  plane into Gimbal Local + Cloud so source, untracked work, and safely
-  classified build artifacts fork and rehydrate with the VM, without changing
-  vanilla Cloud Hypervisor snapshots. See
-  [`docs/living-workspaces.md`](docs/living-workspaces.md).
-- **Snapshot signing trust root (M30.4):** `chm` verifies Ed25519-signed
-  manifests today; the remaining half is the control plane producing + signing
-  production manifests (cross-repo with `gimbal-cloud-control`).
-- **Live in-guest firewall demo:** enforcement ships; the end-to-end demo is
-  blocked only on a net-enabled capture snapshot.
-- **Remote capture validation:** needs real arm64 KVM capacity (a Lima
-  nested-KVM guest, or AWS Graviton bare metal); the Mac only *runs* snapshots.
-- **BYO-subscription loop:** local-managed AWS helpers (`init`, `preflight`,
-  `capture`, `pull`, `push`, `cleanup`) let the Mac drive a user's AWS profile,
-  S3 handoff bucket, and SSH capture host without a hosted control plane.
-- **Create from container image:** a future app action that accepts an OCI/Docker
-  image reference, hides the pull/rootfs/disk/capture process, and produces an
-  HVF-compatible snapshot in the local library.
-
-AWS setup notes for the later cloud round-trip live in
-[`docs/aws-byo-setup.md`](docs/aws-byo-setup.md).
-
-## Reports
-
-| Date | Report | Summary |
-| --- | --- | --- |
-| 2026-07-30 | [Snapshot portability and security audit](reports/snapshot-portability-security/) | Three Graviton captures resume live, but secure coding-agent readiness is blocked by provenance, image, networking, and CI gaps |
+---
 
 ## Relationship to upstream Cloud Hypervisor
 
-This repository is a fork and is **not** tracking upstream for merge-back; it is
-its own project focused on the macOS local runtime.
+This repository is a macOS-focused fork of
+[Cloud Hypervisor](https://www.cloudhypervisor.org/). The macOS product surface
+is intentionally small: `chm/`, `hypervisor/src/hvf/`, and `app/GimbalLocal/`.
+Most upstream VMM crates remain in the tree so the fork can build capture tools
+and preserve attribution, but they are not compiled into the shipped macOS app.
 
-The macOS product is small and self-contained: `chm` depends only on the
-`hypervisor` crate (built with `--features hvf,kvm-snapshot`), which in turn has
-**no** local-crate dependencies. None of the upstream VMM crates (`vmm`,
-`virtio-devices`, `vhost_*`, `pci`, …) are compiled into `chm` or the app.
+## Credits and upstream
 
-Those upstream crates are kept in the tree for one reason: they build the
-patched Linux `cloud-hypervisor` binary used to capture **legacy** GICv2M
-snapshots (the `CH_GIC_V2M` message-SPI patch; see
-[`scripts/hvf/`](scripts/hvf/)). Note that the recommended capture shape is now
-**vanilla** — stock upstream, no fork — which needs none of them; see
-[`docs/hvf-compatible-snapshots.md`](docs/hvf-compatible-snapshots.md). If you
-are here for the macOS port, you only need `chm/`, `hypervisor/src/hvf/`, and
-`app/GimbalLocal/`.
+Placeholder: upstream attribution and public-credit wording are being prepared
+for the launch README.
 
-## License
+## Licence
 
-Unchanged from upstream: dual-licensed under
-**[Apache-2.0](LICENSE-APACHE)** and
-**[BSD-3-Clause](LICENSE-BSD-3-Clause)**. Additional license texts for
-third-party material are retained in [`LICENSES/`](LICENSES/). See
-[`CONTRIBUTING.md`](CONTRIBUTING.md) for contribution and commit conventions
-(including the `Assisted-by:` disclosure trailer used for AI-assisted changes).
+This repository is **opening**, not closing: there are no outside contributors
+whose public work is being relicensed under them. The project is open core, with
+the seam placed where it avoids taking from upstream.
+
+| Component | Licence | Why |
+| --- | --- | --- |
+| Upstream-derived tree | Apache-2.0 / BSD-3-Clause, unchanged | Required by upstream and correct for the inherited code. |
+| `hypervisor/src/hvf/` | Apache-2.0 | Deliberately given back: it implements the upstream hypervisor trait and is the part Cloud Hypervisor itself would plausibly want. |
+| `chm/` | FSL-1.1-ALv2; converts to Apache-2.0 after two years | Source available commercial open core, using a known SPDX licence rather than a bespoke one. |
+| `app/GimbalLocal/` | Proprietary | A closed macOS GUI over an open engine boundary is not upstream-derived. |
+
+Only the OSI-approved parts should be described as open source. `chm/` is source
+available: FSL restricts competing commercial use only, not reading, auditing,
+modifying, patching, self-hosting, or internal use. The app needs a proper EULA;
+that is pending and must preserve third-party OSS rights. Upstream bug fixes
+should go back to Cloud Hypervisor.

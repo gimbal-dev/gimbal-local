@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Receive-side coalescing (LRO) for the guest-facing frame path.
 //!
 //! The userspace NAT emits one Ethernet frame per TCP segment, sized by the

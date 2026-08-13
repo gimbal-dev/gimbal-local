@@ -1,51 +1,96 @@
 # Documentation
 
-This is a macOS-focused fork of Cloud Hypervisor. The documentation here is in
-two groups: a small set written for **this project** (the macOS / Apple
-Hypervisor.framework port), and the larger set of **upstream Cloud Hypervisor**
-reference docs that are preserved as-is.
+This directory is both the public manual and the engineering record for Gimbal
+Local. That is deliberate. The public guides should get a new user to a working
+sandbox; the engineering notes keep the measured state, scars, and limits
+visible instead of hiding them in private lore.
 
-## Start here (the macOS port)
+If a document is marked **engineering log**, it may be more detailed, more
+dated, and more issue-shaped than a normal user guide. Treat it as useful
+evidence, not as polished product copy.
 
-If you are working on the macOS local runtime — `chm`, the HVF backend, or the
-Gimbal Local app — these are the docs you want:
+> **Provenance caveat.** Gimbal Local is entirely AI-authored. The code was
+> written by an AI agent and has not had human line-by-line code review. Human
+> involvement has been specification, direction, acceptance criteria,
+> prioritisation, and judgement calls about what is real versus fake. This is a
+> hypervisor, so the caveat is material: do not use it to isolate untrusted or
+> hostile workloads, and do not treat it as hardened. The evidence in these docs
+> is real — measured runs, mutation-tested guards, and explicit refusals — but
+> it does not replace human security review.
+
+## Start here
+
+| Goal | Read |
+| --- | --- |
+| Install and understand the project | [`../README.md`](../README.md) |
+| Run a coding agent in a disposable local VM | [`running-agents.md`](running-agents.md) |
+| Build a sandbox from an OCI/Docker image | [`container-images.md`](container-images.md) |
+| Resume a Cloud Hypervisor snapshot on a Mac | [`hvf-compatible-snapshots.md`](hvf-compatible-snapshots.md) |
+| Understand the current measured state | [`project-state.md`](project-state.md) |
+
+## Public guides
+
+These are written for people trying to use or evaluate Gimbal Local.
 
 | Doc | What it covers |
 | --- | --- |
-| [`project-state.md`](project-state.md) | **Where the project actually is right now** — what works and the evidence for it, the measured limitations, the gate numbers, what is being worked on, and the open issues grouped. **Start here.** |
-| [`engineering-discipline.md`](engineering-discipline.md) | **How we work here.** Measure don't assert; mutation-test every guard; never restate a constant; fail honestly; and the build/toolchain traps that have each cost real hours. Read before your first change. |
-| [`agents.md`](agents.md) | The eight specialist agents in [`.github/agents/`](../.github/agents/) — which one to use, and what they all assume. Also the fastest honest briefing for a human new to an area. |
-| [`roadmap.md`](roadmap.md) | Milestones to date and what remains, on the V1–V4 vanilla-first spine. The canonical durable tracker. |
-| [`security-model.md`](security-model.md) | Threat model, security invariants, and the M30 hardening plan — how untrusted snapshots and hostile guest workloads are confined. |
-| [`network-policy-plan.md`](network-policy-plan.md) | M28 plan (Pillar ③): how the plane's egress allow-list follows a sandbox to the Mac and is enforced by a userspace NAT — the "provably can't get out" demo. |
-| [`networking.md`](networking.md) | User guide: how a rehydrated guest reaches the network through the userspace NAT, and how the control-plane egress allow-list is enforced locally (DNS + TCP connect). |
-| [`container-images.md`](container-images.md) | **Turning an OCI/Docker image into a bootable sandbox** (`chm image build`) — and, up front, what bites in the first ten minutes: you must bring a kernel, and many arm64 distro kernels build virtio as *modules*, so pass `--modules <DIR>` and chm bundles the closure for you. Compressed and EFI zboot kernels are unwrapped automatically. The rootfs unpacks into guest RAM. Also why agent workloads want a glibc base. |
-| [`credential-proxy.md`](credential-proxy.md) | How a sandboxed job authenticates to GitHub, npm or a registry **without ever holding the credential** — the proxy attaches it as the request leaves. Also: the two kinds of secrets, and the honest limits of the approach. |
-| [`state-cdn-memory-plane.md`](state-cdn-memory-plane.md) | How `chm` consumes the control plane's content-addressed, encrypted memory plane (Phase 2), and the honest demand-fault gap. |
-| [`macos-local-runtime.md`](macos-local-runtime.md) | Architecture of the HVF port: how a KVM snapshot is translated and rehydrated onto Apple Hypervisor.framework. |
-| [`gimbal-local-fork-model.md`](gimbal-local-fork-model.md) | How Gimbal Local models images, live checkpoints, and running sandboxes as a fork-based, branchable lineage — the local edge of the control plane's revision graph. |
-| [`snapshot-retention.md`](snapshot-retention.md) | What a lineage keeps, what it reclaims, and what it costs. Why pinning a revision sits **outside** the retention budget rather than inside it, and why disk usage is reported two ways — a fork hard-links its parent's RAM, so no single number is honest. |
-| [`hvf-compatible-snapshots.md`](hvf-compatible-snapshots.md) | The snapshot contract: **vanilla (stock upstream, ITS/LPI) is the recommended shape**, the legacy GICv2M fallback and where it is still required, and the disk + copy-on-write requirement. |
-| [`graviton-capture-request.md`](graviton-capture-request.md) | The exact snapshot we need captured on real cloud hardware, and how to produce it. Corrected after round 1. |
-| [`cpu-feature-deltas.md`](cpu-feature-deltas.md) | **Which of a capture's CPU registers this Mac actually reproduces** (V1.4). 105 of 238 restore faithfully — and the one real bug is a register HVF restores *perfectly*: the guest still believes it can run 32-bit binaries, and doing so wedges the vCPU. |
-| [`first-resume.md`](first-resume.md) | **What stands between a freshly rehydrated cloud capture and installing a package**: a root filesystem with no room to grow into (chm detects this), a dead `systemd-resolved` whose symptom reads like "no network" when the network is fine, and a package database the capture arrived broken. Three commands, once. |
-| [`environment-variables.md`](environment-variables.md) | Every `CHM_*` variable: the `CHM_TRACE_*` diagnostic surface (there is no debugger for a guest vCPU), the behavioural overrides for A/B-ing a bug, and the policy bindings. |
-| [`graviton-acid-test-results.md`](graviton-acid-test-results.md) | **What happened when we ran it.** A vanilla Graviton2 snapshot boots on Apple silicon. Includes the counter-frequency dilation — measured at 5.081× uncorrected, and **1.000× once corrected** — with every mitigation considered and why each is or is not available. |
-| [`aws-byo-setup.md`](aws-byo-setup.md) | Bring-your-own-AWS setup for the remote→local→remote capture loop (`chm cloud …`). |
-| [`raspberry-pi-offbox-plan.md`](raspberry-pi-offbox-plan.md) | Plan for off-box snapshot capture on a Raspberry Pi / ARM Linux host. |
+| [`running-agents.md`](running-agents.md) | Interactive `chm serve` / `chm ctl console`, headless `chm exec`, and the honest line between proven cold boot and open rehydrated-agent acceptance. |
+| [`container-images.md`](container-images.md) | `chm image build`: kernels, modules, initramfs vs `--disk`, networking, libc, and the measured Copilot CLI path. |
+| [`hvf-compatible-snapshots.md`](hvf-compatible-snapshots.md) | The snapshot contract: vanilla upstream ITS/LPI captures are preferred; legacy GICv2M captures still work. |
+| [`first-resume.md`](first-resume.md) | What to check on the first resume of a real cloud capture: filesystem growth, DNS, package state, and JIT exposure. |
+| [`networking.md`](networking.md) | Userspace NAT, default-deny egress, policy binding, and host-isolation rules. |
+| [`credential-proxy.md`](credential-proxy.md) | How host-held credentials are attached to outbound requests without placing the secret in the guest. |
+| [`security-model.md`](security-model.md) | Threat model and shipped controls. Read with the provenance caveat above: this is not a hardened, human-reviewed boundary. |
+| [`environment-variables.md`](environment-variables.md) | Every `CHM_*` variable, including diagnostics and strictness toggles. |
+| [`exec.md`](exec.md) | `chm exec`: running a command in a sandbox and recovering its exit status. |
+| [`snapshot-export.md`](snapshot-export.md) | Moving revisions between machines and what a bundle deliberately does not contain. |
+| [`snapshot-retention.md`](snapshot-retention.md) | What a lineage keeps, what it reclaims, and how disk usage is reported. |
+| [`continuous-snapshots.md`](continuous-snapshots.md) | Periodic local checkpoints for long-running work. |
+| [`aws-byo-setup.md`](aws-byo-setup.md) | Bring-your-own-AWS setup for a remote capture loop. |
 
-Related, outside this directory:
+## Architecture and design notes
 
-- [`../README.md`](../README.md) — project overview, build, and run.
-- [`../scripts/hvf/README.md`](../scripts/hvf/README.md) — how to capture an
-  HVF-compatible snapshot, and the `e2e-microvm-loop.sh` regression test.
-- Code: [`../chm/`](../chm/) (CLI/daemon), `../hypervisor/src/hvf/` (the HVF
-  backend), and [`../app/GimbalLocal/`](../app/GimbalLocal/) (the desktop app).
+These are public, but they assume you want the machinery rather than a quick
+start.
 
-## A note on the upstream VMM
+| Doc | What it covers |
+| --- | --- |
+| [`macos-local-runtime.md`](macos-local-runtime.md) | How the KVM snapshot is translated and rehydrated onto Hypervisor.framework. |
+| [`cpu-feature-deltas.md`](cpu-feature-deltas.md) | Which captured CPU features this Mac can reproduce, which ones are warned about, and why. |
+| [`gimbal-local-fork-model.md`](gimbal-local-fork-model.md) | Images, revisions, checkpoints, and branchable local lineage. |
+| [`sandbox-spec.md`](sandbox-spec.md) | The declarative sandbox spec and the fields Gimbal Local refuses rather than silently ignoring. |
+| [`state-cdn-memory-plane.md`](state-cdn-memory-plane.md) | The Mac consumer of the content-addressed memory plane; demand faulting is still future work. |
+| [`graviton-acid-test-results.md`](graviton-acid-test-results.md) | The measured Graviton2 rehydration result and counter-frequency correction. |
+| [`graviton-capture-request.md`](graviton-capture-request.md) | The exact capture shape requested from real cloud hardware. |
 
-This is a fork of Cloud Hypervisor. The Linux/KVM VMM crates (`vmm`,
-`virtio-devices`, `pci`, `devices`, …) are not part of the macOS product — they
-exist only to build the patched `cloud-hypervisor` binary used to *capture*
-HVF-compatible snapshots (see [`../scripts/hvf/`](../scripts/hvf/)). You do not
-need to read or touch them to work on the macOS port.
+## Engineering log
+
+These are intentionally kept public because they explain how the project avoids
+fake demos and stale claims. They are not the first thing a release user needs.
+
+| Doc | Why it remains visible |
+| --- | --- |
+| [`project-state.md`](project-state.md) | The measured state of the world, gate numbers, open limitations, and issue grouping. |
+| [`engineering-discipline.md`](engineering-discipline.md) | The project's working rules: measure, mutation-test, fail honestly, and keep build traps written down. |
+| [`agents.md`](agents.md) | The specialist agent map. Useful to humans too, but primarily an engineering handoff tool. |
+| [`network-policy-plan.md`](network-policy-plan.md) | Planning record for the network/filesystem policy track. The shipped user surface is in `networking.md` and `security-model.md`. |
+| [`raspberry-pi-offbox-plan.md`](raspberry-pi-offbox-plan.md) | Off-box capture plan for ARM Linux hardware. Kept as a plan, not a user promise. |
+
+## Internal-only pending scrub
+
+These files are not linked from the public index and should not be published
+until the confidentiality/history decision is made.
+
+| File | Reason |
+| --- | --- |
+| `docs/living-workspaces.md` | Contains detailed architecture for an unshipped workspace capability. The codename it referenced has been scrubbed from HEAD; it remains in git history, which is accepted. |
+| `docs/roadmap.md` | Normally this would be a useful public milestone ledger, but it also references the unshipped workspace track. Treat it as internal-only until scrubbed, including history. |
+
+## Outside this directory
+
+- [`../app/GimbalLocal/`](../app/GimbalLocal/) — the SwiftUI desktop app.
+- [`../chm/`](../chm/) — the CLI and daemon.
+- [`../hypervisor/src/hvf/`](../hypervisor/src/hvf/) — the HVF backend.
+- [`../scripts/hvf/README.md`](../scripts/hvf/README.md) — capture scripts and
+  the end-to-end microVM loop.
+- [`.github/agents/`](../.github/agents/) — the specialist agent definitions.

@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! The transport-independent half of a virtio device.
 //!
 //! A virtio device is two separable things: a *transport*, which is a register

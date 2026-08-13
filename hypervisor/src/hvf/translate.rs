@@ -1,6 +1,6 @@
 // Copyright © 2026 Cloud Hypervisor macOS port
 //
-// SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
 //! KVM ⇄ HVF arm64 vCPU register translation (milestone M3).
 //!

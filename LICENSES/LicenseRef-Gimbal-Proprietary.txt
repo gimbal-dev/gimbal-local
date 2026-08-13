@@ -1,0 +1,17 @@
+Gimbal proprietary source notice
+================================
+
+Copyright 2026 Gimbal. All rights reserved.
+
+Files marked `LicenseRef-Gimbal-Proprietary` are proprietary Gimbal source. No
+licence is granted to copy, modify, redistribute, sublicense, or use those files
+except under a separate written agreement with Gimbal.
+
+This notice applies only to files that carry `LicenseRef-Gimbal-Proprietary` or
+are assigned that identifier by `.reuse/dep5`. It does not limit rights granted
+by Apache-2.0, BSD-3-Clause, CC-BY-4.0, FSL-1.1-ALv2, or any other third-party
+open-source or source-available licence elsewhere in this repository or in a
+distributed app bundle.
+
+The end-user licence terms for packaged Gimbal Local app releases are pending
+and must preserve all third-party open-source rights.

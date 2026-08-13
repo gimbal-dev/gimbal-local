@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: LicenseRef-Gimbal-Proprietary
+
 import Foundation
 
 /// One guest running on this machine, as `chm ps` reports it.

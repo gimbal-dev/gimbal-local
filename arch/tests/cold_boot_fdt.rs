@@ -1,4 +1,4 @@
-// Copyright © 2026 Gimbal
+// Copyright © 2026 Ben De St Paer-Gotch
 //
 // SPDX-License-Identifier: Apache-2.0
 

@@ -5,7 +5,10 @@ Apple Hypervisor.framework — no snapshot, no KVM host, nothing captured
 anywhere in the path.
 
 ```
-chm image build alpine:3.20 --out ~/gimbal-images/alpine
+chm image build alpine:3.20 \
+  --kernel /path/to/vmlinuz-or-Image \
+  --modules /path/to/lib/modules/<kernel-release> \
+  --out ~/gimbal-images/alpine
 chm create --kernel ~/gimbal-images/alpine/Image \
            --initramfs ~/gimbal-images/alpine/initramfs --cpus 2 --memory 512
 ```
@@ -430,12 +433,16 @@ If a tool inside the guest must trust the credential proxy, note that **Node
 ignores the system trust store** — set `NODE_EXTRA_CA_CERTS` as well as
 installing the CA.
 
-## Sandboxes started this way are not yet listed in the app
+## Sandboxes started this way are listed in the app
 
-Cold boot runs as a subprocess with its own Terminal window, deliberately: the
-daemon owns a single HVF slot, so routing cold boots through it would serialise
-them. The consequence is that the app does not currently list them — it can say
-*"No sandboxes yet"* while a guest it launched is running, and offers no Stop
-button for it. Closing the Terminal window is a power cut on a running guest.
+Cold boot still runs as a subprocess with its own Terminal window, deliberately:
+the daemon owns a single HVF slot, so routing cold boots through it would
+serialise them. The app now reads the machine-wide run registry and shows a
+**Running now** section for guests started by the app or by the CLI.
 
-Tracking: [#225](https://github.com/gimbal-dev/gimbal-local/issues/225).
+Stop sends SIGTERM and the row says `stopping…` until the process actually dies.
+That is intentional: closing a Terminal window or killing a guest is a power cut
+on a writable disk, not a graceful shutdown.
+
+Closed: [#225](https://github.com/gimbal-dev/gimbal-local/issues/225) / PR
+[#244](https://github.com/gimbal-dev/gimbal-local/pull/244).

@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! A freestanding aarch64 program that brings up `eth0`, for guests that have
 //! no tool to do it with.
 //!

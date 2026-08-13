@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! A file-backed `virtio-blk` request processor.
 //!
 //! Consumes a popped [`DescChain`] (header + data + status), performs the I/O

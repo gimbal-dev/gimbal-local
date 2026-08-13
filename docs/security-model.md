@@ -1,5 +1,11 @@
 # Gimbal Local — security model & hardening plan (M30)
 
+> **Provenance caveat.** This security model describes intended and implemented
+> controls in AI-authored code that has not had human line-by-line review. It is
+> useful engineering evidence, not a hardened security certification. Do not use
+> Gimbal Local to isolate untrusted or hostile workloads until that review
+> exists.
+
 Gimbal Local brings a snapshot **down from the cloud** and runs it on a personal
 Mac. The whole point is to run **someone else's compute** — increasingly an
 **autonomous coding agent** — inside a sandbox on your machine. That inverts the

@@ -1,6 +1,6 @@
-// Copyright © 2024 Cloud Hypervisor contributors
+// Copyright © 2026 Ben De St Paer-Gotch
 //
-// SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
+// SPDX-License-Identifier: FSL-1.1-ALv2
 
 //! Carry `env` and `postBootCommand` from a spec into a guest that is running.
 //!

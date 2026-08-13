@@ -1,6 +1,7 @@
-// Copyright © 2026 The Cloud Hypervisor Authors
+// Copyright © 2026 Ben De St Paer-Gotch
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //
 //! A minimal DER writer, sized for exactly one job: emitting the X.509 v3
 //! certificates the credential proxy mints for itself.

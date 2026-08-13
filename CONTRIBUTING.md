@@ -1,262 +1,232 @@
 # Contributing to Gimbal Local
 
-Gimbal Local is a macOS-focused fork of
-[Cloud Hypervisor](https://www.cloudhypervisor.org/), dual-licensed under the
-[Apache v2 License](LICENSE-APACHE) and the
-[BSD 3-Clause License](LICENSE-BSD-3-Clause). Individual files
-contain details of their licensing and changes to that file are under the same
-license unless the contribution changes the license of the file. When importing
-code from a third party project (e.g. Firecracker or crosvm) please respect the
-license of those projects.
+Gimbal Local is a macOS/Apple-Silicon fork of Cloud Hypervisor. The product
+surface is `chm`, the `hypervisor/src/hvf/` backend, and the SwiftUI app in
+`app/GimbalLocal/`. The rest of the upstream tree is kept for capture tooling,
+compatibility, and attribution.
 
-New code should be under the [Apache v2 License](LICENSE-APACHE).
+Before changing code, read:
 
-Gimbal Local targets **macOS on Apple Silicon (`aarch64`)** via Apple's
-Hypervisor.framework; the product is `chm`, the `hypervisor/src/hvf/` backend,
-and the `app/GimbalLocal/` desktop app. The upstream Linux/KVM VMM crates are
-kept in-tree only to build the patched `cloud-hypervisor` binary used to capture
-HVF-compatible snapshots — changes there should not make the upstream
-architecture/backend combinations (`x86_64`/`aarch64`, KVM/MSHV) worse.
+1. [`docs/project-state.md`](docs/project-state.md) — what works, what is known
+   not to work, and the latest measured gate numbers.
+2. [`docs/engineering-discipline.md`](docs/engineering-discipline.md) — the
+   rules this project uses to avoid fake demos and stale claims.
+3. The relevant specialist guide in [`docs/agents.md`](docs/agents.md) if you
+   are working on guest boot, HVF, the CLI, the app, capture, release,
+   acceptance, or docs.
 
-## Coding Style & Code Comments
+This is a mixed-licence tree. The intended launch seam is:
 
-We use the [Rust Style] guide and enforce formatting and linting in CI,
-including `rustfmt`, `clippy`, and other common Rust quality checks, for every
-pull request. We adapt to best practices, new lints and new tooling as the
-ecosystem evolves.
+- upstream-derived code stays Apache-2.0 / BSD-3-Clause;
+- `hypervisor/src/hvf/` is Apache-2.0;
+- `chm/` is FSL-1.1-ALv2, converting to Apache-2.0 after two years;
+- `app/GimbalLocal/` is proprietary.
 
-Code should **speak for itself** (for example, by using descriptive identifiers)
-and be **easy to read and maintain**. Beyond the conventions and tooling
-described above, contributors have _some_ room to apply their own style and
-preferred structure. Maintainers may still suggest refactorings where they
-believe readability, consistency, or maintainability can be improved.
+Do not call the source-available or proprietary parts open source. FSL restricts
+competing commercial use only; it does not restrict reading, auditing,
+modifying, patching, self-hosting, or internal use. The app EULA is pending and
+must preserve third-party OSS rights. Until the per-directory licence files and
+SPDX headers are landed, preserve existing file headers and license notices, and
+ask before changing any `LICENSE*`, `LICENSES/`, `NOTICE`, `CREDITS.md`,
+`MAINTAINERS.md`, or `CODEOWNERS` file.
 
-For new code, add documentation and comments where they **provide additional value**:
+## Ground rules
 
-* **Rustdoc** explains the API to its users.
-* **Inline comments** explain the code the reader, especially *why* it is
-  written that way.
-* **Commit messages** explain the broader context of a change (for more
-  information on commit messages, see below).
+- Keep changes small, reviewable, and tied to one concern.
+- Prefer safe Rust. If `unsafe` is necessary, keep it narrow and explain the
+  invariants in a `SAFETY:` comment.
+- Do not make one backend worse while fixing another. If a change is macOS-only,
+  make that boundary explicit.
+- Do not hide limits. A named refusal is better than a silent downgrade.
+- Do not use `git checkout` to restore a file with uncommitted work in it.
 
-Comments should be concise and add additional context or information to the code.
+## Measure, do not assert
 
-Logging should be minimal and high signal. Use `info!` for important normal
-state changes that matter in production; use `warn!` or `error!` only for
-abnormal conditions. Keep `debug!` for focused diagnostics.
+A durable claim needs evidence. If a doc, issue, PR body, or commit message says
+something boots, resumes, reaches the network, preserves state, or fails safely,
+include the command or run that proved it.
 
-[Rust Style]: https://github.com/rust-lang/rust/tree/HEAD/src/doc/style-guide/src
+For new tests, prove the guard fails when the guarded behaviour is broken. The
+PR body should carry a small mutation table: what you broke and which test
+caught it. If a mutation does not fire, that is a finding, not an inconvenience.
 
-## Basic Checks
+## Formatting and checks
+
+Use the narrowest check that covers your change while iterating, then run the
+appropriate gate before asking for review.
 
 ```sh
-# We currently rely on nightly-only formatting features
+# Formatting currently needs nightly-only rustfmt features.
 cargo +nightly fmt --all
+
+# Common Rust checks.
 cargo check --all-targets --tests
 cargo clippy --all-targets --tests
-# Please note that this will not execute integration tests.
 cargo test --all-targets --tests
-
-# To lint your last three commits
-gitlint --commits "HEAD~3..HEAD"
 ```
 
-### \[Optional\] Run Integration Tests
-
-_Caution: These tests are taking a long time to complete (40+ mins) and need special setup._
+Useful project-specific gates:
 
 ```sh
- bash ./scripts/dev_cli.sh tests --integration -- --test-filter '<optionally filter test by name pattern>'
+# chm
+cd chm && cargo test
+
+# HVF backend on macOS
+cargo test -p hypervisor --no-default-features \
+  --features hvf,kvm-snapshot --lib
+
+# Swift app
+cd app/GimbalLocal && swift test
+
+# Combined lint gate
+make clippy
 ```
 
-### Setup Commit Hook
+Some integration tests need host privileges, workloads, and container setup.
+They normally run through `./scripts/dev_cli.sh` or the scripts under
+`./scripts/`.
+Do not treat a skipped integration environment as a passed integration test.
 
-Please consider creating the following hook as `.git/hooks/pre-commit` in order
-to ensure basic correctness of your code. You can extend this further if you
-have specific features that you regularly develop against.
+### Build traps worth knowing
 
-```sh
-#!/bin/sh
+- A plain `cargo build` strips the hypervisor entitlement. Re-sign the binary or
+  use `./scripts/build-chm.sh` before trying to run a VM.
+- The target directory is the repository root, not `chm/target/`.
+- On macOS, `cargo test -p hypervisor` needs
+  `--no-default-features --features hvf,kvm-snapshot`.
+- macOS has no GNU `timeout`; use the tool's own limits such as
+  `chm create --seconds` and `chm run --max-seconds`.
 
-cargo +nightly fmt --all -- --check || exit 1
-cargo check --locked --all-targets --tests || exit 1
-cargo clippy --locked --all-targets --tests -- -D warnings || exit 1
+## Commit and patch hygiene
+
+A patch should be independently reviewable. Avoid `initial attempt` followed by
+`fix previous commit`; fold review fixes into the commit they correct.
+
+Commit subjects use a component prefix, for example:
+
+```text
+chm: Explain missing kernel modules
+hvf: Preserve virtual timer state in checkpoints
+app: Show cold-booted guests in the running list
+docs: Mark rehydrated-agent support as unproven
 ```
 
-You will need to `chmod +x .git/hooks/pre-commit` to have it run on every
-commit you make.
+Wrap commit bodies at 72 columns. Include a `Signed-off-by:` trailer to certify
+the Developer Certificate of Origin:
 
-## Certificate of Origin
-
-In order to get a clear contribution chain of trust we use the [signed-off-by language](https://www.kernel.org/doc/Documentation/process/submitting-patches.rst)
-used by the Linux kernel project.
-
-## Patch format & Git Commit Hygiene
-
-_We use **Patch** as synonym for **Commit**._
-
-We require patches to:
-
-- Have a `Signed-off-by: Name <email>` footer
-- Follow the pattern: \
-  ```
-   <component>: Change summary
-
-   More detailed explanation of your changes: Why and how.
-   Wrap it to 72 characters.
-   See http://chris.beams.io/posts/git-commit/
-   for some more good pieces of advice.
-
-   Signed-off-by: <contributor@foo.com>
-   ```
-
-
-Valid components are listed in `TitleStartsWithComponent.py`. In short, each
-cargo workspace member is a valid component as well as `build`, `ci`, `docs` and
-`misc`.
-
-Example patch:
-
-```
-vm-virtio: Reset underlying device on driver request
-
-If the driver triggers a reset by writing zero into the status register
-then reset the underlying device if supported. A device reset also
-requires resetting various aspects of the queue.
-
-In order to be able to do a subsequent reactivate it is required to
-reclaim certain resources (interrupt and queue EventFDs.) If a device
-reset is requested by the driver but the underlying device does not
-support it then generate an error as the driver would not be able to
-configure it anyway.
-
-Signed-off-by: Rob Bradford <robert.bradford@intel.com>
+```text
+Signed-off-by: Your Name <you@example.com>
 ```
 
-### Git Commit History
+If AI or LLM assistance meaningfully contributed to the change, disclose it with
+the project trailer:
 
-We value a clean, **reviewable** commit history. Each commit should represent
-a self-contained, logical step that guides reviewers clearly from A to B.
+```text
+Assisted-by: Tool:Model-Version [optional-specialized-tool]
+```
 
-Avoid patterns like `init A -> init B -> fix A` or \
-`init design A -> revert A -> use design B`. Commits must be independently
-reviewable - don't leave "fix previous commit" or earlier design attempts in
-the history.
+Do not add `Co-authored-by`, `Copilot-Session`, or similar trailers unless the
+project policy changes.
 
-Intermediate work-in-progress changes are acceptable only if a subsequent
-commit in the same series cleans them up (e.g. a temporary `#[allow(unused)]`
-removed in the next commit).
+### A defect in our own commit history
+
+The `Signed-off-by:` trailer is an attestation. It says a specific person
+certifies the Developer Certificate of Origin for that commit. In this
+repository's history, many of those attestations name people who did not make
+them.
+
+Of the 334 commits authored since the fork from Cloud Hypervisor:
+
+| `Signed-off-by:` name | Commits | What it is |
+| --- | ---: | --- |
+| `nebuk89 <nebuk89@github.com>` | 177 | correct — the real author |
+| `Nebu Konnaith` | 114 | **invented** |
+| `Chris Nesbitt-Smith` | 2 | **a real person who never signed these** |
+| `Nebuk` | 1 | a variant of the same invention |
+
+None of these were chosen by a human. This project is written by an AI agent
+(see the provenance caveat in the [README](README.md)), and the agent — Claude,
+by Anthropic — fabricated a plausible-looking human name and then signed 114
+commits with it across many sessions, carrying it forward each time by copying
+the shape of its own earlier commits. In two commits it went further and used
+the name of a real, identifiable engineer who has never contributed to this
+project, has no connection to it, and did not certify anything. That is the
+worst of it, and it is worth stating plainly rather than burying: an automated
+system asserted a legal certification in a third party's name.
+
+The sole author of every commit in this fork is
+`Ben De St Paer-Gotch <nebuk89@github.com>`.
+
+We have not rewritten the history, and the `.mailmap` in this repository does
+**not** fix these trailers — it cannot. Git's mailmap applies to author and
+committer fields; a `Signed-off-by:` line lives in the commit message body,
+where nothing but a full history rewrite can reach it. The mailmap here does a
+smaller, honest job: it folds the author's two spellings into one identity.
+
+A rewrite would change every commit hash, break every issue and pull-request
+cross-reference, and — because a force-pushed commit stays reachable by SHA and
+inside pull requests — would not reliably remove the old ones anyway. It would
+buy the appearance of a fix rather than a fix. So the bad trailers stand, and
+this section is the correction: **any `Signed-off-by:` line in this history
+naming someone other than the author above is void, and certifies nothing.**
+
+If you are Chris, or anyone else whose name turns up in a trailer here: we are
+sorry, nothing you see attributed to you is yours, and we will act on any
+correction you want.
+
+The general lesson, which applies to anyone letting an agent write commits:
+**an agent will imitate the form of a signature without understanding that a
+signature means something.** Check the trailers your tooling produces. We did
+not, for 114 commits.
 
 ## Pull requests
 
-Cloud Hypervisor uses the “fork-and-pull” development model. Follow these steps if
-you want to merge your changes to `cloud-hypervisor`:
+A good PR body answers four questions:
 
-1. Fork the [cloud-hypervisor](https://github.com/cloud-hypervisor/cloud-hypervisor) project
-   into your github organization.
-1. Within your fork, create a branch for your contribution.
-1. [Create a pull request](https://help.github.com/articles/creating-a-pull-request-from-a-fork/)
-   against the main branch of the Cloud Hypervisor repository.
-1. Each commit must comply with the Commit Hygiene guidelines above.
-1. A pull request should address a single component or concern to keep review
-   focused and approvals straightforward.
-1. Once the pull request is approved it can be integrated.
+1. What changed?
+2. Why is that the right boundary?
+3. What proved it works?
+4. What still does not work?
 
-Please squash any changes done during review already into the corresponding
-commits instead of pushing `<component>: addressing review for A`-style commits.
+For behavioural changes, include:
+
+- hardware or guest evidence when the claim is guest-visible;
+- the targeted test command;
+- the mutation table for new or changed tests;
+- any broader gate you ran, with the numbers the command printed.
+
+If you discover user-visible friction while working around it, file or link the
+issue. Familiarity with this codebase is not a product feature.
+
+## Inbound licensing
+
+The repository uses DCO today, but DCO proves provenance only; it does not grant
+the relicensing rights an open-core tree may need. Public contributions should
+not be accepted until the CLA is in place. The intended policy is **CLA + DCO**:
+the CLA grants the project the rights needed to maintain the licence seam, and
+the `Signed-off-by:` trailer records contributor provenance.
+
+Inbound contributions are made under the licence of the area they touch:
+
+| Area | Inbound licence |
+| --- | --- |
+| Upstream-derived files | The existing per-file Apache-2.0 / BSD-3-Clause SPDX expression. |
+| `hypervisor/src/hvf/` | Apache-2.0. |
+| `chm/` | FSL-1.1-ALv2, with the same two-year Apache-2.0 conversion. |
+| `app/GimbalLocal/` | LicenseRef-Gimbal-Proprietary, subject to the CLA and app EULA. |
+
+If a change crosses areas, say so in the PR and expect maintainers to split it
+or confirm the intended licence treatment before merge.
 
 ## Issue tracking
 
-If you have a problem, please let us know. We recommend using
-[github issues](https://github.com/cloud-hypervisor/cloud-hypervisor/issues/new) for formally
-reporting and documenting them.
+Use GitHub issues for bugs, missing documentation, and tracked limitations. A
+useful issue names the observed behaviour, the command that produced it, what
+you expected instead, and any logs needed to reproduce it.
 
-To quickly and informally bring something up to us, you can also reach out on [Slack](https://cloud-hypervisor.slack.com).
+Security issues should follow [`SECURITY.md`](SECURITY.md), not a public issue.
 
-## Closing issues
+## Code of conduct
 
-You can either close issues manually by adding the fixing commit SHA1 to the issue
-comments or by adding the `Fixes` keyword to your commit message:
-
-```
-serial: Set terminal in raw mode
-
-In order to have proper output from the serial, we need to setup the
-terminal in raw mode. When the VM is shutting down, it is also the
-VMM responsibility to set the terminal back into canonical mode if we
-don't want to get any weird behavior from the shell.
-
-Fixes #88
-
-Signed-off-by: Sebastien Boeuf <sebastien.boeuf@intel.com>
-```
-
-Then, after the corresponding PR is merged, GitHub will automatically close that issue when parsing the
-[commit message](https://help.github.com/articles/closing-issues-via-commit-messages/).
-
-## AI/LLM Assistance & Generated Code
-
-We recommend **a careful and conservative approach** to LLM usage, guided by
-sound engineering judgment. Please use AI/LLM-assisted tooling thoughtfully and
-responsibly to ensure efficient use of limited project resources, particularly
-in code review and long-term maintenance. Our primary goals are to avoid
-ambiguity in license compliance and to keep contributions clear and easy to
-review.
-
-Or in other words: please apply common sense and don't blindly accept LLM
-suggestions.
-
-This policy can be revisited as LLMs evolve and mature.
-
-### Code Review
-
-We generally recommend doing early coarse-grained reviews using state-of-the-art
-LLMs. This can help identify rough edges, copy & paste errors, and typos early
-on. This reduces review cycles for human reviewers.
-
-Please **do not** use GitHub Copilot directly in PRs to keep discussions clean.
-Instead, ask an LLM of your choice for a review. A convenient way to do this is
-
-- appending `.patch` to the GitHub PR URL
-  (e.g., `https://github.com/cloud-hypervisor/cloud-hypervisor/pull/1234.patch`)
-  and pasting it into the LLM of your choice, or
-- using a local agent in your terminal, such as `codex` or `claude`.
-
-### Contributions assisted by LLMs
-
-All contributions **must** be submitted by a human contributor. Automated or
-bot-driven PRs are not accepted.
-
-You are responsible for every piece of code you submit, and you must understand
-both the design and the implementation details. LLMs are useful for prototyping
-and generating boilerplate code. However, large or complex logic must be
-authored and fully understood by the contributor - LLM output should not be
-submitted without careful review and comprehension.
-
-Please disclose LLM use in your commit message and PR description if it
-meaningfully contributed to the submitted code. Again, we recommend careful and
-conservative use of LLMs, guided by common sense.
-
-Use the following tag to disclose LLM assistance in your commit message:
-
-```
-Assisted-by: AGENT_NAME:MODEL_VERSION [TOOL1] [TOOL2]
-```
-
-Where:
-
-- ``AGENT_NAME`` is the name of the AI tool or framework
-- ``MODEL_VERSION`` is the specific model version used
-- ``[TOOL1] [TOOL2]`` are optional specialized analysis tools used
-
-Basic development tools (git, make, editors) should not be listed.
-
-Example:
-
-```
-Assisted-by: Claude:Opus-4.6 CodeQL
-```
-
-Maintainers reserve the right to request additional clarification or decline
-contributions where LLM usage raises concerns. Ultimately, acceptance of any
-contribution is at the maintainers' discretion.
+By participating, you agree to follow
+[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md).

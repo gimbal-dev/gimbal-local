@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! A `virtio-rng` request processor: fill the guest's device-writable buffers
 //! with entropy.
 //!
