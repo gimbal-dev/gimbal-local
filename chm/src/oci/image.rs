@@ -73,8 +73,10 @@ const LAYER_LIMIT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// and `the_kernel_hint_matches_the_documented_procedure` fails if this and
 /// `docs/container-images.md` ever disagree — a message that sends someone to a
 /// doc has to agree with it, or it is worse than saying nothing.
-const KERNEL_DEB_URL: &str = "http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/\
+const KERNEL_DEB_URL: &str = "https://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/\
                               linux-image-unsigned-6.8.0-71-generic_6.8.0-71.71_arm64.deb";
+const KERNEL_DEB_SHA256: &str =
+    "34bda55a30300e85585b4bedc6c6a2b6a9e75acaeaf8c9d34077c7430147b61d";
 
 /// Headroom over the rootfs for the kernel, page tables, and the guest actually
 /// doing something once it boots. Below this even a shell prompt is tight.
@@ -253,6 +255,24 @@ fn discover_kernels(library: &Path) -> Vec<PathBuf> {
     }
     found.sort();
     found
+}
+
+fn kernel_download_hint(library: &Path) -> String {
+    let deb_name = KERNEL_DEB_URL
+        .rsplit('/')
+        .next()
+        .expect("the pinned kernel URL names a package");
+    format!(
+        "No `Image` found under {}, and one has to come from somewhere.\n\n\
+         Get the kernel this project hardware-tests (Ubuntu arm64 generic 6.8.0-71):\n  \
+         curl -LO {KERNEL_DEB_URL}\n  \
+         printf '%s  %s\\n' '{KERNEL_DEB_SHA256}' '{deb_name}' | \\\n    \
+         shasum -a 256 -c - && \\\n  \
+         ar x {deb_name} && tar -xf data.tar\n  \
+         ...then pass --kernel ./boot/vmlinuz-6.8.0-71-generic\n\n\
+         Or see docs/container-images.md.",
+        library.display()
+    )
 }
 
 /// Read a kernel, unwrapping whatever the distro wrapped it in.
@@ -618,16 +638,7 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
                 // which found them in `docs/container-images.md`, where they
                 // had been written down all along. Explaining the reason and
                 // withholding the remedy is what sent them there.
-                format!(
-                    "No `Image` found under {}, and one has to come from somewhere.\n\n\
-                     Get the kernel this project hardware-tests (Ubuntu arm64 generic \
-                     6.8.0-71):\n  \
-                     curl -LO {KERNEL_DEB_URL}\n  \
-                     ar x linux-image-unsigned-*.deb && tar -xf data.tar\n  \
-                     ...then pass --kernel ./boot/vmlinuz-6.8.0-71-generic\n\n\
-                     Or see docs/container-images.md.",
-                    library.display()
-                )
+                kernel_download_hint(&library)
             } else {
                 let list: Vec<String> =
                     found.iter().map(|p| format!("  {}", p.display())).collect();
@@ -1656,30 +1667,62 @@ mod tests {
     /// `docs/container-images.md` -- so the procedure was never missing, only
     /// unreachable from the place it was needed.
     ///
-    /// Two things are pinned. First that the message carries the commands.
-    /// Second, and the reason this is a guard rather than an edit, that the URL
-    /// it prints still exists in the doc it is drawn from: a message telling
-    /// someone to fetch a specific kernel is worse than silence once that
-    /// kernel and the documented one differ, and nothing else would catch the
-    /// day one of them is bumped.
+    /// Three things are pinned: the HTTPS transport, the integrity check, and
+    /// agreement with both places that document the procedure. A message telling
+    /// someone to fetch unverified executable code is worse than silence, as is
+    /// one whose package or digest has drifted from its documentation.
     #[test]
     fn the_kernel_hint_matches_the_documented_procedure() {
         let doc = include_str!("../../../docs/container-images.md");
-        assert!(
-            doc.contains(KERNEL_DEB_URL),
-            "the URL in the --kernel hint is no longer in docs/container-images.md; \
-             bump both or the message sends people at a 404"
-        );
+        let agent = include_str!("../../../.github/agents/guest-boot.agent.md");
+        let hint = kernel_download_hint(Path::new("/empty/image/library"));
+        let normalized_hint = hint.replace("\\\n", " ");
+        let normalized_hint = normalized_hint.split_whitespace().collect::<Vec<_>>().join(" ");
 
-        let src = include_str!("image.rs");
-        let (_, hint) = src
-            .split_once("No `Image` found under {}")
-            .expect("the empty-library branch is still here");
-        let hint = &hint[..900.min(hint.len())];
-        for needed in ["curl -LO", "ar x", "--kernel ./boot/vmlinuz", "container-images.md"] {
+        assert!(
+            KERNEL_DEB_URL.starts_with("https://"),
+            "the recommended kernel must be fetched over HTTPS: {KERNEL_DEB_URL}"
+        );
+        assert!(
+            !hint.contains("http://"),
+            "the emitted kernel hint contains an insecure URL: {hint}"
+        );
+        for needed in [
+            KERNEL_DEB_URL,
+            KERNEL_DEB_SHA256,
+            "shasum -a 256 -c - &&",
+            "curl -LO",
+            "ar x",
+            "--kernel ./boot/vmlinuz",
+            "container-images.md",
+        ] {
             assert!(
                 hint.contains(needed),
                 "a first-run user needs {needed:?} in the hint, not a category name"
+            );
+        }
+        assert!(
+            normalized_hint.contains("shasum -a 256 -c - && ar x"),
+            "kernel extraction must be the immediate success branch of checksum verification"
+        );
+        for (name, procedure) in [
+            ("docs/container-images.md", doc),
+            (".github/agents/guest-boot.agent.md", agent),
+        ] {
+            for needed in [KERNEL_DEB_URL, KERNEL_DEB_SHA256, "shasum -a 256 -c - &&"] {
+                assert!(
+                    procedure.contains(needed),
+                    "{name} has drifted from the verified kernel procedure: missing {needed:?}"
+                );
+            }
+            assert!(
+                !procedure.contains("http://ports.ubuntu.com"),
+                "{name} still recommends an insecure Ubuntu kernel URL"
+            );
+            let normalized = procedure.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                normalized.contains("shasum -a 256 -c - && ar x"),
+                "{name} must make extraction the immediate success branch of checksum verification"
             );
         }
     }

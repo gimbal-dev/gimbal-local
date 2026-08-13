@@ -5,7 +5,8 @@ you are an agent starting a task — read this, then
 [`engineering-discipline.md`](engineering-discipline.md), then the domain guide
 for the area you are touching.
 
-**Last measured sweep:** 2026-08-07, against `main` at `c78890e61`.
+**Last measured sweep:** 2026-08-13, against the
+`nebuk89-public-readiness-audit` working tree based on `7330fc727`.
 **Issue-state refresh:** 2026-08-13, via `gh issue view` / `gh pr view`.
 
 Everything in this document was measured on this machine. Where something is
@@ -57,6 +58,7 @@ three ways:
 | **Max guest RAM on cold boot is 3008 MiB** | Guest RAM starts at `0x40000000` and a single region must end by `0xfc000000`. `chm` refuses larger with the exact maximum in the message. |
 | **Demand-faulting from the state CDN is not implemented** | See [`state-cdn-memory-plane.md`](state-cdn-memory-plane.md). |
 | **`chm state-cdn serve` served files from outside its cache — fixed, unreleased** | Unauthenticated file disclosure. `sanitize()` folded `/` to `_` but kept `.`, so `ref=..` survived as a path segment and `GET /state-cdn/chunk?ref=..&key=NAME` returned any `[A-Za-z0-9.-]+`-named file *beside* the cache dir. Measured end-to-end: `HTTP 200` with the decoy's contents before, `404` after. Present in **every release up to and including v0.2.1**; fixed in tree, **not yet in a published build**. Bounded by: explicit opt-in (nothing starts the server), loopback default, one directory level, and that charset — but peer caching exists to be LAN-bound, so the default is weak mitigation for anyone actually using it. |
+| **The end-user licence has not been reviewed by a lawyer** | [`EULA.md`](../app/GimbalLocal/EULA.md) was written by the maintainer, not by counsel, and ships that way deliberately — the alternative was distributing with no written terms at all. The document says so in its own opening notice rather than implying a review it never had. `scripts/build-gimbal-local-app.sh` refuses release builds while that text is marked an unreviewed *draft*; the gate was cleared by accepting the terms as-authored, not by obtaining review. |
 
 ---
 
@@ -75,11 +77,11 @@ three ways:
 
 ## The gates, and their current numbers
 
-| Suite | Command | Passing |
+| Suite | Command | Measured result |
 | --- | --- | --- |
-| chm | `cd chm && cargo test` | **609** passed / 3 ignored (lib), plus **2** passed / 7 ignored (integration) |
-| hypervisor | `cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib` | **216** |
-| Swift app | `cd app/GimbalLocal && swift test` | **221** XCTest (3 skipped) + **10**, plus **34** Swift Testing cases in 5 suites |
+| chm | `cd chm && cargo test` | **722** passed / 4 ignored (lib), plus **2** passed / 7 ignored (integration) |
+| hypervisor | `cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib` | **255** passed |
+| Swift app | `cd app/GimbalLocal && swift test` | **255** XCTest (3 skipped), plus **34** Swift Testing cases in 5 suites |
 | Lints | `make clippy` | **0** |
 
 `cargo test` and `swift test` each print **more than one** result line. Quote all
@@ -190,7 +192,7 @@ generated init could install the proxy CA)
 | --- | --- |
 | Know how we work before changing anything | [`engineering-discipline.md`](engineering-discipline.md) |
 | Know which specialist agent to use | [`agents.md`](agents.md) |
-| Understand the milestone plan | `docs/roadmap.md` is internal-only pending a review of the unshipped workspace track. |
+| Understand the milestone plan | [`roadmap.md`](roadmap.md) is the public engineering plan; planned work is not a shipped commitment. |
 | Understand the HVF port's architecture | [`macos-local-runtime.md`](macos-local-runtime.md) |
 | Turn a Docker image into a bootable guest | [`container-images.md`](container-images.md) |
 | Understand the threat model | [`security-model.md`](security-model.md) |

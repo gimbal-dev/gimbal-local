@@ -6,15 +6,15 @@
 </p>
 
 <p align="center">
-  <a href="../../releases/latest">
+  <a href="https://github.com/gimbal-dev/gimbal-local/releases/latest">
     <img alt="Download Gimbal" src="https://img.shields.io/badge/Download-Gimbal%20for%20macOS-0969DA?style=for-the-badge&logo=apple&logoColor=white">
   </a>
   &nbsp;
-  <a href="../../releases">
+  <a href="https://github.com/gimbal-dev/gimbal-local/releases">
     <img alt="All releases" src="https://img.shields.io/badge/All%20releases-24292F?style=for-the-badge&logo=github&logoColor=white">
   </a>
   &nbsp;
-  <a href="../../issues">
+  <a href="https://github.com/gimbal-dev/gimbal-local/issues">
     <img alt="Questions and feedback" src="https://img.shields.io/badge/Questions%20%26%20feedback-Open%20an%20issue-1F883D?style=for-the-badge&logo=github&logoColor=white">
   </a>
 </p>
@@ -27,17 +27,20 @@
 </p>
 
 
-> ## <a id="no-human-review"></a>⚠️ Read this first: nobody has reviewed this code
+> ## <a id="no-human-review"></a>⚠️ Read this first: nobody has reviewed the Gimbal code
 >
-> **Every line of code in this repository was written by an AI.** Not
-> AI-assisted — AI-authored. No human has read it line by line, and no human
+> **All Gimbal-specific additions and product code in this fork were written by
+> an AI.** Not AI-assisted — AI-authored. The retained upstream Cloud Hypervisor
+> tree was written by its human contributors; this disclosure does not attribute
+> their work to AI. No human has read the Gimbal code line by line, and no human
 > has reviewed it for correctness or security. It is, in the plainest sense, a
-> vibe-coded project.
+> vibe-coded product built around an upstream human-authored project.
 >
-> The human involvement was entirely product-management: writing the
-> specification, setting direction and acceptance criteria, prioritising,
-> pushing back, and making judgement calls about what was real versus a
-> convincing-looking fake. Valuable work, and none of it code review.
+> The human involvement in the Gimbal-specific work was entirely
+> product-management: writing the specification, setting direction and
+> acceptance criteria, prioritising, pushing back, and making judgement calls
+> about what was real versus a convincing-looking fake. Valuable work, and none
+> of it code review.
 >
 > **This matters because a hypervisor is a security boundary.** This one has
 > never been audited by a person. Do not use Gimbal Local to isolate untrusted,
@@ -82,16 +85,17 @@ chm: guest resumed — serial console follows.
 > **Status: real, and honestly bounded.** A vanilla Graviton2 Cloud Hypervisor
 > snapshot has rehydrated on Apple silicon carrying `617849s` — 7.15 days — of
 > guest uptime. Container-derived guests have reached the internet and run the
-> GitHub Copilot CLI on a cold boot. The hard combined claim, "resume a cloud
-> snapshot and run a coding agent inside that same resumed guest", is still open
-> work. See [What works today](#what-works-today) and
-> [Known limits](#known-limits).
+> GitHub Copilot CLI on a cold boot. On 2026-08-13, an agent also worked inside a
+> rehydrated Graviton2 capture and, after suspend and resume, read back and
+> extended its own file: three agent runs across two cycles, all exit 0, with
+> guest uptime continuous at 14.09 days. See
+> [What works today](#what-works-today) and [Known limits](#known-limits).
 
-> **Beta.** The current release is a public beta. Questions, bugs, support,
+> **Beta.** The current release is a beta. Questions, bugs, support,
 > licensing questions, and security coordination go through
 > [GitHub issues](https://github.com/gimbal-dev/gimbal-local/issues) for now.
-> Issues are public: do not include secrets, credentials, personal data, or
-> working exploit details.
+> Treat issue contents as public: do not include secrets, credentials, personal
+> data, or working exploit details.
 
 There are no stubbed VMs or fake consoles here. If a command in this README says
 that a guest booted, the claim comes from a real guest on real Apple Silicon.
@@ -223,7 +227,7 @@ Measured project state lives in
 | Networking | Userspace NAT works; egress is allow-listed and fail-closed. |
 | Credential custody | The credential proxy can attach host-held credentials as traffic leaves the guest; the guest does not hold the secret. |
 | Desktop app | Starts and stops the daemon, lists snapshots, launches cold boots, and shows guests running on this Mac. |
-| Coding agent in a sandbox | Proven on a cold-booted guest. Rehydrated-cloud-snapshot acceptance remains open. |
+| Coding agent in a sandbox | Proven on a cold-booted guest and, on 2026-08-13, across two suspend/resume cycles in a rehydrated Graviton2 capture. |
 
 ---
 
@@ -288,7 +292,7 @@ Notes that save time:
   to run the binary, or use `./scripts/build-chm.sh`.
 - On macOS, build the hypervisor tests with
   `--no-default-features --features hvf,kvm-snapshot`.
-- See [`CONTRIBUTING.md`](CONTRIBUTING.md) before sending a patch.
+- See [`CONTRIBUTING.md`](CONTRIBUTING.md) for the current contribution status.
 
 ---
 
@@ -338,10 +342,13 @@ the seam placed where it avoids taking from upstream.
 | Upstream-derived tree | Apache-2.0 / BSD-3-Clause, unchanged | Required by upstream and correct for the inherited code. |
 | `hypervisor/src/hvf/` | Apache-2.0 | Deliberately given back: it implements the upstream hypervisor trait and is the part Cloud Hypervisor itself would plausibly want. |
 | `chm/` | FSL-1.1-ALv2; converts to Apache-2.0 after two years | Source available commercial open core, using a known SPDX licence rather than a bespoke one. |
-| `app/GimbalLocal/` | Proprietary | A closed macOS GUI over an open engine boundary is not upstream-derived. |
+| `app/GimbalLocal/` | Proprietary source; draft preview/evaluation EULA for packaged releases | A closed macOS GUI over an open engine boundary is not upstream-derived. |
 
 Only the OSI-approved parts should be described as open source. `chm/` is source
 available: FSL restricts competing commercial use only, not reading, auditing,
-modifying, patching, self-hosting, or internal use. The app needs a proper EULA;
-that is pending and must preserve third-party OSS rights. Upstream bug fixes
-should go back to Cloud Hypervisor.
+modifying, patching, self-hosting, or internal use. The proposed terms for
+packaged app releases are in the narrow
+[draft preview/evaluation EULA](app/GimbalLocal/EULA.md). It is prominently
+marked for legal review and is not final or legal-approved; repository licences
+continue to govern source code, and third-party terms control their respective
+components. Upstream bug fixes should go back to Cloud Hypervisor.

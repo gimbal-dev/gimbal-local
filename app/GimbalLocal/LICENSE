@@ -1,6 +1,12 @@
-The Gimbal Local macOS app source is proprietary Gimbal source, marked with
-`LicenseRef-Gimbal-Proprietary`.
+The Gimbal Local macOS app source is proprietary source of Ben De St Paer-Gotch
+trading as Gimbal, marked with `LicenseRef-Gimbal-Proprietary`.
 
 This does not limit rights in third-party open-source components shipped with or
-used by the app. The packaged app EULA is pending and must preserve those
-third-party rights. See `../../LICENSES/LicenseRef-Gimbal-Proprietary.txt`.
+used by the app, or source-available components governed by their own terms.
+Those terms control their respective components.
+
+The proposed end-user terms for packaged releases are in
+[`EULA.md`](EULA.md), a narrow PREVIEW/EVALUATION draft. It is prominently
+marked `DRAFT — legal review required before public distribution` and must not
+be presented as final or legal-approved. It does not replace repository source
+licences. See `../../LICENSES/LicenseRef-Gimbal-Proprietary.txt`.

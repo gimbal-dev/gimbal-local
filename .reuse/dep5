@@ -3,15 +3,35 @@ Upstream-Name: gimbal-local
 Upstream-Contact:  <>
 Source: https://github.com/gimbal-dev/gimbal-local
 
-Files: docs/*.md *.md
+Files: docs/*.md AGENTS.md CODE_OF_CONDUCT.md CONTRIBUTING.md CREDITS.md
+ MAINTAINERS.md README.md SECURITY.md THIRD_PARTY_NOTICES.md
+ UPSTREAM-CHANGES.md
 Copyright: 2024 Cloud Hypervisor contributors
 License: CC-BY-4.0
+
+Files: reports/snapshot-portability-security/README.md
+ reports/snapshot-portability-security/artifacts/*.md
+ reports/snapshot-portability-security/artifacts/*.json
+Copyright: 2026 Ben De St Paer-Gotch
+License: CC-BY-4.0
+
+Files: reports/snapshot-portability-security/artifacts/discover.sh
+Copyright: 2026 Ben De St Paer-Gotch
+License: Apache-2.0
 
 Files: LICENSE LICENSE-APACHE LICENSE-BSD-3-Clause NOTICE
 Copyright: 2026 Ben De St Paer-Gotch
 License: Apache-2.0
 
+Files: Makefile .mailmap
+Copyright: 2026 Ben De St Paer-Gotch
+License: Apache-2.0
+
 Files: hypervisor/src/hvf/**/*.rs
+Copyright: 2026 Ben De St Paer-Gotch
+License: Apache-2.0
+
+Files: hypervisor/tests/data/*
 Copyright: 2026 Ben De St Paer-Gotch
 License: Apache-2.0
 

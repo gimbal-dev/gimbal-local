@@ -62,9 +62,19 @@ ways.
 built in:
 
 ```bash
-curl -O http://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-image-unsigned-6.8.0-71-generic_6.8.0-71.71_arm64.deb
-ar x linux-image-*.deb && tar -xf data.tar     # data.tar is UNCOMPRESSED; tar -xzf FAILS
+curl -LO https://ports.ubuntu.com/ubuntu-ports/pool/main/l/linux/linux-image-unsigned-6.8.0-71-generic_6.8.0-71.71_arm64.deb
+printf '%s  %s\n' \
+  '34bda55a30300e85585b4bedc6c6a2b6a9e75acaeaf8c9d34077c7430147b61d' \
+  'linux-image-unsigned-6.8.0-71-generic_6.8.0-71.71_arm64.deb' |
+  shasum -a 256 -c - &&
+ar x linux-image-unsigned-6.8.0-71-generic_6.8.0-71.71_arm64.deb &&
+  tar -xf data.tar     # data.tar is UNCOMPRESSED; tar -xzf FAILS
 ```
+
+The digest is recorded in Ubuntu's
+[2025-07-30 `noble-security` arm64 package index](https://snapshot.ubuntu.com/ubuntu/20250730T000000Z/dists/noble-security/main/binary-arm64/Packages.gz)
+and matches the artifact served by Ubuntu's HTTPS ports archive. Do not extract
+or boot it unless `shasum` reports `OK`.
 
 Hand `boot/vmlinuz-*` straight to chm — `kernelimage::decode` unwraps gzip and
 EFI zboot itself. `eth0` appears with **no modprobe**. Note honestly: its

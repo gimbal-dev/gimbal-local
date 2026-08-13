@@ -11,7 +11,8 @@
 #   GIMBAL_SIGN_IDENTITY  codesign identity. Defaults to "-" (ad-hoc), which is
 #                         what a developer wants and what CI can do. A release
 #                         passes a "Developer ID Application: …" identity.
-#   GIMBAL_VERSION        CFBundleShortVersionString (default 0.1.0).
+#   GIMBAL_VERSION        CFBundleShortVersionString. If unset, this is derived
+#                         from chm/Cargo.toml.
 #   GIMBAL_BUILD          CFBundleVersion (default 1).
 #
 # Debug and release differ in one behavioural way, and it is deliberate: a
@@ -38,10 +39,69 @@ elif [[ -n "${1:-}" ]]; then
     echo "usage: build-gimbal-local-app.sh [--release]" >&2
     exit 2
 fi
+[[ $# -le 1 ]] || {
+    echo "build-gimbal-local-app.sh: too many arguments" >&2
+    echo "usage: build-gimbal-local-app.sh [--release]" >&2
+    exit 2
+}
 
 identity="${GIMBAL_SIGN_IDENTITY:--}"
-version="${GIMBAL_VERSION:-0.1.0}"
+chm_version="$(awk '/^\[package\]/{p=1;next} /^\[/{p=0} p&&/^version *=/{gsub(/[",]/,"");print $3;exit}' "$repo_root/chm/Cargo.toml")"
+if [[ -z "$chm_version" ]]; then
+    echo "build-gimbal-local-app.sh: could not read chm/Cargo.toml package version" >&2
+    exit 1
+fi
+version="${GIMBAL_VERSION:-$chm_version}"
 build_number="${GIMBAL_BUILD:-1}"
+
+if [[ ! "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+    echo "build-gimbal-local-app.sh: invalid version \"$version\"" >&2
+    exit 1
+fi
+if [[ ! "$build_number" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+    echo "build-gimbal-local-app.sh: invalid CFBundleVersion \"$build_number\"" >&2
+    exit 1
+fi
+if [[ "$configuration" == "release" && "$version" != "$chm_version" ]]; then
+    echo "build-gimbal-local-app.sh: release version $version does not match chm/Cargo.toml ($chm_version)" >&2
+    exit 1
+fi
+
+# A shipped bundle must carry the notices that apply to it. Check this before
+# either compiler runs. Debug builds copy everything available but only warn,
+# which keeps an incomplete developer checkout usable.
+legal_files=(
+    "LICENSE"
+    "NOTICE"
+    "THIRD_PARTY_NOTICES.md"
+    "CREDITS.md"
+    "app/GimbalLocal/EULA.md"
+)
+missing_legal=()
+for legal_file in "${legal_files[@]}"; do
+    [[ -f "$repo_root/$legal_file" ]] || missing_legal+=("$legal_file")
+done
+if [[ ! -d "$repo_root/LICENSES" ]] \
+    || [[ -z "$(find "$repo_root/LICENSES" -type f -print -quit 2>/dev/null)" ]]; then
+    missing_legal+=("LICENSES/ (with license texts)")
+fi
+if [[ ${#missing_legal[@]} -gt 0 ]]; then
+    if [[ "$configuration" == "release" ]]; then
+        printf 'build-gimbal-local-app.sh: release legal material is missing:\n' >&2
+        printf '  %s\n' "${missing_legal[@]}" >&2
+        exit 1
+    fi
+    printf 'build-gimbal-local-app.sh: warning: legal material is missing:\n' >&2
+    printf '  %s\n' "${missing_legal[@]}" >&2
+fi
+draft_eula_marker="DRAFT — legal review required before public distribution"
+if [[ "$configuration" == "release" ]] \
+    && grep -qF "$draft_eula_marker" "$repo_root/app/GimbalLocal/EULA.md"; then
+    echo "build-gimbal-local-app.sh: app/GimbalLocal/EULA.md is still marked:" >&2
+    echo "  $draft_eula_marker" >&2
+    echo "Legal review must remove that marker before a release build." >&2
+    exit 1
+fi
 
 # One definition of "what entitlements does chm need". Deliberately the same
 # file `scripts/build-chm.sh` has signed with since the port began — a second
@@ -73,6 +133,17 @@ cp "$app_pkg/.build/$configuration/GimbalLocal" "$macos/GimbalLocal"
 
 if [[ "$configuration" == "release" ]]; then
     cp "$repo_root/$chm_bin" "$macos/chm"
+fi
+
+# Keep the committed names so a recipient can identify each notice without
+# needing source-tree context.
+for legal_file in "${legal_files[@]}"; do
+    if [[ -f "$repo_root/$legal_file" ]]; then
+        cp "$repo_root/$legal_file" "$resources/$(basename "$legal_file")"
+    fi
+done
+if [[ -d "$repo_root/LICENSES" ]]; then
+    cp -R "$repo_root/LICENSES" "$resources/LICENSES"
 fi
 
 # Generate the app icon (.icns) from the committed 1024px master. iconutil and

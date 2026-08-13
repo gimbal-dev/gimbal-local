@@ -23,32 +23,42 @@ notarized, stapled, and verified the way a stranger receives it.
 > file → grep the log. Mutation testing and hardware verification are never
 > what you cut; repetition and ceremony are.
 
-## The one command
+## The two phases
 
 ```bash
-GIMBAL_VERSION=0.1.2 scripts/release-macos.sh            # up to Gatekeeper assessment — reversible
-GIMBAL_VERSION=0.1.2 scripts/release-macos.sh --publish  # adds the one irreversible step
+version=0.2.2
+GIMBAL_VERSION="$version" scripts/release-macos.sh
+# Install and review target/GimbalLocal-$version.zip as a stranger would.
+scripts/release-macos.sh \
+    --promote "target/GimbalLocal-$version.release-metadata"
 ```
 
-> **Always set `GIMBAL_VERSION` explicitly.** The script defaults to `0.1.0`
-> while the tree is already past it, so a bare invocation builds the wrong
-> version — and shipped v0.1.1 already contained a bundled CLI that reported
-> `0.1.0`. **Verify the version the built artifact reports**, not just the one
-> you passed in.
+> **Always set `GIMBAL_VERSION` explicitly for the build phase.** There is no
+> release default. Promotion reads the version from the reviewed metadata and
+> refuses any conflicting `GIMBAL_VERSION` or `--version`. The script verifies
+> the exact extracted `chm --version` and Info.plist version; shipped v0.1.1
+> taught us not to trust only the version passed to the build.
 
 Read the header of that script before running it. It documents the environment
 it needs:
 
 | Variable | Meaning |
 | --- | --- |
-| `GIMBAL_SIGN_IDENTITY` | Developer ID Application identity. **Required** — an ad-hoc signature cannot be notarized, so there is deliberately no default. |
+| `GIMBAL_SIGN_IDENTITY` | Expected Developer ID Application identity. **Required for both build and promotion** — promotion uses it as an independent trust anchor instead of trusting unsigned metadata to name its own signer. |
 | `GIMBAL_NOTARY_PROFILE` | `notarytool` keychain profile (default `gimbal-notary`) |
-| `GIMBAL_VERSION` | Release version, also the tag |
+| `GIMBAL_VERSION` | Release version, also the tag. Required for the build phase. |
 | `GIMBAL_BUILD` | `CFBundleVersion` |
 
-**Default to the non-`--publish` mode.** It performs the entire risky part and
-leaves the `.zip` in `target/`. Only add `--publish` when the assessment passed
-and a human has said go.
+The build phase performs the risky work and leaves both the ZIP and a
+`.release-metadata` provenance file in `target/`. It does not publish.
+`--promote METADATA` is the only publishing mode: it verifies the ZIP digest,
+source SHA, exact versions, arm64 Mach-O executables, Developer ID signatures,
+staple, and Gatekeeper state before uploading that same ZIP and metadata file.
+The obsolete `--publish` argument refuses rather than rebuilding.
+
+Both phases require a clean worktree at the metadata's exact source commit.
+Release builds also refuse an absent EULA or one still carrying the prominent
+`DRAFT — legal review required before public distribution` marker.
 
 ---
 
@@ -74,8 +84,9 @@ about to ship*. `release-macos.sh` does this deliberately. **Never remove that
 step to make a release faster.** A release that skipped it would have shipped an
 app that never starts.
 
-This is also why [#214](https://github.com/gimbal-dev/gimbal-local/issues/214)
-is open: every gate we routinely quote is still a **debug** gate.
+The routine gates are still debug by default, but
+[#214](https://github.com/gimbal-dev/gimbal-local/issues/214) is closed: the
+release-configuration gate now exists and the release script runs it itself.
 
 ---
 
@@ -93,20 +104,23 @@ is open: every gate we routinely quote is still a **debug** gate.
 
 ## Release checklist
 
-1. `main` is green on **all** gates: `cd chm && cargo test` (537),
+1. `main` is green on **all** gates: `cd chm && cargo test` (629, 3 ignored),
    `cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib`
-   (216), `cd app/GimbalLocal && swift test` (216), `make clippy` (0),
-   `make security-check`.
-2. Version bumped in `chm/Cargo.toml` and `GIMBAL_VERSION` matching.
-3. `scripts/release-macos.sh` **without** `--publish`. Read the Gatekeeper
-   assessment output — do not skim it.
+   (216), `cd app/GimbalLocal && swift test` (244 XCTest, 3 skipped, plus 35
+   swift-testing), `make clippy` (0), `make security-check`.
+2. Version bumped in `chm/Cargo.toml` and `GIMBAL_VERSION` matching; worktree
+   clean; EULA present and its draft-review marker removed by legal review.
+3. Run `scripts/release-macos.sh` with the explicit version. Read the
+   Gatekeeper assessment output and record the emitted ZIP, SHA-256, and
+   `.release-metadata` path — do not skim them.
 4. **Install the artifact the way a stranger would**, on a machine with no
    development tree, and actually run it. This has caught real bugs that no gate
    caught.
-5. `--publish`.
-6. Verify the published release: does the download link work **for someone
-   outside the repo**? [#219](https://github.com/gimbal-dev/gimbal-local/issues/219)
-   is open precisely because it did not.
+5. After a human says go, run `scripts/release-macos.sh --promote METADATA`.
+   Promotion must upload both the reviewed ZIP and provenance metadata.
+6. Verify the published release and both assets from the intended recipient's
+   access context. [#219](https://github.com/gimbal-dev/gimbal-local/issues/219)
+   is closed, but the external-path check remains a release responsibility.
 
 ---
 
