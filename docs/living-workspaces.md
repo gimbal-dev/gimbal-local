@@ -3,7 +3,7 @@
 **Status:** Product and engineering specification  
 **Date:** 2026-07-31  
 **Scope:** Gimbal Local, Gimbal Cloud, and Gimbal agent images  
-**Implementation ownership:** Gimbal-only; no SV3 dependency or compatibility
+**Implementation ownership:** Gimbal-only; no prior-system dependency or compatibility
 
 ## 1. Executive decision
 
@@ -23,31 +23,31 @@ That workspace must be able to:
 - preserve ignored build artifacts without accidentally transporting secrets;
 - be governed by the same signed policy on KVM and HVF.
 
-The product name is **Gimbal Living Workspaces**. It is not a separate storage
-product. Gimbal owns and builds the lifecycle, policy, identity, checkpoint
-contract, UI, cloud transport, metadata engine, content store, layer model,
-merge engine, guest frontend, and host service.
+The working product name is **Gimbal Living Workspaces**. It is not a
+separate storage product. The lifecycle, policy, identity, checkpoint contract,
+UI, cloud transport, metadata engine, content store, layer model, merge engine,
+guest frontend, and host service are all in this project scope.
 
-### SV3 independence requirement
+### Prior-system independence requirement
 
-The supplied SV3 demos helped express the desired user experience. **SV3 cannot
+The supplied prior-system demos helped express the desired user experience. **The prior system cannot
 be used to implement this product.**
 
 Gimbal must not:
 
-- depend on, vendor, fork, link, import, or execute any SV3 crate, library,
+- depend on, vendor, fork, link, import, or execute any prior-system crate, library,
   binary, service, or repository content;
-- copy or adapt SV3 source code, database schemas, migrations, wire protocols,
+- copy or adapt prior-system source code, database schemas, migrations, wire protocols,
   manifests, storage formats, tests, or internal APIs;
-- claim read/write compatibility with an SV3 volume or checkpoint;
-- make SV3 availability, behavior, or releases part of a Gimbal runtime or
+- claim read/write compatibility with a prior-system volume or checkpoint;
+- make prior-system availability, behavior, or releases part of a Gimbal runtime or
   build contract.
 
 All components and formats in this specification are independently designed,
 implemented, tested, secured, and maintained in Gimbal-owned code. General
 filesystem techniques such as FUSE, copy-on-write layers, content-addressed
 blocks, and three-way merge are requirements to implement, not permission to
-reuse SV3 implementation material.
+reuse prior-system implementation material.
 
 ### Non-negotiable compatibility rule
 
@@ -100,9 +100,9 @@ Gimbal must build its own implementations:
 - an ephemeral side layer excluded structurally from fork and push;
 - reachability GC and read-only `fsck`.
 
-The implementation boundary is derived from Gimbal's own threat model. Gimbal
-assumes the guest may be hostile, so the mapping engine and policy authority
-must live outside the guest.
+The implementation boundary is derived from this project's threat model. The
+guest may be hostile, so the mapping engine and policy authority must live
+outside the guest.
 
 ## 3. Product principles
 
@@ -132,7 +132,7 @@ must live outside the guest.
 
 | ID | Decision |
 | --- | --- |
-| D1 | Living Workspaces is an entirely Gimbal-owned capability plane with no SV3 code, runtime, format, or dependency. |
+| D1 | Living Workspaces is an entirely Gimbal-owned capability plane with no prior-system code, runtime, format, or dependency. |
 | D2 | `gimbal-workspaced` runs beside the hypervisor and owns metadata, policy, layers, manifests, and content blocks. |
 | D3 | A small Linux FUSE frontend in the guest translates VFS operations to authenticated workspace RPC. It contains no authority and no block-store credentials. |
 | D4 | The v1 transport is a private service route over the existing virtio-net path. No new snapshot device is required. |
@@ -950,7 +950,7 @@ Exit gates:
 - metadata-only hydrate demand-fetches blocks;
 - sidecar process can restart and reconnect;
 - no host path is configurable or reachable;
-- dependency and provenance inspection proves there is no SV3 code, schema,
+- dependency and provenance inspection proves there is no prior-system code, schema,
   protocol, storage format, test, binary, or runtime dependency;
 - stock Cloud Hypervisor and `chm` both host the same frontend/protocol.
 
@@ -1058,7 +1058,7 @@ Apple-Silicon hardware CI is required before the feature can leave preview.
 | Sidecar becomes a host escape surface | High | Synthetic namespace, strict RPC, fuzzing, quotas, no host path mapping, security review |
 | GC removes a retained revision | High | Complete root set, tip-last publication, dry-run, fsck and crash gates |
 | Live workspace breaks vanilla contract | High | Outer envelope only, capability routing, vanilla corpus gate on every phase |
-| SV3 implementation material enters Gimbal | High | Independent design and code, dependency/provenance inspection, explicit Phase 0 and release gates |
+| prior-system implementation material enters Gimbal | High | Independent design and code, dependency/provenance inspection, explicit Phase 0 and release gates |
 | Same commit selects wrong workspace state | Medium | One-to-many bindings scoped to ref, lineage, producer trust, and generation |
 | Git edge cases make transparency surprising | Medium | Explicit v1 command matrix; fail unsupported worktrees/submodules modes visibly |
 | Cloud and Local implementations drift | Medium | One protocol/conformance suite; capability not complete until KVM and HVF pass |
@@ -1109,6 +1109,6 @@ cross-repository product synthesis. The final architecture was then reconciled
 against the source code and tightened around Gimbal's hostile-guest and vanilla
 snapshot constraints.
 
-SV3 is not an implementation source. No SV3 code, schema, protocol, migration,
+The prior system is not an implementation source. No prior-system code, schema, protocol, migration,
 test, binary, or storage format may enter the Gimbal implementation. This
 constraint is a release gate, not an optional sourcing preference.

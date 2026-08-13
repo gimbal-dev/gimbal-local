@@ -1,6 +1,6 @@
-// Copyright © 2024 Cloud Hypervisor contributors
+// Copyright © 2026 Ben De St Paer-Gotch
 //
-// SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 //
 //! Rehydrate a real cloud-hypervisor arm64 KVM snapshot into a live Apple
 //! Hypervisor.framework VM.

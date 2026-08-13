@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! A `virtio-pci` (modern, 1.x) transport that services a resumed device's BAR
 //! MMIO and drives a backend.
 //!

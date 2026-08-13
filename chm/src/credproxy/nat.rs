@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! The join between the NAT and the proxy.
 //!
 //! The NAT asks one question per admitted flow — *should this go somewhere else

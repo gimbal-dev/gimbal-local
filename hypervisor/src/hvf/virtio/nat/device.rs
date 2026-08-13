@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! A `smoltcp` [`phy::Device`] that bridges the userspace TCP/IP stack to the
 //! virtio-net frame path. It is not a real NIC: its "wire" is two in-memory
 //! queues.

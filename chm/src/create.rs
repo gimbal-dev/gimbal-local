@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! `chm create` — start a guest from a kernel image, with no capture involved.
 //!
 //! [`super::coldboot`] builds the guest's memory image; this drives it on

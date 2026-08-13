@@ -1,0 +1,27 @@
+Gimbal Local
+============
+
+Gimbal Local includes software derived from Cloud Hypervisor:
+
+  https://www.cloudhypervisor.org/
+  https://github.com/cloud-hypervisor/cloud-hypervisor
+
+The Cloud Hypervisor source tree is licensed under Apache-2.0 AND
+BSD-3-Clause, with per-file SPDX identifiers and copyright notices. Gimbal Local
+retains those notices and license texts. The upstream Cloud Hypervisor
+repository did not contain a top-level NOTICE file at the baseline used for this
+fork, so there was no upstream NOTICE text to propagate.
+
+Gimbal Local modifies Cloud Hypervisor and adds macOS / Apple Silicon support,
+including Apple Hypervisor.framework support, KVM-to-HVF snapshot rehydration,
+userspace GIC and virtio-mmio devices, the `chm` CLI/daemon, OCI image cold boot
+support, and a native macOS app. The upstream comparison baseline and modified
+upstream-file manifest are in UPSTREAM-CHANGES.md.
+
+Those Gimbal Local additions were written by an AI agent and have not had human
+line-by-line code review. Human involvement has been specification, direction,
+acceptance criteria, prioritisation, and judgement calls about measured
+behaviour. Cloud Hypervisor's upstream maintainers did not review, endorse, or
+approve those additions.
+
+This NOTICE file is for attribution only and does not modify the license terms.

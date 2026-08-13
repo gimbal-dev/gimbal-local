@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Kernel modules, folded into the generated initramfs so a container-derived
 //! guest can see its own devices.
 //!

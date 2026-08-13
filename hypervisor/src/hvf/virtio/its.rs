@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! User-space GICv3 ITS (Interrupt Translation Service) model for rehydration.
 //!
 //! A cloud KVM guest routes its virtio (MSI-X) completions as **LPIs through a

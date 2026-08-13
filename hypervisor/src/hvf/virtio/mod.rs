@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! A real, native virtio device model for the macOS rehydration path.
 //!
 //! A cloud-hypervisor arm64 snapshot resumes with its virtio devices fully

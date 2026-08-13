@@ -1,5 +1,9 @@
 // swift-tools-version: 6.0
 
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: LicenseRef-Gimbal-Proprietary
+
 import PackageDescription
 
 let package = Package(

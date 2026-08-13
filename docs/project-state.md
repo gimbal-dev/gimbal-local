@@ -5,7 +5,8 @@ you are an agent starting a task — read this, then
 [`engineering-discipline.md`](engineering-discipline.md), then the domain guide
 for the area you are touching.
 
-**Last verified:** 2026-08-07, against `main` at `c78890e61`.
+**Last measured sweep:** 2026-08-07, against `main` at `c78890e61`.
+**Issue-state refresh:** 2026-08-13, via `gh issue view` / `gh pr view`.
 
 Everything in this document was measured on this machine. Where something is
 believed but not measured, it says so.
@@ -54,7 +55,7 @@ three ways:
 | **105 of 238 CPU registers** restore faithfully | See [`cpu-feature-deltas.md`](cpu-feature-deltas.md). The one real bug is a register HVF restores *perfectly*: the guest still believes it can run 32-bit binaries, and doing so wedges the vCPU. |
 | **Max guest RAM on cold boot is 3008 MiB** | Guest RAM starts at `0x40000000` and a single region must end by `0xfc000000`. `chm` refuses larger with the exact maximum in the message. |
 | **Demand-faulting from the state CDN is not implemented** | See [`state-cdn-memory-plane.md`](state-cdn-memory-plane.md). |
-| **A coding agent has been proven on a cold-booted guest, not on a rehydrated snapshot** | The two halves of the dream — *rehydrate a cloud snapshot* and *run an agent in it* — have each been proven, and **not yet in the same guest**. A cold-booted guest reads this Mac's own `CTR_EL0` and is immune by construction to the DIC delta that makes JITs execute stale code, so V7.1's result says nothing about a rehydrated one. Measured 2026-08-08 on a rehydrated Graviton capture: `npm i -g @github/copilot` exits 0, `npm` fails 10 of 10 without `NODE_OPTIONS=--jitless` and succeeds 5 of 5 with it, and `copilot --version` has not yet returned cleanly on a guest that had not already been wedged by repeated resumes (#257). Tracked as #260; the first-resume walls are in [`first-resume.md`](first-resume.md). |
+| **A coding agent has been proven on a cold-booted guest, not on a rehydrated snapshot** | The two halves of the dream — *rehydrate a cloud snapshot* and *run an agent in it* — have each been proven, and **not yet in the same guest**. A cold-booted guest reads this Mac's own `CTR_EL0` and is immune by construction to the DIC delta that makes JITs execute stale code, so V7.1's result says nothing about a rehydrated one. Measured 2026-08-08 on a rehydrated Graviton capture: `npm i -g @github/copilot` exits 0, `npm` fails 10 of 10 without `NODE_OPTIONS=--jitless` and succeeds 5 of 5 with it. The permanent repeated-resume wedge is now closed (#257 / PR #309); the end-to-end rehydrated-agent acceptance gap is now tracked as #286. The first-resume walls are in [`first-resume.md`](first-resume.md). |
 
 ---
 
@@ -115,11 +116,11 @@ or touch them.
 
 ## What is being worked on right now
 
-The current thrust is **V9.18 — the first-run path actually works.** A clean
-machine acceptance run found that the obvious path a new user takes (build a
-container image → start it from the app → run an agent in it) had potholes at
-every step. None were hypervisor defects; together they decide whether the
-product feels finished.
+The first-run path track, **V9.18 — the first-run path actually works**, is now
+closed. A clean-machine acceptance run found that the obvious path a new user
+takes (build a container image → start it from the app → run an agent in it) had
+potholes at every step. None were hypervisor defects; together they decided
+whether the product felt finished.
 
 Progress on that track:
 
@@ -130,32 +131,29 @@ Progress on that track:
 | [#224](https://github.com/gimbal-dev/gimbal-local/issues/224) — agent workloads need a glibc rootfs | **Closed** (PR #236 — `chm image build` says which libc an image ships) |
 | [#220](https://github.com/gimbal-dev/gimbal-local/issues/220) — a zboot-wrapped kernel was refused as if it were x86 | **Closed** (PR #240) |
 | [#222](https://github.com/gimbal-dev/gimbal-local/issues/222) — container guests get no network or disk | **Closed** — `chm image build --modules <DIR>` bundles the virtio closure and the generated init loads it. Hardware-proved on both musl (`insmod` present) and glibc (`insmod` absent, via chm's own static loader) |
-| [#225](https://github.com/gimbal-dev/gimbal-local/issues/225) — app says "No sandboxes yet" while a guest it launched runs | **Open — the last one on this track** |
+| [#225](https://github.com/gimbal-dev/gimbal-local/issues/225) — app says "No sandboxes yet" while a guest it launched runs | **Closed** (PR #244 — the app shows a Running now section backed by the machine-wide run registry) |
 
 ### The live problem
 
-**#225 — the app's model of "what is running" has a hole exactly the shape of
-its own flagship feature.** Cold boot is a subprocess by design (the daemon owns
-the single process-global HVF slot, so routing cold boots through it would
-serialise them), but `refreshLocal()` lists what the *daemon* knows, and the
-daemon knows nothing about a process it did not spawn. So the app reports
-`All sandboxes 0` while a guest **it built the command for** is running in
-Terminal. Same disease as #192 and #202 — except here the app is the owner.
+The current user-visible gap is **#286 — a coding agent working inside a freshly
+rehydrated cloud capture, on a clean machine.** The cold-boot agent path works,
+and cloud snapshot rehydration works. The combined acceptance run is still the
+line between a strong demo and the full product claim.
 
-There is no lockout to fall back on: `hv_vm_create` is per-*process*, so a
-second guest starts fine. No bound, no visibility, and closing the Terminal
-window is a power cut on a writable overlay.
+A second visible wart is [#310](https://github.com/gimbal-dev/gimbal-local/issues/310):
+a resumed guest can report an RCU stall that the detector classifies as benign,
+but the user-facing presentation still does not explain the difference.
 
 ---
 
 ## The open issue list, grouped
 
-**First-run path (V9.18):** #225 is the only one left; #220, #222, #224 and
-#226 are all closed.
+**First-run path (V9.18):** #220, #222, #224, #225 and #226 are closed.
+**Agent acceptance:** #286 (coding agent inside a freshly rehydrated cloud
+capture on a clean machine)
 **Correctness / honesty of our own gates:** #214 (debug-only tests)
-**CLI surface gaps:** #199 (`export --with-base`), #205 (disk-backed rootfs),
-#211 (import is 19× slower than export), #219 (README download link 404s for
-anyone outside the repo)
+**CLI surface gaps:** #199 (`export --with-base`), #211 (import is 19× slower
+than export)
 **Sandbox spec alignment (V9.15):** #182–#189
 **Product tracks:** #155 (opt-in ingress), #156 (runtime-mutable egress), #157
 (MCP server surface), #159 (V10 Living Workspaces), #170, #171, #174, #238 (the
@@ -171,7 +169,7 @@ generated init could install the proxy CA)
 | --- | --- |
 | Know how we work before changing anything | [`engineering-discipline.md`](engineering-discipline.md) |
 | Know which specialist agent to use | [`agents.md`](agents.md) |
-| Understand the milestone plan and the goal ledger | [`roadmap.md`](roadmap.md) |
+| Understand the milestone plan | `docs/roadmap.md` is internal-only pending a review of the unshipped workspace track. |
 | Understand the HVF port's architecture | [`macos-local-runtime.md`](macos-local-runtime.md) |
 | Turn a Docker image into a bootable guest | [`container-images.md`](container-images.md) |
 | Understand the threat model | [`security-model.md`](security-model.md) |

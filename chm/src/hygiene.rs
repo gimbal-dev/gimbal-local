@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Properties of the test suite itself, checked by the test suite.
 //!
 //! Everything here guards against a failure mode that produces a *flaky* test

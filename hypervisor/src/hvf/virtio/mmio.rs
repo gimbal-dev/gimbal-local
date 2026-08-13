@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! A `virtio-mmio` (version 2) transport, for a guest that has to *discover* its
 //! devices rather than resume with them already configured.
 //!

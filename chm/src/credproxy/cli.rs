@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! `chm proxy` — inspect, export, and smoke-test the credential proxy.
 //!
 //! Deliberately weighted towards *showing* rather than *doing*: the proxy runs

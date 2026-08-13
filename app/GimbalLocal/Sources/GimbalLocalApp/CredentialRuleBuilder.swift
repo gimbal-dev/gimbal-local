@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: LicenseRef-Gimbal-Proprietary
+
 import SwiftUI
 
 /// A guided editor for `proxy-rules.json`.

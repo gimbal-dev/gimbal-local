@@ -1,6 +1,7 @@
-// Copyright © 2026 The Cloud Hypervisor Authors
+// Copyright © 2026 Ben De St Paer-Gotch
 //
-// SPDX-License-Identifier: Apache-2.0
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //
 //! The proxy itself: accept a diverted flow, decide what to do with it, and —
 //! for an intercepted destination — attach the credential as the request leaves.

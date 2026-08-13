@@ -1,0 +1,14 @@
+# Canonical identity for this fork's sole author.
+#
+# The history records the same person under two author names and a bot
+# committer. This file folds them into one identity so that git shortlog,
+# git log --use-mailmap, and GitHub's contributor views are accurate.
+#
+# NOTE: git's mailmap applies to author and committer fields only. It does
+# NOT rewrite Signed-off-by trailers, which live in the commit message body.
+# This repository's history contains fabricated Signed-off-by names that no
+# mailmap can correct; see CONTRIBUTING.md, "A defect in our own commit
+# history", for the full account.
+
+Ben De St Paer-Gotch <nebuk89@github.com> nebuk89 <nebuk89@github.com>
+Ben De St Paer-Gotch <nebuk89@github.com> nebuk89 <nebuk89@users.noreply.github.com>

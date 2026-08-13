@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! A `virtio-net` device: drain the guest's transmit queue and inject host
 //! frames into its receive queue.
 //!

@@ -1,29 +1,19 @@
 # Maintainers
 
 Gimbal Local is a macOS-focused fork of
-[Cloud Hypervisor](https://www.cloudhypervisor.org/). It is maintained as its own
-project (the macOS / Apple Hypervisor.framework runtime) and does **not** track
-upstream for merge-back.
+[Cloud Hypervisor](https://www.cloudhypervisor.org/). It is maintained as an
+independent project for the macOS / Apple Hypervisor.framework runtime.
 
-## Gimbal Local maintainers
-
-The macOS runtime — `chm`, the `hypervisor/src/hvf/` backend, and the
-`app/GimbalLocal/` desktop app:
+## Gimbal Local maintainer
 
 - Ben De St Paer-Gotch — [@nebuk89](https://github.com/nebuk89)
 
-## Upstream Cloud Hypervisor
+## Upstream relationship
 
-The Linux/KVM VMM crates this project forks from (kept in-tree only to build the
-patched `cloud-hypervisor` binary used to *capture* HVF-compatible snapshots) are
-maintained by the upstream Cloud Hypervisor project:
+The upstream Cloud Hypervisor project and its maintainers are not responsible
+for Gimbal Local issues, releases, reviews, or support. Please report Gimbal
+Local problems in this repository, not upstream, unless the issue has first been
+reproduced against unmodified Cloud Hypervisor.
 
-- Sebastien Boeuf - @sboeuf
-- Robert Bradford - @rbradford
-- Bo Chen - @likebreath
-- Samuel Ortiz - @sameo
-- Wei Liu - @liuw
-- Michael Zhao - @michael2012z
-
-See [`CREDITS.md`](CREDITS.md) for the projects and contributors the upstream
-code is based on.
+See [`CREDITS.md`](CREDITS.md) for upstream project attribution and inherited
+credits.

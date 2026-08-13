@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Symlink-safe filesystem opens for untrusted snapshot bundles.
 //!
 //! A downloaded snapshot bundle is untrusted input (see

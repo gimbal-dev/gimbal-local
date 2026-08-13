@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! The egress policy the userspace NAT enforces: a default action plus an
 //! allow/deny list of `host[:port]` rules. This is the hypervisor-side mirror
 //! of the control-plane `chm_profile.egress` that `chm` verifies (digest

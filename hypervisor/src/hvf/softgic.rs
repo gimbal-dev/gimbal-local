@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: Apache-2.0
+
 //! Software GICv3 **distributor + redistributor** register model (M-USGIC, #81).
 //!
 //! When Gimbal rehydrates a stock ITS/LPI snapshot it runs with no Apple managed

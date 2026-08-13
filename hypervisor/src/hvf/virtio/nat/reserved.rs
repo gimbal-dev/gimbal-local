@@ -1,6 +1,6 @@
-// Copyright © 2024 Cloud Hypervisor contributors
+// Copyright © 2026 Ben De St Paer-Gotch
 //
-// SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
+// SPDX-License-Identifier: Apache-2.0
 
 //! Reserved / special-use IPv4 ranges the guest must not reach through the NAT
 //! (M31.1).

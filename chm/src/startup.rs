@@ -1,3 +1,7 @@
+// Copyright © 2026 Ben De St Paer-Gotch
+//
+// SPDX-License-Identifier: FSL-1.1-ALv2
+
 //! Start-to-ready phase timing (#79).
 //!
 //! A rehydrate is a sequence of distinct phases — parse the snapshot, create the

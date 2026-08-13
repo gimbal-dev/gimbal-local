@@ -1,2 +1,3 @@
-# Add the list of code owners here (using their GitHub username)
-* @cloud-hypervisor/cloud-hypervisor-reviewers
+# Gimbal Local code owners.
+# Upstream Cloud Hypervisor reviewers do not own this fork.
+* @nebuk89
