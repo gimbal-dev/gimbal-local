@@ -45,7 +45,8 @@ three ways:
 | Container image pulled from Docker Hub, cold-booted | Worked on a *different* kernel — proving the two paths share nothing |
 | The app cold-booting a guest from its own emitted command | Worked, RTC correct at boot |
 | A container-derived guest reaching the internet | `alpine:3.20` → `wget https://registry.npmjs.org/` rc 0; `debian:12-slim` → TCP to `deb.debian.org:443`, both with virtio bundled by `chm image build --modules` |
-| A coding agent working inside a guest | GitHub Copilot CLI installed, authenticated, wrote and ran JS, holding no credential — **on a cold-booted guest** (V7.1). See the limitation below before reading this as covering rehydrated snapshots. |
+| A coding agent working inside a guest | GitHub Copilot CLI wrote and ran code holding no credential — on a cold-booted guest (V7.1) **and, on 2026-08-13, inside a rehydrated Graviton2 capture across two suspend/resume cycles** (#286). |
+| **An agent resuming its own work after a suspend** | The whole product in one line: the agent wrote `fizz.py`, the guest was suspended and resumed, and the agent then **read back its own file and extended it**. Three agent runs, two cycles, exit 0 each time; guest uptime continuous at 14.09 days across all of it. |
 
 ### Known, measured limitations
 
@@ -55,7 +56,6 @@ three ways:
 | **105 of 238 CPU registers** restore faithfully | See [`cpu-feature-deltas.md`](cpu-feature-deltas.md). The one real bug is a register HVF restores *perfectly*: the guest still believes it can run 32-bit binaries, and doing so wedges the vCPU. |
 | **Max guest RAM on cold boot is 3008 MiB** | Guest RAM starts at `0x40000000` and a single region must end by `0xfc000000`. `chm` refuses larger with the exact maximum in the message. |
 | **Demand-faulting from the state CDN is not implemented** | See [`state-cdn-memory-plane.md`](state-cdn-memory-plane.md). |
-| **A coding agent has been proven on a cold-booted guest, not on a rehydrated snapshot** | The two halves of the dream — *rehydrate a cloud snapshot* and *run an agent in it* — have each been proven, and **not yet in the same guest**. A cold-booted guest reads this Mac's own `CTR_EL0` and is immune by construction to the DIC delta that makes JITs execute stale code, so V7.1's result says nothing about a rehydrated one. Measured 2026-08-08 on a rehydrated Graviton capture: `npm i -g @github/copilot` exits 0, `npm` fails 10 of 10 without `NODE_OPTIONS=--jitless` and succeeds 5 of 5 with it. The permanent repeated-resume wedge is now closed (#257 / PR #309); the end-to-end rehydrated-agent acceptance gap is now tracked as #286. The first-resume walls are in [`first-resume.md`](first-resume.md). |
 
 ---
 
@@ -140,10 +140,22 @@ Progress on that track:
 
 ### The live problem
 
-The current user-visible gap is **#286 — a coding agent working inside a freshly
-rehydrated cloud capture, on a clean machine.** The cold-boot agent path works,
-and cloud snapshot rehydration works. The combined acceptance run is still the
-line between a strong demo and the full product claim.
+**#286 is closed** — on 2026-08-13 an agent worked inside a rehydrated Graviton2
+capture and, after a suspend and resume, read back its own file and extended it.
+The four pillars now stand up in one guest at the same time.
+
+What that run exposed instead is a cluster of **first-contact friction around
+the credential proxy**, none of it hypothetical — each item cost real time
+during the run: [#315](https://github.com/gimbal-dev/gimbal-local/issues/315)
+(a workspace mints a CA the guest does not trust, and the failure is a bare
+curl error), [#316](https://github.com/gimbal-dev/gimbal-local/issues/316) (the
+CA install script `chm` prints is too large for `chm exec`, and there is no
+`chm cp`), [#317](https://github.com/gimbal-dev/gimbal-local/issues/317)
+(`chm proxy check` silently ignores `--workspace` and reports `no-rule` — the
+evidence command giving a wrong verdict), and
+[#318](https://github.com/gimbal-dev/gimbal-local/issues/318) (a client that
+gates on local auth never lets the proxy inject; the placeholder pattern that
+solves it is undocumented).
 
 A second visible wart is [#310](https://github.com/gimbal-dev/gimbal-local/issues/310):
 a resumed guest can report an RCU stall that the detector classifies as benign,
@@ -154,8 +166,8 @@ but the user-facing presentation still does not explain the difference.
 ## The open issue list, grouped
 
 **First-run path (V9.18):** #220, #222, #224, #225 and #226 are closed.
-**Agent acceptance:** #286 (coding agent inside a freshly rehydrated cloud
-capture on a clean machine)
+**Agent acceptance:** #286 closed 2026-08-13 — see above.
+**Credential-proxy first contact:** #315, #316, #317, #318 (all found by that run)
 **Correctness / honesty of our own gates:** #214 (debug-only tests)
 **CLI surface gaps:** #199 (`export --with-base`), #211 (import is 19× slower
 than export)

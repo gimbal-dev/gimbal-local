@@ -6,9 +6,10 @@ Code, OpenAI Codex, or Gemini CLI — inside a Gimbal Local sandbox.
 The most useful first demo is not a benchmark. It is an agent doing real work
 inside a disposable local VM while the Mac keeps the credential.
 
-That path is **proven on a cold-booted guest**. It is not yet proven on a
-freshly rehydrated cloud snapshot; that acceptance gap is tracked as
-[#286](https://github.com/gimbal-dev/gimbal-local/issues/286).
+That path is proven **both ways**: on a cold-booted guest, and — since
+2026-08-13 — inside a freshly rehydrated cloud snapshot, where the agent also
+survived two suspend/resume cycles and carried on with its own earlier work
+([#286](https://github.com/gimbal-dev/gimbal-local/issues/286)).
 
 ---
 
@@ -199,12 +200,20 @@ cache maintenance this Mac needs. A rehydrated Graviton capture can arrive with
 a CPU-feature view that was true in the cloud and false on the Mac. The visible
 symptom is JIT code intermittently executing stale instructions.
 
-For Node itself, `NODE_OPTIONS=--jitless` is the current workaround. It does not
-cover a tool that launches its own native binary. The first-resume guide has the
-current measurements: [`first-resume.md`](first-resume.md).
+For Node itself, `NODE_OPTIONS=--jitless` is the current workaround. Measured
+2026-08-13 during [#286](https://github.com/gimbal-dev/gimbal-local/issues/286),
+the Copilot CLI's **native** binary ran clean on a rehydrated capture *without*
+it, across three separate agent runs — so the older "5 of 5 dead" figure is
+stale. Treat this as workload-dependent rather than fixed: if a JIT-heavy tool
+dies with `SIGILL`, reach for `--jitless` first. The first-resume guide has the
+measurements: [`first-resume.md`](first-resume.md).
 
-Until [#286](https://github.com/gimbal-dev/gimbal-local/issues/286) is closed,
-use cold boot for agent demos and treat rehydrated-agent runs as an experiment.
+Rehydrated agent runs are no longer an experiment. The friction you are most
+likely to hit is not the agent — it is getting the credential proxy's CA into
+the guest ([#315](https://github.com/gimbal-dev/gimbal-local/issues/315),
+[#316](https://github.com/gimbal-dev/gimbal-local/issues/316)) and a client that
+refuses to make the request at all unless it already sees a local token
+([#318](https://github.com/gimbal-dev/gimbal-local/issues/318)).
 
 ## Official agent documentation
 
