@@ -39,11 +39,13 @@
 
 use std::env;
 use std::fmt::Write as _;
+use std::io::{BufWriter, Write as _};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use super::apply;
+use super::ext2::{write_ext2, Ext2Image};
 use super::initramfs::{default_init, write_cpio};
 use super::modload;
 use super::modules;
@@ -121,7 +123,8 @@ pub fn usage() -> String {
          --entrypoint <C>  Override the command init hands over to. Default is\n                      \
          the image's own Entrypoint+Cmd, or /bin/sh.\n    \
          --ram-mib <N>     Guest RAM. Default is sized from the rootfs, because\n                      \
-         an initramfs is unpacked into memory.\n    \
+         an initramfs is unpacked into memory; with --disk the\n                      \
+         rootfs is not in RAM and the default is a plain floor.\n    \
          --vcpus <N>       Default 2.\n    \
          --modules <DIR>   A kernel module tree for this kernel: either\n                      \
          `lib/modules/<release>` itself or a directory holding it.\n                      \
@@ -132,11 +135,16 @@ pub fn usage() -> String {
          unspecified variant or v8. Name one (e.g. linux/arm64/v9)\n                      \
          to select among an image's arm64 variants. A platform\n                      \
          this host cannot boot is refused rather than built.\n    \
+         --disk            Write the rootfs as an ext2 disk image (rootfs.img)\n                      \
+         instead of an initramfs. The guest mounts it rather than\n                      \
+         unpacking it, so guest RAM is sized for the workload\n                      \
+         rather than for the image, and writes persist. Use this\n                      \
+         for images too large to unpack into RAM.\n    \
          --dry-run         Resolve and report without writing anything.\n\
      \n\
-     NOTE: the rootfs ships as an initramfs, so it lives in guest RAM and\n     \
-     changes do not persist across a boot. Attach a disk with `chm create\n     \
-     --disk` for state that should survive.\n"
+     NOTE: by default the rootfs ships as an initramfs, so it lives in guest\n     \
+     RAM and changes do not persist across a boot. Pass --disk to get an ext2\n     \
+     rootfs the guest mounts instead, which persists and does not cost RAM.\n"
         .to_string()
 }
 
@@ -150,6 +158,7 @@ struct Args {
     ram_mib: Option<u64>,
     vcpus: u32,
     dry_run: bool,
+    disk: bool,
     platform: registry::Platform,
 }
 
@@ -162,6 +171,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
     let mut ram_mib = None;
     let mut vcpus = 2;
     let mut dry_run = false;
+    let mut disk = false;
     let mut platform = registry::Platform::host();
     let mut i = 0;
     while i < args.len() {
@@ -191,6 +201,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
                     .map_err(|_| format!("--vcpus wants a number, got `{v}`"))?;
             }
             "--platform" => platform = registry::parse_platform(&next("--platform")?)?,
+            "--disk" => disk = true,
             "--dry-run" => dry_run = true,
             other if other.starts_with('-') => {
                 return Err(format!("unknown option `{other}`\n\n{}", usage()));
@@ -213,6 +224,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
         ram_mib,
         vcpus,
         dry_run,
+        disk,
         platform,
     })
 }
@@ -730,8 +742,24 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
             mode: 0o755,
             size: init.len() as u64,
         },
-        init.into_bytes(),
+        init.clone().into_bytes(),
     );
+    // A disk-backed rootfs is mounted by the kernel rather than unpacked, and
+    // the kernel does not look for `/init` on a real root — it tries
+    // `/sbin/init` first. Putting the same script there means the disk variant
+    // needs no `init=` on the command line, which matters because an explicit
+    // `--cmdline` is never appended to: restating one argument silently drops
+    // `earlycon`, `panic=1` and the guest's wall clock.
+    if args.disk {
+        rootfs.insert(
+            "sbin/init".to_string(),
+            EntryKind::File {
+                mode: 0o755,
+                size: init.len() as u64,
+            },
+            init.into_bytes(),
+        );
+    }
     // chm's own NIC configurator, for the images that ship neither `ip` nor
     // `ifconfig` — which includes node:22 and node:22-slim. Installed beside
     // the init and, like it, last, so image content cannot shadow it.
@@ -766,13 +794,31 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
         }
     }
 
-    let cpio = write_cpio(&rootfs);
-    let ram = args.ram_mib.unwrap_or_else(|| size_ram_mib(content));
-    println!(
-        "  initramfs: {} · guest RAM {} MiB",
-        human_bytes(cpio.len() as u64),
-        ram
-    );
+    // A disk image is mounted, not unpacked, so the rootfs never occupies guest
+    // RAM and the doubling `size_ram_mib` applies does not belong here. This is
+    // the whole point of the variant: RAM is sized for the workload instead of
+    // for the image.
+    let cpio = if args.disk { Vec::new() } else { write_cpio(&rootfs) };
+    let ram = args.ram_mib.unwrap_or_else(|| {
+        if args.disk {
+            RAM_FLOOR_MIB
+        } else {
+            size_ram_mib(content)
+        }
+    });
+    if args.disk {
+        println!(
+            "  rootfs.img: ext2, {} of content · guest RAM {} MiB",
+            human_bytes(content),
+            ram
+        );
+    } else {
+        println!(
+            "  initramfs: {} · guest RAM {} MiB",
+            human_bytes(cpio.len() as u64),
+            ram
+        );
+    }
 
     if args.dry_run {
         println!("  --dry-run: nothing written (would be {})", out.display());
@@ -788,11 +834,12 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
     }
 
     let (kernel_path, kernel_image) = kernel.ok_or("--kernel is required")?;
-    write_image_dir(
+    let disk_image = write_image_dir(
         &out,
         &kernel_path,
         &kernel_image,
         &cpio,
+        &rootfs,
         &args,
         ram,
         &entrypoint,
@@ -808,14 +855,38 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
     if let Some(w) = warn_kernel_virtio(&kernel_image, bundled.as_ref()) {
         println!("\nNOTE: {w}");
     }
-    println!(
-        "Boot it:  chm create --kernel {}/Image --initramfs {}/initramfs \\\n\
-         \t    --cpus {} --memory {}",
-        out.display(),
-        out.display(),
-        args.vcpus,
-        ram
-    );
+    if let Some(img) = &disk_image {
+        println!(
+            "\nrootfs.img: {} ({} free for the guest to write into)",
+            human_bytes(img.size_bytes),
+            human_bytes(img.free_blocks * 4096)
+        );
+        if img.hardlinks_collapsed > 0 {
+            println!(
+                "            {} hardlinks share their inode rather than a copy.",
+                img.hardlinks_collapsed
+            );
+        }
+    }
+    if args.disk {
+        println!(
+            "Boot it:  chm create --kernel {}/Image --disk {}/rootfs.img \\\n\
+             \t    --cpus {} --memory {}",
+            out.display(),
+            out.display(),
+            args.vcpus,
+            ram
+        );
+    } else {
+        println!(
+            "Boot it:  chm create --kernel {}/Image --initramfs {}/initramfs \\\n\
+             \t    --cpus {} --memory {}",
+            out.display(),
+            out.display(),
+            args.vcpus,
+            ram
+        );
+    }
     println!("      or: pick it in Gimbal Local under New sandbox.");
     for line in report.console_findings() {
         println!("{line}");
@@ -880,13 +951,14 @@ fn write_image_dir(
     kernel_path: &Path,
     kernel_image: &[u8],
     cpio: &[u8],
+    rootfs: &super::initramfs::Rootfs,
     args: &Args,
     ram: u64,
     entrypoint: &str,
     report: &apply::Report,
     pulled: u64,
     libc: Libc,
-) -> Result<(), String> {
+) -> Result<Option<Ext2Image>, String> {
     fs::create_dir_all(out).map_err(|e| format!("create {}: {e}", out.display()))?;
 
     // Write the decoded bytes rather than copying the source file: what the
@@ -898,11 +970,26 @@ fn write_image_dir(
     fs::write(&kernel_dst, kernel_image)
         .map_err(|e| format!("write kernel to {}: {e}", kernel_dst.display()))?;
 
-    let initramfs_dst = out.join("initramfs");
-    fs::write(&initramfs_dst, cpio)
-        .map_err(|e| format!("write {}: {e}", initramfs_dst.display()))?;
+    // The disk image is streamed to its file rather than built in a `Vec`: it is
+    // the variant that exists for images too large to hold in memory, so holding
+    // it in memory would be a poor joke.
+    let disk_image = if args.disk {
+        let path = out.join("rootfs.img");
+        let file =
+            fs::File::create(&path).map_err(|e| format!("create {}: {e}", path.display()))?;
+        let mut file = BufWriter::new(file);
+        let summary = write_ext2(rootfs, &mut file, None)
+            .map_err(|e| format!("write {}: {e}", path.display()))?;
+        file.flush().map_err(|e| format!("flush {}: {e}", path.display()))?;
+        Some(summary)
+    } else {
+        let initramfs_dst = out.join("initramfs");
+        fs::write(&initramfs_dst, cpio)
+            .map_err(|e| format!("write {}: {e}", initramfs_dst.display()))?;
+        None
+    };
 
-    let manifest = manifest(args.vcpus, ram);
+    let manifest = manifest(args.vcpus, ram, args.disk);
 
     let manifest_path = out.join("image.json");
     fs::write(
@@ -924,17 +1011,42 @@ fn write_image_dir(
         let _ = writeln!(notes, "            {}", w.replace('\n', "\n            "));
     }
     let _ = writeln!(notes, "pulled:     {} compressed", human_bytes(pulled));
-    let _ = writeln!(notes, "initramfs:  {}", human_bytes(cpio.len() as u64));
-    let _ = writeln!(
-        notes,
-        "ram_mib:    {ram} — an initramfs unpacks into guest RAM, so the rootfs is\n            \
-         resident roughly twice at the peak. Override with --ram-mib."
-    );
-    let _ = writeln!(
-        notes,
-        "\nThe rootfs is an initramfs: it lives in RAM and does not persist across\n\
-         a boot. Attach a disk with `chm create --disk` for state that should survive."
-    );
+    if let Some(img) = &disk_image {
+        let _ = writeln!(notes, "rootfs.img: ext2, {}", human_bytes(img.size_bytes));
+        let _ = writeln!(
+            notes,
+            "            {} free for the guest, {} inodes, {} hardlinks sharing an inode",
+            human_bytes(img.free_blocks * 4096),
+            img.inodes,
+            img.hardlinks_collapsed
+        );
+        let _ = writeln!(
+            notes,
+            "ram_mib:    {ram} — a disk-backed rootfs is mounted, not unpacked, so guest\n            \
+             RAM is sized for the workload rather than for the image. Override\n            \
+             with --ram-mib."
+        );
+        let _ = writeln!(
+            notes,
+            "\nThe rootfs is a disk. `chm image build --disk` produces a reproducible\n\
+             *initial* disk from the image digest; the moment a guest writes to it, that\n\
+             copy is a workspace rather than an image, and rebuilding from the same\n\
+             digest will not reproduce it. Copy rootfs.img per sandbox if you want the\n\
+             original back."
+        );
+    } else {
+        let _ = writeln!(notes, "initramfs:  {}", human_bytes(cpio.len() as u64));
+        let _ = writeln!(
+            notes,
+            "ram_mib:    {ram} — an initramfs unpacks into guest RAM, so the rootfs is\n            \
+             resident roughly twice at the peak. Override with --ram-mib."
+        );
+        let _ = writeln!(
+            notes,
+            "\nThe rootfs is an initramfs: it lives in RAM and does not persist across\n\
+             a boot. Attach a disk with `chm create --disk` for state that should survive."
+        );
+    }
     if report.has_findings() {
         let _ = writeln!(notes, "\nWhat was refused or changed:");
         for r in &report.refused {
@@ -948,7 +1060,7 @@ fn write_image_dir(
         }
     }
     fs::write(out.join("BUILD.txt"), notes).map_err(|e| format!("write BUILD.txt: {e}"))?;
-    Ok(())
+    Ok(disk_image)
 }
 
 /// What `image.json` says about a freshly built image.
@@ -968,13 +1080,27 @@ fn write_image_dir(
 ///
 /// An image that genuinely needs different boot arguments can still say so.
 /// This is about not claiming to need them when we do not.
-fn manifest(vcpus: u32, ram_mib: u64) -> serde_json::Value {
-    json!({
-        "kernel": "Image",
-        "initramfs": "initramfs",
-        "vcpus": vcpus,
-        "ram_mib": ram_mib,
-    })
+fn manifest(vcpus: u32, ram_mib: u64, disk: bool) -> serde_json::Value {
+    // Still no `cmdline` in the disk variant, for the reason above and one more:
+    // `coldboot::implied_root_args` already supplies `root=/dev/vda rw` when a
+    // disk is the only filesystem, and the init script is written to
+    // `/sbin/init` where the kernel looks anyway. Naming either here would be a
+    // second definition of a decision that is already made correctly elsewhere.
+    if disk {
+        json!({
+            "kernel": "Image",
+            "disk": "rootfs.img",
+            "vcpus": vcpus,
+            "ram_mib": ram_mib,
+        })
+    } else {
+        json!({
+            "kernel": "Image",
+            "initramfs": "initramfs",
+            "vcpus": vcpus,
+            "ram_mib": ram_mib,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -1151,6 +1277,7 @@ mod tests {
             &src,
             &decoded,
             b"cpio",
+            &super::super::initramfs::Rootfs::new(),
             &parse(&["alpine:3.20".to_string()]).unwrap(),
             512,
             "/bin/sh",
@@ -1179,6 +1306,26 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// The app reads `image.json` and passes what it finds to `chm create`. A
+    /// disk-backed image that still advertised an `initramfs` would send the app
+    /// looking for a file that was never written, and — worse — an initramfs in
+    /// the config makes `implied_root_args` return `None`, so the kernel would
+    /// be handed a disk with no `root=` to mount it by.
+    #[test]
+    fn the_manifest_names_the_medium_that_was_actually_written() {
+        let disk = manifest(2, 512, true);
+        assert_eq!(disk["disk"], "rootfs.img");
+        assert!(
+            disk.get("initramfs").is_none(),
+            "a disk image must not claim an initramfs: it would suppress root="
+        );
+
+        let ram = manifest(2, 512, false);
+        assert_eq!(ram["initramfs"], "initramfs");
+        assert!(ram.get("disk").is_none());
+        assert!(disk.get("cmdline").is_none() && ram.get("cmdline").is_none());
+    }
+
     /// A console mismatch produces a guest that boots correctly and emits
     /// nothing — the failure mode hardest to attribute. This asserts against
     /// `create.rs`'s own source so the two cannot drift apart silently.
@@ -1187,7 +1334,7 @@ mod tests {
         // The app passes a manifest cmdline straight to `--cmdline`, and that
         // flag is deliberately never appended to -- so a manifest that merely
         // repeats the default is not a no-op, it is a silent downgrade.
-        let m = manifest(2, 1024);
+        let m = manifest(2, 1024, false);
         assert!(
             m.get("cmdline").is_none(),
             "image.json names a command line again: {m}"

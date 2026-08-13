@@ -90,6 +90,38 @@ impl Rootfs {
         self.files.get(path)
     }
 
+    /// Every entry in path order, for a serialiser that is not `write_cpio`.
+    ///
+    /// The order is the `BTreeMap`'s, so parents precede children — the same
+    /// property `write_cpio` relies on, and the reason `write_ext2` can build a
+    /// directory's contents without a second sort.
+    pub fn nodes(&self) -> impl Iterator<Item = (&str, &Node)> {
+        self.files.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    /// Follow a hardlink chain to the entry that actually owns the content.
+    ///
+    /// Exposed because every serialiser has to group hardlinks — a rootfs where
+    /// busybox is linked 400 times becomes 400 copies otherwise — and the
+    /// chain-walk is not something a caller should reimplement.
+    ///
+    /// The returned reference borrows the map's own key rather than the caller's
+    /// `start`, so the answer outlives the question.
+    pub fn resolve_hardlink(&self, start: &str) -> Option<&str> {
+        let (mut key, mut node) = self.files.get_key_value(start)?;
+        for _ in 0..32 {
+            match &node.kind {
+                EntryKind::Hardlink { target } => {
+                    let (k, n) = self.files.get_key_value(target.as_str())?;
+                    key = k;
+                    node = n;
+                }
+                _ => return Some(key.as_str()),
+            }
+        }
+        None
+    }
+
     /// Total bytes of file content — what the initramfs will cost in guest RAM,
     /// near enough to size the guest from.
     pub fn content_bytes(&self) -> u64 {

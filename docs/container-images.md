@@ -115,21 +115,49 @@ refused, and the zboot refusal named *x86*, which was actively misleading.
 `ARM\x64` at offset `0x38` of the result, so you can hand it the file the distro
 actually ships. It says which form it found.
 
-### 3. The rootfs unpacks into guest RAM
+### 3. The rootfs unpacks into guest RAM — unless you pass `--disk`
 
-The rootfs ships as a **cpio initramfs**, which is the only format available
-here: macOS has no `mkfs.ext4` and cannot loopback-mount a Linux filesystem.
-This is a genuine upside — the kernel needs no `root=`, so the whole
-PARTUUID-mismatch failure class disappears — but it means the image is unpacked
-into RAM at boot.
+By default the rootfs ships as a **cpio initramfs**. That has a genuine upside:
+the kernel needs no `root=`, so the whole PARTUUID-mismatch failure class
+disappears. But it means the image is unpacked into RAM at boot, and is
+therefore resident roughly twice at the peak.
 
 `image.json` records a measured `ram_mib` for this reason, and the app uses it.
 A large image needs a large `--memory`, and there is a ceiling of **3008 MiB**
 for a cold boot (guest RAM starts at `0x40000000` and one region must end by
 `0xfc000000`). chm states this exactly when you exceed it.
 
-A disk-backed variant for images too large to unpack into RAM is
-[#205](https://github.com/gimbal-dev/gimbal-local/issues/205).
+For images too large to unpack into RAM, `--disk` writes the rootfs as an
+**ext2 image** the guest mounts instead:
+
+```
+chm image build node:22-slim --kernel ./Image --disk --out ~/gimbal-images/node
+chm create --kernel ~/gimbal-images/node/Image \
+           --disk ~/gimbal-images/node/rootfs.img --cpus 2 --memory 512
+```
+
+Guest RAM is then sized for the workload rather than for the image, and writes
+persist across boots.
+
+Two things worth knowing before you choose it:
+
+- **The kernel must have `virtio_blk` built in**, or the disk is accepted and
+  the guest sees nothing. `chm image build` already checks the kernel you pass
+  and says so. An Ubuntu `generic` arm64 kernel has it; Alpine's `virt` does
+  not.
+- **A disk that has been written to is a workspace, not an image.** The build is
+  reproducible from the image digest, but the moment a guest writes to
+  `rootfs.img` that copy has diverged and rebuilding will not reproduce it. Copy
+  the file per sandbox if you want the original back.
+
+There is no `mkfs.ext4` on macOS, `hdiutil` only produces HFS/APFS, and building
+the filesystem inside a short-lived guest does not work either — the Alpine
+initramfs we boot carries exactly one `mkfs`, `mkfs.vfat`, and FAT has no
+symlinks, no ownership and no executable bit, which a container rootfs needs on
+essentially every path. So chm writes the image itself, on the host. That is
+tractable because of its scope: it is a one-shot serialiser for a tree that is
+already complete, not a filesystem implementation. Every write after the first
+boot is performed by Linux's own ext2 driver.
 
 ## Choosing a base image
 

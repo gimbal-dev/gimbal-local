@@ -52,6 +52,7 @@
 
 pub mod apply;
 pub mod entry;
+pub mod ext2;
 pub mod image;
 pub mod initramfs;
 pub mod modload;
