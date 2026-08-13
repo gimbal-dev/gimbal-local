@@ -1,0 +1,112 @@
+# Copyright © 2026 Ben De St Paer-Gotch
+#
+# SPDX-License-Identifier: FSL-1.1-ALv2
+
+# Manual only, on purpose.
+#
+# This workflow does not run on push or pull_request. Automatic runs are what
+# exhausted this project's Actions budget, and the local gates in
+# scripts/release-macos.sh are the ones that actually block a bad release.
+# Run this when you want a second opinion from a clean machine.
+#
+# Note what this cannot do: GitHub's macOS runners do not expose
+# Hypervisor.framework, so nothing here boots a guest. Anything that needs
+# real virtualization is verified on hardware, by hand, and the evidence goes
+# in the pull request.
+
+name: Tests (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: 'Cargo profile to test in'
+        required: false
+        default: 'release'
+        type: choice
+        options: [release, debug]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tests-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rust:
+    name: Rust unit tests (${{ inputs.profile }})
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      - name: Install the pinned toolchain
+        run: rustup show active-toolchain || rustup toolchain install stable
+
+      # This caches build output (compiled build.rs binaries, proc-macro
+      # dylibs) that later runs execute, keyed on Cargo.lock rather than on
+      # source. That is safe only because this workflow has no pull_request
+      # trigger, so no fork can ever write an entry. Adding one would turn
+      # this line into a cross-branch code-execution path.
+      - name: Cache cargo
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Set the profile flag
+        id: profile
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          if [ "$PROFILE" = "release" ]; then
+            echo "flag=--release" >> "$GITHUB_OUTPUT"
+          else
+            echo "flag=" >> "$GITHUB_OUTPUT"
+          fi
+
+      # The hypervisor crate is the one carrying the HVF backend. These are
+      # unit tests over the state machinery, not guest boots.
+      - name: hypervisor
+        run: |
+          cargo test -p hypervisor ${{ steps.profile.outputs.flag }} \
+            --no-default-features --features hvf,kvm-snapshot --lib
+
+      - name: chm
+        run: cargo test -p gimbal-local ${{ steps.profile.outputs.flag }}
+
+  lint:
+    name: Format and clippy
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+
+      # Formatting needs nightly-only options; see CONTRIBUTING.md.
+      - name: Install nightly rustfmt
+        run: rustup toolchain install nightly --component rustfmt
+
+      # Advisory, not a gate. This tree inherits ~564 rustfmt diffs from
+      # upstream Cloud Hypervisor, so --check cannot pass repo-wide and
+      # reformatting it would bury every future diff in noise. Contributors
+      # format their own regions; see CONTRIBUTING.md.
+      - name: Format (advisory)
+        continue-on-error: true
+        run: cargo +nightly fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy -p gimbal-local -- -D warnings
+
+  swift:
+    name: Swift build
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      - name: Build the app package
+        working-directory: app/GimbalLocal
+        run: swift build
