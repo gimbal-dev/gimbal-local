@@ -154,10 +154,25 @@ final class AppModel: ObservableObject {
     /// which is both untrue and discouraging. This lets an install be honestly
     /// local.
     ///
-    /// Off by default, because hiding a feature the user has is worse than
-    /// showing one they have not set up yet. `UserDefaults.bool` returns false
-    /// when the key is absent, so the default falls out of the read.
-    @Published var localOnly = UserDefaults.standard.bool(forKey: "gimbal.localOnly")
+    /// **On** by default. A public download has no control plane and cannot get
+    /// one, so reaching for a control plane on first launch shows a Cloud
+    /// section that can only ever say "offline" and polls an endpoint that will
+    /// always refuse. The honest first-run shape for this product is local.
+    ///
+    /// The read has to test for *presence*, not just truth: `UserDefaults.bool`
+    /// returns `false` for an absent key, so a plain `bool(forKey:)` cannot tell
+    /// "the user turned this off" apart from "the user has never chosen". That
+    /// difference is the whole default, and getting it wrong would silently
+    /// re-enable the control plane for everyone who deliberately disabled it.
+    @Published var localOnly = AppModel.storedLocalOnly()
+
+    /// Resolve the stored local-only choice, defaulting to `true` when the user
+    /// has never expressed one. Takes the store as a parameter so the default
+    /// is testable without touching the running app's real preferences.
+    nonisolated static func storedLocalOnly(in defaults: UserDefaults = .standard) -> Bool {
+        guard defaults.object(forKey: localOnlyDefaultsKey) != nil else { return true }
+        return defaults.bool(forKey: localOnlyDefaultsKey)
+    }
 
     /// How often a running sandbox saves its live state (#174). Off by default:
     /// each save freezes the guest to capture RAM, so it is a trade the user
@@ -213,7 +228,8 @@ final class AppModel: ObservableObject {
     private let sandboxesDefaultsKey = "gimbal.sandboxes"
     private let welcomeDefaultsKey = "gimbal.welcomeDismissed"
     private let globalDefaultsKey = "gimbal.globalDefaults"
-    private let localOnlyDefaultsKey = "gimbal.localOnly"
+    private nonisolated static let localOnlyDefaultsKey = "gimbal.localOnly"
+    private var localOnlyDefaultsKey: String { AppModel.localOnlyDefaultsKey }
     private let maxRecents = 8
 
     func bootstrap() async {
