@@ -9,9 +9,11 @@ If a document is marked **engineering log**, it may be more detailed, more
 dated, and more issue-shaped than a normal user guide. Treat it as useful
 evidence, not as polished product copy.
 
-> **Provenance caveat.** Gimbal Local is entirely AI-authored. The code was
-> written by an AI agent and has not had human line-by-line code review. Human
-> involvement has been specification, direction, acceptance criteria,
+> **Provenance caveat.** All Gimbal-specific additions and product code in this
+> fork were AI-authored and have not had human line-by-line code review. The
+> retained upstream Cloud Hypervisor tree was written by its human contributors;
+> this caveat does not attribute their work to AI. Human involvement in the
+> Gimbal work has been specification, direction, acceptance criteria,
 > prioritisation, and judgement calls about what is real versus fake. This is a
 > hypervisor, so the caveat is material: do not use it to isolate untrusted or
 > hostile workloads, and do not treat it as hardened. The evidence in these docs
@@ -34,7 +36,7 @@ These are written for people trying to use or evaluate Gimbal Local.
 
 | Doc | What it covers |
 | --- | --- |
-| [`running-agents.md`](running-agents.md) | Interactive `chm serve` / `chm ctl console`, headless `chm exec`, and the honest line between proven cold boot and open rehydrated-agent acceptance. |
+| [`running-agents.md`](running-agents.md) | Interactive `chm serve` / `chm ctl console`, headless `chm exec`, and the measured cold-boot and rehydrated-agent acceptance paths. |
 | [`container-images.md`](container-images.md) | `chm image build`: kernels, modules, initramfs vs `--disk`, networking, libc, and the measured Copilot CLI path. |
 | [`hvf-compatible-snapshots.md`](hvf-compatible-snapshots.md) | The snapshot contract: vanilla upstream ITS/LPI captures are preferred; legacy GICv2M captures still work. |
 | [`first-resume.md`](first-resume.md) | What to check on the first resume of a real cloud capture: filesystem growth, DNS, package state, and JIT exposure. |
@@ -63,6 +65,18 @@ start.
 | [`graviton-acid-test-results.md`](graviton-acid-test-results.md) | The measured Graviton2 rehydration result and counter-frequency correction. |
 | [`graviton-capture-request.md`](graviton-capture-request.md) | The exact capture shape requested from real cloud hardware. |
 
+## Vision and engineering planning
+
+These documents are public plans, not shipped commitments. They describe
+direction and sequencing; use release notes, user guides, and
+[`project-state.md`](project-state.md) for behaviour that has actually shipped
+or been measured.
+
+| Doc | What it covers |
+| --- | --- |
+| [`living-workspaces.md`](living-workspaces.md) | Product vision and architecture for the unshipped living-workspaces capability. |
+| [`roadmap.md`](roadmap.md) | The milestone ledger and engineering plan, including work that is not yet implemented or committed for a release. |
+
 ## Engineering log
 
 These are intentionally kept public because they explain how the project avoids
@@ -75,16 +89,6 @@ fake demos and stale claims. They are not the first thing a release user needs.
 | [`agents.md`](agents.md) | The specialist agent map. Useful to humans too, but primarily an engineering handoff tool. |
 | [`network-policy-plan.md`](network-policy-plan.md) | Planning record for the network/filesystem policy track. The shipped user surface is in `networking.md` and `security-model.md`. |
 | [`raspberry-pi-offbox-plan.md`](raspberry-pi-offbox-plan.md) | Off-box capture plan for ARM Linux hardware. Kept as a plan, not a user promise. |
-
-## Internal-only pending scrub
-
-These files are not linked from the public index and should not be published
-until the confidentiality/history decision is made.
-
-| File | Reason |
-| --- | --- |
-| `docs/living-workspaces.md` | Contains detailed architecture for an unshipped workspace capability. The codename it referenced has been scrubbed from HEAD; it remains in git history, which is accepted. |
-| `docs/roadmap.md` | Normally this would be a useful public milestone ledger, but it also references the unshipped workspace track. Treat it as internal-only until scrubbed, including history. |
 
 ## Outside this directory
 

@@ -1,18 +1,28 @@
 # Contributing to Gimbal Local
 
-> **Before anything else:** every line of code here was written by an AI, and
-> no human has reviewed it line by line. See
-> [Read this first](README.md#no-human-review). If you contribute, you are
-> contributing to a vibe-coded codebase — expect to find things a reviewer
-> would have caught, and please report them rather than assume they are
-> intentional.
+> **Before anything else:** all Gimbal-specific additions and product code in
+> this fork were written by an AI, and no human has reviewed that code line by
+> line. The retained upstream Cloud Hypervisor tree was written by its human
+> contributors. See [Read this first](README.md#no-human-review). Expect to find
+> things a reviewer would have caught, and please report them rather than assume
+> they are intentional.
 
 Gimbal Local is a macOS/Apple-Silicon fork of Cloud Hypervisor. The product
 surface is `chm`, the `hypervisor/src/hvf/` backend, and the SwiftUI app in
 `app/GimbalLocal/`. The rest of the upstream tree is kept for capture tooling,
 compatibility, and attribution.
 
-Before changing code, read:
+## Contribution status
+
+No contributor licence agreement (CLA) exists yet, so **external code
+contributions and pull requests are not being accepted**. Please do not submit
+code or sign a DCO trailer in anticipation of acceptance. Issues, bug reports,
+documentation feedback, and other product feedback remain welcome.
+
+If code contributions open in future, the intended policy is CLA + DCO. The
+project will publish the operative terms and submission instructions first.
+
+Maintainers changing code should read:
 
 1. [`docs/project-state.md`](docs/project-state.md) — what works, what is known
    not to work, and the latest measured gate numbers.
@@ -31,10 +41,13 @@ This is a mixed-licence tree. The intended launch seam is:
 
 Do not call the source-available or proprietary parts open source. FSL restricts
 competing commercial use only; it does not restrict reading, auditing,
-modifying, patching, self-hosting, or internal use. The app EULA is pending and
-must preserve third-party OSS rights. Until the per-directory licence files and
-SPDX headers are landed, preserve existing file headers and license notices, and
-ask before changing any `LICENSE*`, `LICENSES/`, `NOTICE`, `CREDITS.md`,
+modifying, patching, self-hosting, or internal use. A narrow preview/evaluation
+EULA has now been drafted at
+[`app/GimbalLocal/EULA.md`](app/GimbalLocal/EULA.md), but it is not final or
+legal-approved. It preserves third-party OSS and source-available rights and
+applies only to packaged releases as proposed; repository licences continue to
+govern source code. Preserve existing file headers and licence notices, and ask
+before changing any `LICENSE*`, `LICENSES/`, `NOTICE`, `CREDITS.md`,
 `MAINTAINERS.md`, or `CODEOWNERS` file.
 
 ## Ground rules
@@ -59,8 +72,8 @@ caught it. If a mutation does not fire, that is a finding, not an inconvenience.
 
 ## Formatting and checks
 
-Use the narrowest check that covers your change while iterating, then run the
-appropriate gate before asking for review.
+Maintainers should use the narrowest check that covers a change while iterating,
+then run the appropriate gate before review.
 
 ```sh
 # Formatting currently needs nightly-only rustfmt features.
@@ -104,7 +117,7 @@ Do not treat a skipped integration environment as a passed integration test.
 - macOS has no GNU `timeout`; use the tool's own limits such as
   `chm create --seconds` and `chm run --max-seconds`.
 
-## Commit and patch hygiene
+## Maintainer commit and patch hygiene
 
 A patch should be independently reviewable. Avoid `initial attempt` followed by
 `fix previous commit`; fold review fixes into the commit they correct.
@@ -115,18 +128,19 @@ Commit subjects use a component prefix, for example:
 chm: Explain missing kernel modules
 hvf: Preserve virtual timer state in checkpoints
 app: Show cold-booted guests in the running list
-docs: Mark rehydrated-agent support as unproven
+docs: Record rehydrated-agent acceptance
 ```
 
-Wrap commit bodies at 72 columns. Include a `Signed-off-by:` trailer to certify
-the Developer Certificate of Origin:
+Wrap commit bodies at 72 columns. The repository historically requested a
+`Signed-off-by:` trailer as a Developer Certificate of Origin attestation:
 
 ```text
 Signed-off-by: Your Name <you@example.com>
 ```
 
-If AI or LLM assistance meaningfully contributed to the change, disclose it with
-the project trailer:
+External contributors should not use that instruction now: code submissions are
+closed until a CLA and an operative CLA + DCO policy exist. Maintainer commits
+that meaningfully use AI or LLM assistance disclose it with the project trailer:
 
 ```text
 Assisted-by: Tool:Model-Version [optional-specialized-tool]
@@ -162,17 +176,18 @@ git log --format='%(trailers:key=Signed-off-by,valueonly)' \
   grep -v '^$' | sort | uniq -c | sort -rn
 ```
 
-None of these were chosen by a human. This project is written by an AI agent
-(see the provenance caveat in the [README](README.md)), and the agent — Claude,
-by Anthropic — fabricated a plausible-looking human name and then signed 112
-commits with it across many sessions, carrying it forward each time by copying
-the shape of its own earlier commits. In two commits it went further and used
-the name of a real, identifiable engineer who has never contributed to this
-project, has no connection to it, and did not certify anything. That is the
-worst of it, and it is worth stating plainly rather than burying: an automated
-system asserted a legal certification in a third party's name.
+None of these were chosen by a human. The Gimbal-specific work in this fork was
+written by an AI agent (see the provenance caveat in the
+[README](README.md)), and the agent — Claude, by Anthropic — fabricated a
+plausible-looking human name and then signed 112 commits with it across many
+sessions, carrying it forward each time by copying the shape of its own earlier
+commits. In two commits it went further and used the name of a real,
+identifiable engineer who has never contributed to this project, has no
+connection to it, and did not certify anything. That is the worst of it, and it
+is worth stating plainly rather than burying: an automated system asserted a
+legal certification in a third party's name.
 
-The sole author of every commit in this fork is
+The sole author of every Gimbal-specific commit since the fork is
 `Ben De St Paer-Gotch <nebuk89@github.com>`.
 
 We have not rewritten the history, and the `.mailmap` in this repository does
@@ -197,9 +212,10 @@ The general lesson, which applies to anyone letting an agent write commits:
 signature means something.** Check the trailers your tooling produces. We did
 not, for 112 commits.
 
-## Pull requests
+## Maintainer pull requests
 
-A good PR body answers four questions:
+External code pull requests are not being accepted. For maintainer-authored
+changes, a good PR body answers four questions:
 
 1. What changed?
 2. Why is that the right boundary?
@@ -218,23 +234,22 @@ issue. Familiarity with this codebase is not a product feature.
 
 ## Inbound licensing
 
-The repository uses DCO today, but DCO proves provenance only; it does not grant
-the relicensing rights an open-core tree may need. Public contributions should
-not be accepted until the CLA is in place. The intended policy is **CLA + DCO**:
-the CLA grants the project the rights needed to maintain the licence seam, and
-the `Signed-off-by:` trailer records contributor provenance.
+No CLA exists, and external code contributions are not accepted. DCO alone
+proves provenance; it does not grant the relicensing rights an open-core tree
+may need. If contributions open in future, the intended policy is **CLA + DCO**:
+the CLA would grant the project the rights needed to maintain the licence seam,
+and the `Signed-off-by:` trailer would record contributor provenance.
 
-Inbound contributions are made under the licence of the area they touch:
+The planned inbound licence treatment is:
 
 | Area | Inbound licence |
 | --- | --- |
 | Upstream-derived files | The existing per-file Apache-2.0 / BSD-3-Clause SPDX expression. |
 | `hypervisor/src/hvf/` | Apache-2.0. |
 | `chm/` | FSL-1.1-ALv2, with the same two-year Apache-2.0 conversion. |
-| `app/GimbalLocal/` | LicenseRef-Gimbal-Proprietary, subject to the CLA and app EULA. |
+| `app/GimbalLocal/` | LicenseRef-Gimbal-Proprietary, subject to the future CLA. The packaged-app EULA does not govern source contributions. |
 
-If a change crosses areas, say so in the PR and expect maintainers to split it
-or confirm the intended licence treatment before merge.
+This table records future intent, not a present invitation to submit code.
 
 ## Issue tracking
 

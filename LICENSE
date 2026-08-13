@@ -14,8 +14,12 @@ path and by each file's SPDX identifier.
   release automatically converts to Apache-2.0 two years after it is made
   available.
 - `app/GimbalLocal/`: LicenseRef-Gimbal-Proprietary. The app source is
-  proprietary. Third-party open-source rights are preserved. A separate app EULA
-  is still pending.
+  proprietary to Ben De St Paer-Gotch trading as Gimbal. Third-party
+  open-source and source-available rights are preserved. A narrow
+  PREVIEW/EVALUATION EULA for packaged releases is drafted at
+  `app/GimbalLocal/EULA.md`; it is marked for legal review and is not final or
+  legal-approved. Repository licences continue to govern source code, and the
+  applicable third-party terms control their components.
 - Documentation: CC-BY-4.0 unless otherwise marked in `.reuse/dep5`.
 
 Licence texts live in `LICENSES/`, `LICENSE-APACHE`, and
