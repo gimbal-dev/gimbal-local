@@ -104,12 +104,6 @@ that a guest booted, the claim comes from a real guest on real Apple Silicon.
 
 ## Download
 
-> **This repository is private** while the publication work finishes, so the
-> Releases link below will 404 unless you have access. Downloading it without
-> access silently produces a 9-byte file containing `Not Found`, which then
-> fails to unzip with no useful error — so if that happens, this is why. Once
-> the repository is public this note goes away.
-
 Download the latest `GimbalLocal-<version>.zip` from
 [Releases](https://github.com/gimbal-dev/gimbal-local/releases/latest),
 double-click it in Finder to unpack, and drag **Gimbal Local** to
