@@ -1,34 +1,34 @@
 ---
 name: Bug report
-about: File a bug report
+about: Report something that does not work
 title: ''
 labels: ''
 assignees: ''
-
 ---
 
-**Describe the bug**
-A clear and concise description of what the bug is.
+**What happened**
 
-**To Reproduce**
-Steps to reproduce the behaviour:
+What you expected, and what you got instead.
 
-**Version**
+**How to reproduce**
 
-Output of `cloud-hypervisor --version`:
+The exact commands you ran. If a guest is involved, say whether it was a
+rehydrated snapshot, a cold-booted kernel, or an OCI image.
 
-Did you build from source, if so build command line (e.g. features):
+**Evidence**
 
-**VM configuration**
+Paste the output rather than describing it. Useful sources:
 
-What command line did you run (or JSON config data):
+- `chm --version`
+- the console log, or the tail of the daemon log
+- `chm ctl list`
 
-Guest OS version details:
+**Environment**
 
-Host OS version details:
+- macOS version:
+- Mac model and chip (e.g. M2 Pro):
+- Installed from the signed app, or built from source:
 
-**Logs**
+**Anything you already ruled out**
 
-Output of `cloud-hypervisor -v` from either standard error or via `--log-file`:
-
-Linux kernel output:
+Optional, but it saves a round trip.
