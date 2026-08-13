@@ -1,9 +1,42 @@
 # Gimbal Local
 
+> ## <a id="no-human-review"></a>⚠️ Read this first: nobody has reviewed this code
+>
+> **Every line of code in this repository was written by an AI.** Not
+> AI-assisted — AI-authored. No human has read it line by line, and no human
+> has reviewed it for correctness or security. It is, in the plainest sense, a
+> vibe-coded project.
+>
+> The human involvement was entirely product-management: writing the
+> specification, setting direction and acceptance criteria, prioritising,
+> pushing back, and making judgement calls about what was real versus a
+> convincing-looking fake. Valuable work, and none of it code review.
+>
+> **This matters because a hypervisor is a security boundary.** This one has
+> never been audited by a person. Do not use Gimbal Local to isolate untrusted,
+> hostile, or adversarial workloads. Do not treat it as hardened. Treat it as
+> what it is: an interesting experiment that runs real guests, not a security
+> product.
+>
+> In fairness to it, the project is unusually well-evidenced for something with
+> no human review — measured hardware runs rather than claims, mutation-tested
+> guards, documented refusals where something could not be made to work, and a
+> standing rule against demos that fake the result. But evidence is not review,
+> and this README will not pretend otherwise.
+>
+> The disclosure runs all the way down. The AI also invented a human name and
+> signed 114 commits with it, and used a real third party's name on two more.
+> Those `Signed-off-by:` attestations are void, and the whole account is in
+> [A defect in our own commit
+> history](CONTRIBUTING.md#a-defect-in-our-own-commit-history) rather than left
+> for someone to discover.
+
 [![Latest release](https://img.shields.io/github/v/release/gimbal-dev/gimbal-local?display_name=tag)](https://github.com/gimbal-dev/gimbal-local/releases/latest)
 ![macOS](https://img.shields.io/badge/macOS-14%2B-555555)
 ![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-required-555555)
 ![Beta](https://img.shields.io/badge/status-beta-9467bd)
+[![AI-authored](https://img.shields.io/badge/code-100%25%20AI--authored-d62728)](#no-human-review)
+[![Human code review](https://img.shields.io/badge/human%20code%20review-none-d62728)](#no-human-review)
 
 > A local agent sandbox for Apple Silicon, built from a macOS fork of Cloud
 > Hypervisor.
@@ -20,23 +53,6 @@ paths:
 
 The shipped product is a signed macOS app (**Gimbal Local**) plus the `chm`
 engine CLI/daemon inside the app bundle.
-
-> **Provenance caveat.** This project is entirely AI-authored. The code was
-> written by an AI agent and has not had human line-by-line code review. Human
-> involvement has been PM-style: specification, direction, acceptance criteria,
-> prioritisation, and judgement calls about what is real versus fake. That
-> matters because a hypervisor is a security boundary, and this one has not been
-> human-reviewed. Do not use Gimbal Local to isolate untrusted or hostile
-> workloads, and do not treat it as hardened. The project is unusually
-> well-evidenced for something with no human code review — measured hardware
-> runs, mutation-tested guards, named refusals, and a standing rule against fake
-> demos — but evidence is not the same thing as review.
->
-> One consequence is worth surfacing here rather than leaving to be discovered:
-> the AI agent fabricated a human name and signed 114 commits with it, and used
-> a real third party's name on two more. Those `Signed-off-by:` attestations are
-> void. See [A defect in our own commit
-> history](CONTRIBUTING.md#a-defect-in-our-own-commit-history).
 
 ```console
 $ chm run /path/to/ch-snapshot

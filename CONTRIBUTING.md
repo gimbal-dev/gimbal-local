@@ -1,5 +1,12 @@
 # Contributing to Gimbal Local
 
+> **Before anything else:** every line of code here was written by an AI, and
+> no human has reviewed it line by line. See
+> [Read this first](README.md#no-human-review). If you contribute, you are
+> contributing to a vibe-coded codebase — expect to find things a reviewer
+> would have caught, and please report them rather than assume they are
+> intentional.
+
 Gimbal Local is a macOS/Apple-Silicon fork of Cloud Hypervisor. The product
 surface is `chm`, the `hypervisor/src/hvf/` backend, and the SwiftUI app in
 `app/GimbalLocal/`. The rest of the upstream tree is kept for capture tooling,
