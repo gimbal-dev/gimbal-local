@@ -227,6 +227,15 @@ const SNAPSHOT_SYS_REGS: &[u16] = &[
     SYSREG_TPIDR_EL0,
     SYSREG_TPIDRRO_EL0,
     SYSREG_SP_EL1,
+    // The guest's virtual-timer arming state. CVAL is listed before CTL because
+    // `set_state` writes in this order, and arming a deadline before enabling
+    // the timer is the safe sequence — the reverse briefly enables a timer
+    // against whatever comparator happens to be there.
+    //
+    // Their absence was #257: a checkpoint that forgets these resumes every vCPU
+    // with no tick and no deadline. See `SYSREG_CNTV_CTL_EL0`.
+    SYSREG_CNTV_CVAL_EL0,
+    SYSREG_CNTV_CTL_EL0,
 ];
 
 // ---------------------------------------------------------------------------
@@ -886,6 +895,90 @@ static WEDGE_REPORT_REQUESTS: AtomicU64 = AtomicU64::new(0);
 /// kernel is the only observer that can report *that*.
 pub fn request_wedge_report() {
     WEDGE_REPORT_REQUESTS.fetch_add(1, Ordering::Relaxed);
+    roll_call();
+}
+
+/// The largest vCPU index the roll call tracks.
+const ROLL_CALL_VCPUS: usize = 64;
+
+/// A vCPU is *silent* once this long has passed with no run entry. Well beyond
+/// any legitimate `NO_HZ` nap, which `wfi_park_ms` bounds by the guest's own
+/// next deadline, and well inside the 60 s the guest's own detectors need.
+const ROLL_CALL_SILENCE: u64 = 5_000;
+
+/// Milliseconds (monotonic) at each vCPU's last run entry, plus a packed
+/// snapshot of what its GIC held there. Published by the vCPU, read by anyone.
+///
+/// This exists because **both wedge triggers require the wedged vCPU to reach a
+/// run entry, and the one shape that matters most does not.** The overdue-dwell
+/// trigger counts entries; the console trigger is serviced at an entry. A vCPU
+/// parked in WFI waiting for a tick that will never arrive makes no entries at
+/// all, so it cannot report on itself, and the healthy sibling answering the
+/// same request produces a clean bill of health for the wrong CPU. That is
+/// exactly what a real wedge looked like: the guest said `Possible timer
+/// handling issue on cpu=0` while our own report described vcpu 1.
+///
+/// Published state is a compromise the platform forces. `CNTV_*`, `PC` and
+/// `PSTATE` are readable only on the owning thread, so they cannot appear here —
+/// but the load-bearing fact, whether an INTID is stuck active, lives in the
+/// GIC and can be.
+static ROLL_CALL_SEEN: [AtomicU64; ROLL_CALL_VCPUS] =
+    [const { AtomicU64::new(0) }; ROLL_CALL_VCPUS];
+static ROLL_CALL_GIC: [AtomicU64; ROLL_CALL_VCPUS] = [const { AtomicU64::new(0) }; ROLL_CALL_VCPUS];
+
+/// Monotonic milliseconds since process start.
+fn now_ms() -> u64 {
+    static ORIGIN: OnceLock<Instant> = OnceLock::new();
+    ORIGIN.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Pack a vCPU's GIC state into one word so it can be published without a lock.
+/// `+1` on the timestamp so a published zero stays distinguishable from "this
+/// vCPU has never run", which is the state every unused index is in.
+fn pack_gic(vtimer_active: bool, active: usize, pending: usize, depth: usize) -> u64 {
+    (u64::from(vtimer_active))
+        | ((active.min(0xFF) as u64) << 1)
+        | ((pending.min(0xFF) as u64) << 9)
+        | ((depth.min(0xFF) as u64) << 17)
+}
+
+/// Name every vCPU that has stopped entering the guest, and say what its GIC
+/// held when it last did.
+///
+/// Printed alongside the per-vCPU reports rather than instead of them: a running
+/// vCPU can say far more about itself than this can, and a silent one can say
+/// nothing at all.
+fn roll_call() {
+    let now = now_ms();
+    for (idx, seen) in ROLL_CALL_SEEN.iter().enumerate() {
+        let last = seen.load(Ordering::Relaxed);
+        if last == 0 {
+            continue; // never ran: not a vCPU of this VM
+        }
+        let quiet_for = now.saturating_sub(last - 1);
+        if quiet_for < ROLL_CALL_SILENCE {
+            continue;
+        }
+        let g = ROLL_CALL_GIC[idx].load(Ordering::Relaxed);
+        let vtimer_active = g & 1 != 0;
+        let verdict = if vtimer_active {
+            "the timer PPI was stuck active at its last entry — it is waiting for \
+             a tick that cannot be re-queued (#257/#302 shape)"
+        } else {
+            "no INTID was stuck; it is parked for another reason"
+        };
+        eprintln!(
+            "[wedge] vcpu {idx} trigger=roll-call: no run entry for {:.1}s — {verdict}",
+            quiet_for as f64 / 1000.0,
+        );
+        eprintln!(
+            "[wedge] vcpu {idx}   at its last entry: active={} pending={} depth={} \
+             vtimer_active={vtimer_active}",
+            (g >> 1) & 0xFF,
+            (g >> 9) & 0xFF,
+            (g >> 17) & 0xFF,
+        );
+    }
 }
 
 /// What a wedge report observed, as the facts the verdict turns on.
@@ -1240,6 +1333,101 @@ fn leak_active_after() -> Option<u64> {
             .and_then(|v| v.parse::<u64>().ok())
             .filter(|&n| n > 0)
     })
+}
+
+/// Whether a restore must arm the virtual timer itself.
+///
+/// True only when the restored register file carries **no** `CNTV_CTL_EL0` at
+/// all. A supplied value is always honoured, including `ENABLE = 0`: a vCPU
+/// parked by `PSCI CPU_OFF` has its timer genuinely off, and overriding a
+/// captured value would invent state rather than restore it.
+///
+/// The case this exists for is #257. Checkpoints written before the timer pair
+/// joined `SNAPSHOT_SYS_REGS` carry no timer state, so the vCPU keeps its reset
+/// value — no tick, no deadline — and nothing in the guest re-arms it except
+/// code that only runs *because* of an interrupt. Those checkpoints already
+/// exist on users' disks and cannot be rewritten, so the restore has to
+/// recognise the gap rather than faithfully reproduce it.
+fn vtimer_needs_arming(sysregs: &[(u16, u64)]) -> bool {
+    !sysregs.iter().any(|&(id, _)| id == SYSREG_CNTV_CTL_EL0)
+}
+
+#[cfg(test)]
+mod snapshot_sys_reg_tests {
+    use super::{
+        vtimer_needs_arming, SNAPSHOT_SYS_REGS, SYSREG_CNTV_CTL_EL0, SYSREG_CNTV_CVAL_EL0,
+        SYSREG_SCTLR_EL1,
+    };
+
+    /// A checkpoint must carry the guest's virtual-timer arming state.
+    ///
+    /// This is #257. `SNAPSHOT_SYS_REGS` is a *curated* list, so anything absent
+    /// from it is silently discarded on suspend and comes back zeroed — and for
+    /// these two registers, zeroed means a vCPU with no tick and no deadline.
+    /// Nothing in the guest re-arms a timer except code that runs because of an
+    /// interrupt, so a vCPU resumed in userspace with nothing else pending never
+    /// ticks again while its siblings look perfectly healthy.
+    ///
+    /// The omission was invisible for months because the *snapshot* path was
+    /// fine: a KVM capture arrives with the full ONE_REG set, including these.
+    /// Only our own checkpoint dropped them, so the bug needed a suspend/resume
+    /// to appear at all.
+    #[test]
+    fn a_checkpoint_carries_the_virtual_timer_arming_state() {
+        assert!(
+            SNAPSHOT_SYS_REGS.contains(&SYSREG_CNTV_CVAL_EL0),
+            "without CNTV_CVAL a resumed vCPU has no deadline to tick at"
+        );
+        assert!(
+            SNAPSHOT_SYS_REGS.contains(&SYSREG_CNTV_CTL_EL0),
+            "without CNTV_CTL a resumed vCPU's timer comes back disabled"
+        );
+    }
+
+    /// The deadline must be written before the timer is enabled.
+    ///
+    /// `state()` and `set_state` both walk this list in order, so its order *is*
+    /// the write order. Enabling a timer before its comparator is set arms it
+    /// against whatever value happens to be in the register.
+    #[test]
+    fn the_deadline_is_restored_before_the_timer_is_enabled() {
+        let cval = SNAPSHOT_SYS_REGS
+            .iter()
+            .position(|&r| r == SYSREG_CNTV_CVAL_EL0)
+            .expect("CVAL is captured");
+        let ctl = SNAPSHOT_SYS_REGS
+            .iter()
+            .position(|&r| r == SYSREG_CNTV_CTL_EL0)
+            .expect("CTL is captured");
+        assert!(cval < ctl, "arm the deadline, then enable the timer");
+    }
+
+    /// A checkpoint predating the timer pair must not resume with a dead timer.
+    ///
+    /// These already exist on users' disks and cannot be rewritten, so the
+    /// restore has to recognise the gap. Arming a deadline just ahead of now
+    /// costs one spurious tick, which Linux's `timer_handler` absorbs and
+    /// answers by re-arming `CNTV_CVAL` itself.
+    #[test]
+    fn a_restore_carrying_no_timer_state_arms_the_timer_itself() {
+        let old_format = [(SYSREG_SCTLR_EL1, 0x3454_591d)];
+        assert!(vtimer_needs_arming(&old_format));
+        assert!(vtimer_needs_arming(&[]));
+    }
+
+    /// A captured `ENABLE = 0` is guest intent and must be left alone.
+    ///
+    /// A vCPU parked by `PSCI CPU_OFF` has its timer genuinely off. Overriding
+    /// a value the capture supplied would invent state rather than restore it,
+    /// and would wake a core the guest deliberately stopped.
+    #[test]
+    fn a_captured_disabled_timer_is_honoured_rather_than_overridden() {
+        assert!(!vtimer_needs_arming(&[(SYSREG_CNTV_CTL_EL0, 0)]));
+        assert!(!vtimer_needs_arming(&[
+            (SYSREG_CNTV_CVAL_EL0, 0x1234),
+            (SYSREG_CNTV_CTL_EL0, 1),
+        ]));
+    }
 }
 
 #[cfg(test)]
@@ -1624,7 +1812,8 @@ mod usgic_tests {
     use std::time::Instant;
 
     use super::{
-        UserGic, WEDGE_OVERDUE_DWELL, WEDGE_OVERDUE_ENTRIES, WedgeFacts, wedge_verdict,
+        ROLL_CALL_SILENCE, UserGic, WEDGE_OVERDUE_DWELL, WEDGE_OVERDUE_ENTRIES, WedgeFacts,
+        pack_gic, wedge_verdict,
     };
 
     /// The `CNTFRQ_EL0` a Graviton2 capture carries, so a tick count in a test
@@ -1918,6 +2107,48 @@ mod usgic_tests {
         assert!(
             g.note_vtimer_overdue(t1 + WEDGE_OVERDUE_DWELL),
             "a fresh stall after a recovery is a fresh report"
+        );
+    }
+
+    /// The roll call's packed word must survive the round trip, because every
+    /// field in it is read back by a human diagnosing a wedge.
+    ///
+    /// The stuck-timer bit is the one that decides the verdict, so it is checked
+    /// against neighbouring fields set to values that would corrupt it if the
+    /// shifts overlapped.
+    #[test]
+    fn the_roll_call_snapshot_round_trips_every_field() {
+        let g = pack_gic(true, 1, 0, 1);
+        assert_eq!(g & 1, 1, "the stuck-timer bit");
+        assert_eq!((g >> 1) & 0xFF, 1, "active");
+        assert_eq!((g >> 9) & 0xFF, 0, "pending");
+        assert_eq!((g >> 17) & 0xFF, 1, "depth");
+
+        // A healthy vCPU: nothing active, one interrupt waiting.
+        let h = pack_gic(false, 0, 1, 0);
+        assert_eq!(h & 1, 0, "no INTID stuck");
+        assert_eq!((h >> 9) & 0xFF, 1, "pending survives a clear timer bit");
+
+        // Saturating rather than wrapping: a large count must not bleed into the
+        // neighbouring field and invent a stuck timer.
+        let big = pack_gic(false, 9_999, 9_999, 9_999);
+        assert_eq!(big & 1, 0, "a huge active count must not set the timer bit");
+        assert_eq!((big >> 1) & 0xFF, 0xFF, "active saturates");
+        assert_eq!((big >> 9) & 0xFF, 0xFF, "pending saturates");
+    }
+
+    /// The silence threshold must sit above any legitimate idle nap and below
+    /// the guest's own detectors, or the roll call either cries wolf or arrives
+    /// after the evidence is stale.
+    #[test]
+    fn the_roll_call_silence_window_sits_between_a_nap_and_the_guests_own_verdict() {
+        assert!(
+            ROLL_CALL_SILENCE > WEDGE_OVERDUE_DWELL.as_millis() as u64 / 4,
+            "shorter than a fraction of the dwell would report ordinary scheduling"
+        );
+        assert!(
+            ROLL_CALL_SILENCE < 60_000,
+            "the guest needs 60s to report a stall; ours must already be true by then"
         );
     }
 
@@ -3021,6 +3252,48 @@ impl HvfVcpu {
         self.usgic.lock().unwrap().enabled = on;
     }
 
+    /// Publish this vCPU's liveness and GIC state for the roll call.
+    ///
+    /// Called at every run entry, before any early return. Two relaxed atomic
+    /// stores and one short lock on a path that already takes that lock several
+    /// times per entry.
+    fn usgic_publish_liveness(&self) {
+        let idx = self.index as usize;
+        if idx >= ROLL_CALL_VCPUS {
+            return;
+        }
+        // One line per vCPU at its first entry: the virtual timer as restored.
+        // This splits "the checkpoint came back with a dead timer" from "the
+        // timer died later", which no amount of reading the code can settle —
+        // and it is what root-caused #257, so it is kept behind the same flag as
+        // the rest of the vtimer tracing rather than deleted.
+        if ROLL_CALL_SEEN[idx].load(Ordering::Relaxed) == 0
+            && std::env::var_os("CHM_TRACE_VTIMER").is_some()
+        {
+            eprintln!(
+                "[vtimer] vcpu {idx} first entry: CNTV_CTL={:#x} CNTV_CVAL={:#x} CNTVCT={:#x}",
+                self.get_sysreg(0xDF19).unwrap_or(0),
+                self.get_sysreg(0xDF1A).unwrap_or(0),
+                self.current_cntvct(),
+            );
+        }
+        let (vtimer_active, active, pending, depth) = {
+            let g = self.usgic.lock().unwrap();
+            (
+                g.is_active(VTIMER_PPI),
+                g.active.len(),
+                g.pending.len(),
+                g.active.len(),
+            )
+        };
+        ROLL_CALL_GIC[idx].store(
+            pack_gic(vtimer_active, active, pending, depth),
+            Ordering::Relaxed,
+        );
+        // +1 so a live vCPU never publishes 0, which means "never ran".
+        ROLL_CALL_SEEN[idx].store(now_ms() + 1, Ordering::Relaxed);
+    }
+
     /// Self-manage the guest's virtual timer on the userspace-GIC path.
     ///
     /// With no managed GIC, HVF surfaces the timer via `HV_EXIT_REASON_VTIMER_
@@ -3076,12 +3349,6 @@ impl HvfVcpu {
             }
         } else {
             self.usgic_clear_vtimer_overdue();
-        }
-        // A stall the guest kernel itself reported (see `request_wedge_report`).
-        // Serviced here because this runs on the owning thread, which is the only
-        // thread allowed to read this vCPU's registers.
-        if self.usgic_wedge_report_requested() {
-            self.usgic_report_wedge("guest-reported-stall");
         }
     }
 
@@ -4217,6 +4484,29 @@ impl Vcpu for HvfVcpu {
                 self.index
             );
         }
+        // A restore that supplied no `CNTV_CTL_EL0` tells us nothing about the
+        // guest's virtual timer, and the safest reading of "nothing" is not
+        // "disabled". Checkpoints written before the timer pair joined
+        // `SNAPSHOT_SYS_REGS` carry no timer state at all, so honouring the
+        // vCPU's reset value would resume every one of them with no tick and no
+        // deadline — #257, permanently, for every checkpoint that already
+        // exists on a user's disk.
+        //
+        // So arm a deadline just ahead of now and enable the timer. The guest
+        // takes one tick, `timer_handler` sees `ISTATUS`, and Linux re-arms
+        // `CNTV_CVAL` itself on the way out — which is precisely how the vCPUs
+        // that appeared to recover on their own were recovering, except by luck
+        // rather than by design.
+        //
+        // This deliberately does NOT fire when the state supplied `CNTV_CTL`,
+        // even with `ENABLE` clear: a vCPU parked by `PSCI CPU_OFF` has its
+        // timer genuinely off, and overriding a captured value would invent
+        // state instead of restoring it.
+        if vtimer_needs_arming(&s.sysregs) {
+            let now = self.get_sysreg(SYSREG_CNTVCT_EL0).unwrap_or(0);
+            let _ = self.set_sysreg(SYSREG_CNTV_CVAL_EL0, now.saturating_add(1));
+            let _ = self.set_sysreg(SYSREG_CNTV_CTL_EL0, 1);
+        }
         // Restore the managed-GIC CPU-interface registers (priority mask, group
         // enables, active priorities, ...). These are load-bearing for delivery
         // and live in the GIC, not in the vCPU sysreg file. They are restored
@@ -4295,6 +4585,21 @@ impl Vcpu for HvfVcpu {
             // enqueued off this vCPU's thread and can only be applied here, on
             // the owning thread.
             self.usgic_drain_injected();
+            // Publish liveness before anything that can return early. A wedged
+            // vCPU is defined by not getting here, so this must not sit behind a
+            // condition the wedge itself can fail.
+            self.usgic_publish_liveness();
+            // A stall the guest kernel itself reported (see `request_wedge_report`).
+            // Serviced on the owning thread, which is the only thread allowed to
+            // read this vCPU's registers — but *outside* `usgic_poll_vtimer`,
+            // which returns early when the guest has its timer disabled or
+            // masked. A vCPU in that state is precisely the one worth asking
+            // about, and while this check sat behind that early return the real
+            // wedge was silent while a healthy sibling answered for it. Never
+            // gate a report on a condition the fault can itself produce.
+            if self.usgic_wedge_report_requested() {
+                self.usgic_report_wedge("guest-reported-stall");
+            }
             // Self-manage the guest's virtual timer: if its armed CNTV deadline
             // is due, assert PPI 27 now. HVF's own VTIMER_ACTIVATED delivery is
             // unreliable across the mask/unmask cycle and wedges an idle guest,

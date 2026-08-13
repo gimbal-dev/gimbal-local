@@ -138,6 +138,21 @@ pub const SYSREG_MPIDR_EL1: u16 = 0xc005;
 /// its captured value seeds the HVF vtimer offset on restore so the guest's
 /// CNTVCT_EL0 resumes continuously instead of restarting near zero.
 pub const SYSREG_CNTVCT_EL0: u16 = 0xdf02;
+/// EL0 virtual timer compare value: the counter value at which the guest's next
+/// tick is due. Part of the checkpointed state — see [`SYSREG_CNTV_CTL_EL0`].
+pub const SYSREG_CNTV_CVAL_EL0: u16 = 0xdf1a;
+/// EL0 virtual timer control: `ENABLE` (bit 0), `IMASK` (bit 1), `ISTATUS`
+/// (bit 2).
+///
+/// This and `CNTV_CVAL_EL0` are the guest's entire virtual-timer arming state,
+/// and omitting them from a checkpoint is not a lossy nicety — it is #257. A
+/// vCPU resumed with `ENABLE = 0` and `CVAL = 0` has no tick, and nothing in the
+/// guest will re-arm it except code that only runs *because* of an interrupt. A
+/// vCPU that happens to take some other interrupt re-enters the kernel and
+/// re-arms, which is why this looked intermittent for months; one resumed while
+/// executing userspace with nothing else pending never gets that chance and
+/// wedges permanently, while its siblings stay healthy.
+pub const SYSREG_CNTV_CTL_EL0: u16 = 0xdf19;
 /// MPIDR_EL1 bit[31] is RES1 on AArch64; affinity fields occupy Aff0..Aff3.
 pub const MPIDR_RES1: u64 = 1 << 31;
 
