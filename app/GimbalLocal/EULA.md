@@ -1,9 +1,14 @@
 # Gimbal Local preview/evaluation end-user licence
 
-> # DRAFT — legal review required before public distribution
+> # Preview terms — not reviewed by legal counsel
 >
-> This document is proposed wording only. It has not been approved by legal
-> counsel and must not be represented as final or legally sufficient.
+> These terms were written by the project maintainer and have **not** been
+> reviewed by a qualified lawyer. They are published as-is for a preview
+> release so that evaluation users have written terms rather than none at all.
+> They are not a substitute for legal advice, and no claim is made that they
+> are complete or enforceable in any given jurisdiction. If you need
+> legally-assured terms before evaluating Gimbal Local, contact the maintainer
+> before installing.
 
 SPDX-FileCopyrightText: 2026 Ben De St Paer-Gotch trading as Gimbal
 SPDX-License-Identifier: LicenseRef-Gimbal-Proprietary
@@ -109,4 +114,5 @@ permitted and the remaining provisions will continue in effect. A failure to
 enforce a provision is not a waiver. This Agreement does not alter any
 third-party licence or any source-code licence in the repository.
 
-> **DRAFT — legal review required before public distribution.**
+> **These terms have not been reviewed by legal counsel. See the notice at the
+> top of this document.**

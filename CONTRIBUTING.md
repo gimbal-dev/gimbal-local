@@ -156,9 +156,11 @@ certifies the Developer Certificate of Origin for that commit. In this
 repository's history, many of those attestations name people who did not make
 them.
 
-Of the 332 commits authored since the fork from Cloud Hypervisor:
+There are 332 commits since the fork from Cloud Hypervisor. 280 of them carry a
+`Signed-off-by:` trailer, and between them those 280 commits carry 294 trailer
+lines, because a few carry more than one. Counted by name:
 
-| `Signed-off-by:` name | Commits | What it is |
+| `Signed-off-by:` name | Trailer lines | What it is |
 | --- | ---: | --- |
 | `nebuk89 <nebuk89@github.com>` | 177 | correct — the real author |
 | `Nebu Konnaith` | 112 | **invented** |
@@ -166,14 +168,25 @@ Of the 332 commits authored since the fork from Cloud Hypervisor:
 | `Ben De St Paer-Gotch <nebuk89@github.com>` | 2 | correct — the real author, named in full |
 | `Nebuk` | 1 | a variant of the same invention |
 
+The other 52 commits carry no `Signed-off-by:` at all: 37 are merge commits, and
+15 are ordinary commits that should have had one. A repository that asks you for
+a DCO signoff owes you that number about itself.
+
 Counted at `04c91b745`. These figures move as history is added and as pull
-requests are squashed, so rather than ask you to trust them, here is the
-command that produced them — run it and check:
+requests are squashed, so rather than ask you to trust them, here are the
+commands that produced them — run them and check:
 
 ```sh
+# the 294 trailer lines in the table above
 git log --format='%(trailers:key=Signed-off-by,valueonly)' \
     1db8858fac037277f6d744db8dbcb637b1295b9b..main |
   grep -v '^$' | sort | uniq -c | sort -rn
+
+# 332 commits total, and the 280 of them carrying at least one trailer
+git rev-list --count 1db8858fac037277f6d744db8dbcb637b1295b9b..main
+git log --format='%H %(trailers:key=Signed-off-by,valueonly,separator=%x2c)' \
+    1db8858fac037277f6d744db8dbcb637b1295b9b..main |
+  awk 'NF > 1' | wc -l
 ```
 
 None of these were chosen by a human. The Gimbal-specific work in this fork was
@@ -187,6 +200,17 @@ connection to it, and did not certify anything. That is the worst of it, and it
 is worth stating plainly rather than burying: an automated system asserted a
 legal certification in a third party's name.
 
+Two things bound how far that reached, and they belong here because leaving them
+out would make this read as worse than it is. Every commit's **author** field is
+correct — all 332 are `Ben De St Paer-Gotch` or `nebuk89`, the same real person
+at the same real address — so GitHub's blame, history and contributor graph
+never attributed anything to anybody else. And the invented trailers carry *the
+author's own* `@users.noreply.github.com` address rather than the address of the
+person named; on both `Chris Nesbitt-Smith` commits the author's genuine signoff
+is present alongside the false one. Neither fact makes the trailer acceptable.
+Together they mean the false certification sits in commit message bodies and
+nowhere else.
+
 The sole author of every Gimbal-specific commit since the fork is
 `Ben De St Paer-Gotch <nebuk89@github.com>`.
 
@@ -199,7 +223,15 @@ smaller, honest job: it folds the author's two spellings into one identity.
 A rewrite would change every commit hash, break every issue and pull-request
 cross-reference, and — because a force-pushed commit stays reachable by SHA and
 inside pull requests — would not reliably remove the old ones anyway. It would
-buy the appearance of a fix rather than a fix. So the bad trailers stand, and
+buy the appearance of a fix rather than a fix. There is a sharper cost too: the
+oldest affected commit is 129 back, so a rewrite moves roughly 38% of the
+history, and **every release tag sits inside that range**. The notarized
+downloads published against `v0.1.0`, `v0.1.1`, `v0.2.0` and `v0.2.1` were built
+from those exact trees, and re-pointing a tag at a rewritten commit destroys the
+one check that tells you a download came from the tree it claims. Correcting a
+false attestation by invalidating four true ones is a poor trade.
+
+So the bad trailers stand, and
 this section is the correction: **any `Signed-off-by:` line in this history
 naming someone other than the author above is void, and certifies nothing.**
 

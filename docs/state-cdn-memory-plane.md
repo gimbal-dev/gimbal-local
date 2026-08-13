@@ -132,6 +132,31 @@ Serving is safe without a token check **for full-access refs**: the chunks are
 opaque ciphertext, so only a puller that already holds the tenant key (from its
 own legit resume) can decrypt them.
 
+**What that argument depends on — and a bug that broke it.** "Opaque
+ciphertext" only holds if the server can serve nothing *but* cache contents.
+In every release up to and including **v0.2.1** it could not. `sanitize()` folds
+`/` to `_`, which kills multi-segment traversal, but it keeps `.` — so a `ref`
+of `..` survived as a whole path segment and `Path::join` stepped one level out
+of the cache.
+`GET /state-cdn/chunk?ref=..&key=secret.txt` returned any file named
+`[A-Za-z0-9.-]+` sitting *beside* the cache directory: plaintext, unauthenticated,
+200. Measured before and after the fix against a real socket with a decoy file:
+
+| | `ref=..&key=secret.txt` |
+| --- | --- |
+| before | `HTTP 200` — file contents returned |
+| after | `HTTP 404 chunk not in this peer cache` |
+
+The default bind is loopback (`127.0.0.1:9700`), so reaching it needed
+`--addr` on a routable interface. `cache_path` now appends a single plain
+filename component per segment and refuses anything else — `.`, `..`, absolute
+paths, empty — so the containment this section's argument assumes is now
+enforced rather than implied. A refused path and a genuine miss both return
+404, so the endpoint never confirms what does or does not exist off-cache.
+
+The endpoint is still deliberately **unauthenticated**: bind it only to an
+interface you would be willing to hand every ciphertext chunk on.
+
 **Honest boundary — page-range ACLs + peers.** A peer serves any chunk it holds,
 so it does not itself enforce a *page-range ACL*: a puller scoped to a subset of
 pages that reached this peer directly could fetch an out-of-scope chunk it would
