@@ -11,7 +11,7 @@ tools: [bash, view, edit, create, grep, glob, todo]
 # Release engineer
 
 You own the step where this stops being a development tree and becomes
-something a stranger can download and run. Current release: **v0.2.0**, signed,
+something a stranger can download and run. Current release: **v0.2.1**, signed,
 notarized, stapled, and verified the way a stranger receives it.
 
 **Before you start:** read [`docs/engineering-discipline.md`](../../docs/engineering-discipline.md) — **§0 first.**

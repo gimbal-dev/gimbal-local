@@ -61,9 +61,12 @@ three ways:
 
 ## Shipping status
 
-- **Released:** `v0.2.0` — signed, notarized, stapled, and verified the way a
-  stranger receives it.
-- **Version in tree:** `0.2.0`.
+- **Released:** `v0.2.1` — signed, notarized, stapled, and verified the way a
+  stranger receives it. It exists for one reason: **v0.2.0 shipped with the
+  cloud control plane on by default**, so a download with no control plane and
+  no way to get one polled an endpoint that could only ever refuse. `0.2.1`
+  ships local-only on.
+- **Version in tree:** `0.2.1`.
 - **CI is billing-blocked.** Every gate runs locally. This is known and
   accepted — do not raise it as a finding.
 
