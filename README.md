@@ -26,10 +26,6 @@
   <img alt="Interface: CLI + macOS app" src="https://img.shields.io/badge/Interface-CLI%20%2B%20macOS%20app-24292F">
 </p>
 
-<p align="center">
-  <a href="#no-human-review"><img alt="Code: 100% AI-authored" src="https://img.shields.io/badge/Code-100%25%20AI--authored-D1242F"></a>
-  <a href="#no-human-review"><img alt="Human code review: none" src="https://img.shields.io/badge/Human%20code%20review-none-D1242F"></a>
-</p>
 
 > ## <a id="no-human-review"></a>⚠️ Read this first: nobody has reviewed this code
 >
@@ -48,12 +44,6 @@
 > hostile, or adversarial workloads. Do not treat it as hardened. Treat it as
 > what it is: an interesting experiment that runs real guests, not a security
 > product.
->
-> In fairness to it, the project is unusually well-evidenced for something with
-> no human review — measured hardware runs rather than claims, mutation-tested
-> guards, documented refusals where something could not be made to work, and a
-> standing rule against demos that fake the result. But evidence is not review,
-> and this README will not pretend otherwise.
 >
 > The disclosure runs all the way down. The AI also invented a human name and
 > signed 114 commits with it, and used a real third party's name on two more.
