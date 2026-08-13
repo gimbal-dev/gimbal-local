@@ -1,0 +1,111 @@
+# Copyright © 2026 Ben De St Paer-Gotch
+#
+# SPDX-License-Identifier: FSL-1.1-ALv2
+
+# Manual only, on purpose.
+#
+# This workflow does NOT build the shipped artifact. A Gimbal Local release is
+# built, signed, notarized and Gatekeeper-assessed on a developer Mac by
+# scripts/release-macos.sh, because notarization needs an Apple Developer
+# identity and the release gate runs the suite in release configuration on the
+# machine the software actually targets.
+#
+# What this does is the paperwork around that: take an already-notarized zip,
+# create the tag and the GitHub release, attach the artifact and its checksum,
+# and mark it latest. Keeping it separate from the test workflow means a
+# release never waits on, or is blocked by, a test run that cannot boot a guest
+# anyway.
+#
+# The Developer ID certificate and the `gimbal-notary` keychain profile are
+# deliberately NOT GitHub secrets, and must not be added as such. They live only
+# in the developer machine's keychain. That is why this job runs on Linux and
+# only does paperwork: it structurally cannot sign or notarize, so a change that
+# tried to would have to move the runner first, and that is a visible diff.
+#
+# Usage:
+#   1. scripts/release-macos.sh            # build, sign, notarize, assess
+#   2. run this workflow with the version  # or pass --publish to the script
+
+name: Publish release (manual)
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to publish, without the leading v (e.g. 0.2.0)'
+        required: true
+        type: string
+      prerelease:
+        description: 'Mark as a pre-release'
+        required: false
+        default: true
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Create the release
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      # No checkout on purpose. Neither step below reads the tree, and a
+      # checkout would write this job's `contents: write` token into
+      # .git/config on the runner for nothing.
+
+      # Fail early and loudly rather than creating an empty release: the
+      # artifact has to have been uploaded by the developer machine first.
+      #
+      # `version` is free-form dispatch input, so it is passed through the
+      # environment and never spliced into this script's text — an expansion
+      # like ${{ inputs.version }} inside a run: block is executed by the
+      # shell, and this job can publish releases.
+      - name: Check the artifact was staged
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # The env: block above is what closes injection — this value is a
+          # shell variable, never script text. The check below is a shape
+          # guard: it refuses junk early and catches the v0.2.0 double-prefix.
+          case "$VERSION" in
+            *[!0-9.]* | *..* | .* | *. | "")
+              echo "Refusing version '$VERSION': digits and dots only, no leading v."
+              exit 1
+              ;;
+          esac
+          case "$VERSION" in
+            [0-9]*.[0-9]*.[0-9]*) ;;
+            *)
+              echo "Refusing version '$VERSION': expected N.N.N."
+              exit 1
+              ;;
+          esac
+          tag="v$VERSION"
+          if ! gh release view "$tag" --json assets --jq '.assets[].name' 2>/dev/null \
+              | grep -q '\.zip$'; then
+            echo "No .zip asset on $tag."
+            echo "Build and upload it first:"
+            echo "  scripts/release-macos.sh --publish"
+            exit 1
+          fi
+
+      # A pre-release cannot also be latest — GitHub will not surface one that
+      # way — so asking for both would quietly do nothing on every default run.
+      - name: Set the release status
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          if [ "$PRERELEASE" = "true" ]; then
+            gh release edit "$tag" --prerelease
+            echo "$tag marked as a pre-release; not marked latest."
+          else
+            gh release edit "$tag" --prerelease=false --latest
+            echo "$tag marked as the latest release."
+          fi
