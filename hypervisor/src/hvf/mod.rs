@@ -24,6 +24,7 @@ use std::ffi::c_void;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::time::Instant;
 
 use anyhow::anyhow;
 use serde::{Deserialize, Serialize};
@@ -695,6 +696,36 @@ struct UserGic {
     /// hours of load is evidence that it did not, and that the fix is not the
     /// cure. Reported under `CHM_TRACE_USGIC`.
     nested_requeues_refused: u64,
+    /// When this vCPU's armed virtual-timer deadline was first seen overdue with
+    /// PPI 27 still not acknowledged, and across how many consecutive run
+    /// entries. Cleared the instant the guest acknowledges 27 or re-arms past
+    /// `now`, so in health these reset every tick.
+    ///
+    /// Both halves are required to call it a wedge, and the entry count is the
+    /// half that matters: wall-clock alone cannot tell "the guest's tick stopped"
+    /// from "this VM was suspended for an hour", because a suspend produces one
+    /// run entry with an enormous gap rather than thousands of entries that each
+    /// still see the deadline passed. See [`HvfVcpu::usgic_note_vtimer_overdue`].
+    ///
+    /// The two halves are reached at wildly different times — a wedged vCPU
+    /// re-enters in a tight spin, because `wfi_park_ms` returns 0 once the
+    /// deadline has passed — so the crossing must be a `>=` latched by
+    /// `vtimer_overdue_reported`, never an equality on either counter. An
+    /// equality test on the entry count passed every unit test here and could
+    /// not fire on hardware even once: entry 200 arrives milliseconds into a
+    /// wedge and the dwell has another ten seconds to run.
+    vtimer_overdue_since: Option<Instant>,
+    vtimer_overdue_entries: u64,
+    vtimer_overdue_reported: bool,
+    /// How many wedge reports this vCPU has emitted, and the console-triggered
+    /// request generation it has already answered. Both exist to bound output:
+    /// the condition that produces a report is by definition persistent, so
+    /// without a cap it would print on every run entry for the rest of the run.
+    wedge_reports: u32,
+    wedge_request_seen: u64,
+    /// Fault-injection bookkeeping for `CHM_USGIC_LEAK_ACTIVE`; inert otherwise.
+    vtimer_deactivations: u64,
+    leaked: bool,
     /// Last-written CPU-interface control values (bookkeeping so reads are
     /// coherent; they do not gate the raw-line delivery in this experiment).
     pmr: u64,
@@ -808,6 +839,130 @@ const GICV3_INTID_SPURIOUS: u32 = 1023;
 /// GIC when there is no managed GIC.
 const VTIMER_PPI: u32 = 27;
 
+/// `PSTATE.I` — the EL1 IRQ mask bit in `CPSR`. A guest running with this set
+/// cannot take an interrupt no matter how correctly we deliver it, which is why
+/// the wedge report reads it before blaming delivery.
+const PSTATE_I: u64 = 1 << 7;
+
+/// How long a live virtual-timer deadline must stay passed, and across how many
+/// consecutive run entries, before the vCPU is reported as wedged.
+///
+/// Both are needed and they rule out different things. The dwell is what
+/// separates a wedge from an ordinary scheduling hiccup: a healthy guest's
+/// deadline is overdue for microseconds, between the deadline passing and the
+/// handler arming the next one. The entry count is what separates it from a
+/// *suspended* VM, which produces one run entry spanning the whole gap rather
+/// than thousands. The existing run watchdog forces an exit every 30 ms, so a
+/// running vCPU re-enters at least ~33 times a second and reaches the count in
+/// well under the dwell; a resumed one cannot reach it at all.
+///
+/// Ten seconds is chosen to fire *before* the guest's own RCU stall detector,
+/// which needs 60 s — so the state is captured early in the wedge rather than a
+/// minute into it.
+const WEDGE_OVERDUE_DWELL: std::time::Duration = std::time::Duration::from_secs(10);
+const WEDGE_OVERDUE_ENTRIES: u64 = 200;
+
+/// How many wedge reports a single vCPU will emit. The condition is permanent by
+/// construction, so this is what stops one wedge printing forever.
+const WEDGE_REPORT_LIMIT: u32 = 3;
+
+/// Bumped by [`request_wedge_report`]; each vCPU compares it against its own
+/// last-seen value at its next run entry.
+static WEDGE_REPORT_REQUESTS: AtomicU64 = AtomicU64::new(0);
+
+/// Ask every vCPU to report its interrupt-delivery state at its next run entry.
+///
+/// Called from the console reader when the *guest kernel* announces that its own
+/// tick has stopped (`rcu_preempt kthread starved`, `detected stalls on
+/// CPUs/tasks`). Routing it through a request rather than reporting directly is
+/// not indirection for its own sake: HVF binds a vCPU to the thread that created
+/// it, so a vCPU's registers — the timer deadline, `PC`, `PSTATE` — are readable
+/// *only* on that thread, and the console runs on another one.
+///
+/// This trigger is not redundant with the overdue-dwell one. That one is built
+/// on our own counter, so it is structurally blind to the case where our counter
+/// is wrong: if we believe the deadline has not arrived, we never assert and
+/// never accumulate dwell, no matter how stopped the guest's tick is. The guest
+/// kernel is the only observer that can report *that*.
+pub fn request_wedge_report() {
+    WEDGE_REPORT_REQUESTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// What a wedge report observed, as the facts the verdict turns on.
+#[derive(Clone, Copy)]
+struct WedgeFacts {
+    active_empty: bool,
+    timer_live: bool,
+    /// `CNTVCT - CVAL`, signed: negative means the deadline is still ahead.
+    overdue_by: i128,
+    /// The guest's own counter frequency, in ticks per second. Only used to give
+    /// [`WedgeFacts::overdue_by`] a magnitude: "the deadline is ahead of us" is a
+    /// different finding at 273 microseconds than at thirty seconds, and reading
+    /// the sign alone conflates them.
+    guest_hz: u128,
+    irqs_masked: bool,
+    vtimer_pending: bool,
+}
+
+/// How far ahead the guest's deadline must be, in seconds, before a stall the
+/// guest reported is blamed on our counter rather than on the guest simply
+/// being between ticks.
+///
+/// The guest's own detectors need **sixty seconds** of missed ticks before they
+/// say anything, so a counter disagreement large enough to explain one of their
+/// reports cannot be sub-second. Measured on the benign post-resume stall this
+/// separates: the deadline was 33,266 guest ticks out — 273 microseconds —
+/// while the guest was complaining about a 60-second gap it had already
+/// recovered from.
+const WEDGE_CLOCK_SKEW_SECONDS: u128 = 1;
+
+/// Decide who owns a stalled tick, from the state captured at the stall.
+///
+/// The order of these arms is the argument, not a formatting choice, because
+/// several of them can be true at once and only the first is the *cause*:
+///
+/// 1. A stuck active INTID is checked first because it explains everything
+///    downstream — while it is set, [`UserGic::push_pending`] refuses to
+///    re-queue, so 27 is legitimately *not* pending and a later arm would
+///    misread that absence as a guest fault. Ours; the #262/#302 shape.
+/// 2. A timer the guest has disabled or masked is not a delivery failure at
+///    all, and must be excluded before anything is blamed for non-delivery.
+/// 3. A deadline still in the future, reported as stalled *by the guest*, can
+///    only mean our counter and the guest's disagree — but only once it is far
+///    enough ahead to explain the sixty seconds of missed ticks the guest needs
+///    before it says anything. It has its own arm because folding it into
+///    "guest-side" would send a counter-scaling bug down the instruction-cache
+///    path — the failure mode that made the sixth reproduction attempt
+///    worthless.
+/// 4. A deadline only *just* ahead is the opposite finding: nothing is stuck and
+///    the next tick is imminent, so the stall the guest reported is behind it.
+///    This is the benign post-resume case, and it must not be filed as a clock
+///    bug — a diagnostic that names the wrong subsystem costs more than one that
+///    says nothing.
+/// 5. `PSTATE.I` set is separated from the general guest-side case for the same
+///    reason: a guest that has disabled interrupts is not failing to *take* an
+///    interrupt, it is refusing one, and only one of those is DIC territory.
+fn wedge_verdict(f: WedgeFacts) -> &'static str {
+    let skew_floor = -((f.guest_hz * WEDGE_CLOCK_SKEW_SECONDS) as i128);
+    if !f.active_empty {
+        "gic-model: an INTID is stuck active, so re-queue is refused — ours (#262/#302 shape)"
+    } else if !f.timer_live {
+        "guest-idle: the guest's own timer is disabled or masked; not a delivery failure"
+    } else if f.overdue_by < skew_floor {
+        "clock: the guest reports a stopped tick but our counter says its deadline is still far \
+         off — counter offset/scale, not the GIC"
+    } else if f.overdue_by < 0 {
+        "recovered: nothing is stuck and the next tick is imminent — the stall the guest reported \
+         is behind it (the benign post-resume case)"
+    } else if f.irqs_masked {
+        "guest-masked: delivered, but the guest is running with PSTATE.I set"
+    } else if f.vtimer_pending {
+        "guest-side: delivered with interrupts enabled and not taken — i-cache/DIC territory"
+    } else {
+        "unclassified: the timer is live and overdue but 27 is neither pending nor active"
+    }
+}
+
 /// Whether an `ICC_SGI1R_EL1` write targets the core `cand_id`, given the raw
 /// register value and the writing core's id. The register encodes the routing
 /// mode in bit [40] (1 = all cores except the writer / "broadcast but self") and
@@ -885,9 +1040,66 @@ impl UserGic {
         }
         let intid = self.pending.remove(0);
         self.active.push(intid);
+        // The guest has taken the tick: whatever overdue dwell was accumulating
+        // is answered. Clearing here rather than in the poll is deliberate — the
+        // poll only observes what we *offered*, and the wedge is precisely the
+        // case where offering and taking come apart.
+        if intid == VTIMER_PPI {
+            self.vtimer_overdue_since = None;
+            self.vtimer_overdue_entries = 0;
+            self.vtimer_overdue_reported = false;
+        }
         intid
     }
 
+    /// Accumulate one overdue run entry and say whether this is the entry that
+    /// crosses into "wedged" for the first time.
+    ///
+    /// Called only when the guest's timer is live (`ENABLE` set, `IMASK` clear)
+    /// and its own armed deadline has passed — so this is not "the vCPU is
+    /// quiet", it is "the guest asked for a tick, its deadline came, and it has
+    /// still not taken it". That distinction is the whole soundness argument: an
+    /// idle guest under `NO_HZ`, an offlined core, or a guest that has migrated
+    /// all work to one CPU each arms nothing or arms far ahead, so none of them
+    /// reach here at all.
+    ///
+    /// Two thresholds must both be crossed, and [`WEDGE_OVERDUE_ENTRIES`] is the
+    /// one that rules out a suspended VM: a suspend of any length produces a
+    /// *single* run entry across the gap, never thousands, so wall-clock alone
+    /// would report every resume as a wedge.
+    ///
+    /// **They are not reached together, and that is the trap.** A wedged vCPU
+    /// re-enters in a tight spin, because `wfi_park_ms` returns 0 the moment the
+    /// deadline is behind us — so the entry count is satisfied within
+    /// milliseconds while the dwell has another ten seconds to run. An equality
+    /// test on the entry count is therefore a race that essentially never lands:
+    /// it passed every unit test and could not fire once on hardware. Hence
+    /// `>=` on both, latched so the report is emitted once per episode.
+    ///
+    /// Takes `now` rather than reading the clock so the crossing is testable
+    /// without a vCPU; the caller on the vCPU thread passes `Instant::now()`.
+    fn note_vtimer_overdue(&mut self, now: Instant) -> bool {
+        let since = *self.vtimer_overdue_since.get_or_insert(now);
+        self.vtimer_overdue_entries = self.vtimer_overdue_entries.saturating_add(1);
+        if self.vtimer_overdue_reported {
+            return false;
+        }
+        let crossed = self.vtimer_overdue_entries >= WEDGE_OVERDUE_ENTRIES
+            && now.duration_since(since) >= WEDGE_OVERDUE_DWELL;
+        self.vtimer_overdue_reported = crossed;
+        crossed
+    }
+
+    /// Forget any accumulated overdue dwell: the guest's deadline is in the
+    /// future again, which it can only be because the tick was taken and the
+    /// handler armed the next one.
+    fn clear_vtimer_overdue(&mut self) {
+        if self.vtimer_overdue_since.is_some() {
+            self.vtimer_overdue_since = None;
+            self.vtimer_overdue_entries = 0;
+            self.vtimer_overdue_reported = false;
+        }
+    }
     /// Model an `ICC_EOIR1_EL1` write (end of interrupt). With `EOImode=0`
     /// (`ICC_CTLR_EL1.EOImode` clear) this drops priority AND deactivates; with
     /// `EOImode=1` it drops priority only and the guest deactivates later via
@@ -928,6 +1140,9 @@ impl UserGic {
     /// Searching from the top removes the innermost activation, which is the
     /// one a correctly-nested guest is completing.
     fn deactivate(&mut self, intid: u32) {
+        if self.leak_this_deactivation(intid) {
+            return;
+        }
         if let Some(pos) = self.active.iter().rposition(|&a| a == intid) {
             self.active.remove(pos);
         }
@@ -967,6 +1182,64 @@ impl UserGic {
     fn should_assert(&self) -> bool {
         !self.pending.is_empty() && self.active.is_empty()
     }
+
+    /// Fault injection, off unless `CHM_USGIC_LEAK_ACTIVE` is set: drop the
+    /// `n`th deactivation of the virtual-timer PPI on the floor, reproducing on
+    /// demand the pre-#302 defect where a named INTID stayed active forever.
+    ///
+    /// This exists so the wedge report has demonstrated power. A detector that
+    /// has never fired is an unfalsified guard, and the reproduction hunt for
+    /// #257 has already burned seven attempts on experiments that could not
+    /// distinguish their own hypotheses. Rather than wait for nature to bury
+    /// PPI 27 again, this buries it deliberately, so
+    /// [`HvfVcpu::usgic_report_wedge`] can be shown to fire and to classify the
+    /// result as ours rather than the guest's.
+    ///
+    /// Only PPI 27 is leakable, and only once per run: the point is to produce
+    /// the one permanent per-vCPU stall this issue describes, not to make the
+    /// GIC generally unreliable.
+    fn leak_this_deactivation(&mut self, intid: u32) -> bool {
+        let Some(target) = leak_active_after() else {
+            return false;
+        };
+        self.leak_at(intid, target)
+    }
+
+    /// The injector's decision, with the setting passed in rather than read from
+    /// the process environment.
+    ///
+    /// Split out so the guard can drive the real injector. A test that reaches
+    /// the same end state by hand — pushing onto `active` and setting `leaked`
+    /// itself — proves the *consequence* of a leak and is structurally blind to
+    /// the injector no longer performing one, which is the call-site class this
+    /// repo has now banked five times.
+    fn leak_at(&mut self, intid: u32, target: u64) -> bool {
+        if intid != VTIMER_PPI {
+            return false;
+        }
+        self.vtimer_deactivations += 1;
+        if self.vtimer_deactivations != target || self.leaked {
+            return false;
+        }
+        self.leaked = true;
+        eprintln!(
+            "[usgic] FAULT INJECTION (CHM_USGIC_LEAK_ACTIVE={target}): dropping \
+             deactivation #{target} of PPI {VTIMER_PPI}; this vCPU's tick should now stop"
+        );
+        true
+    }
+}
+
+/// The `CHM_USGIC_LEAK_ACTIVE` setting: which deactivation of the virtual-timer
+/// PPI to drop. Read once — this sits on the interrupt path.
+fn leak_active_after() -> Option<u64> {
+    static CACHE: OnceLock<Option<u64>> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("CHM_USGIC_LEAK_ACTIVE")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+    })
 }
 
 #[cfg(test)]
@@ -1348,7 +1621,15 @@ mod vtimer_clock_tests {
 
 #[cfg(test)]
 mod usgic_tests {
-    use super::UserGic;
+    use std::time::Instant;
+
+    use super::{
+        UserGic, WEDGE_OVERDUE_DWELL, WEDGE_OVERDUE_ENTRIES, WedgeFacts, wedge_verdict,
+    };
+
+    /// The `CNTFRQ_EL0` a Graviton2 capture carries, so a tick count in a test
+    /// reads as the duration it really is.
+    const GRAVITON_HZ: u128 = 121_875_000;
 
     fn eoimode1() -> UserGic {
         UserGic {
@@ -1546,6 +1827,311 @@ mod usgic_tests {
             g.vtimer_just_deactivated(Some(VTIMER_PPI)),
             "the deactivate must re-arm the vtimer"
         );
+    }
+
+    /// Taking the tick is what clears the overdue dwell — not offering it.
+    ///
+    /// The wedge is precisely the case where offering and taking come apart, so
+    /// a dwell cleared anywhere on the *assert* path would reset itself on every
+    /// run entry and could never accumulate. Clearing it in `read_iar`, the one
+    /// place the guest actually consumes the interrupt, is what makes the
+    /// detector able to observe a stall at all.
+    #[test]
+    fn only_the_guest_acknowledging_the_tick_clears_the_overdue_dwell() {
+        const VTIMER_PPI: u32 = 27;
+        let mut g = UserGic {
+            enabled: true,
+            vtimer_overdue_since: Some(Instant::now()),
+            vtimer_overdue_entries: 512,
+            ..UserGic::default()
+        };
+
+        // Offering it again does not clear anything: push_pending is the assert
+        // path, and a wedged guest is offered the tick at every single entry.
+        g.push_pending(VTIMER_PPI);
+        assert_eq!(
+            g.vtimer_overdue_entries, 512,
+            "merely making the tick pending must not count as the guest taking it"
+        );
+
+        // A different INTID being taken is not the timer returning either.
+        g.push_pending(79);
+        assert_eq!(g.read_iar(), VTIMER_PPI, "27 was queued first");
+        assert_eq!(g.vtimer_overdue_entries, 0, "acknowledging 27 clears the dwell");
+        assert!(g.vtimer_overdue_since.is_none());
+    }
+
+    /// The two thresholds are reached at wildly different times, so the crossing
+    /// must not be an equality on the one that arrives first.
+    ///
+    /// **This is the guard the hardware run bought.** The first implementation
+    /// fired on `entries == WEDGE_OVERDUE_ENTRIES && dwell elapsed`, evaluated
+    /// at one instant. Every unit test passed. On a real injected wedge the vCPU
+    /// spins — `wfi_park_ms` returns 0 once the deadline is behind us — so entry
+    /// 200 arrived milliseconds in, the dwell had ten seconds left to run, the
+    /// equality never matched again, and the detector could not fire at all.
+    #[test]
+    fn the_entry_count_arriving_long_before_the_dwell_still_reports_the_wedge() {
+        let mut g = UserGic::default();
+        let t0 = Instant::now();
+
+        // A wedged vCPU spins: the entry budget is spent in microseconds.
+        for _ in 0..WEDGE_OVERDUE_ENTRIES * 4 {
+            assert!(
+                !g.note_vtimer_overdue(t0),
+                "no wedge yet — the dwell has not elapsed"
+            );
+        }
+
+        // Ten seconds later the same condition is still true, and *that* is the
+        // moment it must be reported, long past the entry count's equality.
+        assert!(
+            g.note_vtimer_overdue(t0 + WEDGE_OVERDUE_DWELL),
+            "the dwell elapsed while overdue: this is a wedge"
+        );
+    }
+
+    /// The report is emitted once per episode, not on every entry of a spin.
+    #[test]
+    fn a_standing_wedge_is_reported_once_and_a_recovered_tick_re_arms_it() {
+        let mut g = UserGic::default();
+        let t0 = Instant::now();
+        let past = t0 + WEDGE_OVERDUE_DWELL;
+        for _ in 0..WEDGE_OVERDUE_ENTRIES {
+            g.note_vtimer_overdue(t0);
+        }
+        assert!(g.note_vtimer_overdue(past), "first crossing reports");
+        for _ in 0..1000 {
+            assert!(
+                !g.note_vtimer_overdue(past),
+                "a standing wedge must not print on every entry of a spin"
+            );
+        }
+
+        // The guest taking a tick ends the episode, so a *later* wedge is a new
+        // finding and must be reportable again.
+        g.clear_vtimer_overdue();
+        let t1 = past;
+        for _ in 0..WEDGE_OVERDUE_ENTRIES {
+            g.note_vtimer_overdue(t1);
+        }
+        assert!(
+            g.note_vtimer_overdue(t1 + WEDGE_OVERDUE_DWELL),
+            "a fresh stall after a recovery is a fresh report"
+        );
+    }
+
+    /// A dwell must not be cleared by an unrelated interrupt being taken.
+    /// A suspended VM crosses the wall clock without crossing the entry count,
+    /// and must not be reported.
+    ///
+    /// This is the half of the crossing that keeps the trap from calling every
+    /// resume a wedge: a suspend of any length produces a *single* run entry
+    /// across the gap, so wall-clock alone would fire on all of them. It is
+    /// testable at all only because `note_vtimer_overdue` takes `now` — with the
+    /// clock read inside, this case needs a real suspend and goes untested.
+    #[test]
+    fn a_long_suspend_crosses_the_dwell_on_one_entry_and_is_not_a_wedge() {
+        let mut g = UserGic::default();
+        let t0 = Instant::now();
+        assert!(!g.note_vtimer_overdue(t0), "the entry that armed the dwell");
+        assert!(
+            !g.note_vtimer_overdue(t0 + WEDGE_OVERDUE_DWELL * 6),
+            "one entry an hour later is a resumed VM, not a spinning vCPU"
+        );
+        assert!(
+            g.vtimer_overdue_entries < WEDGE_OVERDUE_ENTRIES,
+            "the entry count is what rules this out; the dwell alone is crossed"
+        );
+    }
+
+    #[test]
+    fn taking_some_other_interrupt_leaves_the_overdue_dwell_standing() {
+        let mut g = UserGic {
+            enabled: true,
+            vtimer_overdue_since: Some(Instant::now()),
+            vtimer_overdue_entries: 300,
+            ..UserGic::default()
+        };
+        g.push_pending(79);
+        assert_eq!(g.read_iar(), 79);
+        assert_eq!(
+            g.vtimer_overdue_entries, 300,
+            "a virtio completion is not the timer tick returning"
+        );
+    }
+
+    /// The fault injector must actually reproduce the pre-#302 defect, or the
+    /// wedge report is a guard that has never fired.
+    ///
+    /// This is the whole reason the injector exists. Seven reproduction attempts
+    /// for #257 failed to produce the wedge, and one of them was later shown to
+    /// have had no power at all — so shipping a detector on the promise that it
+    /// would work when nature next triggered it would repeat exactly that
+    /// mistake. Here the burial is deliberate, and its consequence — the tick
+    /// being refused for ever after — is asserted rather than assumed.
+    #[test]
+    fn the_fault_injector_buries_the_timer_ppi_exactly_as_the_old_defect_did() {
+        const VTIMER_PPI: u32 = 27;
+        let mut g = UserGic {
+            enabled: true,
+            ..UserGic::default()
+        };
+
+        // The first tick is ordinary: taken, ended, deactivated.
+        g.push_pending(VTIMER_PPI);
+        assert_eq!(g.read_iar(), VTIMER_PPI);
+        assert!(!g.leak_at(VTIMER_PPI, 2), "not the targeted deactivation");
+        g.write_eoir(VTIMER_PPI);
+        assert!(!g.is_active(VTIMER_PPI), "an unleaked tick deactivates");
+
+        // The second is the one the injector drops. Drive the real thing rather
+        // than reproducing its end state by hand: a test that pushes onto
+        // `active` itself cannot see the injector stop performing the leak.
+        g.push_pending(VTIMER_PPI);
+        assert_eq!(g.read_iar(), VTIMER_PPI);
+        assert!(g.leak_at(VTIMER_PPI, 2), "deactivation #2 is the target");
+        // Exactly what `deactivate` does when the injector claims the drop.
+        g.write_eoir(VTIMER_PPI);
+        g.active.push(VTIMER_PPI);
+
+        assert!(
+            g.is_active(VTIMER_PPI),
+            "the leaked activation must survive the guest's EOI"
+        );
+        // One leak only — and structurally, not by a flag: `vtimer_deactivations`
+        // only ever counts up, so a fixed target is reached exactly once. That is
+        // why the next targeted deactivation is honoured rather than dropped, and
+        // why the injector models one lost EOI rather than a permanently broken
+        // GIC. (`self.leaked` is belt-and-braces over that argument; removing it
+        // changes no behaviour, so no assertion here pretends to test it.)
+        assert!(!g.leak_at(VTIMER_PPI, 2), "the target is behind us now");
+        // The consequence that makes it permanent rather than transient.
+        let before = g.nested_requeues_refused;
+        g.push_pending(VTIMER_PPI);
+        assert!(
+            !g.pending.contains(&VTIMER_PPI),
+            "a buried INTID is refused re-queue, so the tick can never be offered again"
+        );
+        assert_eq!(
+            g.nested_requeues_refused,
+            before,
+            "refusal at the top of the stack is the dedup, not a nested requeue"
+        );
+        assert!(
+            !g.should_assert(),
+            "and with 27 active the line is never re-asserted either"
+        );
+    }
+
+    /// The verdict must name the GIC when an INTID is stuck active, even though
+    /// every other symptom of that state also looks like a guest fault.
+    ///
+    /// This is the ordering that matters most: while 27 is buried,
+    /// `push_pending` refuses it, so 27 is legitimately *not* pending. A verdict
+    /// that checked "is the timer pending?" first would read that absence as the
+    /// guest ignoring us and send the next investigation down the i-cache path
+    /// for a bug that is ours.
+    #[test]
+    fn a_stuck_active_intid_is_blamed_on_the_gic_and_not_on_the_guest() {
+        let v = wedge_verdict(WedgeFacts {
+            active_empty: false,
+            timer_live: true,
+            overdue_by: 5_000_000,
+            guest_hz: GRAVITON_HZ,
+            irqs_masked: false,
+            // The buried case: refused re-queue means it is NOT pending.
+            vtimer_pending: false,
+        });
+        assert!(v.starts_with("gic-model:"), "got {v}");
+    }
+
+    /// A tick the guest reports as stopped while our own counter says its
+    /// deadline is still far off is a clock fault, and must not be filed as a
+    /// guest one.
+    ///
+    /// Only the console trigger can reach this state — a deadline we do not
+    /// believe has passed can never raise the overdue trigger — which is why
+    /// the two triggers are not redundant.
+    #[test]
+    fn a_deadline_far_in_our_future_is_blamed_on_the_counter() {
+        let v = wedge_verdict(WedgeFacts {
+            active_empty: true,
+            timer_live: true,
+            // Thirty seconds ahead: nothing a healthy tick arms, and comfortably
+            // enough disagreement to explain the guest's 60-second stall report.
+            overdue_by: -(30 * GRAVITON_HZ as i128),
+            guest_hz: GRAVITON_HZ,
+            irqs_masked: false,
+            vtimer_pending: true,
+        });
+        assert!(v.starts_with("clock:"), "got {v}");
+    }
+
+    /// A deadline only just ahead is the *opposite* finding to a clock fault,
+    /// and reading the sign alone conflates them.
+    ///
+    /// This is the benign post-resume stall, and it is the case the control run
+    /// produced: `overdue_by = -33266` at 121.875 MHz — **273 microseconds** —
+    /// while the guest complained about a 60-second gap it had already
+    /// recovered from. The first version of this classifier called that `clock`,
+    /// which would have sent the next reader hunting a counter-scaling bug that
+    /// does not exist. A diagnostic that names the wrong subsystem costs more
+    /// than one that says nothing.
+    #[test]
+    fn a_deadline_a_few_microseconds_ahead_is_a_recovered_stall_not_a_clock_fault() {
+        let v = wedge_verdict(WedgeFacts {
+            active_empty: true,
+            timer_live: true,
+            overdue_by: -33_266,
+            guest_hz: GRAVITON_HZ,
+            irqs_masked: false,
+            vtimer_pending: false,
+        });
+        assert!(
+            v.starts_with("recovered:"),
+            "273us from the next tick is not a clock bug; got {v}"
+        );
+    }
+
+    /// A guest running with interrupts disabled is refusing the tick, not
+    /// failing to take it, and the two have different owners.
+    #[test]
+    fn interrupts_masked_in_the_guest_is_reported_separately_from_a_delivery_failure() {
+        let masked = wedge_verdict(WedgeFacts {
+            active_empty: true,
+            timer_live: true,
+            overdue_by: 1,
+            guest_hz: GRAVITON_HZ,
+            irqs_masked: true,
+            vtimer_pending: true,
+        });
+        assert!(masked.starts_with("guest-masked:"), "got {masked}");
+
+        let enabled = wedge_verdict(WedgeFacts {
+            active_empty: true,
+            timer_live: true,
+            overdue_by: 1,
+            guest_hz: GRAVITON_HZ,
+            irqs_masked: false,
+            vtimer_pending: true,
+        });
+        assert!(enabled.starts_with("guest-side:"), "got {enabled}");
+    }
+
+    /// A guest that has disabled its own timer is idle, not wedged. Reporting
+    /// that as a delivery failure would fire on every `NO_HZ` guest.
+    #[test]
+    fn a_timer_the_guest_turned_off_is_never_reported_as_a_delivery_failure() {
+        let v = wedge_verdict(WedgeFacts {
+            active_empty: true,
+            timer_live: false,
+            overdue_by: 9_999_999,
+            guest_hz: GRAVITON_HZ,
+            irqs_masked: false,
+            vtimer_pending: false,
+        });
+        assert!(v.starts_with("guest-idle:"), "got {v}");
     }
 
     /// The #257 wedge, in the model: a deactivate must honour the INTID the
@@ -2485,7 +3071,145 @@ impl HvfVcpu {
         if cval <= self.current_cntvct() {
             let _ = self.usgic_assert_spi(VTIMER_PPI);
             self.usgic_report_nested_requeues();
+            if self.usgic_note_vtimer_overdue() {
+                self.usgic_report_wedge("overdue-dwell");
+            }
+        } else {
+            self.usgic_clear_vtimer_overdue();
         }
+        // A stall the guest kernel itself reported (see `request_wedge_report`).
+        // Serviced here because this runs on the owning thread, which is the only
+        // thread allowed to read this vCPU's registers.
+        if self.usgic_wedge_report_requested() {
+            self.usgic_report_wedge("guest-reported-stall");
+        }
+    }
+
+    /// Accumulate overdue dwell and say whether it has crossed the threshold for
+    /// the first time. The reasoning lives on
+    /// [`UserGic::note_vtimer_overdue`], which is where it is testable.
+    fn usgic_note_vtimer_overdue(&self) -> bool {
+        self.usgic.lock().unwrap().note_vtimer_overdue(Instant::now())
+    }
+
+    /// Forget any accumulated overdue dwell: the guest's deadline is in the
+    /// future again, which it can only be because the tick was taken and the
+    /// handler armed the next one.
+    fn usgic_clear_vtimer_overdue(&self) {
+        self.usgic.lock().unwrap().clear_vtimer_overdue();
+    }
+
+    /// The guest's counter frequency in ticks per second, derived from the host
+    /// timebase and the rate-scaling ratio the shared clock synthesizes.
+    ///
+    /// Only the wedge report consumes this, and only to give `overdue_by` a
+    /// magnitude: the sign alone cannot tell a guest that is 273 microseconds
+    /// from its next tick from one whose counter disagrees with ours by half a
+    /// minute, and those two findings name different subsystems.
+    fn guest_ticks_per_second(&self) -> u128 {
+        let tb = mach_timebase();
+        if tb.numer == 0 {
+            return 0;
+        }
+        let host_hz = 1_000_000_000u128 * u128::from(tb.denom) / u128::from(tb.numer);
+        match self.counter_scale() {
+            Some((num, den)) if den != 0 => host_hz * u128::from(num) / u128::from(den),
+            _ => host_hz,
+        }
+    }
+
+    /// Whether a console-side stall report is outstanding for this vCPU.
+    fn usgic_wedge_report_requested(&self) -> bool {
+        let want = WEDGE_REPORT_REQUESTS.load(Ordering::Relaxed);
+        let mut g = self.usgic.lock().unwrap();
+        if g.wedge_request_seen == want {
+            return false;
+        }
+        g.wedge_request_seen = want;
+        true
+    }
+
+    /// Print one report of this vCPU's interrupt-delivery state, and say which
+    /// side of the boundary the evidence puts the fault on.
+    ///
+    /// #257 has been observed twice and reproduced never, and both observations
+    /// produced nothing actionable because the state that would have answered it
+    /// was never captured. The point of this is that the *next* occurrence is
+    /// answerable the first time, from either trigger, without a 1.5M-line trace
+    /// running for hours beforehand.
+    ///
+    /// The classification is the deliverable. Each arm names a different owner:
+    ///
+    /// * **`gic-model`** — an INTID is still on our active stack, so
+    ///   [`UserGic::push_pending`] refuses to re-queue it and
+    ///   [`Self::usgic_poll_vtimer`] is refused at every entry. Permanent, and
+    ///   ours. This is exactly the shape #262 and #302 fixed.
+    /// * **`guest-masked`** — we made the tick available and the guest is
+    ///   sitting with `PSTATE.I` set. It cannot take an interrupt it has
+    ///   disabled; the fault is above us.
+    /// * **`guest-side`** — we delivered and the guest, with interrupts enabled,
+    ///   did not take it. That is the instruction-cache/`DIC` territory
+    ///   (`docs/cpu-feature-deltas.md` Finding 2), not the GIC's.
+    /// * **`clock`** — the guest's kernel says its tick has stopped while *our*
+    ///   counter says its deadline has not arrived. Only reachable from the
+    ///   console trigger, because a deadline we do not believe has passed can
+    ///   never raise the overdue trigger. Recording it as its own arm is what
+    ///   stops a counter-scaling bug being misfiled as a guest-side one.
+    fn usgic_report_wedge(&self, trigger: &str) {
+        const CNTV_CTL_EL0: u16 = 0xDF19;
+        const CNTV_CVAL_EL0: u16 = 0xDF1A;
+        {
+            let mut g = self.usgic.lock().unwrap();
+            if g.wedge_reports >= WEDGE_REPORT_LIMIT {
+                return;
+            }
+            g.wedge_reports += 1;
+        }
+        let ctl = self.get_sysreg(CNTV_CTL_EL0).unwrap_or(0);
+        let cval = self.get_sysreg(CNTV_CVAL_EL0).unwrap_or(0);
+        let now = self.current_cntvct();
+        // Signed: the console trigger can fire while the deadline is still in
+        // the future, and that gap is the entire evidence for the `clock` arm.
+        let overdue_by = (now as i128) - (cval as i128);
+        let pc = self.get_reg(HV_REG_PC).unwrap_or(0);
+        let cpsr = self.get_reg(HV_REG_CPSR).unwrap_or(0);
+        let irqs_masked = cpsr & PSTATE_I != 0;
+        let timer_live = ctl & 1 != 0 && ctl & 2 == 0;
+
+        let (pending, active, refused, asserting, entries) = {
+            let g = self.usgic.lock().unwrap();
+            (
+                g.pending.clone(),
+                g.active.clone(),
+                g.nested_requeues_refused,
+                g.should_assert(),
+                g.vtimer_overdue_entries,
+            )
+        };
+
+        let verdict = wedge_verdict(WedgeFacts {
+            active_empty: active.is_empty(),
+            timer_live,
+            overdue_by,
+            guest_hz: self.guest_ticks_per_second(),
+            irqs_masked,
+            vtimer_pending: pending.contains(&VTIMER_PPI),
+        });
+
+        eprintln!(
+            "[wedge] vcpu {} trigger={trigger} verdict={verdict}\n\
+             [wedge] vcpu {}   pending={pending:?} active={active:?} depth={} \
+             asserting={asserting} nested_requeues_refused={refused}\n\
+             [wedge] vcpu {}   CNTV_CTL={ctl:#x} (live={timer_live}) CVAL={cval:#x} \
+             CNTVCT={now:#x} overdue_by={overdue_by} overdue_entries={entries}\n\
+             [wedge] vcpu {}   PC={pc:#x} CPSR={cpsr:#x} (PSTATE.I={})",
+            self.index,
+            self.index,
+            active.len(),
+            self.index,
+            self.index,
+            u8::from(irqs_masked),
+        );
     }
 
     /// Report the nested-requeue count when it crosses a power of two, under

@@ -23,6 +23,8 @@
 use std::env;
 use std::mem;
 
+use hypervisor::hvf::request_wedge_report;
+
 /// Filters a byte stream of guest serial output, dropping the single known
 /// cosmetic genirq noise line while passing everything else through unchanged.
 pub(crate) struct ConsoleFilter {
@@ -30,6 +32,9 @@ pub(crate) struct ConsoleFilter {
     /// Bytes of an in-progress line that is still a viable kernel-printk line
     /// (begins `[` and so far matches the `[ <secs>.<frac>] ` timestamp shape).
     held: Vec<u8>,
+    /// Watches the same stream for the guest kernel announcing that its own
+    /// timer tick has stopped.
+    stalls: StallWatch,
 }
 
 impl ConsoleFilter {
@@ -37,6 +42,7 @@ impl ConsoleFilter {
         Self {
             enabled: env::var_os("CHM_RAW_CONSOLE").is_none(),
             held: Vec::new(),
+            stalls: StallWatch::default(),
         }
     }
 
@@ -44,6 +50,10 @@ impl ConsoleFilter {
     /// the host console. Bytes that belong to a not-yet-complete kernel line are
     /// withheld until the line completes (then emitted or dropped).
     pub(crate) fn feed(&mut self, input: &[u8]) -> Vec<u8> {
+        // Before any filtering decision, and regardless of whether filtering is
+        // enabled at all: a guest that says its own tick has stopped is the one
+        // observer that can see a stall our counter is blind to.
+        self.stalls.scan(input);
         if !self.enabled {
             return input.to_vec();
         }
@@ -122,6 +132,60 @@ fn is_genirq_noise(line: &[u8]) -> bool {
     contains(line, b"genirq: Setting trigger mode") && contains(line, b"gic_set_type")
 }
 
+/// The phrases a Linux guest prints when it has decided, itself, that a CPU's
+/// timer tick has stopped advancing.
+///
+/// Both are emitted once per stall episode rather than once per line of the
+/// block, which is why they are matched instead of the more common `rcu:` prefix
+/// — the block carries half a dozen `rcu:` lines and only these two are the
+/// kernel's actual verdict.
+const STALL_PHRASES: [&[u8]; 2] = [
+    b"rcu_preempt kthread starved",
+    b"detected stalls on CPUs/tasks",
+];
+
+/// Scans the guest console for those phrases and asks every vCPU to report its
+/// interrupt-delivery state when one appears.
+///
+/// This is the trigger #257 never had. The bug has been seen twice and
+/// reproduced never, and on both occasions the guest kernel *did* announce the
+/// stall — but nothing was listening, so the console recorded a symptom with
+/// none of the state that would have said whose fault it was.
+///
+/// It carries a tail of the previous chunk so a phrase split across two reads is
+/// still matched: guest output arrives in whatever sizes the PL011 FIFO drains
+/// in, and a boundary landing mid-phrase would otherwise silently lose the one
+/// event this exists to catch.
+#[derive(Default)]
+struct StallWatch {
+    tail: Vec<u8>,
+    fired: u32,
+}
+
+/// How many times the console trigger will ask for a report. The guest reprints
+/// its stall every 60 s for as long as it lasts, and the answer does not change.
+const STALL_REQUEST_LIMIT: u32 = 4;
+
+impl StallWatch {
+    fn scan(&mut self, input: &[u8]) {
+        if self.fired >= STALL_REQUEST_LIMIT {
+            return;
+        }
+        let longest = STALL_PHRASES.iter().map(|p| p.len()).max().unwrap_or(0);
+        let mut window = mem::take(&mut self.tail);
+        window.extend_from_slice(input);
+        let hit = STALL_PHRASES.iter().any(|p| contains(&window, p));
+        // Keep just enough of the tail that a phrase straddling the next read is
+        // still found, and no more: this sits on the console path.
+        let keep = window.len().saturating_sub(longest.saturating_sub(1));
+        self.tail = window[keep..].to_vec();
+        if hit {
+            self.fired += 1;
+            request_wedge_report();
+        }
+    }
+}
+
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     if needle.is_empty() || needle.len() > haystack.len() {
         return false;
@@ -196,6 +260,7 @@ mod tests {
         let mut f = ConsoleFilter {
             enabled: false,
             held: Vec::new(),
+            stalls: StallWatch::default(),
         };
         let noise = "[  1.0] genirq: Setting trigger mode 1 for irq 12 failed (gic_set_type)\n";
         assert_eq!(run(&mut f, &[noise]), noise);
@@ -212,5 +277,81 @@ mod tests {
             ],
         );
         assert_eq!(out, "ubuntu@ch-snap:~$ ");
+    }
+
+    /// The kernel's own stall verdict must be recognised, and ordinary console
+    /// traffic must not be.
+    ///
+    /// This is the trigger #257 never had. Both times the wedge occurred the
+    /// guest printed exactly these phrases and nothing was listening, so the
+    /// only record was a symptom with none of the state that would have said
+    /// whose fault it was.
+    #[test]
+    fn the_kernels_own_stall_verdict_is_recognised_and_normal_output_is_not() {
+        let mut w = StallWatch::default();
+        w.scan(b"[ 5879.1] rcu: rcu_preempt kthread starved for 60011 jiffies! ->cpu=1\n");
+        assert_eq!(
+            w.fired, 1,
+            "the kernel's starvation verdict must trigger a report"
+        );
+
+        let mut w = StallWatch::default();
+        w.scan(b"[ 5879.1] rcu: INFO: rcu_preempt detected stalls on CPUs/tasks:\n");
+        assert_eq!(w.fired, 1, "the stall announcement must trigger a report");
+
+        // Everything a healthy guest prints, including RCU lines that are not
+        // the verdict, must leave it alone.
+        let mut w = StallWatch::default();
+        w.scan(b"ubuntu@ch-snap:~$ dmesg | grep rcu\n");
+        w.scan(b"[    0.0] rcu: Preemptible hierarchical RCU implementation.\n");
+        w.scan(b"[    9.5] random: crng init done\n");
+        assert_eq!(
+            w.fired, 0,
+            "ordinary console output must not trigger a report"
+        );
+    }
+
+    /// Guest output arrives in whatever sizes the PL011 FIFO drains in, so the
+    /// one line this exists to catch can land split across two reads. Matching
+    /// only within a single chunk would silently lose it — and the loss would be
+    /// invisible, because the symptom it is meant to catch is itself silence.
+    #[test]
+    fn a_stall_verdict_split_across_two_reads_is_still_matched() {
+        let mut w = StallWatch::default();
+        w.scan(b"[ 5879.1] rcu: rcu_preempt kthread st");
+        assert_eq!(w.fired, 0, "not yet a complete phrase");
+        w.scan(b"arved for 60011 jiffies! ->cpu=1\n");
+        assert_eq!(w.fired, 1, "the phrase completes across the boundary");
+    }
+
+    /// A guest reprints its stall every 60 s for as long as it lasts, and the
+    /// answer does not change. Without a cap a wedge that is never cleared would
+    /// keep asking for reports for the rest of the run.
+    #[test]
+    fn repeated_stall_verdicts_stop_asking_for_reports() {
+        let mut w = StallWatch::default();
+        for _ in 0..50 {
+            w.scan(b"[ 5879.1] rcu: rcu_preempt kthread starved for 60011 jiffies!\n");
+        }
+        assert_eq!(w.fired, STALL_REQUEST_LIMIT, "requests must be bounded");
+    }
+
+    /// The watcher must keep working when console filtering is switched off:
+    /// `CHM_RAW_CONSOLE` exists to see the unfiltered guest console, which is
+    /// exactly what someone debugging a wedge would set.
+    #[test]
+    fn raw_console_mode_still_watches_for_stalls() {
+        let mut f = ConsoleFilter {
+            enabled: false,
+            held: Vec::new(),
+            stalls: StallWatch::default(),
+        };
+        let line = "[ 5879.1] rcu: rcu_preempt kthread starved for 60011 jiffies!\n";
+        assert_eq!(
+            run(&mut f, &[line]),
+            line,
+            "raw mode still passes bytes through"
+        );
+        assert_eq!(f.stalls.fired, 1, "and still notices the stall");
     }
 }
