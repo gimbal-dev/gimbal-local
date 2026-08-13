@@ -56,6 +56,7 @@ three ways:
 | **105 of 238 CPU registers** restore faithfully | See [`cpu-feature-deltas.md`](cpu-feature-deltas.md). The one real bug is a register HVF restores *perfectly*: the guest still believes it can run 32-bit binaries, and doing so wedges the vCPU. |
 | **Max guest RAM on cold boot is 3008 MiB** | Guest RAM starts at `0x40000000` and a single region must end by `0xfc000000`. `chm` refuses larger with the exact maximum in the message. |
 | **Demand-faulting from the state CDN is not implemented** | See [`state-cdn-memory-plane.md`](state-cdn-memory-plane.md). |
+| **`chm state-cdn serve` served files from outside its cache — fixed, unreleased** | Unauthenticated file disclosure. `sanitize()` folded `/` to `_` but kept `.`, so `ref=..` survived as a path segment and `GET /state-cdn/chunk?ref=..&key=NAME` returned any `[A-Za-z0-9.-]+`-named file *beside* the cache dir. Measured end-to-end: `HTTP 200` with the decoy's contents before, `404` after. Present in **every release up to and including v0.2.1**; fixed in tree, **not yet in a published build**. Bounded by: explicit opt-in (nothing starts the server), loopback default, one directory level, and that charset — but peer caching exists to be LAN-bound, so the default is weak mitigation for anyone actually using it. |
 
 ---
 

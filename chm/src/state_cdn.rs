@@ -25,7 +25,7 @@ use std::fs::{self, OpenOptions};
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::os::unix::fs::FileExt;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::{self, Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
@@ -355,13 +355,33 @@ fn url_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Map a `ref` + `store_key` to a cache file path. Sanitized so a content
-/// address (`sha256:…`) is a safe single filename segment.
-fn cache_path(cache: &Path, memory_ref: &str, key: &str) -> PathBuf {
-    cache.join(sanitize(memory_ref)).join(sanitize(key))
+/// Map a `ref` + `store_key` to a cache file path, or `None` if either would
+/// step outside `cache`. A content address (`sha256:…`) is a safe single
+/// filename segment.
+///
+/// `ref` arrives straight off the peer-cache query string, so this is a trust
+/// boundary. [`sanitize`] folds `/` to `_`, which kills multi-segment
+/// traversal, but it keeps `.` — so `..` survived as a whole segment and
+/// `Path::join` walked up out of the cache. The check below is deliberately
+/// *independent* of `sanitize`'s character rules: whatever it returns, only a
+/// single plain filename component is ever appended.
+fn cache_path(cache: &Path, memory_ref: &str, key: &str) -> Option<PathBuf> {
+    let mut path = cache.to_path_buf();
+    for segment in [memory_ref, key] {
+        let segment = sanitize(segment);
+        let mut components = Path::new(&segment).components();
+        // Exactly one component, and it must be a plain name: this rejects
+        // `.`, `..`, absolute paths, Windows prefixes, and the empty string.
+        match (components.next(), components.next()) {
+            (Some(Component::Normal(name)), None) => path.push(name),
+            _ => return None,
+        }
+    }
+    Some(path)
 }
 
 /// Reduce a ref/key to a filesystem-safe segment (keep alnum/`-`/`.`, else `_`).
+/// Containment is enforced by [`cache_path`], not here.
 fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
@@ -370,7 +390,8 @@ fn sanitize(s: &str) -> String {
 
 /// Write a raw (still-encrypted) chunk into the peer cache.
 fn write_cached_chunk(cache: &Path, memory_ref: &str, key: &str, bytes: &[u8]) -> Result<(), String> {
-    let path = cache_path(cache, memory_ref, key);
+    let path = cache_path(cache, memory_ref, key)
+        .ok_or_else(|| format!("refusing to cache chunk outside {}", cache.display()))?;
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)
             .map_err(|e| format!("create cache dir {}: {e}", parent.display()))?;
@@ -412,9 +433,13 @@ fn route_peer_request(method: &str, target: &str, cache: &Path) -> (u16, &'stati
             let (Some(memory_ref), Some(key)) = (get("ref"), get("key")) else {
                 return (400, "text/plain", b"missing ref or key\n".to_vec());
             };
-            match fs::read(cache_path(cache, memory_ref, key)) {
-                Ok(bytes) => (200, "application/octet-stream", bytes),
-                Err(_) => (404, "text/plain", b"chunk not in this peer cache\n".to_vec()),
+            match cache_path(cache, memory_ref, key).map(fs::read) {
+                Some(Ok(bytes)) => (200, "application/octet-stream", bytes),
+                // A refused path and a genuine miss are indistinguishable to the
+                // caller: never confirm what does or does not exist off-cache.
+                Some(Err(_)) | None => {
+                    (404, "text/plain", b"chunk not in this peer cache\n".to_vec())
+                }
             }
         }
         _ => (404, "text/plain", b"not found\n".to_vec()),
@@ -760,7 +785,16 @@ mod tests {
     #[test]
     fn cache_path_sanitizes_content_addresses() {
         let p = cache_path(Path::new("/cache"), "sha256:aa/bb", "sha256:cc");
-        assert_eq!(p, Path::new("/cache/sha256_aa_bb/sha256_cc"));
+        assert_eq!(p, Some(PathBuf::from("/cache/sha256_aa_bb/sha256_cc")));
+        // Segments that would leave the cache are refused outright.
+        for (r, k) in [("..", "x"), ("x", ".."), (".", "x"), ("", "x"), ("x", "")] {
+            assert_eq!(cache_path(Path::new("/cache"), r, k), None, "ref={r} key={k}");
+        }
+        // A separator is not traversal — `sanitize` folds it into the segment.
+        assert_eq!(
+            cache_path(Path::new("/cache"), "/", "x"),
+            Some(PathBuf::from("/cache/_/x"))
+        );
     }
 
     #[test]
@@ -791,5 +825,43 @@ mod tests {
         assert_eq!(route_peer_request("GET", "/healthz", &cache).0, 200);
 
         let _ = fs::remove_dir_all(&cache);
+    }
+
+    #[test]
+    fn peer_cache_refuses_to_escape_the_cache_directory() {
+        // Layout: <root>/secret.txt beside <root>/cache, which is what we serve.
+        let root = env::temp_dir().join(format!("chm-traversal-{}", process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let cache = root.join("cache");
+        fs::create_dir_all(&cache).unwrap();
+        fs::write(root.join("secret.txt"), b"TENANT-KEY-MATERIAL").unwrap();
+        // A real chunk, so we know the route works at all in this layout.
+        write_cached_chunk(&cache, "sha256:aa", "sha256:bb", b"ok").unwrap();
+
+        // `sanitize` folds `/` to `_`, so deep traversal is already dead — but it
+        // keeps `.`, so `..` survives as a whole path segment and `Path::join`
+        // walks up out of the cache.
+        for (r, k) in [("..", "secret.txt"), ("%2e%2e", "secret.txt")] {
+            let t = format!("/state-cdn/chunk?ref={r}&key={k}");
+            let (code, _, body) = route_peer_request("GET", &t, &cache);
+            assert_ne!(
+                body, b"TENANT-KEY-MATERIAL",
+                "escaped the cache dir with ref={r} key={k}"
+            );
+            assert_eq!(code, 404, "ref={r} key={k} should be rejected");
+        }
+
+        // The legitimate request in the same layout still works.
+        let good = format!(
+            "/state-cdn/chunk?ref={}&key={}",
+            url_encode("sha256:aa"),
+            url_encode("sha256:bb")
+        );
+        assert_eq!(
+            route_peer_request("GET", &good, &cache),
+            (200, "application/octet-stream", b"ok".to_vec())
+        );
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
