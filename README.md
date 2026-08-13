@@ -1,4 +1,35 @@
-# Gimbal Local
+<h1 align="center">Gimbal</h1>
+
+<p align="center">
+  <strong>A local agent sandbox for Apple Silicon.</strong><br>
+  Run supported Cloud&nbsp;Hypervisor / KVM workloads on your Mac, snapshot them, and resume when you need them.
+</p>
+
+<p align="center">
+  <a href="../../releases/latest">
+    <img alt="Download Gimbal" src="https://img.shields.io/badge/Download-Gimbal%20for%20macOS-0969DA?style=for-the-badge&logo=apple&logoColor=white">
+  </a>
+  &nbsp;
+  <a href="../../releases">
+    <img alt="All releases" src="https://img.shields.io/badge/All%20releases-24292F?style=for-the-badge&logo=github&logoColor=white">
+  </a>
+  &nbsp;
+  <a href="../../issues">
+    <img alt="Questions and feedback" src="https://img.shields.io/badge/Questions%20%26%20feedback-Open%20an%20issue-1F883D?style=for-the-badge&logo=github&logoColor=white">
+  </a>
+</p>
+
+<p align="center">
+  <img alt="Status: Beta" src="https://img.shields.io/badge/Status-Beta-DBAB0A?logo=github&logoColor=white">
+  <img alt="Platform: Apple Silicon" src="https://img.shields.io/badge/Platform-Apple%20Silicon-000000?logo=apple&logoColor=white">
+  <img alt="Runtime: Cloud Hypervisor" src="https://img.shields.io/badge/Runtime-Cloud%20Hypervisor-0969DA">
+  <img alt="Interface: CLI + macOS app" src="https://img.shields.io/badge/Interface-CLI%20%2B%20macOS%20app-24292F">
+</p>
+
+<p align="center">
+  <a href="#no-human-review"><img alt="Code: 100% AI-authored" src="https://img.shields.io/badge/Code-100%25%20AI--authored-D1242F"></a>
+  <a href="#no-human-review"><img alt="Human code review: none" src="https://img.shields.io/badge/Human%20code%20review-none-D1242F"></a>
+</p>
 
 > ## <a id="no-human-review"></a>⚠️ Read this first: nobody has reviewed this code
 >
@@ -30,16 +61,6 @@
 > [A defect in our own commit
 > history](CONTRIBUTING.md#a-defect-in-our-own-commit-history) rather than left
 > for someone to discover.
-
-[![Latest release](https://img.shields.io/github/v/release/gimbal-dev/gimbal-local?display_name=tag)](https://github.com/gimbal-dev/gimbal-local/releases/latest)
-![macOS](https://img.shields.io/badge/macOS-14%2B-555555)
-![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-required-555555)
-![Beta](https://img.shields.io/badge/status-beta-9467bd)
-[![AI-authored](https://img.shields.io/badge/code-100%25%20AI--authored-d62728)](#no-human-review)
-[![Human code review](https://img.shields.io/badge/human%20code%20review-none-d62728)](#no-human-review)
-
-> A local agent sandbox for Apple Silicon, built from a macOS fork of Cloud
-> Hypervisor.
 
 Gimbal Local runs `arm64` Linux guests on Apple Hypervisor.framework. It has two
 paths:
@@ -89,17 +110,31 @@ that a guest booted, the claim comes from a real guest on real Apple Silicon.
 
 ## Download
 
+> **This repository is private** while the publication work finishes, so the
+> Releases link below will 404 unless you have access. Downloading it without
+> access silently produces a 9-byte file containing `Not Found`, which then
+> fails to unzip with no useful error — so if that happens, this is why. Once
+> the repository is public this note goes away.
+
 Download the latest `GimbalLocal-<version>.zip` from
-[Releases](https://github.com/gimbal-dev/gimbal-local/releases/latest), unzip
-it, and drag **Gimbal Local** to `/Applications`.
+[Releases](https://github.com/gimbal-dev/gimbal-local/releases/latest),
+double-click it in Finder to unpack, and drag **Gimbal Local** to
+`/Applications`.
+
+If you prefer the terminal, use `ditto` — **not `unzip`**:
 
 ```sh
-# Optional CLI form, if you have GitHub CLI installed.
 gh release download --repo gimbal-dev/gimbal-local \
   --pattern 'GimbalLocal-*.zip'
-unzip GimbalLocal-*.zip
+ditto -x -k GimbalLocal-*.zip .
 mv GimbalLocal.app /Applications/
 ```
+
+`unzip` does not understand the extended attributes the archive carries and
+writes them into the bundle as stray `._*` files. Those are not covered by the
+code signature, so the seal breaks and macOS kills the app with
+`a sealed resource is missing or invalid`. Finder and `ditto` both unpack it
+correctly. Measured on the published 0.2.0 artifact, not assumed.
 
 The app is signed with a Developer ID certificate and notarized by Apple. Finder
 shows it as **Gimbal Local**; the bundle on disk is `GimbalLocal.app`.

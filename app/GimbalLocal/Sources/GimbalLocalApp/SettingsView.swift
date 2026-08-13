@@ -36,7 +36,7 @@ private struct GeneralSettingsTab: View {
         Form {
             Section("Scope") {
                 Toggle("Local only — hide everything that needs a control plane", isOn: $model.localOnly)
-                Text("Gimbal Local runs entirely on this Mac: it cold-boots its own guests and runs images from disk, with no control plane anywhere in the path. Turn this on and the app hides the Cloud section and stops reaching for a control plane at all — no polling, no requests. Off by default, because hiding a feature you have is worse than showing one you have not set up yet.")
+                Text("Gimbal Local runs entirely on this Mac: it cold-boots its own guests and runs images from disk, with no control plane anywhere in the path. On by default — nothing here reaches off this machine unless you turn it off. Do that and the app shows the Cloud section and polls the control plane URL on the Control plane tab; there is no hosted service to point it at yet, so leave it on unless you are running one yourself.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)

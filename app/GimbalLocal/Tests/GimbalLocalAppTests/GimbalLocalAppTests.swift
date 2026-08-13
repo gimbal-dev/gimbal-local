@@ -1428,3 +1428,41 @@ final class SnapshotCadenceWiringTests: XCTestCase {
         )
     }
 }
+
+/// The local-only default (#publish). A public download has no control plane,
+/// so first launch must not reach for one.
+///
+/// The load-bearing case is `an_explicit_false_is_honoured`: `UserDefaults.bool`
+/// answers `false` for an absent key, so a naive read cannot tell "switched off"
+/// from "never chosen" — and defaulting on without testing presence would
+/// silently re-enable the control plane for everyone who deliberately turned it
+/// off.
+final class LocalOnlyDefaultTests: XCTestCase {
+    private func store(_ name: String) -> UserDefaults {
+        let d = UserDefaults(suiteName: "gimbal.tests.localonly.\(name).\(ProcessInfo.processInfo.processIdentifier)")!
+        d.removePersistentDomain(forName: d.description)
+        return d
+    }
+
+    func test_a_fresh_install_is_local_only() {
+        let d = store("fresh")
+        d.removeObject(forKey: "gimbal.localOnly")
+        XCTAssertTrue(
+            AppModel.storedLocalOnly(in: d),
+            "a first launch must not reach for a control plane it cannot have")
+    }
+
+    func test_an_explicit_false_is_honoured() {
+        let d = store("explicitoff")
+        d.set(false, forKey: "gimbal.localOnly")
+        XCTAssertFalse(
+            AppModel.storedLocalOnly(in: d),
+            "a user who turned local-only off must stay off across launches")
+    }
+
+    func test_an_explicit_true_is_honoured() {
+        let d = store("expliciton")
+        d.set(true, forKey: "gimbal.localOnly")
+        XCTAssertTrue(AppModel.storedLocalOnly(in: d))
+    }
+}
