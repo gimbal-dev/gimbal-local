@@ -277,6 +277,45 @@ grep -q "Notarized Developer ID" <<<"$assessment" \
 rm -f "$zip"
 ditto -c -k --keepParent "$bundle" "$zip"
 
+# Verify the ARTIFACT, not the bundle we happen to have on disk. Everything
+# above assessed "$bundle" — the thing this script built and never round-tripped
+# through the archive a user actually receives. That is the same blind spot that
+# once shipped a release whose tests had only ever run in debug: a check that
+# does not touch the shipped bytes reports safety it cannot see.
+#
+# It matters because `ditto -c -k` stores extended attributes as AppleDouble
+# `._*` members, and an extractor that does not understand them writes them into
+# the bundle as literal files. They are not in the code signature, so the seal
+# breaks and macOS kills the binary. `unzip` does exactly this. Finder and
+# `ditto -x -k` do not.
+step "Verifying the artifact a user receives"
+
+extract_check="$(mktemp -d)"
+trap 'rm -rf "$extract_check"' EXIT
+ditto -x -k "$zip" "$extract_check" \
+    || die "the published archive does not extract."
+
+extracted="$extract_check/$(basename "$bundle")"
+[[ -d "$extracted" ]] \
+    || die "the archive does not contain $(basename "$bundle")."
+
+strays="$(find "$extracted" -name '._*' | wc -l | tr -d ' ')"
+[[ "$strays" == "0" ]] \
+    || die "$strays AppleDouble files landed inside the extracted bundle.
+      They are not covered by the signature, so macOS will refuse to run it."
+
+round_trip="$(spctl --assess --type execute --verbose=4 "$extracted" 2>&1 || true)"
+echo "$round_trip" | sed 's/^/  /'
+grep -q "accepted" <<<"$round_trip" \
+    || die "the extracted artifact is refused by Gatekeeper, even though the
+      bundle this script built was accepted. Do not publish it."
+
+# The signed nested binary has to survive the round trip too: a broken seal
+# shows up as SIGKILL at exec, not as a failed signature check.
+"$extracted/Contents/MacOS/chm" --version >/dev/null 2>&1 \
+    || die "the extracted chm will not run. Its code signature did not survive
+      the archive round trip."
+
 step "Done"
 echo "  $zip"
 echo
@@ -317,9 +356,21 @@ opens without a Gatekeeper warning and its ticket verifies offline.
 
 ### Install
 
-1. Download \`GimbalLocal-$version.zip\` below and unzip it.
-2. Move **Gimbal Local.app** to /Applications.
+1. Download \`GimbalLocal-$version.zip\` below.
+2. Double-click it in Finder to unpack, then move **GimbalLocal.app** to
+   /Applications. Finder shows it as **Gimbal Local**.
 3. Open it. The engine starts itself.
+
+If you unpack from a terminal, use \`ditto\`, not \`unzip\`:
+
+\`\`\`
+ditto -x -k GimbalLocal-$version.zip .
+\`\`\`
+
+\`unzip\` does not understand the extended attributes this archive carries, and
+writes them into the app bundle as stray \`._*\` files. They are not covered by
+the code signature, so macOS refuses to run the result. Finder and \`ditto\` both
+unpack it correctly.
 
 \`chm\` ships inside the app. To use it from a terminal:
 
