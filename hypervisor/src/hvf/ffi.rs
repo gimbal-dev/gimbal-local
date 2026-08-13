@@ -153,6 +153,8 @@ pub const SYSREG_CNTV_CVAL_EL0: u16 = 0xdf1a;
 /// executing userspace with nothing else pending never gets that chance and
 /// wedges permanently, while its siblings stay healthy.
 pub const SYSREG_CNTV_CTL_EL0: u16 = 0xdf19;
+/// `CNTV_CTL_EL0.ENABLE` — the bit that decides whether the timer ticks at all.
+pub const CNTV_CTL_ENABLE: u64 = 1 << 0;
 /// MPIDR_EL1 bit[31] is RES1 on AArch64; affinity fields occupy Aff0..Aff3.
 pub const MPIDR_RES1: u64 = 1 << 31;
 

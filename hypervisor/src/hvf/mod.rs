@@ -1337,26 +1337,39 @@ fn leak_active_after() -> Option<u64> {
 
 /// Whether a restore must arm the virtual timer itself.
 ///
-/// True only when the restored register file carries **no** `CNTV_CTL_EL0` at
-/// all. A supplied value is always honoured, including `ENABLE = 0`: a vCPU
-/// parked by `PSCI CPU_OFF` has its timer genuinely off, and overriding a
-/// captured value would invent state rather than restore it.
-///
 /// The case this exists for is #257. Checkpoints written before the timer pair
 /// joined `SNAPSHOT_SYS_REGS` carry no timer state, so the vCPU keeps its reset
 /// value — no tick, no deadline — and nothing in the guest re-arms it except
 /// code that only runs *because* of an interrupt. Those checkpoints already
 /// exist on users' disks and cannot be rewritten, so the restore has to
 /// recognise the gap rather than faithfully reproduce it.
+///
+/// Two shapes qualify, and telling them apart from a deliberately stopped timer
+/// is the whole of the decision:
+///
+/// - **No `CNTV_CTL_EL0` at all** — a checkpoint predating the pair.
+/// - **`ENABLE` clear with `CVAL = 0`** — a checkpoint that captured a vCPU
+///   *already* killed by this bug. `CVAL = 0` is a deadline at counter zero,
+///   and a guest that has run long enough to be checkpointed cannot have one;
+///   the pairing is the signature of registers that were never written.
+///
+/// A vCPU parked by `PSCI CPU_OFF` is honoured, because it does not look like
+/// either: `arch_timer_shutdown` writes `CNTV_CTL` and leaves `CNTV_CVAL`
+/// holding its last real deadline. An enabled timer is always honoured.
 fn vtimer_needs_arming(sysregs: &[(u16, u64)]) -> bool {
-    !sysregs.iter().any(|&(id, _)| id == SYSREG_CNTV_CTL_EL0)
+    let reg = |want: u16| sysregs.iter().find(|&&(id, _)| id == want).map(|&(_, v)| v);
+    match reg(SYSREG_CNTV_CTL_EL0) {
+        None => true,
+        Some(ctl) if ctl & CNTV_CTL_ENABLE != 0 => false,
+        Some(_) => reg(SYSREG_CNTV_CVAL_EL0).unwrap_or(0) == 0,
+    }
 }
 
 #[cfg(test)]
 mod snapshot_sys_reg_tests {
     use super::{
-        vtimer_needs_arming, SNAPSHOT_SYS_REGS, SYSREG_CNTV_CTL_EL0, SYSREG_CNTV_CVAL_EL0,
-        SYSREG_SCTLR_EL1,
+        SNAPSHOT_SYS_REGS, SYSREG_CNTV_CTL_EL0, SYSREG_CNTV_CVAL_EL0, SYSREG_SCTLR_EL1,
+        vtimer_needs_arming,
     };
 
     /// A checkpoint must carry the guest's virtual-timer arming state.
@@ -1415,6 +1428,20 @@ mod snapshot_sys_reg_tests {
         assert!(vtimer_needs_arming(&[]));
     }
 
+    /// A checkpoint that captured an already-wedged vCPU is cured, not preserved.
+    ///
+    /// This is the state #257 leaves behind, and it is what every workspace
+    /// checkpointed by an affected build holds: `ISTATUS` set because `CVAL = 0`
+    /// sits behind the counter, `ENABLE` clear because nothing ever wrote it.
+    /// Restoring it faithfully would keep that vCPU dead forever.
+    #[test]
+    fn a_captured_dead_timer_is_recognised_as_the_bug_rather_than_intent() {
+        assert!(vtimer_needs_arming(&[
+            (SYSREG_CNTV_CVAL_EL0, 0),
+            (SYSREG_CNTV_CTL_EL0, 0x4),
+        ]));
+    }
+
     /// A captured `ENABLE = 0` is guest intent and must be left alone.
     ///
     /// A vCPU parked by `PSCI CPU_OFF` has its timer genuinely off. Overriding
@@ -1422,7 +1449,12 @@ mod snapshot_sys_reg_tests {
     /// and would wake a core the guest deliberately stopped.
     #[test]
     fn a_captured_disabled_timer_is_honoured_rather_than_overridden() {
-        assert!(!vtimer_needs_arming(&[(SYSREG_CNTV_CTL_EL0, 0)]));
+        // `arch_timer_shutdown` writes CTL and leaves CVAL holding the last
+        // real deadline, so a genuinely stopped timer is distinguishable.
+        assert!(!vtimer_needs_arming(&[
+            (SYSREG_CNTV_CVAL_EL0, 0x1_caaf_06de),
+            (SYSREG_CNTV_CTL_EL0, 0x4),
+        ]));
         assert!(!vtimer_needs_arming(&[
             (SYSREG_CNTV_CVAL_EL0, 0x1234),
             (SYSREG_CNTV_CTL_EL0, 1),
@@ -4498,10 +4530,15 @@ impl Vcpu for HvfVcpu {
         // that appeared to recover on their own were recovering, except by luck
         // rather than by design.
         //
-        // This deliberately does NOT fire when the state supplied `CNTV_CTL`,
-        // even with `ENABLE` clear: a vCPU parked by `PSCI CPU_OFF` has its
-        // timer genuinely off, and overriding a captured value would invent
-        // state instead of restoring it.
+        // It also fires for a checkpoint that captured a vCPU this bug had
+        // *already* killed — `ENABLE` clear with `CVAL = 0`, which is what
+        // every affected workspace on disk now holds. Restoring that faithfully
+        // would keep the vCPU dead forever.
+        //
+        // A vCPU parked by `PSCI CPU_OFF` is left alone, because it does not
+        // look like either shape: `arch_timer_shutdown` writes `CNTV_CTL` and
+        // leaves `CNTV_CVAL` holding its last real deadline. Overriding that
+        // would invent state instead of restoring it.
         if vtimer_needs_arming(&s.sysregs) {
             let now = self.get_sysreg(SYSREG_CNTVCT_EL0).unwrap_or(0);
             let _ = self.set_sysreg(SYSREG_CNTV_CVAL_EL0, now.saturating_add(1));
