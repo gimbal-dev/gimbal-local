@@ -16,13 +16,19 @@ import XCTest
 final class ProxyRuleValidatorTests: XCTestCase {
     /// The real binary, or nil when it has not been built. Nil skips rather
     /// than fails: a missing build artifact is not a defect in this code.
+    ///
+    /// Located from `#filePath` rather than the working directory, because a
+    /// relative path only resolves when the runner happens to start in the
+    /// package directory. This file's own location is a fact about the
+    /// checkout, so it holds wherever the test is run from and in whoever's
+    /// clone — an earlier version of this list ended in one developer's
+    /// absolute home path, which could never match anyone else's.
     private var chmPath: String? {
+        var root = URL(fileURLWithPath: #filePath)
+        for _ in 0..<5 { root.deleteLastPathComponent() }
         let candidates = [
-            FileManager.default.currentDirectoryPath + "/../../target/debug/chm",
-            FileManager.default.currentDirectoryPath + "/../../../target/debug/chm",
-            NSHomeDirectory()
-                + "/StudioProjects/copilot-worktrees/cloud-hypervisor-mac"
-                + "/nebuk89-cuddly-robot/target/debug/chm",
+            root.appendingPathComponent("target/debug/chm").path,
+            root.appendingPathComponent("target/release/chm").path,
         ]
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }

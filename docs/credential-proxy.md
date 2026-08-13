@@ -132,9 +132,48 @@ Two things the trust-store check has to be, learned by getting both wrong:
   the moment it happens, rather than a corrupt certificate that surfaces later
   as an unexplained TLS error.
 
----
+### Doing it from the CLI alone, without the app
 
-## 2. Two kinds of secrets
+The app's *Install CA in guest* button does all of the above for you. Doing it
+by hand hits three walls that are not obvious, all of them measured while
+closing [#286](https://github.com/gimbal-dev/gimbal-local/issues/286):
+
+**1. A workspace does not inherit the image's CA.** `chm workspace IMAGE WS`
+symlinks `state.json`, `snapshot/` and `disks/`, but **mints a fresh proxy CA**.
+A guest that already trusted the image's CA will not trust the workspace's, and
+the failure surfaces as a bare `curl` error naming nothing. Install the CA the
+*workspace* is serving, not one you installed earlier
+([#315](https://github.com/gimbal-dev/gimbal-local/issues/315)).
+
+**2. The install script is bigger than `chm exec` can carry, and there is no
+`chm cp`.** Framed input tops out at **4000 bytes**
+([#316](https://github.com/gimbal-dev/gimbal-local/issues/316)). Get the file in
+by appending base64 in chunks, then verify it arrived intact — do not skip the
+hash, because a dropped chunk becomes an unexplained TLS error much later:
+
+```sh
+# host: split the script into ~1200-char base64 chunks
+base64 -i ca-install.sh | fold -w 1200 > /tmp/chunks
+
+# guest: start clean, then append each chunk
+chm exec -- bash -lc 'rm -f /tmp/ca.b64'
+while read -r c; do
+  chm exec -- bash -lc "printf %s '$c' >> /tmp/ca.b64"
+done < /tmp/chunks
+
+chm exec -- bash -lc 'base64 -d /tmp/ca.b64 > /tmp/ca-install.sh && md5sum /tmp/ca-install.sh'
+md5 -q ca-install.sh   # host side: these two must match
+```
+
+**3. `chm proxy check --workspace WS` silently ignores `--workspace`** and
+answers `no-rule` for a workspace that has a perfectly good rule
+([#317](https://github.com/gimbal-dev/gimbal-local/issues/317)). That is worse
+than a missing feature, because it is the command you would reach for as
+*evidence*. Until it is fixed, do not trust it — prove injection the way
+[§7](#proving-it-works-before-trusting-it-with-anything) describes, with a
+control.
+
+
 
 Not every secret is the same, and the split decides where it should live.
 
@@ -319,6 +358,29 @@ The rest of the hardening, and why each is there:
 ---
 
 ## 6. The honest limitations
+
+**A client that checks for a local credential never gives the proxy a chance.**
+This is the most likely way a real agent fails against a working proxy, and it
+looks like the proxy is broken when it is not. The GitHub Copilot CLI, for
+example, refuses to make the request at all unless it already sees a token — so
+injection at the network edge never happens, because there is no request to
+inject into ([#318](https://github.com/gimbal-dev/gimbal-local/issues/318)).
+
+The pattern that solves it is to give the client a **worthless placeholder**
+shaped like a real credential, and let the proxy replace it in flight:
+
+```sh
+# in the guest — deliberately not a real token
+export GH_TOKEN=github_pat_0000000000000000000000_000000000000000000000000000000000000000
+```
+
+This is safe rather than a fudge, and the reason is structural: the proxy
+**drops every existing copy of a header it manages** before attaching the real
+one (`injection_replaces_every_copy_of_the_managed_header` in
+[`http.rs`](../chm/src/credproxy/http.rs) guards it). The placeholder therefore
+cannot reach the origin, and cannot be used for anything if it leaks. Match the
+shape the client validates — a fine-grained `github_pat_…` is accepted where a
+classic `ghp_…` is rejected outright.
 
 **The proxy authenticates the destination, not the caller.** Anything running in
 the guest can route a request through it and get the credential attached, so an

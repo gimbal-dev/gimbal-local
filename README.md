@@ -46,7 +46,7 @@
 > product.
 >
 > The disclosure runs all the way down. The AI also invented a human name and
-> signed 114 commits with it, and used a real third party's name on two more.
+> signed 112 commits with it, and used a real third party's name on two more.
 > Those `Signed-off-by:` attestations are void, and the whole account is in
 > [A defect in our own commit
 > history](CONTRIBUTING.md#a-defect-in-our-own-commit-history) rather than left
@@ -234,8 +234,8 @@ your workload today.
 
 | Limit | Detail |
 | --- | --- |
-| Rehydrated agent acceptance is not done | A coding agent has been proven in a cold-booted guest, not yet in a freshly rehydrated cloud capture on a clean machine. Tracked as [#286](https://github.com/gimbal-dev/gimbal-local/issues/286). |
-| Some rehydrated captures need JIT care | A guest captured on hardware with `CTR_EL0.DIC = 1` can run JITs that execute stale code on this Mac. `chm` warns; `NODE_OPTIONS=--jitless` fixes Node itself but not native agent binaries. See [`docs/first-resume.md`](docs/first-resume.md). |
+| Setting up the credential proxy in a guest has sharp edges | The proxy itself works — an agent ran with no credential in the guest, verified against a control. But a new workspace mints a CA the guest does not already trust ([#315](https://github.com/gimbal-dev/gimbal-local/issues/315)), the install script for it is too large to pass through `chm exec` and there is no `chm cp` ([#316](https://github.com/gimbal-dev/gimbal-local/issues/316)), and a client that checks for a local token never gives the proxy a chance ([#318](https://github.com/gimbal-dev/gimbal-local/issues/318)). Expect to hit these on first contact. |
+| Some rehydrated captures need JIT care | A guest captured on hardware with `CTR_EL0.DIC = 1` can run JITs that execute stale code on this Mac. `chm` warns; `NODE_OPTIONS=--jitless` fixes Node itself. Measured 2026-08-13, the Copilot CLI's native binary ran clean **without** it, so the earlier 5-of-5 failure is out of date — but treat this as workload-dependent, not solved. |
 | 32-bit guest binaries can wedge a rehydrated guest | HVF reports the relevant register faithfully; the guest still believes AArch32 is available. `CHM_STRICT_AARCH32=1` refuses instead of warning. See [`docs/cpu-feature-deltas.md`](docs/cpu-feature-deltas.md). |
 | Old captures may need a counter-frequency override | Newer captures record the counter frequency and are corrected automatically. Older captures can need `CHM_GUEST_CNTFRQ=121875000`. See [`docs/hvf-compatible-snapshots.md`](docs/hvf-compatible-snapshots.md). |
 | Cold-boot RAM has a hard ceiling | Guest RAM starts at `0x40000000` and one region must end by `0xfc000000`, so this path tops out at 3008 MiB. Disk-backed rootfs images avoid the old initramfs-size wall, not the RAM ceiling. |
@@ -302,8 +302,30 @@ and preserve attribution, but they are not compiled into the shipped macOS app.
 
 ## Credits and upstream
 
-Placeholder: upstream attribution and public-credit wording are being prepared
-for the launch README.
+Gimbal Local exists because of
+[Cloud Hypervisor](https://github.com/cloud-hypervisor/cloud-hypervisor) and its
+contributors. The VMM, device model, snapshot and migration machinery this
+project rehydrates on Apple silicon are theirs; what is added here is the macOS
+runtime around them. Cloud Hypervisor in turn builds on
+[rust-vmm](https://github.com/rust-vmm),
+[Firecracker](https://firecracker-microvm.github.io/) and
+[crosvm](https://chromium.googlesource.com/chromiumos/platform/crosvm/), and
+that credit chain is preserved in full in [`CREDITS.md`](CREDITS.md).
+
+Two things worth saying plainly, because a fork can easily imply more than it
+should:
+
+- **Upstream did not review, endorse or approve any of this.** The Cloud
+  Hypervisor project is independent of this fork and is not responsible for its
+  issues, releases or support. Please do not take Gimbal Local bugs to them.
+  Which upstream files were modified, and the baseline they are compared
+  against, are recorded in [`UPSTREAM-CHANGES.md`](UPSTREAM-CHANGES.md).
+- **The HVF backend is given back, deliberately.**
+  [`hypervisor/src/hvf/`](hypervisor/src/hvf/) stays Apache-2.0 — it sits inside
+  an upstream crate, implements an upstream trait, and is the piece upstream
+  could most directly use. Restricting it would read as taking from the project
+  this one is built on. The commercial seam is elsewhere; see
+  [Licence](#licence).
 
 ## Licence
 

@@ -75,13 +75,15 @@ again" because a second shell is harmless while init exiting is a kernel panic.
 | `chm run --max-seconds` | **Different flag, different command.** |
 | `chm exec --timeout` | Seconds to wait, **default 300**; exit 124 on timeout, 125 if the command could not be run |
 
-> **[#215](https://github.com/gimbal-dev/gimbal-local/issues/215) says `chm exec`
-> has no deadline. It is open, and the code disagrees with it** — `--timeout` is
-> documented in `--help` and `exec_run` sets one deadline covering the whole
-> wait. Either the issue predates the flag or it describes a case the flag does
-> not cover. **Reproduce it before you fix anything**, and close it if it is
-> stale. Do not repeat the "no deadline" claim as fact — I did, from memory,
-> and it was wrong.
+> **[#215](https://github.com/gimbal-dev/gimbal-local/issues/215) claimed `chm
+> exec` has no deadline. It was closed as not reproducible** — measured against
+> the exact scenario in the report (a capture resuming to a password login
+> nobody holds, so the guest is genuinely up and genuinely never reaching a
+> shell): `--timeout 12` returned `exit=124` after 12 s with
+> `{"status":"timeout"}`. `--timeout` is documented in `--help` and `exec_run`
+> sets one deadline covering the whole wait. Do not repeat the "no deadline"
+> claim as fact — I did, from memory, and it was wrong; that is why this note
+> exists rather than the issue link alone.
 | `chm proxy ca --for-guest` | **Advertised but does not exist** ([#210](https://github.com/gimbal-dev/gimbal-local/issues/210)) |
 
 macOS has no `timeout`. Use the tool's own flag. `killall`/`pkill` are
