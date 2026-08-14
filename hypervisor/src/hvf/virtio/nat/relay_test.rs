@@ -17,6 +17,10 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::time::Instant as StdInstant;
 
+/// The address the test guest holds, matching what `chm`'s `GUEST_IP` gives a
+/// real one. Ingress dials *at* this, so the ingress tests need it by name.
+const GUEST_ADDR: Ipv4Addr = Ipv4Addr::new(192, 168, 249, 2);
+
 /// An allow-all policy that also opts into local egress, for the relay tests
 /// that deliberately dial a `127.0.0.1` echo server (the reserved-address guard
 /// blocks loopback by default — M31.1).
@@ -68,10 +72,7 @@ impl Guest {
         let boot = StdInstant::now();
         let mut iface = Interface::new(config, &mut device, SmolInstant::from_millis(0));
         iface.update_ip_addrs(|addrs| {
-            let _ = addrs.push(IpCidr::new(
-                IpAddress::Ipv4(Ipv4Address::new(192, 168, 249, 2)),
-                24,
-            ));
+            let _ = addrs.push(IpCidr::new(IpAddress::Ipv4(GUEST_ADDR), 24));
         });
         // Default route via the NAT gateway (.1).
         let _ = iface
@@ -105,6 +106,59 @@ impl Guest {
     fn poll(&mut self) {
         let now = self.now();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
+    }
+
+    /// Arm `count` sockets listening on `port` inside the guest, and return
+    /// their handles.
+    ///
+    /// `count` is the concurrency the guest can accept at once — a real server
+    /// has a backlog, this one has exactly this many sockets — which is what
+    /// makes the parallel-ingress test a measurement rather than a hope.
+    fn listen(&mut self, port: u16, count: usize) -> Vec<SocketHandle> {
+        (0..count)
+            .map(|_| {
+                let mut sock = new_tcp_socket();
+                sock.listen(port).expect("guest listen");
+                self.sockets.add(sock)
+            })
+            .collect()
+    }
+
+    /// Echo one round of whatever arrived on each of `socks`, prefixed with the
+    /// guest port that received it.
+    ///
+    /// The prefix is the whole point: a host client that gets `7777:` back knows
+    /// *which port inside the guest* served it, so "only the exposed port is
+    /// reachable" is something the host can measure rather than infer.
+    fn serve_echo(&mut self, socks: &[SocketHandle]) {
+        for &h in socks {
+            let s = self.sockets.get_mut::<tcp::Socket>(h);
+            if !s.can_recv() {
+                continue;
+            }
+            let port = s.local_endpoint().map_or(0, |e| e.port);
+            let data = s
+                .recv(|buf| {
+                    let owned = buf.to_vec();
+                    (buf.len(), owned)
+                })
+                .unwrap_or_default();
+            if data.is_empty() || !s.can_send() {
+                continue;
+            }
+            let mut reply = format!("{port}:").into_bytes();
+            reply.extend_from_slice(&data);
+            let _ = s.send_slice(&reply);
+        }
+    }
+
+    /// Whether any of `socks` ever left the listening state — i.e. whether a
+    /// connection reached that port at all.
+    fn any_accepted(&mut self, socks: &[SocketHandle]) -> bool {
+        socks.iter().any(|&h| {
+            let s = self.sockets.get_mut::<tcp::Socket>(h);
+            s.state() != tcp::State::Listen
+        })
     }
 }
 
@@ -480,5 +534,368 @@ fn a_flow_the_decider_declines_still_goes_straight_to_its_origin() {
             .iter()
             .any(|e| e.rule.starts_with("divert ")),
         "no divert should be recorded"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Ingress (V11.0, #330): reaching a port *inside* the guest from the host.
+// ---------------------------------------------------------------------------
+
+/// The guest port these tests expose, and one they deliberately never expose.
+const EXPOSED_PORT: u16 = 7777;
+const UNEXPOSED_PORT: u16 = 9999;
+
+/// A host client, on its own thread because the NAT is only serviced by the
+/// test thread: connect to `host_port`, send `token`, and read back exactly the
+/// reply the guest's echo will produce.
+///
+/// It returns what it actually received rather than asserting inside the
+/// thread, so a crossed stream is reported as *the wrong bytes* — the finding —
+/// instead of a panic in a thread nobody is watching.
+fn spawn_client(host_port: u16, token: String, guest_port: u16) -> ClientHandle {
+    let expected = format!("{guest_port}:{token}");
+    let want = expected.len();
+    let handle = std::thread::spawn(move || -> std::io::Result<String> {
+        let mut s = TcpStream::connect(SocketAddrV4::new(INGRESS_BIND_ADDR, host_port))?;
+        s.set_read_timeout(Some(Duration::from_secs(30)))?;
+        s.write_all(token.as_bytes())?;
+        s.flush()?;
+        let mut buf = vec![0u8; want];
+        s.read_exact(&mut buf)?;
+        Ok(String::from_utf8_lossy(&buf).to_string())
+    });
+    ClientHandle { handle, expected }
+}
+
+struct ClientHandle {
+    handle: std::thread::JoinHandle<std::io::Result<String>>,
+    expected: String,
+}
+
+/// Service the NAT and the guest until every client thread has finished, or
+/// `deadline` passes. Returns whether they all finished.
+fn pump_until_done(
+    guest: &mut Guest,
+    nat: &mut NatResponder,
+    socks: &[SocketHandle],
+    clients: &[ClientHandle],
+    deadline: Duration,
+) -> bool {
+    let start = StdInstant::now();
+    while start.elapsed() < deadline {
+        guest.serve_echo(socks);
+        pump(guest, nat);
+        if clients.iter().all(|c| c.handle.is_finished()) {
+            // One more pass so the final FIN exchange is not left in flight.
+            pump(guest, nat);
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    false
+}
+
+/// A NAT with the default (guard-on) allow-all egress policy. Ingress is
+/// governed by `expose`, not by the egress policy, so these tests deliberately
+/// do *not* opt into local egress: an exposed port must work without loosening
+/// the reserved-address guard.
+fn ingress_nat() -> NatResponder {
+    NatResponder::new(
+        [192, 168, 249, 1],
+        [0x02, 0, 0, 0, 0, 1],
+        EgressPolicy::allow_all(),
+        NatLimits::default(),
+    )
+}
+
+#[test]
+fn bytes_traverse_host_to_guest_and_back() {
+    // Guard 1, and the whole of #330: a host process writes to a loopback port
+    // and the bytes are answered by something listening *inside* the guest.
+    let mut nat = ingress_nat();
+    let exp = nat
+        .expose(SocketAddrV4::new(GUEST_ADDR, EXPOSED_PORT))
+        .expect("expose");
+    let mut guest = Guest::new();
+    let socks = guest.listen(EXPOSED_PORT, 2);
+
+    let clients = vec![spawn_client(exp.host_port, "hello".to_string(), EXPOSED_PORT)];
+    assert!(
+        pump_until_done(&mut guest, &mut nat, &socks, &clients, Duration::from_secs(30)),
+        "the host client must complete its round trip"
+    );
+    let got = clients
+        .into_iter()
+        .next()
+        .unwrap()
+        .handle
+        .join()
+        .expect("client thread")
+        .expect("client io");
+    assert_eq!(
+        got,
+        format!("{EXPOSED_PORT}:hello"),
+        "the reply must come from the guest's own listener on {EXPOSED_PORT}"
+    );
+}
+
+#[test]
+fn a_port_that_was_not_exposed_is_unreachable() {
+    // Guard 2. The guest listens on both ports; only one was named. The host
+    // gets an answer tagged with the exposed port and never with the other, and
+    // the unexposed port's sockets never leave LISTEN — so this fails both if
+    // ingress ever forwarded to the wrong port and if it ever forwarded to
+    // every port.
+    let mut nat = ingress_nat();
+    let exp = nat
+        .expose(SocketAddrV4::new(GUEST_ADDR, EXPOSED_PORT))
+        .expect("expose");
+    let mut guest = Guest::new();
+    let exposed_socks = guest.listen(EXPOSED_PORT, 2);
+    let unexposed_socks = guest.listen(UNEXPOSED_PORT, 2);
+    let all: Vec<SocketHandle> = exposed_socks
+        .iter()
+        .chain(unexposed_socks.iter())
+        .copied()
+        .collect();
+
+    let clients = vec![spawn_client(exp.host_port, "probe".to_string(), EXPOSED_PORT)];
+    assert!(
+        pump_until_done(&mut guest, &mut nat, &all, &clients, Duration::from_secs(30)),
+        "the exposed port must still work"
+    );
+    let got = clients
+        .into_iter()
+        .next()
+        .unwrap()
+        .handle
+        .join()
+        .expect("client thread")
+        .expect("client io");
+    assert_eq!(got, format!("{EXPOSED_PORT}:probe"));
+    assert!(
+        !guest.any_accepted(&unexposed_socks),
+        "nothing may have reached guest port {UNEXPOSED_PORT}; it was never exposed"
+    );
+
+    // And there is no *other* host port that would reach it: exposure is
+    // one-at-a-time and by name, so the whole inbound surface is this list.
+    let exposures = nat.exposures();
+    assert_eq!(exposures.len(), 1, "exactly one port was named");
+    assert_eq!(exposures[0].guest.port(), EXPOSED_PORT);
+    assert!(
+        !exposures.iter().any(|e| e.guest.port() == UNEXPOSED_PORT),
+        "no host listener may reach a port nobody exposed"
+    );
+}
+
+#[test]
+fn the_ingress_bind_address_is_loopback() {
+    // Guard 3. Two halves, because there are two ways to get this wrong: the
+    // constant could name a wider address, or the bind could ignore it. The
+    // test reads the same constant the bind does rather than restating
+    // `127.0.0.1`, so widening the constant fails here rather than silently
+    // agreeing with a copy.
+    assert!(
+        INGRESS_BIND_ADDR.is_loopback(),
+        "an exposed guest port must be reachable from this Mac and nowhere else"
+    );
+    let mut nat = ingress_nat();
+    let exp = nat
+        .expose(SocketAddrV4::new(GUEST_ADDR, EXPOSED_PORT))
+        .expect("expose");
+    let bound = nat.ingress[0]
+        .listener
+        .local_addr()
+        .expect("the listener's own address");
+    assert_eq!(
+        bound,
+        SocketAddr::from(SocketAddrV4::new(INGRESS_BIND_ADDR, exp.host_port)),
+        "the listener must be bound to the address the constant names"
+    );
+
+    // The behavioural half: from an address that is not loopback, the port must
+    // not answer. Skipped rather than faked when this Mac has no other IPv4 —
+    // a test that quietly proves nothing is worse than one that says why.
+    if let Some(lan) = non_loopback_ipv4() {
+        let err = TcpStream::connect_timeout(
+            &SocketAddr::from(SocketAddrV4::new(lan, exp.host_port)),
+            Duration::from_secs(2),
+        )
+        .err();
+        assert!(
+            err.is_some(),
+            "an exposed port answered on {lan}, so it is not loopback-only"
+        );
+    } else {
+        eprintln!("no non-loopback IPv4 on this host; skipped the off-loopback probe");
+    }
+}
+
+/// This host's primary non-loopback IPv4, discovered by asking the routing
+/// table which source address it would use — a connected UDP socket sends
+/// nothing, so this works offline and costs no packets. `None` when there is no
+/// route at all (an unplugged machine), which is a skip and not a failure.
+fn non_loopback_ipv4() -> Option<Ipv4Addr> {
+    let sock = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    sock.connect("192.0.2.1:9").ok()?;
+    match sock.local_addr().ok()? {
+        SocketAddr::V4(v4) if !v4.ip().is_loopback() && !v4.ip().is_unspecified() => Some(*v4.ip()),
+        _ => None,
+    }
+}
+
+/// How many host connections are opened at once in the concurrency guard.
+///
+/// Chosen against a measurement rather than a feeling: one browser page load
+/// opens on the order of 80 parallel connections (#329), and this stack had
+/// only ever been exercised with `curl` and `git clone`. 96 is the first number
+/// above that, so a regression that survives `curl` still fails here.
+const PARALLEL_FLOWS: usize = 96;
+
+#[test]
+fn concurrent_ingress_flows_do_not_cross_streams() {
+    // Guard 4, and the biggest open risk in the epic. Every client sends a
+    // token only it knows and must get that token back. A NAT that muddled two
+    // flows would still return *something* to everyone, so a length or liveness
+    // check would pass; only the identity check catches it.
+    let mut nat = ingress_nat();
+    let exp = nat
+        .expose(SocketAddrV4::new(GUEST_ADDR, EXPOSED_PORT))
+        .expect("expose");
+    let mut guest = Guest::new();
+    let socks = guest.listen(EXPOSED_PORT, PARALLEL_FLOWS);
+
+    let clients: Vec<ClientHandle> = (0..PARALLEL_FLOWS)
+        .map(|i| spawn_client(exp.host_port, format!("token-{i:04}"), EXPOSED_PORT))
+        .collect();
+    let finished = pump_until_done(
+        &mut guest,
+        &mut nat,
+        &socks,
+        &clients,
+        Duration::from_secs(60),
+    );
+
+    let mut wrong: Vec<String> = Vec::new();
+    let mut failed = 0usize;
+    for c in clients {
+        let expected = c.expected.clone();
+        match c.handle.join().expect("client thread") {
+            Ok(got) if got == expected => {}
+            Ok(got) => wrong.push(format!("expected {expected}, got {got}")),
+            Err(e) => {
+                failed += 1;
+                if wrong.len() < 4 {
+                    wrong.push(format!("{expected}: {e}"));
+                }
+            }
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{PARALLEL_FLOWS} concurrent ingress flows: {failed} errored, \
+         mismatches/errors: {wrong:?}"
+    );
+    assert!(
+        finished,
+        "all {PARALLEL_FLOWS} flows must complete inside the deadline"
+    );
+}
+
+#[test]
+fn an_ingress_flow_is_counted_against_the_connection_cap() {
+    // "Subject to NatLimits like any other flow": an exposed port must not be a
+    // way to open an unbounded number of host sockets. With a cap of 1, the
+    // second inbound connection is refused (the host stream is dropped, so the
+    // client sees a close, not a hang) and the refusal is recorded.
+    let mut nat = NatResponder::new(
+        [192, 168, 249, 1],
+        [0x02, 0, 0, 0, 0, 1],
+        EgressPolicy::allow_all(),
+        NatLimits {
+            max_connections: Some(1),
+            max_bytes_per_sec: None,
+        },
+    );
+    let exp = nat
+        .expose(SocketAddrV4::new(GUEST_ADDR, EXPOSED_PORT))
+        .expect("expose");
+    let mut guest = Guest::new();
+    let socks = guest.listen(EXPOSED_PORT, 4);
+
+    let clients: Vec<ClientHandle> = (0..2)
+        .map(|i| spawn_client(exp.host_port, format!("capped-{i}"), EXPOSED_PORT))
+        .collect();
+    // Not expected to all finish: one of them is meant to be refused.
+    let mut denied = false;
+    let start = StdInstant::now();
+    while start.elapsed() < Duration::from_secs(10) {
+        guest.serve_echo(&socks);
+        pump(&mut guest, &mut nat);
+        if nat
+            .drain_events()
+            .iter()
+            .any(|e| e.domain == "ingress" && !e.allowed && e.rule == "connection-limit")
+        {
+            denied = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    for c in clients {
+        let _ = c.handle.join();
+    }
+    assert!(
+        denied,
+        "an inbound flow over the connection cap must be refused and recorded"
+    );
+}
+
+#[test]
+fn exposing_refuses_port_zero_and_a_second_listener_for_the_same_port() {
+    // Fail closed: both of these are ambiguous rather than harmless, so neither
+    // may quietly succeed. Port 0 is the OS's word for "choose one" and no guest
+    // listens on it; a second exposure of the same port would give it two host
+    // ports with nothing to say which is meant.
+    let mut nat = ingress_nat();
+    let zero = nat
+        .expose(SocketAddrV4::new(GUEST_ADDR, 0))
+        .expect_err("port 0 must be refused");
+    assert!(zero.contains("port 0"), "{zero}");
+
+    let first = nat
+        .expose(SocketAddrV4::new(GUEST_ADDR, EXPOSED_PORT))
+        .expect("first exposure");
+    let dup = nat
+        .expose(SocketAddrV4::new(GUEST_ADDR, EXPOSED_PORT))
+        .expect_err("a duplicate exposure must be refused");
+    assert!(
+        dup.contains(&first.host_port.to_string()),
+        "the refusal must name the host port it is already on: {dup}"
+    );
+    assert_eq!(nat.exposures().len(), 1, "the refusal armed nothing");
+}
+
+#[test]
+fn ingress_source_ports_are_not_reused_while_in_flight() {
+    // Two inbound flows to one exposed port differ only in their gateway-side
+    // source port. Handing out the same one twice would present the guest with
+    // two connections sharing a four-tuple — the mechanism by which streams
+    // cross — so the pool must never repeat a port that is still live.
+    let mut nat = ingress_nat();
+    let mut seen: HashSet<u16> = HashSet::new();
+    for _ in 0..64 {
+        let port = nat.free_ingress_port().expect("a free source port");
+        assert!(seen.insert(port), "port {port} was handed out twice");
+        nat.ingress_ports.insert(port);
+    }
+    // Returned ports become available again, or a long-lived sandbox would run
+    // the pool dry.
+    let reclaimed = *seen.iter().next().unwrap();
+    nat.ingress_ports.remove(&reclaimed);
+    assert!(
+        nat.ingress_ports.len() == seen.len() - 1,
+        "the pool must give a retired port back"
     );
 }
