@@ -39,12 +39,24 @@ pub struct Report {
     pub whiteouts: usize,
     /// Directories cleared by an opaque marker.
     pub opaques: usize,
+    /// Directory entries that named an existing symlink to a directory, and
+    /// were therefore *not* applied.
+    ///
+    /// Counted rather than listed, and reported, because it is the one thing
+    /// here that changes what the image contains without anything being wrong:
+    /// a `.deb` that ships `./bin/` on a usr-merge base means `/usr/bin`, and
+    /// applying it literally would destroy the alias every other file depends
+    /// on.
+    pub aliased_dirs: usize,
 }
 
 impl Report {
     /// Did anything happen that a user should see before booting this?
     pub fn has_findings(&self) -> bool {
-        !self.refused.is_empty() || !self.sanitised.is_empty() || !self.skipped_nodes.is_empty()
+        !self.refused.is_empty()
+            || !self.sanitised.is_empty()
+            || !self.skipped_nodes.is_empty()
+            || self.aliased_dirs > 0
     }
 
     /// What to print on the console, one line per category that actually
@@ -86,6 +98,14 @@ impl Report {
                 } else {
                     "ies"
                 }
+            ));
+        }
+        if self.aliased_dirs > 0 {
+            out.push(format!(
+                "Redirected {} director{} through a usr-merge symlink \
+                 (e.g. `bin` -> `usr/bin`) rather than replacing it.",
+                self.aliased_dirs,
+                if self.aliased_dirs == 1 { "y" } else { "ies" }
             ));
         }
         out
@@ -143,6 +163,36 @@ pub fn apply(layers: &[Layer]) -> (Rootfs, Report) {
             match super::entry::decide(&e.raw) {
                 Verdict::Accept { path, kind, notes } => {
                     report.sanitised.extend(notes);
+
+                    // Follow any symlink the rootfs already has in this path's
+                    // parents, and refuse to overwrite a directory *alias*
+                    // with a real directory.
+                    //
+                    // This is the usr-merge rule, and it is not theoretical.
+                    // Ubuntu's `iproute2` ships `./bin/`, `./bin/ip`,
+                    // `./sbin/` and `./sbin/bridge` — because dpkg does this
+                    // aliasing itself, so the package never had to. Applied
+                    // literally, the directory entries replace `bin ->
+                    // usr/bin` and `sbin -> usr/sbin`, and every one of the
+                    // ~1400 programs that used to be reachable through them
+                    // stops being. Measured: the guest that resulted booted to
+                    // `Kernel panic - not syncing: No working init found`,
+                    // having tried `/sbin/init` and `/bin/sh` and found
+                    // neither.
+                    //
+                    // Resolving here rather than at write time also closes the
+                    // silent-drop half of the same class: cpio entries are
+                    // unpacked in sorted order, so a file written through a
+                    // symlink whose target has not been created yet is
+                    // discarded by the kernel without a word.
+                    let path = fs.resolve_parents(&path);
+                    if matches!(kind, EntryKind::Directory { .. })
+                        && matches!(fs.kind_of(&path), Some(EntryKind::Symlink { .. }))
+                    {
+                        report.aliased_dirs += 1;
+                        continue;
+                    }
+
                     // A hardlink is a second *name* for content already in the
                     // archive, and it stays one: cpio expresses that with a
                     // shared `ino`, and `write_cpio` does the grouping.
@@ -156,7 +206,7 @@ pub fn apply(layers: &[Layer]) -> (Rootfs, Report) {
                     // nothing is refused at the layer that introduced it rather
                     // than becoming a zero-byte command later.
                     if let EntryKind::Hardlink { target } = &kind {
-                        let src = target.trim_start_matches("./").to_string();
+                        let src = fs.resolve_parents(target.trim_start_matches("./"));
                         if fs.contains(&src) {
                             fs.insert(path, EntryKind::Hardlink { target: src }, Vec::new());
                         } else {
@@ -170,10 +220,12 @@ pub fn apply(layers: &[Layer]) -> (Rootfs, Report) {
                     fs.insert(path, kind, e.data.clone());
                 }
                 Verdict::Whiteout { path } => {
+                    let path = fs.resolve_parents(&path);
                     fs.whiteout(&path);
                     report.whiteouts += 1;
                 }
                 Verdict::Opaque { dir } => {
+                    let dir = fs.resolve_parents(&dir);
                     fs.opaque(&dir);
                     report.opaques += 1;
                 }
@@ -213,6 +265,69 @@ mod tests {
             },
             data: Vec::new(),
         }
+    }
+
+    fn symlink(path: &str, target: &str) -> TarEntry {
+        TarEntry {
+            raw: RawEntry {
+                path: path.to_string(),
+                kind: EntryKind::Symlink {
+                    target: target.to_string(),
+                },
+            },
+            data: Vec::new(),
+        }
+    }
+
+    /// Regression for a guest that panicked with `No working init found`.
+    ///
+    /// Ubuntu's `iproute2` ships `./bin/`, `./bin/ip`, `./sbin/` and
+    /// `./sbin/bridge`, because dpkg does usr-merge aliasing itself and the
+    /// package never had to. Applied literally on top of a base whose `bin` is
+    /// a symlink to `usr/bin`, the directory entry replaces the symlink and
+    /// every program reachable through it disappears at once -- `/bin/sh`
+    /// included, which is why the kernel had nothing left to run.
+    #[test]
+    fn a_deb_that_ships_bin_does_not_destroy_the_usr_merge_symlink() {
+        let base = layer(vec![
+            symlink("bin", "usr/bin"),
+            dir("usr"),
+            dir("usr/bin"),
+            file("usr/bin/sh", "#!/bin/sh\n"),
+        ]);
+        let iproute2 = layer(vec![dir("bin"), file("bin/ip", "ELF")]);
+        let (fs, report) = apply(&[base, iproute2]);
+
+        assert!(
+            matches!(fs.kind_of("bin"), Some(EntryKind::Symlink { .. })),
+            "`bin` stopped being a symlink, so everything under /bin is gone"
+        );
+        assert!(
+            fs.contains("usr/bin/sh"),
+            "/bin/sh is no longer reachable, and the kernel panics"
+        );
+        assert!(
+            fs.contains("usr/bin/ip"),
+            "`bin/ip` was not redirected through the alias: {:?}",
+            fs.paths().collect::<Vec<_>>()
+        );
+        assert!(!fs.contains("bin/ip"), "`ip` was written through a symlink");
+        assert_eq!(report.aliased_dirs, 1, "the redirection was not reported");
+    }
+
+    /// The redirection must not become a way to write outside the tree, and it
+    /// must not fire on the ordinary case. A layer replacing a symlink with a
+    /// *file* is a legitimate thing an image does and is left alone.
+    #[test]
+    fn replacing_a_symlink_with_a_file_is_still_allowed() {
+        let base = layer(vec![symlink("bin", "usr/bin"), dir("usr"), dir("usr/bin")]);
+        let upper = layer(vec![file("bin", "not a directory")]);
+        let (fs, report) = apply(&[base, upper]);
+        assert!(
+            matches!(fs.kind_of("bin"), Some(EntryKind::File { .. })),
+            "an explicit replacement was swallowed by the alias rule"
+        );
+        assert_eq!(report.aliased_dirs, 0);
     }
 
     fn layer(entries: Vec<TarEntry>) -> Layer {

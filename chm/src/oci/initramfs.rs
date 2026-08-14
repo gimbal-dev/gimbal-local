@@ -83,9 +83,12 @@ impl Rootfs {
         self.files.contains_key(path)
     }
 
-    /// Read a node back. Only the tests need this — `apply` writes through
-    /// `insert`/`whiteout`/`opaque` and `write_cpio` iterates.
-    #[cfg(test)]
+    /// Read a node back.
+    ///
+    /// Used by the browser build, which appends to `/etc/passwd` rather than
+    /// replacing it (replacing would take `root` with it, and the init runs as
+    /// root before it drops), and which needs a victim's size before removing
+    /// it in order to report what the subtraction cost.
     pub fn get(&self, path: &str) -> Option<&Node> {
         self.files.get(path)
     }
@@ -136,6 +139,63 @@ impl Rootfs {
 
     pub fn insert(&mut self, path: String, kind: EntryKind, data: Vec<u8>) {
         self.files.insert(path, Node { kind, data });
+    }
+
+    /// What is at `path` today, if anything.
+    ///
+    /// Narrower than [`Self::get`] on purpose: the caller that needs this is
+    /// asking a question about the *shape* of what is there, and handing it
+    /// the node's bytes as well would let it grow into something else.
+    pub fn kind_of(&self, path: &str) -> Option<&EntryKind> {
+        self.files.get(path).map(|n| &n.kind)
+    }
+
+    /// Rewrite `path` so that none of its parent directories is a symlink.
+    ///
+    /// Writing to `sbin/init` on a usr-merge image — Ubuntu, Debian bookworm,
+    /// `node:22-slim` — writes *through* `sbin -> usr/sbin`, and what happens
+    /// then is bad in two different ways depending on the serialiser. The cpio
+    /// unpacker emits entries in sorted order, so `sbin/init` is unpacked
+    /// before `usr/sbin` exists and the kernel drops the file **in silence**;
+    /// that is the trap [`super::nicfg::GUEST_PATH`] documents. `write_ext2`
+    /// cannot attach a child to a symlink inode at all.
+    ///
+    /// Measured: a `--disk` build on `ubuntu:24.04` put the generated init at
+    /// `sbin/init`, and the guest booted to
+    /// `Run /sbin/init as init process` / `Run /bin/sh as init process` —
+    /// the kernel tried it, could not find it, and fell through to a shell.
+    /// The image looked fine and simply did not run its own init.
+    ///
+    /// Absolute link targets are taken as rootfs-relative, which is what they
+    /// mean inside an image. A chain longer than 32 links is not resolved: it
+    /// is either a loop or something adversarial, and returning the path
+    /// unchanged leaves the caller no worse off than before this existed.
+    pub fn resolve_parents(&self, path: &str) -> String {
+        let Some((dir, name)) = path.rsplit_once('/') else {
+            return path.to_string();
+        };
+        let mut acc = String::new();
+        for part in dir.split('/') {
+            if !acc.is_empty() {
+                acc.push('/');
+            }
+            acc.push_str(part);
+            for _ in 0..32 {
+                match self.files.get(&acc).map(|n| &n.kind) {
+                    Some(EntryKind::Symlink { target }) => {
+                        acc = if let Some(abs) = target.strip_prefix('/') {
+                            abs.to_string()
+                        } else if let Some((parent, _)) = acc.rsplit_once('/') {
+                            format!("{parent}/{target}")
+                        } else {
+                            target.clone()
+                        };
+                    }
+                    _ => break,
+                }
+            }
+        }
+        format!("{acc}/{name}")
     }
 
     /// Remove one path — an OCI whiteout. Removes a whole subtree when the
@@ -837,6 +897,94 @@ fn read_cpio_file(d: &[u8], want: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Regression for a boot failure that produced no error message at all.
+    ///
+    /// A `--disk` build on `ubuntu:24.04` wrote the generated init to
+    /// `sbin/init`, but `sbin` is a symlink to `usr/sbin` on every usr-merge
+    /// base. The guest booted, printed `Run /sbin/init as init process`,
+    /// found nothing, and fell through to `/bin/sh` — an image that looked
+    /// built and simply did not run its own init.
+    #[test]
+    fn a_path_through_a_usr_merge_symlink_is_rewritten_to_the_real_directory() {
+        let mut r = Rootfs::new();
+        r.insert(
+            "sbin".to_string(),
+            EntryKind::Symlink {
+                target: "usr/sbin".to_string(),
+            },
+            Vec::new(),
+        );
+        assert_eq!(
+            r.resolve_parents("sbin/init"),
+            "usr/sbin/init",
+            "the init would be written through a symlink and silently lost"
+        );
+    }
+
+    /// Debian writes these as absolute links. Taking `/usr/sbin` literally
+    /// would put the file outside the rootfs, which is the opposite of the
+    /// bug this is fixing.
+    #[test]
+    fn an_absolute_link_target_is_read_as_rootfs_relative() {
+        let mut r = Rootfs::new();
+        r.insert(
+            "sbin".to_string(),
+            EntryKind::Symlink {
+                target: "/usr/sbin".to_string(),
+            },
+            Vec::new(),
+        );
+        assert_eq!(r.resolve_parents("sbin/init"), "usr/sbin/init");
+    }
+
+    /// A relative target resolves against the link's own directory, not
+    /// against the root. `usr/lib64 -> lib` means `usr/lib`, never `lib`.
+    #[test]
+    fn a_relative_link_target_resolves_beside_the_link() {
+        let mut r = Rootfs::new();
+        r.insert(
+            "usr/lib64".to_string(),
+            EntryKind::Symlink {
+                target: "lib".to_string(),
+            },
+            Vec::new(),
+        );
+        assert_eq!(r.resolve_parents("usr/lib64/ld.so"), "usr/lib/ld.so");
+    }
+
+    /// A loop must terminate. Returning something is fine; hanging the build
+    /// is not.
+    #[test]
+    fn a_symlink_loop_does_not_hang_the_build() {
+        let mut r = Rootfs::new();
+        for (from, to) in [("a", "b"), ("b", "a")] {
+            r.insert(
+                from.to_string(),
+                EntryKind::Symlink {
+                    target: to.to_string(),
+                },
+                Vec::new(),
+            );
+        }
+        let _ = r.resolve_parents("a/x");
+    }
+
+    /// The ordinary case must be left exactly alone, including a path with no
+    /// directory component at all — `/init` and the NIC configurator both live
+    /// at the root precisely to avoid this whole class.
+    #[test]
+    fn a_path_with_no_symlink_in_it_is_returned_unchanged() {
+        let mut r = Rootfs::new();
+        r.insert(
+            "usr/sbin".to_string(),
+            EntryKind::Directory { mode: 0o755 },
+            Vec::new(),
+        );
+        assert_eq!(r.resolve_parents("usr/sbin/init"), "usr/sbin/init");
+        assert_eq!(r.resolve_parents("init"), "init");
+        assert_eq!(r.resolve_parents("etc/passwd"), "etc/passwd");
+    }
 
     fn f(data: &[u8]) -> (EntryKind, Vec<u8>) {
         (

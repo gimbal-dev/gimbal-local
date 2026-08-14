@@ -163,6 +163,16 @@ Two things worth knowing before you choose it:
   `rootfs.img` that copy has diverged and rebuilding will not reproduce it. Copy
   the file per sandbox if you want the original back.
 
+On a usr-merge base — Ubuntu, Debian bookworm, `node:22-slim` — `/sbin` is a
+symlink to `/usr/sbin`, so the generated init is written to the real directory
+rather than through the link. Without that the guest boots, prints `Run
+/sbin/init as init process`, finds nothing and panics with `No working init
+found`. Layer entries are resolved the same way, and a directory entry that
+names an existing symlink to a directory is redirected rather than replacing
+it: Ubuntu's `iproute2` ships `./bin/` and `./sbin/` as real directories,
+because dpkg does that aliasing itself, and applying them literally destroys
+every path reachable through `/bin` — `/bin/sh` included.
+
 There is no `mkfs.ext4` on macOS, `hdiutil` only produces HFS/APFS, and building
 the filesystem inside a short-lived guest does not work either — the Alpine
 initramfs we boot carries exactly one `mkfs`, `mkfs.vfat`, and FAT has no
@@ -212,6 +222,85 @@ addons do not — and nothing at build time can tell them apart. A warning that
 fires on a working image is worse than a missing one.
 
 Tracking: [#224](https://github.com/gimbal-dev/gimbal-local/issues/224).
+
+## A browser sandbox: `--browser`
+
+```
+chm image build --browser --kernel ~/gimbal-images/ubuntu/Image --out ~/gimbal-images/browser
+chm create --kernel ~/gimbal-images/browser/Image \
+    --disk ~/gimbal-images/browser/rootfs.img \
+    --cpus 2 --memory 2048 --net --seconds 0
+```
+
+The guest boots straight into `chromium-headless-shell` and serves the Chrome
+DevTools Protocol on port 9222 **inside the guest**. It prints when it is ready
+and then does nothing else:
+
+```
+gimbal-browser: user namespaces work; running sandboxed as uid 65432
+gimbal-browser: CDP ready after 2
+{
+   "Browser": "HeadlessChrome/151.0.7922.34",
+   "Protocol-Version": "1.3",
+   ...
+}
+```
+
+`--browser` implies `--disk` (the rootfs is 472 MiB, which does not belong in
+RAM) and defaults the reference to `ubuntu:24.04`, which supplies libraries
+only. The browser itself comes from the Playwright CDN, and every one of the
+56 artefacts is fetched over HTTPS and checked against a SHA-256 pinned in
+`chm/src/oci/browser.rs` before it is used. Nothing is taken on trust because
+it arrived over TLS.
+
+### What is in it, and what is deliberately not
+
+| | |
+| --- | --- |
+| unpacked rootfs | 472.0 MiB, 5142 paths |
+| `rootfs.img` | 594.7 MiB, of which 118.8 MiB is free space |
+| browser | Chromium 151.0.7922.34, the build `playwright-core` 1.62.1 pins |
+| removed | 1638 paths: apt, dpkg, debconf, and their databases |
+
+The removals are the point. A guest reachable over CDP is only as safe as the
+claim "there is a browser in there and nothing else", and a package manager
+makes that claim false. The build **audits** the image it assembled rather than
+trusting the removal list, and refuses to write one where a package manager or
+a remote shell survived.
+
+There is still a `/bin/sh`, because the generated init is a shell script and
+the guest cannot boot without one. What there is not is anything that *serves*
+it: no sshd, no supervisor, no `/process/exec` endpoint.
+
+### Measured on hardware
+
+| | |
+| --- | --- |
+| boot to CDP answering | 2 s after the browser starts; kernel hands over at 0.13 s |
+| peak RSS, browser idle | 236-270 MB across 5-10 processes |
+| peak RSS, one page loaded | **526 MiB** over 10 processes (English Wikipedia) |
+| ceiling | `MAX_MEMORY_MIB` is 3008, so a page costs about 17% of it |
+| `/dev/shm` | needs no explicit `size=`; the tmpfs default gave 981 MiB and 1.3 MiB was used |
+| sandbox | user namespaces **work**; the browser drops to uid 65432 and keeps its own sandbox |
+
+`--no-sandbox` is only used if the kernel refuses an unprivileged user
+namespace, and the launcher says which path it took rather than passing the
+flag quietly. As root without it Chromium refuses to start at all
+(`zygote_host_impl_linux.cc:101`).
+
+### It is not reachable from the host yet
+
+`chm create --expose 9222` will connect and get nothing. This is a property of
+Chromium, not of chm, and it was measured rather than guessed:
+
+- `strings` on `headless_shell` 151 lists `remote-debugging-port` and
+  `remote-debugging-pipe`. There is **no** `remote-debugging-address` switch.
+- Passing one anyway leaves `/proc/net/tcp` showing `0100007F:2406` —
+  127.0.0.1:9222.
+
+chm's ingress dials the guest at its NAT address, so a guest that only listens
+on loopback cannot be reached. Closing that needs a forwarder inside the guest,
+which this image does not yet carry.
 
 ## Entrypoints
 

@@ -45,6 +45,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use super::apply;
+use super::browser;
 use super::ext2::{write_ext2, Ext2Image};
 use super::initramfs::{default_init, write_cpio};
 use super::modload;
@@ -142,6 +143,12 @@ pub fn usage() -> String {
          unpacking it, so guest RAM is sized for the workload\n                      \
          rather than for the image, and writes persist. Use this\n                      \
          for images too large to unpack into RAM.\n    \
+         --browser         Build a browser sandbox: add a pinned arm64\n                      \
+         chromium-headless-shell and the libraries it needs, take\n                      \
+         the package manager back out, and boot straight into the\n                      \
+         browser with CDP on 9222. Implies --disk, and defaults the\n                      \
+         reference to ubuntu:24.04. Reach it with\n                      \
+         `chm create --net --expose 9222`.\n    \
          --dry-run         Resolve and report without writing anything.\n\
      \n\
      NOTE: by default the rootfs ships as an initramfs, so it lives in guest\n     \
@@ -161,6 +168,7 @@ struct Args {
     vcpus: u32,
     dry_run: bool,
     disk: bool,
+    browser: bool,
     platform: registry::Platform,
 }
 
@@ -174,6 +182,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
     let mut vcpus = 2;
     let mut dry_run = false;
     let mut disk = false;
+    let mut browser = false;
     let mut platform = registry::Platform::host();
     let mut i = 0;
     while i < args.len() {
@@ -204,6 +213,7 @@ fn parse(args: &[String]) -> Result<Args, String> {
             }
             "--platform" => platform = registry::parse_platform(&next("--platform")?)?,
             "--disk" => disk = true,
+            "--browser" => browser = true,
             "--dry-run" => dry_run = true,
             other if other.starts_with('-') => {
                 return Err(format!("unknown option `{other}`\n\n{}", usage()));
@@ -218,7 +228,15 @@ fn parse(args: &[String]) -> Result<Args, String> {
         i += 1;
     }
     Ok(Args {
-        reference: reference.ok_or_else(|| format!("which image?\n\n{}", usage()))?,
+        reference: match reference {
+            Some(r) => r,
+            // The base of a browser sandbox is an implementation detail of the
+            // browser, not a choice the user is making, so `--browser` supplies
+            // it. Overridable, because someone measuring a different base
+            // should not have to patch the binary to do it.
+            None if browser => reference::parse(browser::BASE_IMAGE)?,
+            None => return Err(format!("which image?\n\n{}", usage())),
+        },
         kernel,
         modules,
         out,
@@ -226,7 +244,12 @@ fn parse(args: &[String]) -> Result<Args, String> {
         ram_mib,
         vcpus,
         dry_run,
-        disk,
+        // A browser rootfs is ~470 MB unpacked, which is over MAX_MEMORY_MIB
+        // once an initramfs is resident twice at the peak. `--disk` is not a
+        // preference here, it is the only variant that can boot -- so it is
+        // implied rather than left as a trap.
+        disk: disk || browser,
+        browser,
         platform,
     })
 }
@@ -694,10 +717,13 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
         }
         None => ImageConfig::default(),
     };
-    let entrypoint = args
-        .entrypoint
-        .clone()
-        .unwrap_or_else(|| config.boot_command());
+    let entrypoint = args.entrypoint.clone().unwrap_or_else(|| {
+        if args.browser {
+            format!("/{}", browser::LAUNCH_PATH)
+        } else {
+            config.boot_command()
+        }
+    });
     println!("  entrypoint: {entrypoint}");
     // Before the layer pull, not after: the whole cost of finding this out the
     // hard way is the pull and the boot that follow.
@@ -722,10 +748,16 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
         read_layers.push(layer);
     }
 
+    // The browser and its libraries, on top of the base image's layers and
+    // through the same policy: they are downloads off the internet, so they get
+    // the traversal, symlink-escape and setuid handling every layer gets.
+    if args.browser {
+        read_layers.extend(browser::layers(&browser::cache_dir(), LAYER_LIMIT_BYTES)?);
+    }
+
     let (mut rootfs, report) = apply::apply(&read_layers);
     let content = rootfs.content_bytes();
     println!("  rootfs: {} paths, {}", rootfs.len(), human_bytes(content));
-
     // Classify what the *image* shipped, before the generated init is added —
     // the init is ours and carries no loader, but the question being answered
     // is about the base someone chose.
@@ -740,6 +772,36 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
     // that happened to ship a file at one of these paths must not decide what
     // driver the guest loads.
     let module_paths = install_modules(&mut rootfs, bundled.as_ref())?;
+
+    // The browser's own files, and then the subtraction that makes the image
+    // honest. Both happen after every layer has been applied, so no ordering
+    // trick in an image can reintroduce a package manager or shadow the script
+    // the guest boots into.
+    if args.browser {
+        browser::install(&mut rootfs);
+        let removed = browser::strip(&mut rootfs);
+        // Checked, not asserted. The argument for exposing a CDP port is that
+        // the guest holds a browser and nothing else, so the build proves that
+        // about the image it actually assembled rather than trusting the
+        // removal list to have been complete.
+        let survivors = browser::audit(&rootfs);
+        if !survivors.is_empty() {
+            return Err(format!(
+                "the browser image still contains {} thing(s) that make \
+                 \"a browser and nothing else\" untrue:\n  {}\n\n\
+                 Add them to browser::REMOVED. Refusing to write an image \
+                 whose security argument does not hold.",
+                survivors.len(),
+                survivors.join("\n  ")
+            ));
+        }
+        println!(
+            "  browser: removed {} path(s), {}; audited clean — no package \
+             manager, no remote shell",
+            removed.paths,
+            human_bytes(removed.bytes)
+        );
+    }
 
     let init = default_init(
         &entrypoint,
@@ -762,8 +824,13 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
     // `--cmdline` is never appended to: restating one argument silently drops
     // `earlycon`, `panic=1` and the guest's wall clock.
     if args.disk {
+        // Through any symlink the image put in the way. `sbin` is a symlink to
+        // `usr/sbin` on every usr-merge base, and writing the init to a path
+        // that goes through it produces an image the kernel boots and then
+        // cannot find an init in — measured on `ubuntu:24.04`.
+        let sbin_init = rootfs.resolve_parents("sbin/init");
         rootfs.insert(
-            "sbin/init".to_string(),
+            sbin_init,
             EntryKind::File {
                 mode: 0o755,
                 size: init.len() as u64,
@@ -811,7 +878,9 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
     // for the image.
     let cpio = if args.disk { Vec::new() } else { write_cpio(&rootfs) };
     let ram = args.ram_mib.unwrap_or_else(|| {
-        if args.disk {
+        if args.browser {
+            browser::RAM_MIB
+        } else if args.disk {
             RAM_FLOOR_MIB
         } else {
             size_ram_mib(content)
@@ -925,7 +994,7 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
 /// The bomb limit is passed through unchanged and applies to the running total
 /// of unpacked bytes, which matters more here than for gzip: zstd reaches far
 /// higher ratios, so this is the format where that limit earns its keep.
-fn read_blob(blob: &[u8], limit: u64) -> Result<targz::Layer, String> {
+pub fn read_blob(blob: &[u8], limit: u64) -> Result<targz::Layer, String> {
     if blob.starts_with(&[0x1f, 0x8b]) {
         return targz::read_layer(GzDecoder::new(blob), limit);
     }
