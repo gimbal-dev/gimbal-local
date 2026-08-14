@@ -49,10 +49,46 @@ guest ──virtio-net──▶ chm userspace NAT ──host socket──▶ pub
 | Default posture | ⚠️ **allow-all to the public internet** when no policy is bound; default-deny only once a policy sets it |
 | Host-network isolation (loopback / LAN / metadata) | ✅ **enforced** by the reserved-address guard, regardless of policy (M31.1) |
 | Denial visibility | ✅ each blocked flow is logged to the console + audit trail once |
-| UDP beyond DNS, IPv6, inbound/listen, ICMP to real hosts | ⛔ out of V0 scope (answered-empty or denied, never silently broken) |
+| UDP beyond DNS, IPv6, ICMP to real hosts | ⛔ out of V0 scope (answered-empty or denied, never silently broken) |
+| **Inbound** — reaching a port *inside* the guest | ✅ opt-in per port with `chm create --expose <port>`, loopback only (V11.0) |
 
 The guest keeps the static address capture-side cloud-init gave it
 (`192.168.249.2/24`, gateway `192.168.249.1`); the NAT owns the gateway address.
+
+## Reaching a port inside the guest (`--expose`)
+
+Everything above is the guest reaching out. The other direction — a process on
+your Mac reaching a server *inside* the sandbox — is what `--expose` does, and
+it exists because an agent driving a browser in the guest needs to attach to a
+CDP endpoint from the host.
+
+```console
+$ chm create --kernel Image --initramfs rootfs.cpio --net --expose 7777
+chm: ingress 127.0.0.1:64707 -> guest 192.168.249.2:7777 (loopback only)
+...
+$ curl -s http://127.0.0.1:64707/
+hello from inside the guest
+```
+
+It is the existing NAT relay run backwards: a host `TcpListener` whose accepted
+connections open a smoltcp socket **towards** the guest, relayed by the same
+loop that carries egress and counted against the same `NatLimits`. Four
+properties are deliberate, and each is enforced rather than documented:
+
+- **Loopback only.** The listener binds `127.0.0.1` and nothing else. There is
+  no flag that accepts `0.0.0.0`, because that is how a sandbox's innards end up
+  on the LAN by accident. Measured: connecting to the same port via this Mac's
+  own LAN address is refused.
+- **Ephemeral host port**, chosen by the OS and printed at start-up, so two
+  sandboxes exposing the same guest port cannot collide.
+- **Opt-in, one port at a time.** No ranges, no wildcard. A port nobody named
+  has no host listener, so there is no path to it at all.
+- **Fails closed.** `--expose 8080:7777`, `--expose 7777/tcp`, `--expose
+  7000-7100` and `--expose 0` are all refused with what the value would have had
+  to be. `--expose` without `--net` is refused too.
+
+If nothing inside the guest is listening on the port, the host connection is
+**reset**, promptly — not left hanging.
 
 ## How the policy gets there
 

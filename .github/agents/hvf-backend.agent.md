@@ -73,7 +73,7 @@ codesign --sign - --entitlements hypervisor/tests/data/hv.entitlements --force .
 vmm_sys_util::ioctl` — the KVM path is Linux-only. Always:
 
 ```bash
-cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib   # 216 tests
+cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib   # 262 tests
 cargo clippy -p hypervisor --no-default-features --features hvf,kvm-snapshot
 ```
 
@@ -150,9 +150,9 @@ policy is enforced on the data path.
 ## Gates
 
 ```bash
-cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib   # 216
+cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib   # 262
 make clippy                                                                        # 0
-make test-hvf                                                                      # signed HVF integration
+make test-hvf                                                                      # signed HVF integration (33 pass, 1 known-red: #334)
 make security-check                                                                # invariant I1
 cargo +nightly fmt --all
 ```
