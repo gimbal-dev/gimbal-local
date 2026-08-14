@@ -26,11 +26,21 @@
 //! so default-deny is unbypassable from inside the sandbox. (M28.2 ships the NAT
 //! with an allow-all policy; M28.3 threads the real control-plane profile in.)
 //!
+//! # Ingress: the mirror image
+//!
+//! V11.0 adds the other direction, for the one case that needs it: a host
+//! process (Playwright, `curl`) reaching a port *inside* the guest. It is the
+//! same relay run backwards — a loopback [`TcpListener`] whose accepted
+//! connections open a smoltcp socket **towards** the guest — so it reuses
+//! [`NatResponder::relay`] and lands in the same `flows` vector under the same
+//! [`NatLimits`], rather than growing a second datapath. See
+//! [`NatResponder::expose`] for the fail-closed, opt-in-per-port contract.
+//!
 //! # V0 scope
 //!
-//! IPv4 TCP + DNS (A records). UDP beyond DNS, IPv6, ICMP to real hosts, and
-//! inbound/listen are out of scope for V0 — each is a clearly-denied or
-//! answered-empty path, never a silently-broken one.
+//! IPv4 TCP + DNS (A records). UDP beyond DNS, IPv6 and ICMP to real hosts are
+//! out of scope for V0 — each is a clearly-denied or answered-empty path, never
+//! a silently-broken one.
 
 mod device;
 mod dns;
@@ -50,7 +60,7 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{EthernetAddress, HardwareAddress, IpAddress, IpCidr};
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpStream};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
@@ -66,6 +76,22 @@ const HOST_READ_CHUNK: usize = 16 * 1024;
 
 /// How long a host connect may take before the flow is torn down.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// The address every host ingress listener binds to.
+///
+/// **Loopback, always.** An exposed guest port is reachable from processes on
+/// this Mac and from nowhere else. Binding wider would put a sandbox's innards
+/// on the LAN, which is a separate decision nobody has taken — so it is
+/// deliberately a constant rather than a flag, because a flag that accepts
+/// `0.0.0.0` is how that decision gets taken by accident. The bind and its test
+/// read this same constant; neither restates it.
+pub const INGRESS_BIND_ADDR: Ipv4Addr = Ipv4Addr::LOCALHOST;
+
+/// The gateway-side source ports ingress flows dial the guest from: the IANA
+/// dynamic range, so a guest's own connection tracking sees an ordinary client.
+const INGRESS_PORT_LO: u16 = 49152;
+const INGRESS_PORT_HI: u16 = 65535;
+
 /// How much burst the bandwidth token bucket allows: one second of the rate, so
 /// a short idle period lets a subsequent transfer briefly run at line rate
 /// before settling to the sustained cap.
@@ -121,10 +147,44 @@ enum HostSide {
     },
 }
 
-/// A live guest TCP flow: its smoltcp socket plus the host side.
+/// A live TCP flow: its smoltcp socket plus the host side.
+///
+/// One type for both directions. A guest-initiated (egress) flow's smoltcp
+/// socket was accepted from a listener and its host stream was dialled; an
+/// inbound (ingress) flow is the reverse. Past that difference the relay is the
+/// same, which is why there is one `Flow`, one `flows` vector and one
+/// [`NatResponder::service_flows`].
 struct Flow {
     handle: SocketHandle,
     host: HostSide,
+    /// For an ingress flow, the gateway-side source port smoltcp dialled the
+    /// guest from; returned to the pool when the flow retires. `None` for a
+    /// guest-initiated flow, whose ports the guest chose.
+    ingress_port: Option<u16>,
+}
+
+/// One explicitly exposed guest port and the host listener that reaches it.
+struct Ingress {
+    /// The endpoint *inside the guest* accepted connections are relayed to.
+    guest: SocketAddrV4,
+    /// Bound on [`INGRESS_BIND_ADDR`], port chosen by the OS. Non-blocking, so
+    /// accepting is just another thing the service tick does.
+    listener: TcpListener,
+    host_port: u16,
+}
+
+/// What an [`expose`](NatResponder::expose) produced: the loopback port a host
+/// process should dial, and the guest endpoint it reaches.
+///
+/// Returned rather than printed so the caller owns how it is reported — the
+/// port is ephemeral and has to reach the user somehow, and only the caller
+/// knows whether that is a console line or a JSON field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Exposure {
+    /// The OS-chosen port on [`INGRESS_BIND_ADDR`].
+    pub host_port: u16,
+    /// The guest endpoint it forwards to.
+    pub guest: SocketAddrV4,
 }
 
 /// Where an admitted flow should be sent, instead of straight to its origin.
@@ -165,6 +225,15 @@ pub struct NatResponder {
     /// destination, awaiting the guest's SYN.
     listeners: HashMap<SocketAddrV4, SocketHandle>,
     flows: Vec<Flow>,
+    /// Ports inside the guest a host process was explicitly allowed to reach,
+    /// each with its own loopback listener. Empty unless somebody named one.
+    ingress: Vec<Ingress>,
+    /// Gateway-side source ports currently used by ingress flows, so two
+    /// concurrent inbound connections cannot present the guest with the same
+    /// four-tuple.
+    ingress_ports: HashSet<u16>,
+    /// Where the next ingress source-port search starts.
+    next_ingress_port: u16,
     events: Vec<EgressEvent>,
     /// Denials already logged to the console, keyed by `"domain target"`, so a
     /// guest retransmitting a blocked SYN doesn't spam the operator.
@@ -221,6 +290,9 @@ impl NatResponder {
             dns,
             listeners: HashMap::new(),
             flows: Vec::new(),
+            ingress: Vec::new(),
+            ingress_ports: HashSet::new(),
+            next_ingress_port: INGRESS_PORT_LO,
             events: Vec::new(),
             logged_denials: HashSet::new(),
             gateway_ip: gw,
@@ -266,6 +338,195 @@ impl NatResponder {
     /// The gateway address the NAT presents to the guest.
     pub fn gateway_ip(&self) -> Ipv4Addr {
         self.gateway_ip
+    }
+
+    /// Make one TCP port *inside* the guest reachable from this Mac, on a fresh
+    /// loopback port the OS chooses, and return the [`Exposure`] describing it.
+    ///
+    /// This is the whole of the inbound surface, and it is deliberately narrow:
+    ///
+    /// * **Opt-in, one port at a time.** There is no range form and no wildcard
+    ///   form, so a port nobody named has no host listener and there is no code
+    ///   path that could dial it. That is the guarantee, and it is structural
+    ///   rather than a check somebody could later delete.
+    /// * **Loopback only** — see [`INGRESS_BIND_ADDR`].
+    /// * **Ephemeral host port**, so two sandboxes exposing the same guest port
+    ///   cannot collide, and neither can a sandbox and something already
+    ///   running on this Mac.
+    /// * **Fails closed.** Port 0, or a guest port already exposed (which host
+    ///   port would a caller then use?), is an error rather than a quiet
+    ///   no-op or a second listener nobody can tell apart.
+    ///
+    /// The caller supplies the guest's full address rather than the NAT
+    /// deriving it: the guest's IP is a convention held by `chm` (`GUEST_IP`),
+    /// and restating it here would be a second copy free to drift.
+    pub fn expose(&mut self, guest: SocketAddrV4) -> Result<Exposure, String> {
+        if guest.port() == 0 {
+            return Err(
+                "cannot expose port 0: it is not a port a guest can listen on, \
+                 it is the OS's word for \"choose one\""
+                    .to_string(),
+            );
+        }
+        if let Some(prev) = self.ingress.iter().find(|i| i.guest == guest) {
+            return Err(format!(
+                "guest port {} is already exposed on 127.0.0.1:{}; exposing it \
+                 twice would give it two host ports and no way to say which one \
+                 is meant",
+                guest.port(),
+                prev.host_port
+            ));
+        }
+        let bind = SocketAddrV4::new(INGRESS_BIND_ADDR, 0);
+        let listener = TcpListener::bind(bind)
+            .map_err(|e| format!("binding a host port for guest {guest}: {e}"))?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("making the ingress listener for {guest} non-blocking: {e}"))?;
+        let host_port = listener
+            .local_addr()
+            .map_err(|e| format!("reading the ingress port for {guest}: {e}"))?
+            .port();
+        self.ingress.push(Ingress {
+            guest,
+            listener,
+            host_port,
+        });
+        Ok(Exposure { host_port, guest })
+    }
+
+    /// Every exposure currently armed, in the order they were asked for.
+    pub fn exposures(&self) -> Vec<Exposure> {
+        self.ingress
+            .iter()
+            .map(|i| Exposure {
+                host_port: i.host_port,
+                guest: i.guest,
+            })
+            .collect()
+    }
+
+    /// Accept whatever the host ingress listeners have queued and dial each one
+    /// at the guest. Non-blocking: a tick with nothing waiting costs one
+    /// `accept` per exposure.
+    fn accept_ingress(&mut self) {
+        if self.ingress.is_empty() {
+            return;
+        }
+        // Collected first because dialling needs `&mut self` while the listener
+        // is borrowed from `self.ingress`.
+        let mut accepted: Vec<(SocketAddrV4, TcpStream)> = Vec::new();
+        for ing in &self.ingress {
+            // An error ends this listener's turn: `WouldBlock` is the normal
+            // "nothing waiting", and anything else is this listener's problem,
+            // not the next one's.
+            while let Ok((stream, _peer)) = ing.listener.accept() {
+                accepted.push((ing.guest, stream));
+            }
+        }
+        for (guest, stream) in accepted {
+            self.dial_guest(guest, stream);
+        }
+    }
+
+    /// Open a smoltcp socket towards `guest` for an accepted host connection.
+    ///
+    /// Dropping `stream` on any refusal is what the host client sees as a
+    /// closed connection — a fail-closed path with no silent hang.
+    fn dial_guest(&mut self, guest: SocketAddrV4, stream: TcpStream) {
+        let target = guest.to_string();
+        let policy = self.policy.label().to_string();
+        // An exposed port is not a way around the datapath caps: an inbound
+        // flow occupies a host socket and a smoltcp socket exactly like a
+        // guest-initiated one, and is counted with them.
+        if let Some(max) = self.limits.max_connections
+            && self.flows.len() + self.listeners.len() >= max
+        {
+            self.events.push(EgressEvent {
+                domain: "ingress",
+                target: target.clone(),
+                allowed: false,
+                rule: "connection-limit".to_string(),
+                policy,
+            });
+            self.note_denial("ingress", &target, "connection-limit");
+            return;
+        }
+        let Some(local_port) = self.free_ingress_port() else {
+            self.events.push(EgressEvent {
+                domain: "ingress",
+                target: target.clone(),
+                allowed: false,
+                rule: "ingress-ports-exhausted".to_string(),
+                policy,
+            });
+            self.note_denial("ingress", &target, "ingress-ports-exhausted");
+            return;
+        };
+        // The relay reads and writes without blocking on every service tick.
+        if stream.set_nonblocking(true).is_err() {
+            return;
+        }
+        stream.set_nodelay(true).ok();
+
+        let handle = self.sockets.add(new_tcp_socket());
+        let cx = self.iface.context();
+        let sock = self.sockets.get_mut::<tcp::Socket>(handle);
+        let remote = (IpAddress::Ipv4(*guest.ip()), guest.port());
+        if sock.connect(cx, remote, local_port).is_err() {
+            self.sockets.remove(handle);
+            self.events.push(EgressEvent {
+                domain: "ingress",
+                target: target.clone(),
+                allowed: false,
+                rule: "connect-failed".to_string(),
+                policy,
+            });
+            return;
+        }
+        // Bound the *connect* only. A guest that never answers (no such
+        // listener behind a live stack, or no stack at all) must fail rather
+        // than leave the host client waiting forever; but once established this
+        // is cleared, because a CDP websocket sitting idle for a minute is
+        // healthy, not stalled.
+        sock.set_timeout(Some(smoltcp::time::Duration::from_micros(
+            CONNECT_TIMEOUT.as_micros() as u64,
+        )));
+        self.ingress_ports.insert(local_port);
+        self.events.push(EgressEvent {
+            domain: "ingress",
+            target,
+            allowed: true,
+            rule: "exposed".to_string(),
+            policy,
+        });
+        self.flows.push(Flow {
+            handle,
+            host: HostSide::Relaying {
+                stream,
+                pending: Vec::new(),
+                host_eof: false,
+            },
+            ingress_port: Some(local_port),
+        });
+    }
+
+    /// Take an unused gateway-side source port, or `None` if every port in the
+    /// dynamic range is in flight.
+    fn free_ingress_port(&mut self) -> Option<u16> {
+        let span = (INGRESS_PORT_HI - INGRESS_PORT_LO) as u32 + 1;
+        for _ in 0..span {
+            let port = self.next_ingress_port;
+            self.next_ingress_port = if port == INGRESS_PORT_HI {
+                INGRESS_PORT_LO
+            } else {
+                port + 1
+            };
+            if !self.ingress_ports.contains(&port) {
+                return Some(port);
+            }
+        }
+        None
     }
 
     fn now(&self) -> SmolInstant {
@@ -336,6 +597,7 @@ impl NatResponder {
         }
         self.iface.poll(now, &mut self.device, &mut self.sockets);
         self.service_dns();
+        self.accept_ingress();
         self.promote_listeners();
         self.service_flows();
         // Poll again so bytes we pushed into sockets are framed for the guest.
@@ -496,6 +758,7 @@ impl NatResponder {
             self.flows.push(Flow {
                 handle,
                 host: HostSide::Connecting { rx },
+                ingress_port: None,
             });
         }
     }
@@ -513,6 +776,14 @@ impl NatResponder {
             let handle = self.flows[idx].handle;
             // Resolve a pending connect first (may transition the host side).
             self.advance_connect(idx);
+            // An established ingress flow no longer needs its connect deadline
+            // (see `dial_guest`): from here on, silence is idleness.
+            if self.flows[idx].ingress_port.is_some() {
+                let sock = self.sockets.get_mut::<tcp::Socket>(handle);
+                if sock.state() == tcp::State::Established && sock.timeout().is_some() {
+                    sock.set_timeout(None);
+                }
+            }
 
             let done = match &mut self.flows[idx].host {
                 HostSide::Connecting { .. } => false,
@@ -534,6 +805,9 @@ impl NatResponder {
         // Retire high-to-low so indices stay valid.
         for idx in retire.into_iter().rev() {
             let flow = self.flows.remove(idx);
+            if let Some(port) = flow.ingress_port {
+                self.ingress_ports.remove(&port);
+            }
             let sock = self.sockets.get_mut::<tcp::Socket>(flow.handle);
             sock.abort();
             self.sockets.remove(flow.handle);
@@ -571,13 +845,16 @@ impl NatResponder {
         }
     }
 
-    /// Relay bytes between one smoltcp socket and its host stream. Returns
-    /// `true` when the flow is fully done and should be retired.
     /// Relay bytes between one smoltcp socket and its host stream, consuming from
     /// `budget` (the tick's remaining bandwidth allowance; `None` = unlimited).
     /// When the budget is exhausted, bytes are left buffered — TCP backpressure
-    /// then slows the guest — rather than dropped. Returns `true` when the flow is
-    /// fully done and should be retired.
+    /// then slows the sender — rather than dropped. Returns `true` when the flow
+    /// is fully done and should be retired.
+    ///
+    /// Direction-agnostic, and that is the point: `sock` is always the
+    /// guest-facing side and `stream` always the host-facing one, whichever end
+    /// opened the connection. An ingress flow is this same function with the
+    /// request arriving on `stream` instead of `sock`.
     fn relay(sock: &mut tcp::Socket, host: &mut HostSide, budget: &mut Option<u64>) -> bool {
         let HostSide::Relaying {
             stream,
