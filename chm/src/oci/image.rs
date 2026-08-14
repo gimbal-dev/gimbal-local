@@ -762,8 +762,13 @@ fn build(args: &[String]) -> Result<ExitCode, String> {
     // `--cmdline` is never appended to: restating one argument silently drops
     // `earlycon`, `panic=1` and the guest's wall clock.
     if args.disk {
+        // Through any symlink the image put in the way. `sbin` is a symlink to
+        // `usr/sbin` on every usr-merge base, and writing the init to a path
+        // that goes through it produces an image the kernel boots and then
+        // cannot find an init in — measured on `ubuntu:24.04`.
+        let sbin_init = rootfs.resolve_parents("sbin/init");
         rootfs.insert(
-            "sbin/init".to_string(),
+            sbin_init,
             EntryKind::File {
                 mode: 0o755,
                 size: init.len() as u64,

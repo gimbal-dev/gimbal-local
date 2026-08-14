@@ -163,6 +163,16 @@ Two things worth knowing before you choose it:
   `rootfs.img` that copy has diverged and rebuilding will not reproduce it. Copy
   the file per sandbox if you want the original back.
 
+On a usr-merge base — Ubuntu, Debian bookworm, `node:22-slim` — `/sbin` is a
+symlink to `/usr/sbin`, so the generated init is written to the real directory
+rather than through the link. Without that the guest boots, prints `Run
+/sbin/init as init process`, finds nothing and panics with `No working init
+found`. Layer entries are resolved the same way, and a directory entry that
+names an existing symlink to a directory is redirected rather than replacing
+it: Ubuntu's `iproute2` ships `./bin/` and `./sbin/` as real directories,
+because dpkg does that aliasing itself, and applying them literally destroys
+every path reachable through `/bin` — `/bin/sh` included.
+
 There is no `mkfs.ext4` on macOS, `hdiutil` only produces HFS/APFS, and building
 the filesystem inside a short-lived guest does not work either — the Alpine
 initramfs we boot carries exactly one `mkfs`, `mkfs.vfat`, and FAT has no
