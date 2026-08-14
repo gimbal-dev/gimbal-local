@@ -31,6 +31,7 @@
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::io::{stdin, IsTerminal, Write};
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,7 +44,7 @@ use hypervisor::hvf::devices::{MmioBus, Pl011, Pl031};
 use hypervisor::hvf::virtio::block::{BlockDevice, FileBackend};
 use hypervisor::hvf::virtio::devcore::{Backend, MsiSink, MsiSpiInjector};
 use hypervisor::hvf::virtio::mmio::{self, MmioParams, VirtioMmioDevice, device_id};
-use hypervisor::hvf::virtio::nat::{EgressPolicy, NatLimits, NatResponder};
+use hypervisor::hvf::virtio::nat::{EgressPolicy, INGRESS_BIND_ADDR, NatLimits, NatResponder};
 use hypervisor::hvf::virtio::net::{NetDevice, NetKick};
 use hypervisor::hvf::virtio::{GuestMemory, features};
 use hypervisor::hvf::{
@@ -173,6 +174,11 @@ struct CreateArgs {
     /// deny-all posture, which is what an unconfigured sandbox gets everywhere
     /// else in this tree (see `docs/security-model.md` §1a).
     egress_allow: Vec<String>,
+    /// TCP ports *inside* the guest a process on this Mac may reach, each
+    /// forwarded from its own ephemeral loopback port (V11.0, #330). Empty
+    /// means nothing inside the guest is reachable, which is the posture every
+    /// sandbox has had until now.
+    expose: Vec<u16>,
     /// Credential-injection rules for the egress proxy. The guest never holds
     /// the credential; the header is attached as the request leaves. See
     /// `docs/credential-proxy.md`.
@@ -209,6 +215,11 @@ fn usage() -> String {
      \x20 --egress-allow <h:p>  Permit egress to host:port. Repeatable.\n\
      \x20                     Without any, the NIC is up but reaches nothing\n\
      \x20                     beyond the hosts --proxy-rules implies.\n\
+     \x20 --expose <port>     Make one TCP port inside the guest reachable\n\
+     \x20                     from this Mac. Repeatable, one port each; there\n\
+     \x20                     is no range and no wildcard. Each gets its own\n\
+     \x20                     ephemeral 127.0.0.1 port, printed at start-up,\n\
+     \x20                     so two sandboxes cannot collide. Loopback only.\n\
      \x20 --proxy-rules <path>  Credential-injection rules (see chm proxy).\n\
      \x20                     The hosts they name become reachable too:\n\
      \x20                     naming a host in a rule is the intent to reach\n\
@@ -262,12 +273,42 @@ fn default_max_seconds(stdin_is_tty: bool) -> u64 {
     }
 }
 
+/// Parse one `--expose` value into the guest TCP port it names.
+///
+/// **Fails closed.** A bare decimal port in `1..=65535` and nothing else. Every
+/// other shape people reasonably type — `7777/tcp`, `8080:7777`,
+/// `127.0.0.1:7777`, `7000-7100` — means something specific in some other tool
+/// and something *different* in each, so guessing here is guessing which port
+/// of a sandbox becomes reachable from the host. The refusal says what the
+/// value would have had to be, because "invalid" alone leaves the caller to
+/// find out by experiment which of the four they typed.
+fn parse_expose(raw: &str) -> Result<u16, String> {
+    let port: u16 = raw.parse().map_err(|_| {
+        format!(
+            "--expose {raw}: expose takes one guest TCP port and nothing else, \
+             as a plain number (--expose 7777). There is no host:guest form (the \
+             host port is ephemeral and chm prints it), no /tcp suffix, and no \
+             range: each port is named on its own."
+        )
+    })?;
+    if port == 0 {
+        return Err(
+            "--expose 0: port 0 is the OS's word for \"choose one\", not a port \
+             a guest can listen on. Name the port your program binds inside the \
+             guest."
+                .to_string(),
+        );
+    }
+    Ok(port)
+}
+
 fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     let mut cfg = ColdBootConfig::default();
     let mut dry_run = false;
     let mut max_seconds = default_max_seconds(stdin().is_terminal());
     let mut kernel: Option<PathBuf> = None;
     let mut egress_allow: Vec<String> = Vec::new();
+    let mut expose: Vec<u16> = Vec::new();
     let mut cmdline_explicit = false;
     let mut cmdline_extra: Vec<String> = Vec::new();
     let mut proxy_rules: Option<PathBuf> = None;
@@ -324,6 +365,19 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
             "--disk" => cfg.disks.push(PathBuf::from(value("--disk")?)),
             "--net" => cfg.net = true,
             "--egress-allow" => egress_allow.push(value("--egress-allow")?),
+            "--expose" => {
+                let port = parse_expose(&value("--expose")?)?;
+                // Ambiguous rather than harmless: the same port named twice
+                // would get two host ports, and nothing would say which one the
+                // caller meant to hand out.
+                if expose.contains(&port) {
+                    return Err(format!(
+                        "--expose {port} was given twice; each guest port is \
+                         exposed once, on one host port"
+                    ));
+                }
+                expose.push(port);
+            }
             "--env" => {
                 let (k, v) = postboot::parse_assignment(&value("--env")?)?;
                 env.insert(k, v);
@@ -371,6 +425,11 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     if !egress_allow.is_empty() && !cfg.net {
         return Err("--egress-allow needs --net; there is no NIC to allow through".into());
     }
+    if !expose.is_empty() && !cfg.net {
+        return Err(
+            "--expose needs --net; there is no NIC for a host connection to arrive on".into(),
+        );
+    }
     if proxy_rules.is_some() && !cfg.net {
         return Err("--proxy-rules needs --net; there is no traffic to intercept".into());
     }
@@ -410,6 +469,7 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
         dry_run,
         max_seconds,
         egress_allow,
+        expose,
         proxy_rules,
         workspace,
         postboot: postboot::Plan { env, post_boot },
@@ -1282,6 +1342,26 @@ fn await_ready(ready: &Arc<(Mutex<bool>, Condvar)>) {
     }
 }
 
+/// Arm one loopback listener per `--expose`d guest port and report each one.
+///
+/// The ports are reported rather than returned because they are the *only*
+/// thing the caller can act on: the host port is ephemeral by design (so two
+/// sandboxes cannot collide) and nobody can dial a number they were not told.
+/// A failure to bind is fatal — a guest booting without the port somebody asked
+/// for is a sandbox that silently is not the one they asked for.
+fn expose_guest_ports(mut nat: NatResponder, ports: &[u16]) -> Result<NatResponder, String> {
+    for &port in ports {
+        let exposure = nat.expose(SocketAddrV4::new(Ipv4Addr::from(GUEST_IP), port))?;
+        eprintln!(
+            "chm: ingress {}:{} -> guest {} (loopback only)",
+            INGRESS_BIND_ADDR,
+            exposure.host_port,
+            exposure.guest
+        );
+    }
+    Ok(nat)
+}
+
 /// Build a `virtio-mmio` device for each placement the image reserved.
 ///
 /// The device model is shared with the restore path — same queue walker, same
@@ -1358,6 +1438,7 @@ fn build_virtio(
                 eprintln!("chm: {}", egress_posture_line(Some(&policy)));
                 let responder =
                     NatResponder::new(GATEWAY_IP, GATEWAY_MAC, policy, NatLimits::default());
+                let responder = expose_guest_ports(responder, &args.expose)?;
                 VirtioMmioDevice::new(
                     "net0",
                     Backend::Net(NetDevice::new(Box::new(responder))),
@@ -1562,6 +1643,70 @@ mod tests {
         ]))
         .unwrap_err();
         assert!(e.contains("--net"), "error must name the missing flag: {e}");
+    }
+
+    #[test]
+    fn expose_takes_a_bare_port_and_refuses_every_other_shape() {
+        // Fail closed. Each of these means something in *some* tool and
+        // something different in each, so a guess here is a guess about which
+        // port of a sandbox becomes reachable from this Mac. The refusal has to
+        // name the form that would have worked, or the caller finds out by
+        // experiment.
+        let ok = parse(&args(&[
+            "--kernel", "/tmp/Image", "--net", "--expose", "7777", "--expose", "9222",
+        ]))
+        .unwrap();
+        assert_eq!(ok.expose, vec![7777, 9222], "each named port, in order");
+
+        for bad in [
+            "7777/tcp",
+            "8080:7777",
+            "127.0.0.1:7777",
+            "7000-7100",
+            "cdp",
+            "",
+            "-1",
+            "70000",
+        ] {
+            let e = parse(&args(&["--kernel", "/tmp/Image", "--net", "--expose", bad]))
+                .unwrap_err();
+            assert!(
+                e.contains("--expose") && e.contains("plain number"),
+                "`--expose {bad}` must refuse and say what would work: {e}"
+            );
+        }
+
+        let zero = parse(&args(&["--kernel", "/tmp/Image", "--net", "--expose", "0"])).unwrap_err();
+        assert!(zero.contains("choose one"), "port 0 must be refused: {zero}");
+    }
+
+    #[test]
+    fn exposing_the_same_port_twice_is_ambiguous_and_refused() {
+        let e = parse(&args(&[
+            "--kernel", "/tmp/Image", "--net", "--expose", "7777", "--expose", "7777",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("twice"), "{e}");
+    }
+
+    #[test]
+    fn expose_without_a_nic_is_a_parse_error_not_a_silent_no_op() {
+        // Same reasoning as --egress-allow: accepting it would promise a
+        // reachable port to a guest that has no NIC for the connection to
+        // arrive on, and the caller would only find out by curling it.
+        let e = parse(&args(&["--kernel", "/tmp/Image", "--expose", "7777"])).unwrap_err();
+        assert!(e.contains("--net"), "error must name the missing flag: {e}");
+    }
+
+    #[test]
+    fn nothing_inside_a_guest_is_reachable_unless_it_was_named() {
+        // The opt-in half of the contract, stated as a property of the default:
+        // a guest with a NIC and no --expose has no inbound surface at all.
+        let a = parse(&args(&["--kernel", "/tmp/Image", "--net"])).unwrap();
+        assert!(
+            a.expose.is_empty(),
+            "a sandbox is reachable from the host only where somebody said so"
+        );
     }
 
     #[test]
