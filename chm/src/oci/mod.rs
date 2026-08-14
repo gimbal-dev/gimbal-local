@@ -51,6 +51,7 @@
 //! review the security of this feature; the rest is plumbing.
 
 pub mod apply;
+pub mod browser;
 pub mod entry;
 pub mod ext2;
 pub mod image;
