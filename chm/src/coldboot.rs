@@ -579,7 +579,7 @@ impl ColdGuestImage {
     /// because that is the shape the hypervisor FFI takes; the allocation
     /// itself stays owned by `mem`.
     pub fn host_ptr(&self) -> *mut u8 {
-        use vm_memory::GuestMemory as _;
+        use vm_memory::GuestMemoryBackend as _;
         let region = self
             .mem
             .find_region(GuestAddress(self.ram_base))

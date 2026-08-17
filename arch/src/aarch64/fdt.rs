@@ -24,7 +24,7 @@ use hypervisor::arch::aarch64::regs::{
 use log::{debug, info, warn};
 use thiserror::Error;
 use vm_fdt::{FdtWriter, FdtWriterResult};
-use vm_memory::{Address, Bytes, GuestMemory, GuestMemoryError, GuestMemoryRegion};
+use vm_memory::{Address, Bytes, GuestMemoryBackend, GuestMemoryError, GuestMemoryRegion};
 
 use super::super::{DeviceType, GuestMemoryMmap, InitramfsConfig};
 use super::layout::{
