@@ -120,31 +120,19 @@ fn netmask(prefix: u8) -> Result<[u8; 4], NicfgError> {
 
 /// Rewrite one sentinel, insisting it occurs exactly once.
 ///
-/// Finding it twice is as bad as not finding it: we would not know which copy
-/// the program reads, so both are refused rather than picking the first.
+/// The "exactly once" rule lives in [`super::sentinel`] because
+/// [`super::cdpfwd`] needs the same rule and a second copy of it would be a
+/// second chance to get it wrong.
 fn patch(
     image: &mut [u8],
     name: &'static str,
     sentinel: u32,
     value: [u8; 4],
 ) -> Result<(), NicfgError> {
-    let needle = sentinel.to_le_bytes();
-    let hits: Vec<usize> = image
-        .windows(4)
-        .enumerate()
-        .filter(|(_, w)| *w == needle)
-        .map(|(i, _)| i)
-        .collect();
-    match hits.as_slice() {
-        [at] => {
-            image[*at..*at + 4].copy_from_slice(&value);
-            Ok(())
-        }
-        other => Err(NicfgError::Sentinel {
-            name,
-            found: other.len(),
-        }),
-    }
+    let at = super::sentinel::find_exactly_once(image, sentinel)
+        .map_err(|found| NicfgError::Sentinel { name, found })?;
+    image[at..at + 4].copy_from_slice(&value);
+    Ok(())
 }
 
 /// The configurator, with this deployment's addresses written into it.

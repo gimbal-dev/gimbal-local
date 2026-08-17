@@ -82,9 +82,11 @@ use std::str;
 use flate2::read::DeflateDecoder;
 use ring::digest::{digest, SHA256};
 
+use super::cdpfwd;
 use super::entry::{EntryKind, RawEntry};
 use super::initramfs::Rootfs;
 use super::targz::{Layer, TarEntry};
+use crate::create::GUEST_IP;
 use crate::imp::human_bytes;
 
 /// Where the browser lands in the guest. Under `/opt` because it is neither
@@ -950,9 +952,10 @@ mkdir -p "$XDG_CACHE_HOME" "$XDG_CONFIG_HOME" 2>/dev/null
 # passing one anyway leaves /proc/net/tcp showing `0100007F:2406`, which is
 # 127.0.0.1:9222.
 #
-# So this guest serves CDP to itself. Reaching it from the host needs a
-# forwarder inside the guest that this image deliberately does not yet carry;
-# see the note in docs/container-images.md.
+# So the guest reaches its own browser, and /{fwd} carries that one port from
+# the guest's NIC address to this loopback so `chm create --expose` can reach
+# it too. That forwarder relays bytes and understands nothing: see
+# chm/src/oci/cdpfwd.S and invariant I15 in docs/security-model.md.
 set -- --remote-debugging-port={port} \
     --user-data-dir="$PROFILE" \
     --disable-gpu \
@@ -978,6 +981,13 @@ else
 fi
 browser=$!
 
+# The one-port forwarder, which is how anything outside the guest reaches CDP
+# at all. It binds {guest_ip}:{port} and dials 127.0.0.1:{port}, forwards bytes
+# and parses nothing. Without --net there is no such address to bind, so it
+# says why and exits rather than pretending.
+/{fwd} &
+forwarder=$!
+
 # Poll rather than sleep. `--max-time` on every request, so a wedged endpoint
 # costs two seconds instead of the rest of the boot.
 i=0
@@ -1002,6 +1012,26 @@ while [ $i -lt {deadline} ]; do
 done
 [ $i -lt {deadline} ] || echo "{failed} CDP did not answer within {deadline}s"
 
+# Loopback answering is not the property that matters to a caller on the host;
+# reaching it through the forwarder is. Probed separately so a browser that is
+# up but unreachable cannot look like a success.
+if kill -0 "$forwarder" 2>/dev/null; then
+    through=$(curl -sS --max-time 2 \
+        http://{guest_ip}:{port}/json/version 2>/dev/null)
+    case "$through" in
+        *webSocketDebuggerUrl*)
+            echo "{tag}: CDP reachable at {guest_ip}:{port}"
+            ;;
+        *)
+            echo "{failed} the CDP forwarder is running but {guest_ip}:{port}"
+            echo "{failed} did not answer; --expose will find nothing there"
+            ;;
+    esac
+else
+    echo "{failed} the CDP forwarder did not stay up. Without --net the guest"
+    echo "{failed} has no {guest_ip} to bind and CDP is loopback-only."
+fi
+
 # PID 1's child, and the only thing this guest does from here on.
 wait "$browser"
 echo "{failed} the browser exited with status $?"
@@ -1009,6 +1039,11 @@ echo "{failed} the browser exited with status $?"
         port = CDP_PORT,
         uid = RUN_UID,
         dir = format_args!("/{GUEST_DIR}"),
+        fwd = cdpfwd::GUEST_PATH,
+        guest_ip = format_args!(
+            "{}.{}.{}.{}",
+            GUEST_IP[0], GUEST_IP[1], GUEST_IP[2], GUEST_IP[3]
+        ),
         tag = LOG_TAG,
         ready = READY_MARKER,
         failed = FAILED_MARKER,
@@ -1061,12 +1096,13 @@ pub fn strip(rootfs: &mut Rootfs) -> Removed {
     summary
 }
 
-/// Install the launcher, the unprivileged user, and the profile directory.
+/// Install the launcher, the CDP forwarder, the unprivileged user, and the
+/// profile directory.
 ///
 /// Written straight into the rootfs rather than shipped as a layer because
-/// these three are *ours*: no image content should be able to shadow the script
-/// the guest boots into, which is exactly what would happen if they went
-/// through [`super::apply::apply`] alongside the layers.
+/// these are *ours*: no image content should be able to shadow the script the
+/// guest boots into, or the forwarder it starts, which is exactly what would
+/// happen if they went through [`super::apply::apply`] alongside the layers.
 pub fn install(rootfs: &mut Rootfs) {
     let script = launch_script();
     rootfs.insert(
@@ -1076,6 +1112,19 @@ pub fn install(rootfs: &mut Rootfs) {
             size: script.len() as u64,
         },
         script.into_bytes(),
+    );
+
+    // A forwarder we cannot produce is a build-integrity failure, not something
+    // to ship a half-built image over: the launcher would start a path that is
+    // not there and the guest would be unreachable with no explanation.
+    let fwd = cdpfwd::forwarder().expect("cdpfwd image");
+    rootfs.insert(
+        cdpfwd::GUEST_PATH.to_string(),
+        EntryKind::File {
+            mode: 0o755,
+            size: fwd.len() as u64,
+        },
+        fwd,
     );
 
     // Appended, not written: dropping the base image's own `/etc/passwd` would
@@ -1490,6 +1539,81 @@ mod tests {
              remote-debugging-port and remote-debugging-pipe), so passing it \
              asserts something untrue:\n{s}"
         );
+    }
+
+    /// The forwarder is the only reason anything outside the guest can reach
+    /// CDP at all, so an image that installs it and a launcher that never
+    /// starts it is a silent failure of the whole feature.
+    #[test]
+    fn the_launcher_starts_the_forwarder_and_probes_through_it() {
+        let s = launch_script();
+        assert!(
+            s.contains(&format!("/{}\n", cdpfwd::GUEST_PATH))
+                || s.contains(&format!("/{} &", cdpfwd::GUEST_PATH)),
+            "the launcher never starts /{}:\n{s}",
+            cdpfwd::GUEST_PATH
+        );
+        let ip = format!(
+            "{}.{}.{}.{}",
+            GUEST_IP[0], GUEST_IP[1], GUEST_IP[2], GUEST_IP[3]
+        );
+        assert!(
+            s.contains(&format!("http://{ip}:{CDP_PORT}/json/version")),
+            "the launcher never checks that CDP is reachable through the \
+             forwarder, so a browser that is up but unreachable would look \
+             like a success:\n{s}"
+        );
+    }
+
+    /// A forwarder that did not bind must say so. Without `--net` there is no
+    /// guest address to bind and `--expose` will find nothing; a launcher that
+    /// stayed quiet about that would leave the user debugging the host.
+    #[test]
+    fn the_launcher_reports_a_forwarder_that_did_not_bind() {
+        let s = launch_script();
+        let complaints: Vec<&str> = s
+            .lines()
+            .filter(|l| !l.trim_start().starts_with('#'))
+            .filter(|l| l.contains(FAILED_MARKER) && l.contains("forwarder"))
+            .collect();
+        assert!(
+            !complaints.is_empty(),
+            "no line reports a forwarder that is not answering:\n{s}"
+        );
+    }
+
+    /// The address in the launcher must be the one chm dials, or the probe
+    /// would pass in the guest while `--expose` still reached nothing.
+    #[test]
+    fn the_launcher_probes_the_address_chm_dials() {
+        let s = launch_script();
+        assert!(
+            s.contains(&format!(
+                "{}.{}.{}.{}",
+                GUEST_IP[0], GUEST_IP[1], GUEST_IP[2], GUEST_IP[3]
+            )),
+            "the launcher does not mention the guest address chm forwards \
+             to:\n{s}"
+        );
+    }
+
+    #[test]
+    fn the_forwarder_is_installed_and_executable() {
+        let mut rootfs = Rootfs::default();
+        install(&mut rootfs);
+        let node = rootfs
+            .get(cdpfwd::GUEST_PATH)
+            .unwrap_or_else(|| panic!("/{} is not in the rootfs", cdpfwd::GUEST_PATH));
+        assert_eq!(node.data, cdpfwd::forwarder().expect("forwarder"));
+        match node.kind {
+            EntryKind::File { mode, .. } => assert_eq!(
+                mode & 0o111,
+                0o111,
+                "the forwarder is not executable, so the launcher's `&` starts \
+                 nothing"
+            ),
+            ref other => panic!("the forwarder is not a file: {other:?}"),
+        }
     }
 
     #[test]
