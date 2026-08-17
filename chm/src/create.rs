@@ -727,6 +727,7 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         &image_dir.display().to_string(),
         args.cfg.vcpus.into(),
         args.cfg.memory_mib,
+        &args.expose,
     )
     .unwrap_or_else(|e| {
         // A registry that cannot be written is a guest you cannot see, not a

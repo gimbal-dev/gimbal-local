@@ -47,6 +47,8 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use hypervisor::hvf::virtio::nat::INGRESS_BIND_ADDR;
+
 /// What kind of guest a record describes.
 ///
 /// Recorded rather than inferred because the entry points are not
@@ -94,6 +96,14 @@ pub struct Record {
     pub started_at_ms: u64,
     pub vcpus: u32,
     pub memory_mib: u64,
+    /// Guest TCP ports this run publishes to the host, from `--expose`.
+    ///
+    /// Ingress is a property of a **run**, not of a workspace: the same image
+    /// started twice, once with `--expose` and once without, has an inbound
+    /// surface in one case and none in the other. Nothing on disk in the
+    /// workspace can answer which, so the live-run registry is the only place
+    /// that can — and `chm posture` reads it from here rather than guessing.
+    pub exposed: Vec<u16>,
 }
 
 impl Record {
@@ -104,9 +114,10 @@ impl Record {
     /// than interpolated, because a path is user input and an image called
     /// `my"image` would otherwise emit a document nothing can parse.
     fn to_json(&self) -> String {
+        let exposed: Vec<String> = self.exposed.iter().map(u16::to_string).collect();
         format!(
             "{{\"pid\":{},\"kind\":\"{}\",\"label\":\"{}\",\"source\":\"{}\",\
-             \"started_at_ms\":{},\"vcpus\":{},\"memory_mib\":{}}}",
+             \"started_at_ms\":{},\"vcpus\":{},\"memory_mib\":{},\"exposed\":[{}]}}",
             self.pid,
             self.kind.as_str(),
             json_escape(&self.label),
@@ -114,6 +125,7 @@ impl Record {
             self.started_at_ms,
             self.vcpus,
             self.memory_mib,
+            exposed.join(","),
         )
     }
 
@@ -132,6 +144,11 @@ impl Record {
             started_at_ms: json_number(s, "started_at_ms")?,
             vcpus: json_number(s, "vcpus").unwrap_or(0) as u32,
             memory_mib: json_number(s, "memory_mib").unwrap_or(0),
+            // Absent means a record written before this field existed. An
+            // older `chm` publishing a port is not something a newer reader
+            // can discover, so the empty default is a statement about the
+            // record, not a claim that the run has no inbound surface.
+            exposed: json_u16_array(s, "exposed").unwrap_or_default(),
         })
     }
 }
@@ -180,8 +197,9 @@ pub fn register(
     source: &str,
     vcpus: u32,
     memory_mib: u64,
+    exposed: &[u16],
 ) -> io::Result<Option<Registration>> {
-    register_in(&registry_dir(), kind, label, source, vcpus, memory_mib)
+    register_in(&registry_dir(), kind, label, source, vcpus, memory_mib, exposed)
 }
 
 /// [`register`], against a named directory.
@@ -198,6 +216,7 @@ pub fn register_in(
     source: &str,
     vcpus: u32,
     memory_mib: u64,
+    exposed: &[u16],
 ) -> io::Result<Option<Registration>> {
     fs::create_dir_all(dir)?;
     let pid = process::id();
@@ -225,6 +244,7 @@ pub fn register_in(
         started_at_ms: now_ms(),
         vcpus,
         memory_mib,
+        exposed: exposed.to_vec(),
     };
     let mut f = &file;
     f.write_all(record.to_json().as_bytes())?;
@@ -244,8 +264,24 @@ pub fn list() -> Vec<Record> {
 
 /// [`list`], against a named directory.
 pub fn list_in(dir: &Path) -> Vec<Record> {
-    let Ok(entries) = fs::read_dir(dir) else {
-        return Vec::new();
+    try_list_in(dir).unwrap_or_default()
+}
+
+/// [`list_in`], distinguishing an empty registry from an unreadable one.
+///
+/// [`list_in`] answers `[]` either way, which is right for `chm ps` — it has
+/// nothing to show in both cases. It is wrong for a security report: "no run
+/// publishes a port" and "I could not find out" are opposite claims, and a
+/// control that reports the first when it means the second is a mechanism
+/// asserting safety it did not establish.
+///
+/// A registry directory that does not exist is not an error — nothing has ever
+/// registered, so nothing is running, and that is a real answer.
+pub fn try_list_in(dir: &Path) -> io::Result<Vec<Record>> {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e),
     };
 
     let mut live = Vec::new();
@@ -271,7 +307,7 @@ pub fn list_in(dir: &Path) -> Vec<Record> {
     }
 
     live.sort_by_key(|r| (r.started_at_ms, r.pid));
-    live
+    Ok(live)
 }
 
 /// Read a record if — and only if — its writer is still alive.
@@ -372,6 +408,22 @@ fn json_number(s: &str, key: &str) -> Option<u64> {
     rest[..end].parse().ok()
 }
 
+/// Pull an array of ports out of a flat JSON object.
+///
+/// `None` means the key is absent or unreadable; `Some(vec![])` means it was
+/// there and empty. Those are different answers — the first cannot rule out an
+/// inbound surface and the second can — so they must not collapse into one.
+fn json_u16_array(s: &str, key: &str) -> Option<Vec<u16>> {
+    let at = s.find(&format!("\"{key}\":["))? + key.len() + 4;
+    let rest = &s[at..];
+    let end = rest.find(']')?;
+    let body = rest[..end].trim();
+    if body.is_empty() {
+        return Some(Vec::new());
+    }
+    body.split(',').map(|p| p.trim().parse().ok()).collect()
+}
+
 /// `chm ps` — say what is running.
 pub fn ps_main(raw: &[String]) -> process::ExitCode {
     let mut json = false;
@@ -404,22 +456,40 @@ pub fn ps_main(raw: &[String]) -> process::ExitCode {
     }
 
     println!(
-        "{:<8} {:<8} {:<24} {:<10} STARTED",
-        "PID", "KIND", "NAME", "SIZE"
+        "{:<8} {:<8} {:<24} {:<10} {:<9} STARTED",
+        "PID", "KIND", "NAME", "SIZE", "EXPOSED"
     );
     for r in &runs {
         println!(
-            "{:<8} {:<8} {:<24} {:<10} {}",
+            "{:<8} {:<8} {:<24} {:<10} {:<9} {}",
             r.pid,
             r.kind.as_str(),
             truncate(&r.label, 24),
             format!("{}c/{}M", r.vcpus, r.memory_mib),
+            exposed_column(&r.exposed),
             relative(r.started_at_ms),
+        );
+    }
+    if runs.iter().any(|r| !r.exposed.is_empty()) {
+        println!(
+            "\nEXPOSED names guest ports reachable from this host, on {INGRESS_BIND_ADDR}."
         );
     }
     println!("\nStop one with `kill <PID>`; a guest with a writable disk is better");
     println!("stopped from its own console, because a signal is a power cut.");
     process::ExitCode::SUCCESS
+}
+
+/// Render a run's published ports for the `EXPOSED` column.
+///
+/// A run with no inbound surface reads `-` rather than an empty cell, so the
+/// column is never ambiguous between "none" and "this row did not say".
+fn exposed_column(ports: &[u16]) -> String {
+    if ports.is_empty() {
+        return "-".to_string();
+    }
+    let rendered: Vec<String> = ports.iter().map(u16::to_string).collect();
+    truncate(&rendered.join(","), 9)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -489,9 +559,21 @@ mod tests {
         }
 
         fn register(&self, kind: Kind, label: &str) -> Registration {
-            register_in(&self.dir, kind, label, &format!("/src/{label}"), 2, 512)
-                .unwrap()
-                .expect("registration")
+            self.register_exposing(kind, label, &[])
+        }
+
+        fn register_exposing(&self, kind: Kind, label: &str, exposed: &[u16]) -> Registration {
+            register_in(
+                &self.dir,
+                kind,
+                label,
+                &format!("/src/{label}"),
+                2,
+                512,
+                exposed,
+            )
+            .unwrap()
+            .expect("registration")
         }
     }
 
@@ -624,6 +706,7 @@ mod tests {
             started_at_ms: 42,
             vcpus: 1,
             memory_mib: 8,
+            exposed: vec![9222, 7777],
         };
         let back = Record::from_json(&r.to_json()).expect("round trip");
         assert_eq!(back, r);
@@ -680,6 +763,7 @@ mod tests {
             started_at_ms: 3,
             vcpus: 2,
             memory_mib: 512,
+            exposed: vec![8080],
         };
         let back = Record::from_json(&r.to_json()).expect("round trip");
         assert_eq!(back.source, "/real", "a label impersonated the source");
@@ -732,6 +816,7 @@ mod tests {
             started_at_ms: at,
             vcpus: 1,
             memory_mib: 1,
+            exposed: Vec::new(),
         }
     }
 
@@ -749,5 +834,135 @@ mod tests {
             "help does not point at the daemon"
         );
         assert!(u.contains("--json"));
+    }
+
+    /// Published ports survive the round trip, and an older record does not
+    /// come back claiming ports it never had.
+    ///
+    /// The second half is the compatibility property: every record written
+    /// before this field existed has no `exposed` key at all, and defaulting to
+    /// empty is the only reading of that which is not an invention.
+    #[test]
+    fn published_ports_round_trip_and_default_to_none() {
+        let r = Record {
+            pid: 11,
+            kind: Kind::Cold,
+            label: "browser".to_string(),
+            source: "/img/browser".to_string(),
+            started_at_ms: 1,
+            vcpus: 2,
+            memory_mib: 2048,
+            exposed: vec![9222, 7777],
+        };
+        let back = Record::from_json(&r.to_json()).expect("round trip");
+        assert_eq!(back.exposed, vec![9222, 7777], "the ports did not survive");
+
+        let older = "{\"pid\":5,\"kind\":\"cold\",\"label\":\"a\",\"source\":\"/s\",\
+                     \"started_at_ms\":9,\"vcpus\":2,\"memory_mib\":64}";
+        let old = Record::from_json(older).expect("a record predating the field still loads");
+        assert!(
+            old.exposed.is_empty(),
+            "a record with no exposed key invented ports"
+        );
+    }
+
+    /// Absent and present-but-empty are different answers.
+    ///
+    /// They collapse to the same `Vec` in a `Record`, deliberately — an older
+    /// writer and a guest with no `--expose` both mean "no ingress". They must
+    /// not collapse in the *reader*, or a future caller that needs to tell them
+    /// apart has no way back.
+    #[test]
+    fn the_reader_distinguishes_an_absent_array_from_an_empty_one() {
+        assert_eq!(json_u16_array("{\"a\":1}", "exposed"), None);
+        assert_eq!(json_u16_array("{\"exposed\":[]}", "exposed"), Some(vec![]));
+        assert_eq!(
+            json_u16_array("{\"exposed\":[9222, 80]}", "exposed"),
+            Some(vec![9222, 80])
+        );
+    }
+
+    /// A registry that cannot be read is not a registry that is empty.
+    ///
+    /// `list_in` cannot tell the two apart and does not need to. `try_list_in`
+    /// exists because `chm posture` does: reporting "nothing publishes a port"
+    /// when the truthful answer is "I could not find out" is a control claiming
+    /// safety it never established.
+    #[test]
+    fn an_unreadable_registry_is_an_error_and_a_missing_one_is_not() {
+        let s = Scratch::new("readable");
+        let missing = s.dir.join("never-existed");
+        assert!(
+            try_list_in(&missing).expect("a missing registry is an empty one").is_empty(),
+            "a registry that has never been written should read as no runs"
+        );
+
+        // A *file* where a directory is expected is the cheapest unreadable
+        // registry there is, and unlike a chmod it behaves the same for root.
+        let not_a_dir = s.dir.join("occupied");
+        fs::write(&not_a_dir, b"x").unwrap();
+        assert!(
+            try_list_in(&not_a_dir).is_err(),
+            "an unreadable registry was reported as an empty one"
+        );
+    }
+
+    /// `chm ps` shows the ports, and shows their absence as absence.
+    #[test]
+    fn the_exposed_column_names_the_ports_or_says_there_are_none() {
+        assert_eq!(exposed_column(&[]), "-");
+        assert_eq!(exposed_column(&[9222]), "9222");
+        assert_eq!(exposed_column(&[9222, 7777]), "9222,7777");
+        assert!(
+            exposed_column(&[9222, 7777, 8080]).ends_with('\u{2026}'),
+            "a long list must be marked as truncated, not silently shortened"
+        );
+    }
+
+    /// The one entry point with an `--expose` flag must hand it to the registry.
+    ///
+    /// Every other assertion here is about an *outcome*, and an outcome test
+    /// structurally cannot see a call site passing `&[]` instead of the user's
+    /// ports: the record round-trips perfectly, `chm ps` renders perfectly, and
+    /// `chm posture` reports "no guest publishes a port" while one does. That
+    /// is the seventh instance of this class in this repo, so it is read from
+    /// the source. Needle assembled from parts so it cannot match itself.
+    #[test]
+    fn chm_create_hands_its_exposed_ports_to_the_registry() {
+        // Scoped to the `runs::register` call itself, not to the whole file.
+        // `&args.expose` also appears where the ports are actually opened, and a
+        // needle satisfied by a second site cannot detect its removal from the
+        // one that matters -- the first draft of this guard passed happily
+        // against a create.rs that registered no ports at all.
+        let src = include_str!("create.rs");
+        let call = format!("runs::{}(", "register");
+        let at = src.find(&call).expect("chm create no longer registers its run");
+
+        // Balance the parens: `label_for(&image_dir)` is nested inside, so the
+        // first `)` is not the end of the call.
+        let mut depth = 0usize;
+        let mut end = at;
+        for (i, c) in src[at..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = at + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let args: String = src[at..end].split_whitespace().collect();
+
+        let needle = format!("&args.{},", "expose");
+        assert!(
+            args.contains(&needle),
+            "chm create no longer hands its published ports to the registry, so \
+             chm posture will report a sandbox with an open port as having none. \
+             The call reads: {args}"
+        );
     }
 }

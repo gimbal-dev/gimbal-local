@@ -41,7 +41,9 @@ use std::process::ExitCode;
 
 use crate::credproxy;
 use crate::limits;
+use crate::runs;
 use crate::signing;
+use hypervisor::hvf::virtio::nat::INGRESS_BIND_ADDR;
 
 /// Whether a control is on, and how strongly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +185,20 @@ fn assess(dir: &Path) -> Vec<Control> {
         state: egress_state,
         detail: egress_detail,
     });
+
+    // I14 — ingress. Every other row here answers for *this*
+    // process's environment or *this* workspace's files. Ingress can do
+    // neither: `--expose` is a flag on `chm create`, so it is neither an env
+    // binding nor a file, and it has already been consumed by the time a guest
+    // is running. The live-run registry is the only thing that records it.
+    //
+    // That makes this row machine-scoped rather than workspace-scoped, and
+    // that is the correct scope rather than a compromise: a published port is
+    // bound on host loopback, which every process on this host shares. A door
+    // into someone else's sandbox is still a door into this machine, and a
+    // posture report that stayed silent about it because a different directory
+    // opened it would be reporting the boundary it did not check.
+    out.push(ingress_control(&runs::registry_dir()));
 
     // Resource ceilings (M30.6) — default-on since V4.2.
     let (doc, source) = limits::resolve_limits(dir, None);
@@ -349,6 +365,82 @@ fn assess(dir: &Path) -> Vec<Control> {
     });
 
     out
+}
+
+/// The ingress row, over an injected registry directory so it is testable.
+///
+/// This is the executable form of **I14**, which has been written down since
+/// V11.0 with a full evidence column and has never had a posture row. The
+/// posture-coupling guard could not have caught that: it requires every
+/// `CHM_STRICT_*` env var to appear in a row, and ingress is armed by a CLI
+/// flag on `chm create`, not by the environment.
+///
+/// It is also the one control that escapes the "whose posture is it?" trap by
+/// construction. Every other row resolves from the environment of the process
+/// computing it, so `chm posture` and `chm ctl posture` can legitimately
+/// disagree; a published port is a property of a **live run**, so both read the
+/// same machine-wide registry and both answer for the whole Mac.
+///
+/// Three outcomes, not two. The third is the point:
+///
+/// * ports published → **weakened**. It is a deliberate weakening and the
+///   report exits non-zero, which is what makes `chm posture && deploy` refuse
+///   while a door into a sandbox is open.
+/// * nothing published → **not applicable**. There is no inbound surface to
+///   describe, and calling that "active" would claim a control we do not run.
+/// * the registry could not be read → **weakened**, naming the reason. It must
+///   not read as "nothing is exposed": that is the shape of failure this repo
+///   has banked seven times, a mechanism reporting safety it never established.
+fn ingress_control(registry: &Path) -> Control {
+    let (state, detail) = match runs::try_list_in(registry) {
+        Err(e) => (
+            State::Weakened,
+            format!(
+                "could not read the live-run registry ({}): {e}. This report \
+                 cannot say whether a sandbox on this machine publishes a port, \
+                 so treat it as if one does.",
+                registry.display()
+            ),
+        ),
+        Ok(live) => {
+            let mut published: Vec<String> = live
+                .iter()
+                .filter(|r| !r.exposed.is_empty())
+                .map(|r| {
+                    let ports: Vec<String> = r.exposed.iter().map(u16::to_string).collect();
+                    format!("{} (pid {}) {}", r.label, r.pid, ports.join(","))
+                })
+                .collect();
+            published.sort();
+            if published.is_empty() {
+                (
+                    State::NotApplicable,
+                    format!(
+                        "no guest running on this machine publishes a port. \
+                         `chm create --expose <PORT>` opens one, on \
+                         {INGRESS_BIND_ADDR}."
+                    ),
+                )
+            } else {
+                (
+                    State::Weakened,
+                    format!(
+                        "reachable from this host on {INGRESS_BIND_ADDR}: {}. \
+                         Anything on this machine can dial those, not just the \
+                         process that asked for them. `chm ps` lists them; \
+                         stopping the guest closes them.",
+                        published.join("; ")
+                    ),
+                )
+            }
+        }
+    };
+    Control {
+        invariant: "I14",
+        name: "guest ingress",
+        state,
+        detail,
+    }
 }
 
 pub(crate) fn posture_main(raw: &[String]) -> ExitCode {
@@ -563,5 +655,117 @@ mod tests {
                  mentions it. Add a row to assess()."
             );
         }
+    }
+
+    /// The registry is the only thing that can answer for ingress.
+    ///
+    /// `--expose` is a flag on `chm create` — not an env var, not a workspace
+    /// file — so `assess`, which reads this process's environment and a
+    /// workspace directory, structurally cannot see it. Ingress is a property
+    /// of a *live run*, which is what the run registry records.
+    ///
+    /// The records are made by `register_in` rather than written by hand,
+    /// because a hand-written record is *dead*: liveness is an `flock` held by
+    /// the writer, so a synthetic file is reaped on the first read and every
+    /// assertion below would pass by describing an empty registry. That is
+    /// exactly how the first draft of these tests passed while proving nothing.
+    fn live_registry(name: &str, exposed: &[u16]) -> (std::path::PathBuf, runs::Registration) {
+        let dir = std::env::temp_dir().join(format!(
+            "chm-posture-ingress-{}-{}",
+            name,
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let reg = runs::register_in(
+            &dir,
+            runs::Kind::Cold,
+            name,
+            &format!("/img/{name}"),
+            2,
+            2048,
+            exposed,
+        )
+        .expect("registry is writable")
+        .expect("registration");
+        (dir, reg)
+    }
+
+    /// A published port is a weakening, and the report has to say so.
+    ///
+    /// It is a deliberate one — `--expose` is opt-in and refused without
+    /// `--net` — but `chm posture` is a gate (`chm posture && deploy`), so
+    /// exiting 0 while a door into a sandbox stands open is the whole failure
+    /// this row exists to remove.
+    #[test]
+    fn a_published_port_is_reported_as_a_weakened_control() {
+        let (dir, reg) = live_registry("browser", &[9222]);
+        let c = ingress_control(&dir);
+        assert_eq!(c.state, State::Weakened, "an open port read as safe");
+        assert!(c.detail.contains("9222"), "the port itself is not named");
+        assert!(
+            c.detail.contains("browser"),
+            "the run holding it is not named"
+        );
+        assert!(
+            c.detail.contains(&INGRESS_BIND_ADDR.to_string()),
+            "the address the port is bound to is not named"
+        );
+        drop(reg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Nothing published is not a control we are running, so do not claim one.
+    #[test]
+    fn no_published_port_is_not_applicable_rather_than_active() {
+        let (dir, reg) = live_registry("quiet", &[]);
+        let c = ingress_control(&dir);
+        assert_eq!(
+            c.state,
+            State::NotApplicable,
+            "a guest with no exposed port was reported as one that has some"
+        );
+        drop(reg);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The branch this row exists for.
+    ///
+    /// "No run publishes a port" and "I could not find out" are opposite
+    /// claims, and reporting the first when the second is true is a mechanism
+    /// asserting safety it never established — the shape of failure this repo
+    /// has banked seven times.
+    #[test]
+    fn a_registry_that_cannot_be_read_is_never_reported_as_nothing_exposed() {
+        let path = std::env::temp_dir().join(format!("chm-posture-blind-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&path);
+        std::fs::write(&path, b"not a directory").unwrap();
+
+        let c = ingress_control(&path);
+        assert_eq!(
+            c.state,
+            State::Weakened,
+            "an unreadable registry was reported as a machine with no open ports"
+        );
+        assert!(
+            c.detail.contains("could not read"),
+            "the report does not say that it failed to find out"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A row nobody adds to the report is a row nobody reads.
+    ///
+    /// `assess` is where the report is assembled, and an assertion about
+    /// `ingress_control`'s return value cannot see a call site that no longer
+    /// exists — the class this repo has missed seven times. Needle assembled
+    /// from parts so it cannot match its own assertion text.
+    #[test]
+    fn the_report_actually_carries_the_ingress_row() {
+        let needle = format!("{}(&runs::registry_dir())", "ingress_control");
+        assert!(
+            include_str!("posture.rs").contains(&needle),
+            "chm posture no longer reports ingress, so a sandbox can be \
+             reachable from this host with nothing saying so"
+        );
     }
 }
