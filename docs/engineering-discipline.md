@@ -162,6 +162,57 @@ guard was matching prose, not code, and reported a safety it did not provide.
 > documentation instead of the code. Match the full invocation, and write the
 > reason into the test so nobody loosens it back.
 
+### A source-reading needle can silently relocate
+
+The sharper version of the same family. A guard that reads its own file with
+`include_str!` and navigates by `split(needle).nth(1)` is only correct while the
+occurrence it means is the one it lands on. Both halves of that can move:
+
+- **The needle can match itself.** A file that reads its own source contains the
+  assertion text too, so the literal in `split("…")` is one of its own matches.
+  Assemble the needle from parts — `format!("let mut tally = {}::default();",
+  "EgressTally")` — so it cannot.
+- **The needle can occur in the test module.** A production line and three test
+  uses of the same string means `.nth(1)` is correct *only* because production
+  happens to come first. Rename or move the production line and the guard
+  silently starts inspecting test code, with the suite still green — it reports
+  on a region that is not the one it names.
+
+The cure is an assertion, not a cleverer search:
+
+```rust
+let spawn = format!("let mut tally = {}::default();", "EgressTally");
+assert_eq!(
+    src.matches(&spawn).count(), 1,
+    "…or this guard reads a region that is not the loop"
+);
+let body = src.split(&spawn).nth(1)…
+```
+
+That fails loudly in **both** directions: an occurrence removed from the site
+that matters, and an occurrence added somewhere that does not.
+
+> **Generalisation:** *a needle appearing in more than one place cannot detect
+> its removal from the one that matters.* Uniqueness is part of the guard, so
+> assert it.
+
+### A mutation harness with hardcoded backup paths goes stale
+
+A helper script that restores from fixed paths (`/tmp/create.rs.good`) is
+restoring whatever was there when you *last* refreshed it — which silently
+reverts every edit you have made since. Re-copy the backups immediately before
+any mutation run, and check the digests. A harness that quietly undoes your work
+is worse than mutating by hand.
+
+Two more one-liners that have each cost a run here:
+
+- A Python mutation helper **must assert the text actually changed.**
+  `str.replace` no-ops silently on an absent needle, and a mutation that never
+  landed is indistinguishable from a fire-proof guard.
+- Prose **wraps.** A guard reading a `.md` file must flatten whitespace before
+  searching, or a reinstated claim that happens to break across a newline sails
+  straight past the substring search.
+
 ### Restoring: never use `git checkout`
 
 Use a `/tmp` backup and `cp`. `git checkout` to restore a mutated file has
@@ -350,7 +401,7 @@ These are not style preferences. Each one has cost real time.
 
 | Trap | What happens | What to do |
 | --- | --- | --- |
-| **Every `cargo build` strips the hypervisor entitlement** | `hv_vm_create failed: 0xfae94007 — HV_DENIED` | Re-sign after *every* build: `codesign --sign - --entitlements hypervisor/tests/data/hv.entitlements --force ./target/debug/chm`, run from the **repo root** |
+| **Every `cargo build` strips the hypervisor entitlement** | `hv_vm_create failed: 0xfae94007 — HV_DENIED` | Re-sign after *every* build: `codesign --sign - --entitlements hypervisor/tests/data/hv.entitlements --force ./target/debug/chm`, run from the **repo root**. Verify by **reading** `codesign -d --entitlements - ./target/debug/chm` and looking for `com.apple.security.hypervisor` / `[Bool] true` — do not `grep -c`, the dump format has changed before and a count is a proxy for the answer, not the answer |
 | **The target dir is the workspace root** | You look in `chm/target/` and find nothing | The binary is at `<repo>/target/debug/chm` |
 | **Root-level `cargo build --bin chm` fails in `kvm-ioctls`** — *and looks like it worked* | Stale binary silently used | Always `cd chm && cargo build` |
 | **`cargo test -p hypervisor` with default features fails on macOS** | `E0432: unresolved import vmm_sys_util::ioctl` — the KVM path is Linux-only | Use `--no-default-features --features hvf,kvm-snapshot` |
