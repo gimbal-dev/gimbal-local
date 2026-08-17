@@ -52,6 +52,7 @@
 
 pub mod apply;
 pub mod browser;
+pub mod cdpfwd;
 pub mod entry;
 pub mod ext2;
 pub mod image;
@@ -61,4 +62,5 @@ pub mod modules;
 pub mod nicfg;
 pub mod reference;
 pub mod registry;
+pub mod sentinel;
 pub mod targz;
