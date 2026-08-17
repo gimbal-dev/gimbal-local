@@ -1104,14 +1104,27 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         for dev in &net_devices {
             dev.set_net_kick(kick.clone());
         }
+        // A workspace is where an audit trail can live; without one the handle
+        // records nothing. Draining is *not* conditional on that, because the
+        // NAT buffers every decision until somebody takes them — an undrained
+        // cold boot grows that buffer for the life of the guest, and `--seconds
+        // 0` is the shape this path is normally run in.
+        let audit = args
+            .workspace
+            .as_deref()
+            .map(crate::audit::AuditLog::open)
+            .unwrap_or_default();
         Some(
             thread::Builder::new()
                 .name("cold-net".into())
                 .spawn(move || {
                     await_ready(&ready);
+                    // Deduplicates, so a page opening eighty connections to one
+                    // allowed host writes one record rather than eighty.
+                    let mut tally = crate::audit::EgressTally::default();
                     while running.load(Ordering::Acquire) {
                         for dev in &net_devices {
-                            dev.service_net();
+                            service_and_record(dev, &mut tally, &audit);
                         }
                         kick.wait(NET_SERVICE_INTERVAL);
                     }
@@ -1339,6 +1352,47 @@ fn await_ready(ready: &Arc<(Mutex<bool>, Condvar)>) {
     let mut done = lock.lock().unwrap();
     while !*done {
         done = cv.wait(done).unwrap();
+    }
+}
+
+/// Service a NAT device and record every decision it made.
+///
+/// Servicing and recording are deliberately one operation. The NAT buffers
+/// every egress decision until somebody takes them, so a caller that services
+/// without draining grows an unbounded `Vec` for the life of the guest — and
+/// `--seconds 0` is the shape this path is normally run in. Keeping the two
+/// halves in one function means the call site cannot do half of it.
+fn service_and_record(
+    dev: &VirtioMmioDevice,
+    tally: &mut crate::audit::EgressTally,
+    audit: &crate::audit::AuditLog,
+) {
+    dev.service_net();
+    record_egress(dev.drain_egress_events(), tally, audit);
+}
+
+/// Write one audit record per *distinct* egress decision.
+///
+/// The tally deduplicates, so a page opening eighty connections to one allowed
+/// host writes one record rather than eighty. An [`AuditLog`] with no workspace
+/// behind it drops everything, which is why there is no `Option` here: the
+/// no-workspace case is the disabled handle, not a branch.
+///
+/// [`AuditLog`]: crate::audit::AuditLog
+fn record_egress(
+    events: Vec<hypervisor::hvf::virtio::nat::EgressEvent>,
+    tally: &mut crate::audit::EgressTally,
+    audit: &crate::audit::AuditLog,
+) {
+    for ev in events {
+        if !tally.observe(ev.domain, &ev.target, &ev.rule, ev.allowed) {
+            continue;
+        }
+        if ev.allowed {
+            audit.egress_allow(ev.domain, &ev.target, &ev.rule, &ev.policy);
+        } else {
+            audit.egress_deny(ev.domain, &ev.target, &ev.rule, &ev.policy);
+        }
     }
 }
 
@@ -1987,5 +2041,122 @@ mod tests {
             "create must still ask the archive whether its init installs the CA, and act \
              on the answer; without it a pre-#238 image fails a certificate check in silence"
         );
+    }
+
+    /// A denial the guest was told about must also survive the guest.
+    ///
+    /// The console print is a stream nobody is watching once the VM stops; the
+    /// audit trail is the only channel that can answer "what did this sandbox
+    /// try to reach" afterwards. Before this, the cold-boot path opened no
+    /// `AuditLog` at all, so `--workspace`'s own help text ("Where the proxy CA
+    /// and audit trail live") over-promised on every `chm create`.
+    #[test]
+    fn a_denied_flow_reaches_the_audit_trail() {
+        let dir = std::env::temp_dir().join(format!("chm-egaudit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit = crate::audit::AuditLog::open(&dir);
+        let mut tally = crate::audit::EgressTally::default();
+
+        super::record_egress(vec![egress_event("dns", "neverssl.com", false)], &mut tally, &audit);
+
+        let trail = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap_or_default();
+        assert!(
+            trail.contains(r#""event":"egress-deny""#) && trail.contains("neverssl.com"),
+            "a refused destination must be named in audit.jsonl, got: {trail}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// One page can open eighty connections to one host. Eighty identical lines
+    /// would bury the one refusal a reader is looking for.
+    #[test]
+    fn a_repeated_decision_is_recorded_once() {
+        let dir = std::env::temp_dir().join(format!("chm-egdedup-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let audit = crate::audit::AuditLog::open(&dir);
+        let mut tally = crate::audit::EgressTally::default();
+
+        for _ in 0..80 {
+            super::record_egress(
+                vec![egress_event("tcp", "10.0.0.1:443", true)],
+                &mut tally,
+                &audit,
+            );
+        }
+
+        let trail = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap_or_default();
+        let n = trail.lines().filter(|l| l.contains("10.0.0.1:443")).count();
+        assert_eq!(n, 1, "eighty identical flows must write one record, wrote {n}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The defect this whole change exists to fix: the events pile up until
+    /// somebody takes them, and nothing else in the process ever does.
+    ///
+    /// Draining is therefore *not* conditional on a workspace. With no
+    /// `--workspace` the handle is the disabled one and drops every record --
+    /// but the buffer must still be emptied, or a `--seconds 0` guest grows it
+    /// for its whole life. `AuditLog::default()` is exactly that handle, so
+    /// this asserts the drain happens on the path where nothing is written.
+    #[test]
+    fn events_are_consumed_even_with_no_workspace() {
+        let audit = crate::audit::AuditLog::default();
+        let mut tally = crate::audit::EgressTally::default();
+        let events = vec![
+            egress_event("dns", "a.example", false),
+            egress_event("dns", "b.example", false),
+        ];
+
+        super::record_egress(events, &mut tally, &audit);
+
+        // `record_egress` takes the vector by value, so consuming it is what
+        // bounds the buffer; the tally having seen both is the observable proof
+        // that neither was skipped on the no-workspace path.
+        assert!(
+            !tally.observe("dns", "a.example", "default-deny", false),
+            "the first event was never observed, so the drain did not reach it"
+        );
+        assert!(
+            !tally.observe("dns", "b.example", "default-deny", false),
+            "the second event was never observed, so the drain stopped early"
+        );
+    }
+
+    /// Servicing a NAT device without draining it is the defect. This asserts
+    /// the two cannot be separated at the call site: `service_and_record` is
+    /// the only thing the cold-net loop calls, and it does both.
+    #[test]
+    fn the_net_loop_cannot_service_without_recording() {
+        let src = include_str!("create.rs");
+        let loop_body = src
+            .split("let mut tally = crate::audit::EgressTally::default();")
+            .nth(1)
+            .and_then(|s| s.split("kick.wait(NET_SERVICE_INTERVAL)").next())
+            .expect("the cold-net loop must still spawn with a tally and a kick");
+        assert!(
+            loop_body.contains(&format!("{}(dev,", "service_and_record")),
+            "the cold-net loop must service through service_and_record, which drains"
+        );
+        assert!(
+            !loop_body.contains("dev.service_net()"),
+            "the cold-net loop must not service a device directly -- that is the \
+             shape that leaves drain_egress_events() uncalled and the buffer growing"
+        );
+    }
+
+    fn egress_event(
+        domain: &'static str,
+        target: &str,
+        allowed: bool,
+    ) -> hypervisor::hvf::virtio::nat::EgressEvent {
+        hypervisor::hvf::virtio::nat::EgressEvent {
+            domain,
+            target: target.to_string(),
+            allowed,
+            rule: if allowed { "allow".into() } else { "default-deny".into() },
+            policy: "test-policy".into(),
+        }
     }
 }
