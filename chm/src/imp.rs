@@ -2620,6 +2620,10 @@ fn run_usgic(args: &Args, loaded: Loaded, kind: runs::Kind) -> Result<ExitCode, 
         &args.snapshot_dir.display().to_string(),
         loaded.num_vcpus,
         loaded.total_ram / (1 << 20),
+        // `chm run` and `chm connect` have no `--expose` (#341: cold boot has
+        // the networking flags, the snapshot path has the checkpoints, and the
+        // two sets are disjoint). No ingress to declare, so declare none.
+        &[],
     )
     .unwrap_or_else(|e| {
         eprintln!("chm: warning: could not record this run: {e}");

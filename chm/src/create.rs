@@ -44,7 +44,9 @@ use hypervisor::hvf::devices::{MmioBus, Pl011, Pl031};
 use hypervisor::hvf::virtio::block::{BlockDevice, FileBackend};
 use hypervisor::hvf::virtio::devcore::{Backend, MsiSink, MsiSpiInjector};
 use hypervisor::hvf::virtio::mmio::{self, MmioParams, VirtioMmioDevice, device_id};
-use hypervisor::hvf::virtio::nat::{EgressPolicy, INGRESS_BIND_ADDR, NatLimits, NatResponder};
+use hypervisor::hvf::virtio::nat::{
+    EgressEvent, EgressPolicy, INGRESS_BIND_ADDR, NatLimits, NatResponder,
+};
 use hypervisor::hvf::virtio::net::{NetDevice, NetKick};
 use hypervisor::hvf::virtio::{GuestMemory, features};
 use hypervisor::hvf::{
@@ -52,6 +54,7 @@ use hypervisor::hvf::{
 };
 use hypervisor::{VmExit, VmOps};
 
+use crate::audit::{AuditLog, EgressTally};
 use crate::coldboot::{ColdBootConfig, VirtioKind};
 use crate::console::RawConsole;
 use crate::imp::{
@@ -724,6 +727,7 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         &image_dir.display().to_string(),
         args.cfg.vcpus.into(),
         args.cfg.memory_mib,
+        &args.expose,
     )
     .unwrap_or_else(|e| {
         // A registry that cannot be written is a guest you cannot see, not a
@@ -1112,7 +1116,7 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         let audit = args
             .workspace
             .as_deref()
-            .map(crate::audit::AuditLog::open)
+            .map(AuditLog::open)
             .unwrap_or_default();
         Some(
             thread::Builder::new()
@@ -1121,7 +1125,7 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                     await_ready(&ready);
                     // Deduplicates, so a page opening eighty connections to one
                     // allowed host writes one record rather than eighty.
-                    let mut tally = crate::audit::EgressTally::default();
+                    let mut tally = EgressTally::default();
                     while running.load(Ordering::Acquire) {
                         for dev in &net_devices {
                             service_and_record(dev, &mut tally, &audit);
@@ -1364,8 +1368,8 @@ fn await_ready(ready: &Arc<(Mutex<bool>, Condvar)>) {
 /// halves in one function means the call site cannot do half of it.
 fn service_and_record(
     dev: &VirtioMmioDevice,
-    tally: &mut crate::audit::EgressTally,
-    audit: &crate::audit::AuditLog,
+    tally: &mut EgressTally,
+    audit: &AuditLog,
 ) {
     dev.service_net();
     record_egress(dev.drain_egress_events(), tally, audit);
@@ -1380,9 +1384,9 @@ fn service_and_record(
 ///
 /// [`AuditLog`]: crate::audit::AuditLog
 fn record_egress(
-    events: Vec<hypervisor::hvf::virtio::nat::EgressEvent>,
-    tally: &mut crate::audit::EgressTally,
-    audit: &crate::audit::AuditLog,
+    events: Vec<EgressEvent>,
+    tally: &mut EgressTally,
+    audit: &AuditLog,
 ) {
     for ev in events {
         if !tally.observe(ev.domain, &ev.target, &ev.rule, ev.allowed) {
@@ -2130,8 +2134,19 @@ mod tests {
     #[test]
     fn the_net_loop_cannot_service_without_recording() {
         let src = include_str!("create.rs");
+        // Assembled from parts so this literal is not itself a match (the file
+        // reads its own source), and asserted unique so a second occurrence
+        // cannot silently shift `nth(1)` onto some other region -- which is
+        // exactly what a rename of the production line would otherwise do.
+        let spawn = format!("let mut tally = {}::default();", "EgressTally");
+        assert_eq!(
+            src.matches(&spawn).count(),
+            1,
+            "the cold-net loop's tally must be the only match for {spawn:?}, \
+             or this guard reads a region that is not the loop"
+        );
         let loop_body = src
-            .split("let mut tally = crate::audit::EgressTally::default();")
+            .split(&spawn)
             .nth(1)
             .and_then(|s| s.split("kick.wait(NET_SERVICE_INTERVAL)").next())
             .expect("the cold-net loop must still spawn with a tally and a kick");
