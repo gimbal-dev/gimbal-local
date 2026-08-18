@@ -40,6 +40,11 @@ use crate::{
 
 mod ffi;
 use ffi::*;
+// Re-exported for the integration suite, which needs to name the guest's
+// virtual-timer registers to construct a restore that arrives with the timer
+// already overdue. A test that restated these values would keep passing if the
+// encodings ever moved.
+pub use ffi::{SYSREG_CNTV_CTL_EL0, SYSREG_CNTV_CVAL_EL0};
 pub mod gic;
 use gic::HvfGicV3;
 pub mod checkpoint;
@@ -3053,6 +3058,18 @@ impl HvfVcpu {
         Ok(v)
     }
 
+    /// Does this vCPU have Apple's managed GIC behind it?
+    ///
+    /// The CPU-interface registers live in the GIC, not in the vCPU sysreg file,
+    /// so a read of one succeeds exactly when a managed GIC exists and fails on
+    /// a GIC-less VM. Two callers need this answer — snapshot capture, and the
+    /// virtual-timer activation handler — and they must not each carry their own
+    /// spelling of it: the timer handler's correctness depends on agreeing with
+    /// what capture recorded.
+    fn managed_gic_present(&self) -> bool {
+        self.get_icc_reg(GIC_ICC_SNAPSHOT_REGS[0]).is_ok()
+    }
+
     /// Restore virtual-counter continuity from a snapshot's captured
     /// `CNTVCT_EL0`. HVF defines `CNTVCT_EL0 = mach_absolute_time() - offset`,
     /// so seeding the offset with `mach_absolute_time() - snapshot_cntvct` makes
@@ -4435,7 +4452,7 @@ impl Vcpu for HvfVcpu {
         // Capture the managed-GIC CPU-interface registers. These are absent on a
         // GIC-less VM; in that case the first read fails and we record none.
         let mut gic_icc = Vec::new();
-        if self.get_icc_reg(GIC_ICC_SNAPSHOT_REGS[0]).is_ok() {
+        if self.managed_gic_present() {
             for &reg in GIC_ICC_SNAPSHOT_REGS {
                 gic_icc.push((reg, self.get_icc_reg(reg)?));
             }
@@ -4989,6 +5006,24 @@ impl Vcpu for HvfVcpu {
                 // when HVF does surface the activation. Re-arm so the GIC
                 // re-evaluates and delivers PPI 27 — without asserting the raw IRQ
                 // line, which would bypass the GIC and deliver a spurious IRQ.
+                //
+                // Only when a managed GIC actually exists. This arm is also
+                // reached on a VM with NO interrupt controller at all, and there
+                // unmasking is not merely useless, it is unbounded: HVF re-fires
+                // the activation on the next entry, nothing can ever deliver or
+                // acknowledge PPI 27, and the guest does not retire a single
+                // instruction between exits. Measured at 10,000 consecutive
+                // `VTIMER_ACTIVATED` exits with PC unmoved — and each one was
+                // reported to the caller as `VmExit::Ignore`, so a wedged vCPU
+                // presented as a busy but healthy one.
+                //
+                // HVF auto-masked the timer on the way out, so declining to
+                // unmask is what lets the guest run on. The timer output is the
+                // one thing a GIC-less vCPU has no way to observe, so leaving it
+                // masked withholds nothing the guest could have used.
+                if !self.managed_gic_present() {
+                    return Ok(VmExit::Ignore);
+                }
                 if let Err(rc) = gic::rearm_vtimer(self.id) {
                     return Err(HypervisorCpuError::RunVcpu(anyhow!(
                         "failed to re-arm vtimer: {:#010x}",
