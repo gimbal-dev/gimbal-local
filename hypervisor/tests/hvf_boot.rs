@@ -20,7 +20,7 @@ use std::{env, fs};
 
 use hypervisor::arch::aarch64::gic::{GicState, Vgic, VgicConfig};
 use hypervisor::hvf::gic::{inject_lpi_via_lr, GICD_TYPER, HvfGicV3};
-use hypervisor::hvf::{icache_wx, HvfVcpu, VtimerClock};
+use hypervisor::hvf::{icache_wx, HvfVcpu, VtimerClock, SYSREG_CNTV_CTL_EL0, SYSREG_CNTV_CVAL_EL0};
 use hypervisor::{CpuState, HypervisorVmConfig, HypervisorVmError, Vcpu, Vm, VmExit, VmOps};
 
 type VmOpsResult<T> = Result<T, HypervisorVmError>;
@@ -4093,4 +4093,77 @@ fn a_thread_writing_its_own_page_escapes_wx_instead_of_wedging() {
         "the guest escaped without taking any W^X faults ({exec} exec, {write} \
          write), so stage-2 enforcement was inert and this proves nothing"
     );
+}
+
+/// A vCPU with no interrupt controller must retire guest instructions even when
+/// its virtual timer is enabled and long overdue.
+///
+/// HVF reports an overdue virtual timer as `HV_EXIT_REASON_VTIMER_ACTIVATED`
+/// and auto-masks the timer on the way out. The managed-GIC handler answers by
+/// unmasking so the GIC can re-evaluate and deliver PPI 27 — correct when there
+/// is a GIC, and unbounded when there is not: nothing can ever deliver or
+/// acknowledge the interrupt, so the deadline is still behind us on the next
+/// entry and the vCPU exits again without retiring an instruction. That
+/// livelock was reported to the caller as `VmExit::Ignore`, i.e. as a busy but
+/// healthy vCPU, which is why it presented as a hang rather than an error.
+///
+/// This arrives at the hazard by the route a real capture takes — a faithfully
+/// restored `CNTV_CTL_EL0`/`CNTV_CVAL_EL0` pair — rather than the route
+/// `hvf_snapshot_restore_midflight` takes, where `vtimer_needs_arming`
+/// synthesizes a deadline for a checkpoint that recorded none. Both reach the
+/// same exit; only this one proves an enabled, overdue timer that came out of a
+/// snapshot cannot wedge a GIC-less guest.
+#[test]
+fn hvf_overdue_vtimer_without_a_gic_still_retires_instructions() {
+    let mut snapshot: CpuState;
+    {
+        let ram = HostRam::new(RAM_SIZE);
+        ram.load(0, &GUEST_CODE);
+        let vm_ops = Arc::new(RecordingVmOps {
+            writes: Mutex::new(Vec::new()),
+        });
+        let (_vm, mut vcpu) = build_vm(&ram, vm_ops.clone());
+        vcpu.setup_regs(0, RAM_BASE, 0).expect("setup_regs");
+        snapshot = vcpu.state().expect("capture state");
+    }
+
+    // Arm the timer in the past. CNTVCT counts up from host boot, so 0 is a
+    // deadline that can never be in the future; ENABLE set with IMASK clear is
+    // the shape a running Linux guest is captured in.
+    match &mut snapshot {
+        CpuState::Hvf(s) => {
+            s.sysregs
+                .retain(|&(id, _)| id != SYSREG_CNTV_CTL_EL0 && id != SYSREG_CNTV_CVAL_EL0);
+            s.sysregs.push((SYSREG_CNTV_CVAL_EL0, 0));
+            s.sysregs.push((SYSREG_CNTV_CTL_EL0, 1));
+            assert!(
+                s.gic_icc.is_empty(),
+                "build_vm must not create a vgic for this test to mean anything"
+            );
+        }
+        _ => panic!("expected an HVF CpuState"),
+    }
+
+    {
+        let ram = HostRam::new(RAM_SIZE);
+        ram.load(0, &GUEST_CODE);
+        let vm_ops = Arc::new(RecordingVmOps {
+            writes: Mutex::new(Vec::new()),
+        });
+        let (_vm, mut vcpu) = build_vm(&ram, vm_ops.clone());
+        vcpu.set_state(&snapshot).expect("restore state");
+
+        // run_to_shutdown bounds its own iterations, so a livelock here fails
+        // with its bound rather than hanging the suite.
+        let exit = run_to_shutdown(vcpu.as_mut());
+        assert!(
+            matches!(exit, VmExit::Shutdown),
+            "expected Shutdown, got {exit:?}"
+        );
+        assert_eq!(
+            *vm_ops.writes.lock().unwrap(),
+            vec![1, 2, 3, 4, 5, 6],
+            "guest did not make forward progress with an overdue virtual timer"
+        );
+    }
 }
