@@ -17,7 +17,7 @@ help:
 	@echo "  make clippy                   Lint chm + hvf + arch configs"
 	@echo "  make security-check           Enforce the no-host-FS-passthrough guard"
 	@echo "  make fmt                      Format (nightly rustfmt)"
-	@echo "  make test-hvf                 Run hvf_boot tests (signs, runs serially)"
+	@echo "  make test-hvf                 Run the HVF gate (signed hvf_boot + lib tests)"
 	@echo "  make test-release             Run every suite in RELEASE configuration"
 
 # Build and code-sign chm; prints the signed binary path on stdout.
@@ -86,6 +86,19 @@ test-release:
 #
 # This target used to stop at `--no-run`, which built the tests and ran none of
 # them. A gate that cannot fail is not a gate.
+#
+# It then ran only the `hvf_boot` integration binary, which is the same disease
+# one layer up: the HVF unit tests were silently outside the gate. Those are not
+# incidental — `snapshot_sys_reg_tests` is what holds the #257 cure, the register
+# list whose *order* is the restore write order. Swapping CNTV_CVAL and CNTV_CTL
+# leaves all 35 integration tests green, so anyone measuring a mutation with this
+# target alone would conclude the invariant was unguarded. That misreading
+# happened, on that exact invariant. The lib suite is therefore part of the gate,
+# not a thing to remember to run beside it.
+#
+# `hvf_boot.rs::the_hvf_gate_runs_the_hypervisor_unit_tests` holds this target to
+# that. It lives in the integration suite on purpose: a guard placed in the lib
+# suite would be silenced by the very change it exists to catch.
 test-hvf:
 	@set -e; \
 	bin=$$(cargo test -p hypervisor --no-default-features \
@@ -97,4 +110,7 @@ test-hvf:
 	test -n "$$bin" || { echo "could not locate the hvf_boot test binary"; exit 1; }; \
 	codesign --sign - --entitlements hypervisor/tests/data/hv.entitlements \
 		--force "$$bin" >/dev/null 2>&1; \
-	"$$bin" --test-threads=1
+	"$$bin" --test-threads=1; \
+	echo "==> hypervisor unit tests (hvf,kvm-snapshot)"; \
+	cargo test -p hypervisor --no-default-features \
+		--features hvf,kvm-snapshot --lib

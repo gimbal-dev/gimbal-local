@@ -4167,3 +4167,60 @@ fn hvf_overdue_vtimer_without_a_gic_still_retires_instructions() {
         );
     }
 }
+
+/// The HVF gate must run the hypervisor's unit tests, not only this binary.
+///
+/// `make test-hvf` is the command this project quotes as "the HVF suite", and
+/// for a long time it ran only the `hvf_boot` integration binary. That leaves
+/// `hvf::snapshot_sys_reg_tests` outside the gate — the module holding the #257
+/// cure, where `SNAPSHOT_SYS_REGS` is walked in order by both `state()` and
+/// `set_state`, so the list's *order* is the restore write order.
+///
+/// The cost is not theoretical. Swapping `CNTV_CVAL` and `CNTV_CTL` — arming a
+/// timer against whatever comparator happens to be there — leaves every test in
+/// this binary green. Mutating that invariant and running only `make test-hvf`
+/// reports the ordering as unguarded when it is in fact guarded, which is
+/// exactly the wrong conclusion to draw about the hardest bug in this tree.
+///
+/// This guard lives in the integration suite deliberately. The obvious home is
+/// beside the invariant it protects, in the lib suite — but a guard there would
+/// be silenced by the very change it exists to catch, because dropping the lib
+/// suite from the gate also drops the guard. It has to sit in the part of the
+/// gate that cannot be removed without the gate visibly doing nothing.
+#[test]
+fn the_hvf_gate_runs_the_hypervisor_unit_tests() {
+    let makefile = include_str!("../../Makefile");
+
+    // Scope to this target's recipe. `--lib` appears in `test-release` too, so a
+    // whole-file search would pass while the HVF gate ran no unit tests at all.
+    //
+    // A recipe line is tab-indented *or* the continuation of one that ended in a
+    // backslash. The embedded python3 program is wrapped at column 0, so a plain
+    // indentation test stops halfway through the recipe and reads as a failure.
+    let mut body = Vec::new();
+    let mut continued = false;
+    for line in makefile
+        .split_once("\ntest-hvf:\n")
+        .expect("the Makefile defines a test-hvf target")
+        .1
+        .lines()
+    {
+        if !line.starts_with('\t') && !continued {
+            break;
+        }
+        continued = line.ends_with('\\');
+        body.push(line);
+    }
+    let body = body.join("\n");
+
+    assert!(
+        body.contains("--lib"),
+        "make test-hvf does not run the hypervisor unit tests, so the guards on \
+         SNAPSHOT_SYS_REGS are outside the gate that claims to cover HVF:\n{body}"
+    );
+    assert!(
+        body.contains("--test hvf_boot"),
+        "make test-hvf no longer runs the integration binary, so adding the lib \
+         suite has traded one half of the gate for the other:\n{body}"
+    );
+}

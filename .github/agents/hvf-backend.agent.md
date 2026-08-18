@@ -84,6 +84,12 @@ builds with `--no-run`, extracts the executable path from the JSON output,
 re-signs it, then runs it. **Do not bypass it** by calling `cargo test` directly
 and concluding HVF is broken.
 
+It then runs the hypervisor **lib** suite, because the two cover different code.
+A mutation inside `hvf/mod.rs` guarded by a `#[cfg(test)]` module in that same
+file is invisible to the integration binary: swap `CNTV_CVAL`/`CNTV_CTL` in
+`SNAPSHOT_SYS_REGS` and all 36 integration tests stay green while the lib suite
+fails. Run the gate, not one half of it.
+
 ---
 
 ## There is no debugger for a guest vCPU
@@ -152,7 +158,7 @@ policy is enforced on the data path.
 ```bash
 cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib   # 262
 make clippy                                                                        # 0
-make test-hvf                                                                      # signed HVF integration (33 pass, 1 known-red: #334)
+make test-hvf                                                                      # signed hvf_boot (36) THEN the lib suite (262)
 make security-check                                                                # invariant I1
 cargo +nightly fmt --all
 ```
