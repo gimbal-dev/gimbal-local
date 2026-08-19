@@ -162,6 +162,66 @@ guard was matching prose, not code, and reported a safety it did not provide.
 > documentation instead of the code. Match the full invocation, and write the
 > reason into the test so nobody loosens it back.
 
+### Mutating a function is not mutating its call site
+
+**Nine recorded instances in this repo**, and the most expensive of them was the
+product's own entry point: `chm vanilla export A B` printed usage and refused
+*every time it had ever been run*, while 827 tests stayed green — because every
+test called the exporter directly and nothing crossed the argument parser.
+
+An assertion about an outcome is structurally blind to a path that is no longer
+taken. So the mutation that matters is often not "break the function" but
+**"stop calling it"**:
+
+```rust
+install_modules(&mut rootfs, None)?;   // was: bundled.as_ref(), image.rs:774
+LocalImage.scan(root:, probeKernel:)   // Swift: hand it a stub prober
+```
+
+Prefer making the mutation *impossible* over catching it. Both of these are
+better than another guard:
+
+- **Remove the default argument value.** A parameter defaulting to `0` or `nil`
+  lets a dropped call site compile; without the default it is a compile error.
+  `LocalImage.scan` (`LocalImage.swift:212`) takes `probeKernel` with **no**
+  default for exactly this reason. Note that its neighbour `classify` keeps one
+  — it is a pure function over explicit inputs, so a stub there is a legitimate
+  test affordance rather than a dropped production path. The rule is about the
+  call site that ships, not about defaults in general.
+- **Change the arity.** `hypervisor/src/compat.rs:60` declares `fcntl`
+  variadic; reverting it to a fixed third parameter is now `E0061`, because the
+  guards at `:287` and `:296` call it with two arguments. That declaration is
+  load-bearing: on Apple arm64 a variadic argument goes on the stack while a
+  fixed one goes in a register, so the wrong shape silently never set
+  `O_NONBLOCK` and hung every release build.
+
+Where neither is available, add a source-reading guard that pins the call site —
+and know that it covers something different from the outcome tests. That is what
+a mutation pair proves: break the function and the outcome tests fire; break the
+call site and only the source guard does.
+
+### A guard whose body recomputes the answer cannot fail
+
+The strongest lesson on the vanilla-export stream, and the hardest to see by
+reading.
+
+`the_exported_counter_advances_at_the_guests_frequency` restated the product's
+arithmetic in the test body and asserted against its own restatement. The
+function it named was **never called**. Four independent defects left it green.
+
+> **Generalisation:** *a test that recomputes the value it is checking is a
+> mirror of the product with none of the product's code in it — it agrees with
+> itself in every world.*
+
+The cure is three things together, and dropping any one of them brings the
+mirror back:
+
+1. **Drive the real function.** If the function's name does not appear as a call
+   in the test body, the test is about arithmetic, not about the product.
+2. **Choose the inputs independently.** Inputs derived from the same expression
+   as the expectation are the mirror wearing a disguise.
+3. **Source the constants from the committed fixture**, never retyped. See §4.
+
 ### A source-reading needle can silently relocate
 
 The sharper version of the same family. A guard that reads its own file with
@@ -196,6 +256,17 @@ that matters, and an occurrence added somewhere that does not.
 > its removal from the one that matters.* Uniqueness is part of the guard, so
 > assert it.
 
+The same guard has a second failure mode once you *bound* the region it reads.
+Narrowing a whole-file scrape to "the dispatch table only" is usually right — it
+is how you stop a guard false-positiving on unrelated code — but a bounding bug
+that closes the region early leaves the guard reading a prefix of what it names,
+silently.
+
+> **Generalisation:** *a source-reading guard is only as good as the region it
+> reads.* Mutate at **both ends** of that region, not just in the middle. A
+> mid-table mutation fires whether the bound is right or wrong; only a mutation
+> against the **last** entry can tell you the region reaches the end.
+
 ### A mutation harness with hardcoded backup paths goes stale
 
 A helper script that restores from fixed paths (`/tmp/create.rs.good`) is
@@ -212,6 +283,12 @@ Two more one-liners that have each cost a run here:
 - Prose **wraps.** A guard reading a `.md` file must flatten whitespace before
   searching, or a reinstated claim that happens to break across a newline sails
   straight past the substring search.
+- **`sed -n 'l'` inserts its own line-wrap backslashes.** It wraps at the
+  terminal width and marks the wrap with a `\`, which is indistinguishable from
+  a `\` that is really in the file — and in Rust source, trailing backslashes
+  are load-bearing. Three needle attempts were built here against a line
+  splitting that did not exist. **Read exact line content with `python3` and
+  `repr()`**, which settled the same question in one command.
 
 ### Restoring: never use `git checkout`
 
