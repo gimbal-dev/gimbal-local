@@ -18,6 +18,30 @@ user's disk.
 | `manifest-v1-pre-smp.json` | The pre-SMP state shape: no `host_realtime_ns`, `usgic` or `usgic_cpus` | Those additive fields keeping their defaults |
 | `overlay-fingerprint-pre-v9.6` | A real fingerprint carrying a `.bitmap` line | The exact format that #178 could no longer read |
 | `checkpoint-dir-shape-v1` | The directory listing of a real checkpoint, and of a real pruned revision | The set of files a checkpoint *is* — a sidecar added, or `overlay.fingerprint` dropped |
+| `vanilla-state-2cpu-net.json` | A **vanilla upstream Cloud Hypervisor** `state.json`, captured on AWS Graviton2: 2 vCPU, a NIC, 11 devices | That `chm` can write one back that upstream still understands |
+| `vanilla-state-graviton-{1,2,3,1cpu}.json` | Four more real captures, 1 vCPU, no NIC | The same, across machine shapes we cannot produce here |
+
+## The vanilla captures are an oracle, not a sample
+
+These five are the sharpest fixtures in this directory, and for a reason the
+others cannot claim: they were authored by **upstream Cloud Hypervisor on
+hardware this project does not have**. A Mac cannot capture one — that needs
+KVM — so no bug in this tree can have influenced their contents.
+
+That matters because `chm` is about to start *writing* `state.json` rather than
+only reading it (#353, #341), and a writer built beside a reader is exactly the
+by-construction agreement described above. Round-tripping a document nobody
+here wrote is the one check with independent authority.
+
+They are **committed** rather than swept out of a scratch directory. An earlier
+draft read them from `/tmp`, which meant the gate silently narrowed to a single
+document on any machine that had been rebooted — coverage that disappears
+without saying so is worse than coverage you never claimed.
+`the_oracle_is_not_quietly_missing` pins the count for that reason.
+
+Audited before committing: across all five, the only strings are PCI addresses,
+device names, memory-region kinds and two disk filenames. No hostnames, no
+paths, no credentials.
 
 ## Why a shape fixture, when the writer is already shared
 
