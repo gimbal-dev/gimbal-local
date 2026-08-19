@@ -1897,8 +1897,11 @@ fn workspace(raw: &[String]) -> Result<ExitCode, String> {
              sandboxes from one image diverge independently. If the image ships\n\
              a golden checkpoint the workspace is seeded from it and resumes\n\
              that settled state (`chm connect <WORKSPACE_DIR> --checkpoint`);\n\
-             otherwise `chm run <WORKSPACE_DIR>` cold-boots it. Either way a\n\
-             later suspend saves a checkpoint inside the workspace."
+             otherwise `chm run <WORKSPACE_DIR>` rehydrates the base capture.\n\
+             Either way a later suspend saves a checkpoint inside the workspace.\n\
+             \n\
+             IMAGE_DIR must be a captured snapshot, not a `chm image build`\n\
+             output: those cold-boot with `chm create` and need no workspace."
         );
         return if positionals.len() == 2 {
             Ok(ExitCode::SUCCESS)
