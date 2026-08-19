@@ -63,6 +63,19 @@ fmt:
 # finding a release-only failure *at release time* is the worst moment for it:
 # highest pressure, least slack. This makes the configuration one command away.
 #
+# The HVF integration suite is part of this, and it is the half that was
+# missing until the SIMD&FP work found it. Those tests need a real VM, so they
+# were left to `make test-hvf`, which builds in debug -- and the *only* class of
+# defect this target exists to catch is one that is benign in debug. Declaring
+# `hv_vcpu_set_simd_fp_reg`'s 16-byte value as `[u8; 16]` writes all 32 vector
+# registers correctly at opt-level=0 and writes 32 zeros at opt-level=s,
+# returning HV_SUCCESS both times. Measured, on this target:
+#
+#   debug   -> every_simd_fp_register_survives_a_state_round_trip ... ok
+#   release -> FAILED, v0..v31 all zero
+#
+# A gate that would have passed the bug it was built for is not a gate.
+#
 # Run it before any milestone that claims a gate, not only before a release.
 test-release:
 	@set -e; \
@@ -71,6 +84,17 @@ test-release:
 	echo "==> hypervisor, release (hvf,kvm-snapshot)"; \
 	cargo test -p hypervisor --release --no-default-features \
 		--features hvf,kvm-snapshot --lib; \
+	echo "==> hypervisor HVF integration, release (hvf,kvm-snapshot)"; \
+	bin=$$(cargo test -p hypervisor --release --no-default-features \
+		--features hvf,kvm-snapshot --test hvf_boot --no-run \
+		--message-format=json 2>/dev/null \
+		| python3 -c "import sys,json;\
+[print(m['executable']) for m in (json.loads(l) for l in sys.stdin if l.startswith('{'))\
+ if m.get('profile',{}).get('test') and m.get('executable')]" | tail -1); \
+	test -n "$$bin" || { echo "could not locate the release hvf_boot binary"; exit 1; }; \
+	codesign --sign - --entitlements hypervisor/tests/data/hv.entitlements \
+		--force "$$bin" >/dev/null 2>&1; \
+	"$$bin" --test-threads=1; \
 	echo "==> app, release"; \
 	swift test -c release --package-path app/GimbalLocal; \
 	echo; echo "All suites green in release configuration."

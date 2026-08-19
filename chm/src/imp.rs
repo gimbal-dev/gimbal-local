@@ -4611,6 +4611,7 @@ mod tests {
                     // 0xc020 is ID_AA64PFR0_EL1 (S3_0_C0_C4_0).
                     sysregs: vec![(0xc020, pfr0)],
                     gic_icc: Vec::new(),
+                    fp: None,
                     mp_state_running: true,
                 }],
                 gic_dist: Vec::new(),
@@ -4646,6 +4647,7 @@ mod tests {
                     // 0xd801 is CTR_EL0 (S3_3_C0_C0_1).
                     sysregs: vec![(0xd801, ctr)],
                     gic_icc: Vec::new(),
+                    fp: None,
                     mp_state_running: true,
                 }],
                 gic_dist: Vec::new(),
@@ -4681,6 +4683,7 @@ mod tests {
                     // 0xc038 is ID_AA64MMFR0_EL1 (S3_0_C0_C7_0).
                     sysregs: vec![(0xc038, v)],
                     gic_icc: Vec::new(),
+                    fp: None,
                     mp_state_running: true,
                 }],
                 gic_dist: Vec::new(),

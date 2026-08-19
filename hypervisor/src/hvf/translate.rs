@@ -45,7 +45,7 @@
 //! are the remaining M3 work; the per-vCPU GIC CPU-interface (ICC) registers,
 //! however, ARE handled here because they share the system-register encoding.
 
-use super::VcpuHvfState;
+use super::{VcpuFpState, VcpuHvfState};
 use super::ffi::{SYSREG_ELR_EL1, SYSREG_SP_EL0, SYSREG_SP_EL1, SYSREG_SPSR_EL1};
 
 // --- KVM AArch64 ONE_REG ABI constants (architectural, stable) -------------
@@ -75,6 +75,25 @@ const OFF_PSTATE: usize = 33 * 8; // -> CPSR/PSTATE
 const OFF_SP_EL1: usize = 34 * 8;
 const OFF_ELR_EL1: usize = 35 * 8;
 const OFF_SPSR0: usize = 36 * 8; // spsr[0] -> SPSR_EL1
+
+// `struct user_fpsimd_state fp_regs` follows `spsr[5]`, which ends at 328, at
+// its natural 16-byte alignment. Its own layout is
+// `{ __uint128_t vregs[32]; __u32 fpsr; __u32 fpcr; __u32 __reserved[2]; }`,
+// so the block runs 336..864 and `struct kvm_regs` is 864 bytes overall.
+/// Byte offset of `kvm_regs.fp_regs` — the start of `vregs[0]` (Q0).
+pub const OFF_FP_VREGS: usize = 336;
+/// Byte offset of `kvm_regs.fp_regs.fpsr`.
+pub const OFF_FPSR: usize = OFF_FP_VREGS + 32 * 16;
+/// Byte offset of `kvm_regs.fp_regs.fpcr`.
+pub const OFF_FPCR: usize = OFF_FPSR + 4;
+
+/// Byte offset of SIMD&FP vector register `index` (Q0..Q31) in `kvm_regs`.
+///
+/// Exists so a writer patching a captured `core_regs` blob does not re-derive
+/// the layout: the offsets above are the single statement of it.
+pub const fn kvm_fp_vreg_offset(index: usize) -> usize {
+    OFF_FP_VREGS + index * 16
+}
 
 /// Build the KVM ONE_REG id for a core register at `byte_offset` in `kvm_regs`.
 pub const fn kvm_core_reg_id(byte_offset: usize) -> u64 {
@@ -127,6 +146,12 @@ pub struct KvmArm64VcpuRegs {
     pub core: Vec<(u64, u64)>,
     pub sys: Vec<(u64, u64)>,
     pub gic_icc: Vec<(u64, u64)>,
+    /// The SIMD&FP register file, which lives in `kvm_regs.fp_regs` rather than
+    /// in the ONE_REG `(id, value)` list above. It cannot join that list: a
+    /// `(u64, u64)` pair cannot hold a 128-bit vector, and inventing two 64-bit
+    /// ids for the halves would name registers the KVM ABI does not define.
+    /// `None` means the source carried no FP state.
+    pub fp: Option<VcpuFpState>,
 }
 
 impl KvmArm64VcpuRegs {
@@ -185,7 +210,12 @@ pub fn lower_to_kvm(hvf: &VcpuHvfState) -> KvmArm64VcpuRegs {
         .map(|&(id, v)| (kvm_sysreg_id(id), v))
         .collect();
 
-    KvmArm64VcpuRegs { core, sys, gic_icc }
+    KvmArm64VcpuRegs {
+        core,
+        sys,
+        gic_icc,
+        fp: hvf.fp.clone(),
+    }
 }
 
 /// Raise a KVM ONE_REG vCPU snapshot into an HVF `VcpuHvfState`, ready for
@@ -237,6 +267,7 @@ pub fn raise_from_kvm(kvm: &KvmArm64VcpuRegs) -> VcpuHvfState {
         sp_el1,
         sysregs,
         gic_icc,
+        fp: kvm.fp.clone(),
         mp_state_running: true,
     }
 }
@@ -289,10 +320,26 @@ pub mod kvm_ingest {
             .filter_map(|r| kvm_sysreg_to_hvf(r.id).map(|_| (r.id, r.addr)))
             .collect();
 
+        // `kvm_regs.fp_regs` has been deserialized all along; until #357 it was
+        // read and thrown away. Every real Graviton capture carries live values
+        // here -- up to 25 of the 32 vector registers non-zero, and `fpsr`
+        // showing IXC set -- so discarding it was discarding guest state.
+        let fp = Some(VcpuFpState {
+            vregs: core_regs
+                .fp_regs
+                .vregs
+                .iter()
+                .map(|v| v.to_le_bytes())
+                .collect(),
+            fpsr: core_regs.fp_regs.fpsr,
+            fpcr: core_regs.fp_regs.fpcr,
+        });
+
         KvmArm64VcpuRegs {
             core,
             sys,
             gic_icc: Vec::new(),
+            fp,
         }
     }
 
@@ -797,6 +844,7 @@ pub mod gic_ingest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hvf::FP_VREG_COUNT;
     use std::collections::BTreeMap;
 
     // hv_sys_reg_t values for a representative spread of EL1 system registers.
@@ -877,6 +925,22 @@ mod tests {
             sysregs,
             gic_icc: vec![(ICC_PMR_EL1, 0xf0), (0xc667, 0x1)], // PMR, IGRPEN1
             mp_state_running: true,
+            // A distinct byte in every lane, so a lowering that forwards only
+            // the first register -- or forwards a shared default 32 times --
+            // is as visible as one that drops the block entirely.
+            fp: Some(VcpuFpState {
+                vregs: (0..FP_VREG_COUNT)
+                    .map(|i| {
+                        let mut v = [0u8; 16];
+                        for (j, b) in v.iter_mut().enumerate() {
+                            *b = ((i * 16 + j) ^ 0x5a) as u8;
+                        }
+                        v
+                    })
+                    .collect(),
+                fpsr: 0x10,
+                fpcr: 0x0100_0000,
+            }),
         };
 
         let kvm = lower_to_kvm(&original);
@@ -896,6 +960,12 @@ mod tests {
             sorted(&original.gic_icc),
             "GIC ICC registers must round-trip"
         );
+        assert_eq!(
+            restored.fp, original.fp,
+            "the SIMD&FP register file must round-trip: every real Graviton \
+             capture carries live floating-point state, so dropping it here \
+             resumes the guest with a zeroed register file"
+        );
     }
 
     #[test]
@@ -913,6 +983,10 @@ mod tests {
             ],
             gic_icc: vec![],
             mp_state_running: true,
+            // `None` is the back-compat shape: a snapshot written before FP
+            // capture existed must still lower without inventing a register
+            // file that was never observed.
+            fp: None,
         };
         let kvm = lower_to_kvm(&hvf);
 
