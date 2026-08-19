@@ -49,7 +49,7 @@ use serde_json::{Map, Value};
 /// the floating-point state among them -- and the guest would resume into a
 /// machine subtly unlike the one it was suspended from. Patching keeps the
 /// parent's answer for every question we cannot ask.
-const CORE_REGS_LEN: usize = 864;
+pub(crate) const CORE_REGS_LEN: usize = 864;
 
 /// Byte offsets into `core_regs`, from `struct kvm_regs` on aarch64:
 /// `user_pt_regs` (x0-x30, sp, pc, pstate) then `sp_el1`, `elr_el1`, `spsr[5]`,
@@ -143,45 +143,20 @@ impl Vcpu {
         Self::x_offset(i).map(|o| self.read(o))
     }
 
-    pub fn set_x(&mut self, i: usize, v: u64) -> bool {
-        match Self::x_offset(i) {
-            Some(o) => {
-                self.write(o, v);
-                true
-            }
-            None => false,
-        }
-    }
-
     pub fn pc(&self) -> u64 {
         self.read(OFF_PC)
-    }
-    pub fn set_pc(&mut self, v: u64) {
-        self.write(OFF_PC, v);
     }
     pub fn sp(&self) -> u64 {
         self.read(OFF_SP)
     }
-    pub fn set_sp(&mut self, v: u64) {
-        self.write(OFF_SP, v);
-    }
     pub fn pstate(&self) -> u64 {
         self.read(OFF_PSTATE)
-    }
-    pub fn set_pstate(&mut self, v: u64) {
-        self.write(OFF_PSTATE, v);
     }
     pub fn sp_el1(&self) -> u64 {
         self.read(OFF_SP_EL1)
     }
-    pub fn set_sp_el1(&mut self, v: u64) {
-        self.write(OFF_SP_EL1, v);
-    }
     pub fn elr_el1(&self) -> u64 {
         self.read(OFF_ELR_EL1)
-    }
-    pub fn set_elr_el1(&mut self, v: u64) {
-        self.write(OFF_ELR_EL1, v);
     }
     /// `spsr[0..5]`.
     pub fn spsr(&self, i: usize) -> Option<u64> {
@@ -193,6 +168,26 @@ impl Vcpu {
     /// rebuilt.
     pub fn core_bytes(&self) -> &[u8] {
         &self.core
+    }
+
+    /// Update a core register the capture already carries, addressed by its
+    /// byte offset in `struct kvm_regs`. Returns `false` for an offset that is
+    /// misaligned or runs past the block, rather than growing it.
+    ///
+    /// Offsets rather than typed setters because the writer's input is a list
+    /// of KVM `ONE_REG` ids, and an id *is* an offset. Routing them through
+    /// named accessors would mean re-deriving, here, which offset each id
+    /// means -- a second copy of a mapping the KVM ABI already fixes.
+    ///
+    /// This still patches in place, so the floating-point block at offset 336
+    /// keeps the ancestor's bytes: no core id the register-lowering emits
+    /// lands there, and nothing here zeroes what it is not given.
+    pub fn set_core_reg(&mut self, byte_offset: usize, value: u64) -> bool {
+        if !byte_offset.is_multiple_of(8) || byte_offset + 8 > self.core.len() {
+            return false;
+        }
+        self.write(byte_offset, value);
+        true
     }
 
     /// The value of a system register by its KVM `ONE_REG` id.
@@ -681,28 +676,27 @@ mod tests {
     /// else in the 57 KB document.
     #[test]
     fn each_register_setter_writes_only_its_own_field() {
-        type Set = fn(&mut Vcpu, u64);
         type Get = fn(&Vcpu) -> u64;
-        let fields: [(&str, usize, Set, Get); 5] = [
-            ("pc", OFF_PC, Vcpu::set_pc, Vcpu::pc),
-            ("sp", OFF_SP, Vcpu::set_sp, Vcpu::sp),
-            ("pstate", OFF_PSTATE, Vcpu::set_pstate, Vcpu::pstate),
-            ("sp_el1", OFF_SP_EL1, Vcpu::set_sp_el1, Vcpu::sp_el1),
-            ("elr_el1", OFF_ELR_EL1, Vcpu::set_elr_el1, Vcpu::elr_el1),
+        let fields: [(&str, usize, Get); 5] = [
+            ("pc", OFF_PC, Vcpu::pc),
+            ("sp", OFF_SP, Vcpu::sp),
+            ("pstate", OFF_PSTATE, Vcpu::pstate),
+            ("sp_el1", OFF_SP_EL1, Vcpu::sp_el1),
+            ("elr_el1", OFF_ELR_EL1, Vcpu::elr_el1),
         ];
 
         let mut seen = std::collections::BTreeSet::new();
-        for (name, off, _, _) in &fields {
+        for (name, off, _) in &fields {
             assert!(seen.insert(*off), "{name} shares offset {off} with another field");
         }
 
         const PREFIX: &str = "snapshots/cpu-manager/snapshots/0/snapshot_data/state/Kvm/core_regs/";
         let original = VanillaState::parse(REAL).unwrap();
-        for (name, off, set, get) in fields {
+        for (name, off, get) in fields {
             let sentinel = 0xffff_0000_dead_0000 | off as u64;
             let mut advanced = original.clone();
             let mut v = advanced.vcpu(0).unwrap();
-            set(&mut v, sentinel);
+            assert!(v.set_core_reg(off, sentinel), "{name}: the offset was refused");
             advanced.set_vcpu(0, &v).unwrap();
 
             let changed = original.changed_paths(&advanced);
@@ -814,8 +808,8 @@ mod tests {
         let mut advanced = original.clone();
 
         let mut v = advanced.vcpu(1).unwrap();
-        assert!(v.set_x(0, 0xdead_beef_0000_0001));
-        v.set_pc(0xffff_8000_0800_0000);
+        assert!(v.set_core_reg(OFF_X0, 0xdead_beef_0000_0001));
+        assert!(v.set_core_reg(OFF_PC, 0xffff_8000_0800_0000));
         advanced.set_vcpu(1, &v).unwrap();
 
         // The diff descends to the byte, so the intended blast radius can be
@@ -863,7 +857,7 @@ mod tests {
 
         let mut s2 = s.clone();
         let mut v = s2.vcpu(0).unwrap();
-        v.set_pc(0x1234);
+        assert!(v.set_core_reg(OFF_PC, 0x1234));
         s2.set_vcpu(0, &v).unwrap();
 
         assert_eq!(
@@ -965,5 +959,29 @@ mod tests {
     fn a_capture_that_is_not_json_is_refused() {
         assert!(VanillaState::parse(b"not json").is_err());
         assert!(VanillaState::parse(b"[1,2,3]").is_err());
+    }
+
+    /// A misaligned core-register write must be refused, not truncated.
+    ///
+    /// `core_regs` is a flat `struct kvm_regs`, so an offset that is not a
+    /// multiple of 8 straddles two registers: the write would land half in one
+    /// and half in its neighbour, corrupting a register nobody named. Refusing
+    /// is the only safe answer, and `set_core_reg` is the sole writer of the
+    /// block, so this check is the only thing standing there.
+    #[test]
+    fn a_misaligned_core_register_write_is_refused() {
+        let bytes = std::fs::read("testdata/vanilla-state-2cpu-net.json").unwrap();
+        let doc = VanillaState::parse(&bytes).unwrap();
+        let id = doc.vcpu_ids()[0];
+        let mut v = doc.vcpu(id).unwrap();
+        let before = v.core_bytes().to_vec();
+        for bad in [1usize, 4, 7, OFF_PC + 1, CORE_REGS_LEN - 4] {
+            assert!(!v.set_core_reg(bad, 0xdead_beef), "offset {bad} must be refused");
+        }
+        assert!(v.set_core_reg(OFF_PC, 0xdead_beef), "an aligned offset must still work");
+        assert!(!v.set_core_reg(CORE_REGS_LEN, 1), "past the end must be refused");
+        let mut want = before.clone();
+        want[OFF_PC..OFF_PC + 8].copy_from_slice(&0xdead_beefu64.to_le_bytes());
+        assert_eq!(v.core_bytes(), &want[..], "a refused write must leave no trace");
     }
 }

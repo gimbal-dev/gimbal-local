@@ -1124,7 +1124,7 @@ fn patch_clone(
 ///
 /// An error is always "could not take the shortcut", never "the import failed":
 /// every caller falls back to writing the file out in full.
-fn clone_file(src: &Path, dest: &Path) -> Result<(), String> {
+pub(crate) fn clone_file(src: &Path, dest: &Path) -> Result<(), String> {
     let (Ok(c_src), Ok(c_dest)) = (
         CString::new(src.as_os_str().as_bytes()),
         CString::new(dest.as_os_str().as_bytes()),

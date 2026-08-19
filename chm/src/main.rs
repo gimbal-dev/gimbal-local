@@ -136,15 +136,14 @@ mod disktail;
 
 /// Reading *and writing* a vanilla Cloud Hypervisor `state.json` (#353, #341).
 /// Everything else in this tree only ever reads one, which is why a lineage
-/// advanced on a Mac cannot go back to the cloud.
-///
-/// TODO(#353): drop this allow when `chm export --vanilla` consumes the module.
-/// The writer lands first, and on its own, because its correctness rests on
-/// round-tripping five real upstream captures -- evidence that is available
-/// now and has nothing to do with whichever command eventually calls it.
-/// Landing both together would have buried that proof in a much larger diff.
-#[allow(dead_code)]
+/// advanced on a Mac could not go back to the cloud.
 mod vanilla;
+
+/// Writing a Mac-advanced lineage back out as a vanilla capture (#353), on
+/// state captured from a live Hypervisor.framework vCPU -- no KVM, no QEMU and
+/// no Linux host anywhere in the path.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod vanilla_export;
 
 /// Properties of the test suite itself (#243).
 mod hygiene;
