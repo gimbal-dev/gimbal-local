@@ -134,6 +134,18 @@ mod runs;
 /// Notice a capture whose partition table does not use the whole disk (#259).
 mod disktail;
 
+/// Reading *and writing* a vanilla Cloud Hypervisor `state.json` (#353, #341).
+/// Everything else in this tree only ever reads one, which is why a lineage
+/// advanced on a Mac cannot go back to the cloud.
+///
+/// TODO(#353): drop this allow when `chm export --vanilla` consumes the module.
+/// The writer lands first, and on its own, because its correctness rests on
+/// round-tripping five real upstream captures -- evidence that is available
+/// now and has nothing to do with whichever command eventually calls it.
+/// Landing both together would have buried that proof in a much larger diff.
+#[allow(dead_code)]
+mod vanilla;
+
 /// Properties of the test suite itself (#243).
 mod hygiene;
 
