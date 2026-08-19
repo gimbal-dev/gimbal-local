@@ -81,6 +81,21 @@ pub const fn kvm_core_reg_id(byte_offset: usize) -> u64 {
     KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | (byte_offset as u64 / 4)
 }
 
+/// The byte offset into `struct kvm_regs` that a core-register ONE_REG id
+/// addresses, or `None` if `id` is not a 64-bit `KVM_REG_ARM_CORE` entry.
+///
+/// The exact inverse of [`kvm_core_reg_id`], and the piece a *writer* needs:
+/// [`lower_to_kvm`] emits `(id, value)` pairs, and patching them into a
+/// captured `core_regs` blob means turning each id back into the offset it
+/// names. Offsets are returned unbounded — the caller owns the blob and is the
+/// only one that knows how long it is.
+pub fn kvm_core_reg_offset(id: u64) -> Option<usize> {
+    let is_arm64 = (id & 0xff00_0000_0000_0000) == KVM_REG_ARM64;
+    let is_u64 = (id & KVM_REG_SIZE_U64) == KVM_REG_SIZE_U64;
+    let is_core = (id & KVM_REG_ARM_COPROC_MASK) == KVM_REG_ARM_CORE;
+    (is_arm64 && is_u64 && is_core).then(|| (id & SYSREG_ENC_MASK) as usize * 4)
+}
+
 /// Build the 64-bit KVM ONE_REG id for an AArch64 system register given its
 /// 16-bit `(op0,op1,crn,crm,op2)` encoding (an `hv_sys_reg_t` value).
 pub const fn kvm_sysreg_id(enc16: u16) -> u64 {
@@ -287,7 +302,7 @@ pub mod kvm_ingest {
         raise_from_kvm(&from_kvm(core_regs, sys_regs))
     }
 
-    use kvm_bindings::{kvm_mp_state, KVM_MP_STATE_STOPPED};
+    use kvm_bindings::{kvm_mp_state, KVM_MP_STATE_RUNNABLE, KVM_MP_STATE_STOPPED};
     use serde::Deserialize;
 
     /// The aarch64 `VcpuKvmState` exactly as cloud-hypervisor serializes it into
@@ -333,6 +348,23 @@ pub mod kvm_ingest {
         // and should not run until a PSCI CPU_ON wakes it.
         hvf.mp_state_running = s.mp_state.mp_state != KVM_MP_STATE_STOPPED;
         Ok(hvf)
+    }
+
+    /// The `mp_state` a KVM snapshot should carry for a vCPU that HVF captured
+    /// as running (or not) -- the inverse of the read one line above, and
+    /// deliberately its neighbour so the two cannot be changed apart.
+    ///
+    /// Kept here rather than in the writer because the value is an ABI
+    /// constant, not a model: on aarch64 `KVM_MP_STATE_STOPPED` is **5**, not
+    /// the 3 that x86's `KVM_MP_STATE_HALTED` uses. A writer that retyped it
+    /// from memory would hand the cloud a vCPU in a state it never asked for,
+    /// and nothing on this side would notice.
+    pub fn kvm_mp_state_for(running: bool) -> u32 {
+        if running {
+            KVM_MP_STATE_RUNNABLE
+        } else {
+            KVM_MP_STATE_STOPPED
+        }
     }
 }
 
