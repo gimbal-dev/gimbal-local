@@ -45,10 +45,15 @@ use serde_json::{Map, Value};
 ///
 /// Held as the ancestor's own bytes with typed accessors patching in place,
 /// never rebuilt from the fields we happen to model. A Mac that reconstructed
-/// this block from an HVF vCPU would zero every field HVF does not expose --
-/// the floating-point state among them -- and the guest would resume into a
-/// machine subtly unlike the one it was suspended from. Patching keeps the
-/// parent's answer for every question we cannot ask.
+/// this block from an HVF vCPU would zero every field HVF does not expose, and
+/// the guest would resume into a machine subtly unlike the one it was suspended
+/// from. Patching keeps the parent's answer for every question we cannot ask.
+///
+/// The floating-point state used to be the worked example here. It is not any
+/// more: HVF does expose it, and #357 wired it through, so the exporter now
+/// patches `fp_regs` from the live vCPU like any other block. Everything still
+/// unmodelled -- `__reserved`, and whatever a future `kvm_regs` grows -- is
+/// what the ancestor's bytes are still holding.
 pub(crate) const CORE_REGS_LEN: usize = 864;
 
 /// Byte offsets into `core_regs`, from `struct kvm_regs` on aarch64:
@@ -179,14 +184,40 @@ impl Vcpu {
     /// named accessors would mean re-deriving, here, which offset each id
     /// means -- a second copy of a mapping the KVM ABI already fixes.
     ///
-    /// This still patches in place, so the floating-point block at offset 336
-    /// keeps the ancestor's bytes: no core id the register-lowering emits
-    /// lands there, and nothing here zeroes what it is not given.
+    /// This still patches in place, so nothing here zeroes what it is not
+    /// given. It cannot reach the floating-point block at offset 336: no core
+    /// id the register-lowering emits lands there, and a `u64` at an 8-byte
+    /// stride cannot address a 128-bit vector register anyway. That block is
+    /// written by `set_core_bytes`.
     pub fn set_core_reg(&mut self, byte_offset: usize, value: u64) -> bool {
         if !byte_offset.is_multiple_of(8) || byte_offset + 8 > self.core.len() {
             return false;
         }
         self.write(byte_offset, value);
+        true
+    }
+
+    /// Update a run of bytes in `core_regs` at `byte_offset`, for state whose
+    /// width a `ONE_REG` id cannot express.
+    ///
+    /// The SIMD&FP block is the whole reason this exists. `kvm_core_reg_id`
+    /// hardcodes `KVM_REG_SIZE_U64`, so the id space `set_core_reg` speaks can
+    /// name neither a 128-bit vector register nor the 32-bit `fpsr`/`fpcr` --
+    /// the ids simply do not exist. Lowering carries that state beside the id
+    /// list rather than inside it, and it has to land somewhere.
+    ///
+    /// Deliberately byte-addressed and not 8-aligned: `fpcr` sits at 852.
+    /// Returns `false` for a run that would leave the block, rather than
+    /// growing it -- the length is the ancestor's, and a write past it would
+    /// be describing a `kvm_regs` this capture is not.
+    pub fn set_core_bytes(&mut self, byte_offset: usize, bytes: &[u8]) -> bool {
+        let Some(end) = byte_offset.checked_add(bytes.len()) else {
+            return false;
+        };
+        if end > self.core.len() {
+            return false;
+        }
+        self.core[byte_offset..end].copy_from_slice(bytes);
         true
     }
 
@@ -841,9 +872,14 @@ mod tests {
         );
     }
 
-    /// The floating-point block has no accessor here. It must still survive a
-    /// write, because a Mac patches the ancestor's own bytes rather than
-    /// rebuilding a register block from the fields it happens to model.
+    /// A core-register write must not disturb the bytes around it.
+    ///
+    /// The floating-point block is the observable stand-in: `set_core_reg`
+    /// cannot address it (wrong width, wrong alignment, and no `ONE_REG` core
+    /// id lands there), and the fixture carries non-zero bytes in it, so it is
+    /// the one region of `core_regs` this test can watch for collateral
+    /// damage. `set_core_bytes` writes it deliberately -- that is a different
+    /// call, and is what the exporter uses.
     #[test]
     fn a_register_write_carries_state_this_module_cannot_name() {
         let s = VanillaState::parse(REAL).unwrap();
