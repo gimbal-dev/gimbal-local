@@ -1160,7 +1160,13 @@ fn write_image_dir(
 ///
 /// An image that genuinely needs different boot arguments can still say so.
 /// This is about not claiming to need them when we do not.
-fn manifest(vcpus: u32, ram_mib: u64, disk: bool) -> serde_json::Value {
+/// Visible to the crate so `checkpoint::cold_boot_create_command` can be tested
+/// against *this* function's output rather than a second, separately-maintained
+/// description of the same file. That reader exists because `chm workspace` has
+/// to recognise a cold-boot image to refuse it usefully (#340), and a reader
+/// pinned to a copy of the writer's shape is the #180 mirror again: it agrees
+/// until someone changes the writer.
+pub(crate) fn manifest(vcpus: u32, ram_mib: u64, disk: bool) -> serde_json::Value {
     // Still no `cmdline` in the disk variant, for the reason above and one more:
     // `coldboot::implied_root_args` already supplies `root=/dev/vda rw` when a
     // disk is the only filesystem, and the init script is written to

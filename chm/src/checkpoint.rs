@@ -1489,11 +1489,29 @@ pub(crate) fn fork_into(src_dir: &Path, dst_dir: &Path) -> Result<(), String> {
 /// and the matching disk overlays are copied so RAM and disk stay consistent.
 /// `chm connect <ws_dir> --checkpoint` then RESUMES that settled state instead
 /// of cold-booting. This lets an image avoid replaying a fragile boot phase
-/// (e.g. cloud-init's `serial-getty` restart) on every new sandbox. When the
-/// image has no golden checkpoint the workspace starts cold from the base
-/// (`chm run <ws_dir>` cold-boots; a later suspend saves a checkpoint inside the
-/// workspace).
+/// (e.g. cloud-init's `serial-getty` restart) on every new sandbox.
+///
+/// When the image has no golden checkpoint the workspace starts from the base
+/// capture: `chm run <ws_dir>` rehydrates `state.json` + `snapshot/`, and a
+/// later suspend saves a checkpoint inside the workspace. It does **not** cold
+/// boot — this docstring used to say it did, which is not a thing `chm run` can
+/// do (`imp.rs::load_snapshot` requires `state.json`), and reading it as an
+/// invitation to point `chm workspace` at a `chm image build` output is how
+/// #340 was found. Cold boot is `chm create`, and it originates no lineage
+/// (#341).
 pub(crate) fn workspace_from_image(image_dir: &Path, ws_dir: &Path) -> Result<(), String> {
+    // Before anything is created. `symlink_base` links whichever of the three
+    // base entries exist and says nothing when none do, so an image directory
+    // with none of them used to produce an empty workspace, exit 0, and a
+    // success message naming a `chm run` that could not work (#340).
+    //
+    // Checked here rather than left to `chm run` because the error there names
+    // `state.json` in the *workspace* -- the directory we just made -- and so
+    // describes the symptom while saying nothing about the image that was
+    // actually unsuitable. The unsuitable input is knowable at this instant.
+    if let Some(why) = unusable_as_base(image_dir) {
+        return Err(why);
+    }
     if ws_dir.exists() {
         return Err(format!("workspace {} already exists", ws_dir.display()));
     }
@@ -1510,6 +1528,126 @@ pub(crate) fn workspace_from_image(image_dir: &Path, ws_dir: &Path) -> Result<()
         }
     }
     Ok(())
+}
+
+/// The base entries a workspace shares, and that `chm run` then needs: the
+/// parent `state.json` (device + memory layout) and its base RAM. `disks/` is
+/// deliberately absent — a diskless snapshot is legitimate.
+const REQUIRED_BASE: [&str; 2] = ["state.json", "snapshot/memory-ranges"];
+
+/// Why `image_dir` cannot seed a workspace, or `None` if it can.
+///
+/// The word "image" is overloaded: `chm image build` writes a *cold-boot* image
+/// (a kernel plus an initramfs or a rootfs), and `chm workspace` needs a
+/// *snapshot* image (a capture with `state.json` and base RAM). Reaching for
+/// the one you just built is the natural first move, so that specific mistake
+/// is named rather than answered with a generic refusal (#340).
+///
+/// Both branches say what was expected and what was found. A refusal that only
+/// says no leaves the user to guess which of the two kinds of directory they
+/// are holding, which is the confusion that produced the bug.
+fn unusable_as_base(image_dir: &Path) -> Option<String> {
+    if !image_dir.is_dir() {
+        return Some(format!(
+            "{} is not a directory, so there is no image to make a workspace from",
+            image_dir.display()
+        ));
+    }
+    let missing: Vec<&str> = REQUIRED_BASE
+        .iter()
+        .copied()
+        .filter(|item| !image_dir.join(item).exists())
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+
+    let d = image_dir.display();
+    // A cold-boot image is recognised by what `chm image build` writes, so the
+    // detector and the writer are pinned together by a test rather than by two
+    // separately-maintained lists (#180: a mirror agrees right up until the
+    // moment the agreement is the thing under test).
+    if let Some(cmd) = cold_boot_create_command(image_dir) {
+        return Some(format!(
+            "{d} is a cold-boot image, not a snapshot.\n\
+             \x20 It has no {}, and a workspace exists to share a captured snapshot's base.\n\
+             \x20 Cold-boot it directly instead — it needs no workspace:\n\
+             \x20     {cmd}\n\
+             \x20 `chm workspace` and `chm run` take a snapshot captured on a KVM host; see \
+             docs/hvf-compatible-snapshots.md.",
+            missing.join(" or "),
+        ));
+    }
+    Some(format!(
+        "{d} is not a snapshot image: it has no {}.\n\
+         \x20 A workspace shares a captured snapshot's {} read-only.\n\
+         \x20 Found instead: {}",
+        missing.join(" or "),
+        REQUIRED_BASE.join(" + "),
+        describe_contents(image_dir),
+    ))
+}
+
+/// The `chm create` line that would boot this directory, if it looks like a
+/// cold-boot image at all.
+///
+/// Best effort by design: `image.json` is read when it parses, because it names
+/// the sizing `chm image build` *measured* for this rootfs (`oci/mod.rs`) and a
+/// suggestion that silently dropped it would under-provision the guest. When it
+/// is absent or unreadable the conventional filenames still give a working
+/// command, and when there is no kernel at all this is not a cold-boot image
+/// and the caller says something else.
+fn cold_boot_create_command(dir: &Path) -> Option<String> {
+    let manifest: Option<serde_json::Value> = fs::read_to_string(dir.join("image.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok());
+    let named = |key: &str| -> Option<String> {
+        manifest
+            .as_ref()
+            .and_then(|m| m.get(key))
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+    };
+    let present = |name: &str| dir.join(name).is_file().then(|| name.to_string());
+
+    let kernel = named("kernel").or_else(|| present("Image"))?;
+    let mut cmd = format!("chm create --kernel {}/{kernel}", dir.display());
+    if let Some(initramfs) = named("initramfs").or_else(|| present("initramfs")) {
+        cmd.push_str(&format!(" --initramfs {}/{initramfs}", dir.display()));
+    }
+    if let Some(disk) = named("disk").or_else(|| present("rootfs.img")) {
+        cmd.push_str(&format!(" --disk {}/{disk}", dir.display()));
+    }
+    if let Some(n) = manifest.as_ref().and_then(|m| m.get("vcpus")).and_then(serde_json::Value::as_u64) {
+        cmd.push_str(&format!(" --cpus {n}"));
+    }
+    if let Some(m) = manifest.as_ref().and_then(|m| m.get("ram_mib")).and_then(serde_json::Value::as_u64) {
+        cmd.push_str(&format!(" --memory {m}"));
+    }
+    Some(cmd)
+}
+
+/// A short listing of what a directory actually holds, for a refusal that would
+/// otherwise leave the user running `ls` to find out what we saw.
+fn describe_contents(dir: &Path) -> String {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return "nothing readable".to_string();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    if names.is_empty() {
+        return "an empty directory".to_string();
+    }
+    names.sort();
+    // Enough to recognise the directory, not enough to bury the message.
+    let shown = names.len().min(8);
+    let mut list = names[..shown].join(", ");
+    if names.len() > shown {
+        list.push_str(&format!(", and {} more", names.len() - shown));
+    }
+    list
 }
 
 /// Symlink an image's immutable base (`state.json`, `snapshot/`, `disks/`) into a
@@ -1582,6 +1720,10 @@ mod tests {
     use std::process;
     use std::thread;
     use std::time::Duration;
+
+    // The real `image.json` writer, so the cold-boot detector is tested against
+    // what `chm image build` actually emits rather than a copy of it (#180).
+    use crate::oci::image::manifest as image_manifest;
 
     #[test]
     fn checkpoint_paths_are_under_the_snapshot_dir() {
@@ -2928,5 +3070,149 @@ mod tests {
                  belongs to commit_checkpoint, and a second copy of it will drift"
             );
         }
+    }
+
+    /// #340: `chm workspace` pointed at a `chm image build` output symlinked
+    /// nothing (none of the three base entries exist), reported success, and
+    /// named a `chm run` that then failed on the *workspace* — one step too
+    /// late, describing the wrong directory.
+    ///
+    /// Two things are asserted, and the second is the one that made the bug
+    /// costly: it must refuse, and it must leave nothing behind. An empty
+    /// workspace that exists is a workspace the user now has to clean up and,
+    /// worse, one a second `chm workspace` would refuse as "already exists".
+    #[test]
+    fn a_cold_boot_image_is_refused_and_leaves_no_workspace() {
+        let root = env::temp_dir().join(format!("chm-cold-{}-{}", process::id(), now_ms()));
+        let image = root.join("alpine-img");
+        let ws = root.join("sandbox-a");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&image).unwrap();
+
+        // Exactly what `chm image build` leaves behind.
+        fs::write(image.join("Image"), b"kernel").unwrap();
+        fs::write(image.join("initramfs"), b"cpio").unwrap();
+        fs::write(image.join("BUILD.txt"), b"notes").unwrap();
+        fs::write(
+            image.join("image.json"),
+            serde_json::to_string(&image_manifest(2, 1024, false)).unwrap(),
+        )
+        .unwrap();
+
+        let err = workspace_from_image(&image, &ws).expect_err("a cold-boot image cannot seed one");
+        assert!(
+            err.contains("cold-boot image"),
+            "the refusal must name the kind of directory this actually is: {err}"
+        );
+        assert!(
+            err.contains("chm create --kernel"),
+            "the refusal must say what WOULD boot it, not just what will not: {err}"
+        );
+        assert!(
+            !ws.exists(),
+            "a refused workspace must not exist: a leftover empty dir is refused as \
+             `already exists` on the retry"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The suggestion is built from `image.json`, so it has to keep agreeing
+    /// with the function that WRITES `image.json`.
+    ///
+    /// No `Image`/`initramfs` files are created here on purpose: the reader
+    /// falls back to those conventional names when the manifest is silent, and
+    /// that fallback would mask a renamed key and let this test pass while a
+    /// real image produced a suggestion with no kernel in it. Withholding the
+    /// files makes the manifest the only possible source. #180 is the reason
+    /// this is a shared call and not a hand-written copy of the same JSON.
+    #[test]
+    fn the_cold_boot_suggestion_is_built_from_what_image_build_writes() {
+        let root = env::temp_dir().join(format!("chm-mani-{}-{}", process::id(), now_ms()));
+        let image = root.join("img");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&image).unwrap();
+        fs::write(
+            image.join("image.json"),
+            serde_json::to_string(&image_manifest(4, 2048, false)).unwrap(),
+        )
+        .unwrap();
+
+        let cmd = cold_boot_create_command(&image)
+            .expect("an image.json naming a kernel is a cold-boot image");
+        for expected in ["--kernel", "Image", "--initramfs", "initramfs"] {
+            assert!(
+                cmd.contains(expected),
+                "the suggestion lost `{expected}` — image.json's shape moved and this \
+                 reader did not follow it: {cmd}"
+            );
+        }
+        // The sizing `chm image build` measured for this rootfs, not a default:
+        // a suggestion that dropped it would under-provision the guest.
+        assert!(cmd.contains("--cpus 4"), "vcpus must survive into the suggestion: {cmd}");
+        assert!(cmd.contains("--memory 2048"), "ram_mib must survive: {cmd}");
+
+        // The disk variant names a disk instead of an initramfs.
+        fs::write(
+            image.join("image.json"),
+            serde_json::to_string(&image_manifest(1, 512, true)).unwrap(),
+        )
+        .unwrap();
+        let cmd = cold_boot_create_command(&image).expect("a disk image is still a cold boot");
+        assert!(cmd.contains("--disk"), "the disk variant must be offered a --disk: {cmd}");
+        assert!(
+            !cmd.contains("--initramfs"),
+            "a disk image has no initramfs to offer: {cmd}"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A snapshot whose base RAM is missing is refused here rather than at
+    /// `chm run`, for the same reason as #340: the workspace would be created,
+    /// and the later error would name a path inside it.
+    #[test]
+    fn a_snapshot_without_base_ram_is_refused_before_the_workspace_exists() {
+        let root = env::temp_dir().join(format!("chm-noram-{}-{}", process::id(), now_ms()));
+        let image = root.join("img");
+        let ws = root.join("ws");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&image).unwrap();
+        fs::write(image.join("state.json"), b"{}").unwrap();
+
+        let err = workspace_from_image(&image, &ws).expect_err("no base RAM, no workspace");
+        assert!(
+            err.contains("snapshot/memory-ranges"),
+            "the refusal must name the thing that is missing: {err}"
+        );
+        assert!(!ws.exists(), "a refused workspace must not exist");
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A directory that is neither kind gets the generic refusal, and it lists
+    /// what it saw — otherwise the user's next move is to run `ls` themselves
+    /// to find out what we were looking at.
+    #[test]
+    fn an_unrecognised_directory_is_refused_naming_what_it_found() {
+        let root = env::temp_dir().join(format!("chm-huh-{}-{}", process::id(), now_ms()));
+        let image = root.join("img");
+        let ws = root.join("ws");
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&image).unwrap();
+        fs::write(image.join("notes.txt"), b"hello").unwrap();
+
+        let err = workspace_from_image(&image, &ws).expect_err("not an image of either kind");
+        assert!(
+            err.contains("notes.txt"),
+            "the refusal must show what it found: {err}"
+        );
+        assert!(
+            !err.contains("cold-boot image"),
+            "there is no kernel here, so calling it a cold-boot image would be a guess: {err}"
+        );
+        assert!(!ws.exists(), "a refused workspace must not exist");
+
+        let _ = fs::remove_dir_all(&root);
     }
 }
