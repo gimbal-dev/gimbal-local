@@ -20,6 +20,7 @@ use crate::disktail;
 use crate::livesnap;
 use crate::kernelimage;
 use crate::runs;
+use crate::vanilla_export;
 use crate::create::create_main;
 use crate::oci::image::image_main;
 use crate::cloud;
@@ -1445,6 +1446,13 @@ pub fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        Some("vanilla") => match vanilla(&raw[1..]) {
+            Ok(code) => code,
+            Err(e) => {
+                eprintln!("chm vanilla: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Some("revisions") => match revisions(&raw[1..]) {
             Ok(code) => code,
             Err(e) => {
@@ -1540,8 +1548,7 @@ fn usage() -> String {
          chm resume <SNAPSHOT_DIR> [OPTIONS]   (restore a saved checkpoint)\n    \
          chm connect <SNAPSHOT_DIR> [OPTIONS]  (interactive session)\n    \
          chm exec [OPTIONS] -- <CMD> [ARG...]  (run a command in the guest)\n    \
-         chm ps [--json]                       (what is running right now)\n\
-    \
+         chm ps [--json]                       (what is running right now)\n    \
          chm spec <COMMAND> [OPTIONS]          (describe a sandbox in a file)\n\
      \n\
      BUILD AN IMAGE\n    \
@@ -1553,6 +1560,7 @@ fn usage() -> String {
          chm fork <SRC_DIR> <DST_DIR>          (branch a saved revision)\n    \
          chm revisions <SNAPSHOT_DIR> [--json] (list the lineage)\n    \
          chm rollback <SNAPSHOT_DIR> <REV_ID>  (roll back to a revision)\n    \
+         chm vanilla export <SNAP_DIR> <OUT>   (write a vanilla capture back)\n    \
          chm manifest <COMMAND> [OPTIONS]      (sign / verify a manifest)\n\
      \n\
      SECURITY AND EVIDENCE\n    \
@@ -1925,6 +1933,158 @@ fn workspace(raw: &[String]) -> Result<ExitCode, String> {
 /// (its suspend/fork/rollback lineage), oldest first.
 /// Shared by the parser and its test, so the documented order and the accepted
 /// order cannot drift apart.
+const VANILLA_USAGE: &str = "usage: chm vanilla export <SNAPSHOT_DIR> <OUT_DIR> [--json]\n\
+     \n\
+     Write this lineage's current checkpoint back out as a *vanilla* Cloud\n\
+     Hypervisor capture -- the same shape upstream writes on a KVM host, and\n\
+     the shape `chm run` reads. The register state comes from a live Apple\n\
+     Hypervisor.framework vCPU; there is no KVM, no QEMU and no Linux host\n\
+     anywhere in the path.\n\
+     \n\
+     This is what makes the cloud round trip symmetric. Until now a snapshot\n\
+     could only travel one way: down from the cloud, run here, and whatever\n\
+     the guest did on this Mac stayed on this Mac.\n\
+     \n\
+     The export rewrites this lineage's own ancestor rather than synthesising\n\
+     a document, so every field a Mac did not re-measure is the cloud's own\n\
+     bytes. `--json` reports exactly which fields changed, so the claim is\n\
+     checkable rather than asserted.\n\
+     \n\
+     OUT_DIR must not exist. Guest RAM and the disks are APFS clones plus the\n\
+     sectors that were written, so an export of a 10 GiB machine costs close\n\
+     to what actually changed.";
+
+/// What `chm vanilla` was asked to do.
+///
+/// Parsing is split out from doing because the dispatch arm hands this
+/// function `&raw[1..]` -- the slice *after* `vanilla` -- so the verb is at
+/// index 0, not 1. An off-by-one here is invisible to every test that calls
+/// the exporter directly, and it makes the command print usage forever
+/// instead of exporting anything.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum VanillaCmd {
+    /// An explicit `-h`/`--help`. Asking for help and getting it is a success.
+    Help,
+    Export {
+        dir: PathBuf,
+        out: PathBuf,
+        json: bool,
+    },
+}
+
+/// Parse the argv slice the dispatcher passes for `chm vanilla`.
+///
+/// `raw[0]` is the sub-verb (`export`), NOT `vanilla`.
+pub(crate) fn parse_vanilla(raw: &[String]) -> Result<VanillaCmd, String> {
+    if raw.iter().any(|a| a == "-h" || a == "--help") {
+        return Ok(VanillaCmd::Help);
+    }
+    let json = raw.iter().any(|a| a == "--json");
+    let positionals: Vec<&String> = raw.iter().filter(|a| !a.starts_with('-')).collect();
+
+    match positionals.first().map(|s| s.as_str()) {
+        Some("export") if positionals.len() == 3 => Ok(VanillaCmd::Export {
+            dir: PathBuf::from(positionals[1]),
+            out: PathBuf::from(positionals[2]),
+            json,
+        }),
+        Some("export") => Err(format!(
+            "`export` takes a snapshot directory and an output directory, got {}",
+            positionals.len() - 1
+        )),
+        Some(other) => Err(format!("expected `export` after `vanilla`, got `{other}`")),
+        None => Err("expected `export <SNAPSHOT_DIR> <OUT_DIR>`".to_string()),
+    }
+}
+
+/// `chm vanilla export <SNAPSHOT_DIR> <OUT_DIR>` (#353).
+fn vanilla(raw: &[String]) -> Result<ExitCode, String> {
+    let (dir, out, json) = match parse_vanilla(raw) {
+        Ok(VanillaCmd::Help) => {
+            println!("{VANILLA_USAGE}");
+            return Ok(ExitCode::SUCCESS);
+        }
+        Ok(VanillaCmd::Export { dir, out, json }) => (dir, out, json),
+        Err(e) => {
+            eprintln!("{VANILLA_USAGE}");
+            return Err(e);
+        }
+    };
+    let dir = dir.as_path();
+    let out = out.as_path();
+    let report = vanilla_export::export(dir, out)?;
+
+    if json {
+        let paths: Vec<serde_json::Value> = report
+            .changed_paths
+            .iter()
+            .map(|p| serde_json::Value::String(p.clone()))
+            .collect();
+        let warnings: Vec<serde_json::Value> = report
+            .warnings
+            .iter()
+            .map(|w| serde_json::Value::String(w.clone()))
+            .collect();
+        let disks: Vec<serde_json::Value> = report
+            .disks
+            .iter()
+            .map(|(name, sectors)| {
+                serde_json::json!({ "disk": name, "sectors_overlaid": sectors })
+            })
+            .collect();
+        println!(
+            "{}",
+            serde_json::json!({
+                "out": out.display().to_string(),
+                "vcpus": report.vcpus,
+                "ram_bytes": report.ram_bytes,
+                "disks": disks,
+                "changed_paths": paths,
+                "not_carried": warnings,
+                "vcpus_exported": report
+                    .vcpu_summaries
+                    .iter()
+                    .map(|l| serde_json::Value::String(l.clone()))
+                    .collect::<Vec<serde_json::Value>>(),
+            })
+        );
+        return Ok(ExitCode::SUCCESS);
+    }
+
+    println!("vanilla capture written to {}", out.display());
+    println!(
+        "  {} vCPU register block(s) rewritten, guest RAM {}",
+        report.vcpus,
+        human_bytes(report.ram_bytes)
+    );
+    // Where each guest core actually was, read back out of the written
+    // document. A zero or wild `pc` is the cheapest visible symptom of an
+    // offset or byte-order mistake in the register block.
+    for line in &report.vcpu_summaries {
+        println!("  {line}");
+    }
+    for (name, sectors) in &report.disks {
+        if *sectors == 0 {
+            println!("  {name}: unchanged from the base");
+        } else {
+            println!(
+                "  {name}: {sectors} sector(s) overlaid ({})",
+                human_bytes(sectors * 512)
+            );
+        }
+    }
+    // The differential IS the evidence: a field outside this list would mean
+    // the export had invented something the guest never did.
+    println!("  {} field(s) differ from the ancestor:", report.changed_paths.len());
+    for p in &report.changed_paths {
+        println!("    {p}");
+    }
+    for w in &report.warnings {
+        println!("  not carried: {w}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 const REVISIONS_USAGE: &str = "usage: chm revisions <SNAPSHOT_DIR> [--json] [--usage]\n       \
      chm revisions <SNAPSHOT_DIR> pin    <REVISION_ID>\n       \
      chm revisions <SNAPSHOT_DIR> unpin  <REVISION_ID>\n       \
@@ -4249,15 +4409,59 @@ mod tests {
     /// test fixes the class, by reading the dispatch table out of this file's
     /// own source and requiring every arm to be reachable from the help.
     ///
-    /// If this fails because a new `Some("...")` was added for something that
-    /// is *not* a subcommand, that is still worth a look: the dispatch match is
-    /// the only place that shape is meant to appear.
+    /// The extraction is bounded to the dispatch `match` itself, tracked by
+    /// brace balance from its head. Scanning the whole file was the first
+    /// shape, and it broke the moment a *nested* `match` elsewhere used the
+    /// same `Some("...")` arm: `parse_vanilla` dispatches its own sub-verb, and
+    /// the guard reported `export` as an undocumented top-level subcommand.
+    /// A guard that fires on things it was never meant to see gets weakened to
+    /// silence it; bounding it to the table it is guarding keeps its teeth.
     #[test]
+    /// A `\\` at the end of a line in a Rust string eats the newline *and*
+    /// the next line's leading whitespace, so an entry whose predecessor
+    /// forgets to write the indent before its backslash silently renders at
+    /// column 0. That shipped twice: once in `VANILLA_USAGE`, once on the
+    /// `chm spec` line here. Nothing else notices, because every guard we had
+    /// asks whether a subcommand is *mentioned*, and a de-indented line
+    /// mentions it perfectly.
+    #[test]
+    fn no_help_entry_loses_its_indentation() {
+        let help = usage();
+        let stray: Vec<&str> = help
+            .lines()
+            .skip(1) // the title line is deliberately at column 0
+            .filter(|l| l.starts_with("chm "))
+            .collect();
+        assert!(
+            stray.is_empty(),
+            "help entries rendered at column 0 (a `\\` ate their indent): {stray:?}"
+        );
+    }
+
     fn every_dispatched_subcommand_appears_in_the_help() {
         let src = include_str!("imp.rs");
         let help = usage();
 
-        let mut dispatched: Vec<&str> = src
+        const HEAD: &str = "match raw.first().map(String::as_str) {";
+        let start = src.find(HEAD).expect("the dispatch match head moved");
+        let mut depth = 0i32;
+        let mut end = src.len();
+        for (i, c) in src[start..].char_indices() {
+            match c {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = start + i;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let table = &src[start..end];
+
+        let mut dispatched: Vec<&str> = table
             .lines()
             .filter_map(|l| l.trim().strip_prefix("Some(\""))
             .filter_map(|r| r.split('"').next())
@@ -5329,5 +5533,100 @@ mod revisions_args_tests {
             src.contains(&parse),
             "and the flag must still be recognised on the command line"
         );
+    }
+}
+
+#[cfg(test)]
+mod vanilla_args_tests {
+    use super::*;
+
+    /// The dispatch arm hands `vanilla()` the slice *after* `vanilla`, so the
+    /// sub-verb is at index 0. This shipped indexing it at 1, which made
+    /// `chm vanilla export A B` print usage and refuse forever -- the command
+    /// could never do its job. Every unit test called the exporter directly,
+    /// so none of them crossed the parser.
+    #[test]
+    fn export_parses_at_the_slice_the_dispatcher_actually_passes() {
+        let argv: Vec<String> = ["export", "/snap", "/out"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        match parse_vanilla(&argv) {
+            Ok(VanillaCmd::Export { dir, out, json }) => {
+                assert_eq!(dir, PathBuf::from("/snap"));
+                assert_eq!(out, PathBuf::from("/out"));
+                assert!(!json);
+            }
+            other => panic!("expected an Export, got {other:?}"),
+        }
+    }
+
+    /// The parse tests above are only meaningful if the dispatcher really does
+    /// strip one element. Mutating a function is not mutating its call site,
+    /// so pin the call site itself.
+    #[test]
+    fn the_vanilla_dispatch_arm_strips_only_the_subcommand_name() {
+        let src = include_str!("imp.rs");
+        let needle = format!("Some(\"vanilla\") => match {}(&raw[1..])", "vanilla");
+        assert!(
+            src.contains(&needle),
+            "the vanilla dispatch arm no longer passes `&raw[1..]`; \
+             parse_vanilla indexes the sub-verb at 0 and would be off by one"
+        );
+    }
+
+    #[test]
+    fn a_json_flag_is_not_mistaken_for_a_positional() {
+        let argv: Vec<String> = ["export", "/snap", "/out", "--json"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        match parse_vanilla(&argv) {
+            Ok(VanillaCmd::Export { json, dir, .. }) => {
+                assert!(json, "--json was dropped");
+                assert_eq!(dir, PathBuf::from("/snap"));
+            }
+            other => panic!("expected an Export, got {other:?}"),
+        }
+    }
+
+    /// An explicit help request is a success, and it must win over an
+    /// otherwise-invalid argument list rather than being reported as an error.
+    #[test]
+    fn an_explicit_help_request_is_not_an_error() {
+        for flag in ["-h", "--help"] {
+            let argv = vec![flag.to_string()];
+            assert_eq!(parse_vanilla(&argv), Ok(VanillaCmd::Help), "{flag}");
+        }
+        let argv: Vec<String> = ["export", "--help"].iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(parse_vanilla(&argv), Ok(VanillaCmd::Help));
+    }
+
+    /// Each refusal has to name what was actually wrong; a single generic
+    /// message would send a reader to the wrong half of the command line.
+    #[test]
+    fn each_way_of_getting_it_wrong_is_refused_by_name() {
+        let call = |args: &[&str]| {
+            parse_vanilla(&args.iter().map(|s| (*s).to_string()).collect::<Vec<String>>())
+                .expect_err("should have been refused")
+        };
+        assert!(call(&[]).contains("expected `export <SNAPSHOT_DIR> <OUT_DIR>`"));
+        assert!(call(&["frobnicate", "a", "b"]).contains("frobnicate"));
+        let short = call(&["export", "/snap"]);
+        assert!(short.contains("got 1"), "{short}");
+        let long = call(&["export", "/snap", "/out", "/extra"]);
+        assert!(long.contains("got 3"), "{long}");
+    }
+
+    /// The usage text is printed straight to a terminal, so a continuation
+    /// that keeps its source indentation renders as a ragged five-space step.
+    #[test]
+    fn the_usage_text_carries_no_accidental_indentation() {
+        for (n, line) in VANILLA_USAGE.lines().enumerate() {
+            assert!(
+                !line.starts_with(' '),
+                "VANILLA_USAGE line {n} is indented: {line:?}"
+            );
+        }
     }
 }
