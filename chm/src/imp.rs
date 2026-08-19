@@ -4403,20 +4403,6 @@ mod tests {
         assert_eq!(relative_age(now + 60_000), "0s ago");
     }
 
-    /// `--help` is the only place a user can discover what `chm` does, and it
-    /// had drifted: seven dispatched subcommands were absent from it, including
-    /// `create` — the whole cold-boot path. Listing them once fixes today; this
-    /// test fixes the class, by reading the dispatch table out of this file's
-    /// own source and requiring every arm to be reachable from the help.
-    ///
-    /// The extraction is bounded to the dispatch `match` itself, tracked by
-    /// brace balance from its head. Scanning the whole file was the first
-    /// shape, and it broke the moment a *nested* `match` elsewhere used the
-    /// same `Some("...")` arm: `parse_vanilla` dispatches its own sub-verb, and
-    /// the guard reported `export` as an undocumented top-level subcommand.
-    /// A guard that fires on things it was never meant to see gets weakened to
-    /// silence it; bounding it to the table it is guarding keeps its teeth.
-    #[test]
     /// A `\\` at the end of a line in a Rust string eats the newline *and*
     /// the next line's leading whitespace, so an entry whose predecessor
     /// forgets to write the indent before its backslash silently renders at
@@ -4438,6 +4424,27 @@ mod tests {
         );
     }
 
+    /// `--help` is the only place a user can discover what `chm` does, and it
+    /// had drifted: seven dispatched subcommands were absent from it, including
+    /// `create` — the whole cold-boot path. Listing them once fixes today; this
+    /// test fixes the class, by reading the dispatch table out of this file's
+    /// own source and requiring every arm to be reachable from the help.
+    ///
+    /// The extraction is bounded to the dispatch `match` itself, tracked by
+    /// brace balance from its head. Scanning the whole file was the first
+    /// shape, and it broke the moment a *nested* `match` elsewhere used the
+    /// same `Some("...")` arm: `parse_vanilla` dispatches its own sub-verb, and
+    /// the guard reported `export` as an undocumented top-level subcommand.
+    /// A guard that fires on things it was never meant to see gets weakened to
+    /// silence it; bounding it to the table it is guarding keeps its teeth.
+    /// This guard had itself stopped running. A later test was inserted at
+    /// this function's `fn` header line, which left the doc comment and
+    /// `#[test]` above orphaned onto the newcomer and stole the attribute from
+    /// this one -- so from that commit until #357 the help was unguarded, and
+    /// the suite reported otherwise. Third time in this repo; the tell is a
+    /// `duplicated attribute` warning nobody reads. Append at the module's
+    /// closing brace instead of splicing at a `fn` line.
+    #[test]
     fn every_dispatched_subcommand_appears_in_the_help() {
         let src = include_str!("imp.rs");
         let help = usage();
@@ -4604,6 +4611,7 @@ mod tests {
                     // 0xc020 is ID_AA64PFR0_EL1 (S3_0_C0_C4_0).
                     sysregs: vec![(0xc020, pfr0)],
                     gic_icc: Vec::new(),
+                    fp: None,
                     mp_state_running: true,
                 }],
                 gic_dist: Vec::new(),
@@ -4639,6 +4647,7 @@ mod tests {
                     // 0xd801 is CTR_EL0 (S3_3_C0_C0_1).
                     sysregs: vec![(0xd801, ctr)],
                     gic_icc: Vec::new(),
+                    fp: None,
                     mp_state_running: true,
                 }],
                 gic_dist: Vec::new(),
@@ -4674,6 +4683,7 @@ mod tests {
                     // 0xc038 is ID_AA64MMFR0_EL1 (S3_0_C0_C7_0).
                     sysregs: vec![(0xc038, v)],
                     gic_icc: Vec::new(),
+                    fp: None,
                     mp_state_running: true,
                 }],
                 gic_dist: Vec::new(),

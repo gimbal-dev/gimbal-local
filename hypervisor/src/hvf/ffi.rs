@@ -50,8 +50,11 @@ pub fn hv_return_str(code: i32) -> &'static str {
     }
 }
 
-// hv_reg_t — general-purpose and special core registers.
+// hv_reg_t — general-purpose and special core registers. The enum runs
+// X0..X30 = 0..30, then the four below in order, so PC..CPSR are 31..34.
 pub const HV_REG_PC: u32 = 31;
+pub const HV_REG_FPCR: u32 = 32;
+pub const HV_REG_FPSR: u32 = 33;
 pub const HV_REG_CPSR: u32 = 34;
 
 // hv_exit_reason_t
@@ -232,6 +235,17 @@ unsafe extern "C" {
     pub fn hv_vcpu_get_reg(vcpu: u64, reg: u32, value: *mut u64) -> i32;
     pub fn hv_vcpu_set_sys_reg(vcpu: u64, reg: u16, value: u64) -> i32;
     pub fn hv_vcpu_get_sys_reg(vcpu: u64, reg: u16, value: *mut u64) -> i32;
+
+    /// Read one 128-bit SIMD&FP register (Q0..Q31). The value is returned
+    /// through a pointer, so this direction has no ABI ambiguity and can be
+    /// declared normally.
+    pub fn hv_vcpu_get_simd_fp_reg(vcpu: u64, reg: u32, value: *mut [u8; 16]) -> i32;
+
+    /// Address-only handle on the SIMD&FP *setter*. Deliberately declared with
+    /// no parameters: it must never be called through this signature. See
+    /// [`set_simd_fp_reg`], which is the only supported way in.
+    #[link_name = "hv_vcpu_set_simd_fp_reg"]
+    fn hv_vcpu_set_simd_fp_reg_addr();
     pub fn hv_vcpu_run(vcpu: u64) -> i32;
     // Force the listed vCPUs to return from `hv_vcpu_run` promptly. Safe to call
     // from a thread other than the one running the vCPU; the interrupted run
@@ -317,6 +331,61 @@ unsafe extern "C" {
     pub fn os_release(object: *mut c_void);
 }
 
+/// Write one 128-bit SIMD&FP register (Q0..Q31).
+///
+/// The C prototype takes the value **by value**:
+///
+/// ```c
+/// typedef __attribute__((ext_vector_type(16))) uint8_t hv_simd_fp_uchar16_t;
+/// hv_return_t hv_vcpu_set_simd_fp_reg(hv_vcpu_t, hv_simd_fp_reg_t,
+///                                     hv_simd_fp_uchar16_t value);
+/// ```
+///
+/// AAPCS64 passes a Short Vector argument in a SIMD register (`v0` here), not
+/// in general-purpose registers. Stable Rust cannot spell that: `uint8x16_t` in
+/// an `extern` signature is rejected as "use of SIMD type in FFI is highly
+/// experimental" and needs nightly's `simd_ffi`. Both spellings that *do*
+/// compile put the value in the wrong place, and neither is honest about it —
+/// `hv_vcpu_set_simd_fp_reg` returns `HV_SUCCESS` regardless. Measured on
+/// Apple silicon by writing a distinct pattern to each of Q0..Q31 and reading
+/// every one back through the pointer-based getter:
+///
+/// | declaration            | `-C opt-level=0` | `-C opt-level=s` | `-C opt-level=3` |
+/// | ---------------------- | ---------------- | ---------------- | ---------------- |
+/// | `value: u128`          | 0/32             | 0/32             | -                |
+/// | `value: [u8; 16]`      | **32/32**        | **0/32**         | -                |
+/// | `ldr q0` + `blr` below | 32/32            | 32/32            | 32/32            |
+///
+/// The `[u8; 16]` row is the trap: a debug build round-trips every register and
+/// a release build silently writes zeros into all 32. That is the same shape as
+/// the `fcntl` ABI bug in `compat.rs`, which also passed under `-O0` and broke
+/// every shipped binary.
+///
+/// So the value is placed in `q0` explicitly and the function reached with an
+/// indirect call. `clobber_abi("C")` tells the compiler this is a C call.
+pub fn set_simd_fp_reg(vcpu: u64, reg: u32, value: &[u8; 16]) -> i32 {
+    let rc: u64;
+    // SAFETY: `hv_vcpu_set_simd_fp_reg_addr` is the real Hypervisor.framework
+    // symbol, entered here with the AAPCS64 argument placement its C prototype
+    // requires: `x0` = vcpu, `w1` = register index, `q0` = the 16-byte value
+    // loaded from `value`, which is a valid readable 16-byte pointer for the
+    // duration of the call. `clobber_abi("C")` marks every caller-saved
+    // register the callee may destroy, so the compiler keeps nothing live
+    // across the `blr`. The return is `hv_return_t`, a 32-bit value in `w0`.
+    unsafe {
+        core::arch::asm!(
+            "ldr q0, [{val}]",
+            "blr {func}",
+            val = in(reg) value.as_ptr(),
+            func = in(reg) hv_vcpu_set_simd_fp_reg_addr as *const () as usize,
+            inlateout("x0") vcpu => rc,
+            in("x1") reg as u64,
+            clobber_abi("C"),
+        );
+    }
+    rc as i32
+}
+
 unsafe extern "C" {
     /// Mach monotonic tick count. The HVF vtimer offset is defined relative to
     /// it: `CNTVCT_EL0 = mach_absolute_time() - offset`.
@@ -359,5 +428,41 @@ mod tests {
             assert_ne!(hv_return_str(code), "unknown hv_return_t", "code {code:#010x}");
         }
         assert_eq!(hv_return_str(0x1234_5678), "unknown hv_return_t");
+    }
+
+    /// `hv_vcpu_set_simd_fp_reg` takes its 16-byte value **by value**, and
+    /// AAPCS64 passes a Short Vector in `v0`. No stable-Rust `extern`
+    /// declaration can say that: `uint8x16_t` needs `#![feature(simd_ffi)]`,
+    /// and every expressible substitute passes in general-purpose registers,
+    /// so the callee reads whatever `v0` happened to hold.
+    ///
+    /// The reason this guard reads the source rather than asserting an outcome
+    /// is that a `[u8; 16]` declaration **measures 32/32 correct at
+    /// `opt-level=0`** and 0/32 at `-Os`, returning `HV_SUCCESS` in both. A
+    /// behavioural test compiled in debug therefore cannot see the bug -- it is
+    /// the exact shape of the `fcntl` variadic defect that shipped a hung
+    /// release binary (see `compat.rs`, and the release arm of `make
+    /// test-release` that exists because of it).
+    ///
+    /// Needles are assembled from parts so this assertion cannot match its own
+    /// text.
+    #[test]
+    fn the_simd_setter_passes_its_value_in_a_vector_register() {
+        let src = include_str!("ffi.rs");
+        let load = format!("{} q0, [{{val}}]", "ldr");
+        assert!(
+            src.contains(&load),
+            "the SIMD&FP setter no longer loads the value into q0 before the \
+             call, so it is being passed in general-purpose registers. HVF \
+             will return HV_SUCCESS and write whatever v0 held."
+        );
+
+        let by_value = format!("{}: [u8; 16]) -> i32;", "value");
+        assert!(
+            !src.contains(&by_value),
+            "an `extern` declaration is taking the 16-byte value by value. \
+             That passes in x-registers, which is correct at opt-level=0 and \
+             silently writes zeros to all 32 registers at -Os."
+        );
     }
 }

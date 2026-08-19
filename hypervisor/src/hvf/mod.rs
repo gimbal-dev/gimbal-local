@@ -195,6 +195,36 @@ pub struct HvfIrqRoutingEntry {
     pub data: u32,
 }
 
+/// The SIMD&FP register file: Q0..Q31 plus the two control/status registers.
+///
+/// Held as raw little-endian bytes rather than a numeric type because that is
+/// exactly how both ends want it — Hypervisor.framework hands back 16 opaque
+/// bytes, and KVM's `user_fpsimd_state.vregs[32]` is 512 contiguous bytes in
+/// the same order. Keeping it as bytes means the translation is a copy and has
+/// no endianness or lane-order opinion to get wrong.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VcpuFpState {
+    /// Q0..Q31, each 16 bytes little-endian.
+    pub vregs: Vec<[u8; 16]>,
+    pub fpsr: u32,
+    pub fpcr: u32,
+}
+
+/// Number of SIMD&FP vector registers on AArch64. Not a free parameter: it is
+/// the architectural register count, and both HVF's `hv_simd_fp_reg_t` and
+/// KVM's `user_fpsimd_state.vregs[32]` are sized by it.
+pub const FP_VREG_COUNT: usize = 32;
+
+impl Default for VcpuFpState {
+    fn default() -> Self {
+        Self {
+            vregs: vec![[0u8; 16]; FP_VREG_COUNT],
+            fpsr: 0,
+            fpcr: 0,
+        }
+    }
+}
+
 /// Full architectural vCPU state — the unit of snapshot/restore.
 #[derive(Clone, Serialize, Deserialize, Default)]
 pub struct VcpuHvfState {
@@ -208,6 +238,11 @@ pub struct VcpuHvfState {
     /// owns these and they are not reachable via `hv_vcpu_get_sys_reg`.
     #[serde(default)]
     pub gic_icc: Vec<(u16, u64)>,
+    /// SIMD&FP register file. `None` in snapshots written before this was
+    /// captured; restoring such a snapshot leaves the FP registers at their
+    /// reset values, which is what those snapshots have always done.
+    #[serde(default)]
+    pub fp: Option<VcpuFpState>,
     pub mp_state_running: bool,
 }
 
@@ -3025,6 +3060,61 @@ impl HvfVcpu {
         Ok(v)
     }
 
+    /// Read one 128-bit SIMD&FP register (Q0..Q31).
+    fn get_simd_fp_reg(&self, reg: u32) -> CpuResult<[u8; 16]> {
+        let mut v = [0u8; 16];
+        // SAFETY: FFI on the owning thread; out-param valid for 16 bytes.
+        let ret = unsafe { hv_vcpu_get_simd_fp_reg(self.id, reg, &mut v) };
+        if ret != HV_SUCCESS {
+            return Err(HypervisorCpuError::GetRegister(anyhow!(
+                "hv_vcpu_get_simd_fp_reg({reg}) failed: {:#010x}",
+                ret as u32
+            )));
+        }
+        Ok(v)
+    }
+
+    /// Write one 128-bit SIMD&FP register (Q0..Q31).
+    fn set_simd_fp_reg(&self, reg: u32, val: &[u8; 16]) -> CpuResult<()> {
+        // Goes through the asm trampoline in `ffi`: the C setter takes its
+        // value in a SIMD register and stable Rust cannot spell that in an
+        // `extern` signature. See `ffi::set_simd_fp_reg` for the measurement.
+        let ret = ffi::set_simd_fp_reg(self.id, reg, val);
+        if ret != HV_SUCCESS {
+            return Err(HypervisorCpuError::SetRegister(anyhow!(
+                "hv_vcpu_set_simd_fp_reg({reg}) failed: {:#010x}",
+                ret as u32
+            )));
+        }
+        Ok(())
+    }
+
+    /// Capture the whole SIMD&FP register file.
+    fn get_fp_state(&self) -> CpuResult<VcpuFpState> {
+        let mut vregs = Vec::with_capacity(FP_VREG_COUNT);
+        for reg in 0..FP_VREG_COUNT {
+            vregs.push(self.get_simd_fp_reg(reg as u32)?);
+        }
+        Ok(VcpuFpState {
+            vregs,
+            fpsr: self.get_reg(HV_REG_FPSR)? as u32,
+            fpcr: self.get_reg(HV_REG_FPCR)? as u32,
+        })
+    }
+
+    /// Restore the whole SIMD&FP register file.
+    ///
+    /// Unlike the EL1 system registers, none of these can be read-only on a
+    /// given core, so a failure here is a real failure and is not swallowed.
+    fn set_fp_state(&self, fp: &VcpuFpState) -> CpuResult<()> {
+        for (i, v) in fp.vregs.iter().enumerate().take(FP_VREG_COUNT) {
+            self.set_simd_fp_reg(i as u32, v)?;
+        }
+        self.set_reg(HV_REG_FPSR, u64::from(fp.fpsr))?;
+        self.set_reg(HV_REG_FPCR, u64::from(fp.fpcr))?;
+        Ok(())
+    }
+
     /// Establish this vCPU's affinity in MPIDR_EL1.
     ///
     /// HVF leaves MPIDR_EL1 reading 0, which lacks the architectural RES1 bit
@@ -4464,6 +4554,7 @@ impl Vcpu for HvfVcpu {
             sp_el1: self.get_sysreg(SYSREG_SP_EL1)?,
             sysregs,
             gic_icc,
+            fp: Some(self.get_fp_state()?),
             mp_state_running: true,
         }))
     }
@@ -4480,6 +4571,12 @@ impl Vcpu for HvfVcpu {
         }
         self.set_reg(HV_REG_PC, s.pc)?;
         self.set_reg(HV_REG_CPSR, s.cpsr)?;
+        // Snapshots written before FP capture carry `None`; there is nothing to
+        // restore and the registers keep their reset values, exactly as those
+        // snapshots have always resumed.
+        if let Some(fp) = &s.fp {
+            self.set_fp_state(fp)?;
+        }
         // Some EL1 system registers may be read-only on a given core; restoring
         // them is best-effort and must not abort the whole restore.
         let _ = self.set_sysreg(SYSREG_SP_EL1, s.sp_el1);

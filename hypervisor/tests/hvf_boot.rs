@@ -4224,3 +4224,148 @@ fn the_hvf_gate_runs_the_hypervisor_unit_tests() {
          suite has traded one half of the gate for the other:\n{body}"
     );
 }
+
+/// `make test-release` must run this suite, not only the lib suite.
+///
+/// The defect class this target exists for is *benign in debug*. `fcntl`'s
+/// missing variadic marker read a zero at `opt-level=0` and garbage at
+/// `opt-level=s`; declaring `hv_vcpu_set_simd_fp_reg`'s 16-byte value as
+/// `[u8; 16]` writes all 32 vector registers correctly at `opt-level=0` and
+/// writes 32 zeros at `opt-level=s`, `HV_SUCCESS` both times. Measured against
+/// that exact mutation:
+///
+/// ```text
+/// debug   -> every_simd_fp_register_survives_a_state_round_trip ... ok
+/// release -> FAILED, v0..v31 all zero
+/// ```
+///
+/// So the integration suite -- the only place a real vCPU is ever created --
+/// running in debug alone is the same disease `test-hvf` had one layer down.
+///
+/// This guard lives in the integration suite deliberately: dropping the release
+/// arm removes the configuration that runs it, and the guard goes with it, which
+/// is loud. Placed in the lib suite it would keep passing while the thing it
+/// guards no longer ran.
+#[test]
+fn the_release_gate_runs_this_suite_in_release() {
+    let makefile = include_str!("../../Makefile");
+
+    let mut body = Vec::new();
+    let mut continued = false;
+    for line in makefile
+        .split_once("\ntest-release:\n")
+        .expect("the Makefile defines a test-release target")
+        .1
+        .lines()
+    {
+        if !line.starts_with('\t') && !continued {
+            break;
+        }
+        continued = line.ends_with('\\');
+        body.push(line);
+    }
+    let body = body.join("\n");
+
+    // Assembled from parts: a literal needle would match this assertion's own
+    // text if the guard ever moved into a file the Makefile search could see.
+    let selector = format!("--test {}", "hvf_boot");
+    assert!(
+        body.contains(&selector),
+        "make test-release no longer builds the HVF integration suite, so the \
+         only tests that create a real vCPU have gone back to running in debug \
+         alone -- the configuration in which the ABI defects this target exists \
+         to catch are benign:\n{body}"
+    );
+    assert!(
+        body.contains("--release"),
+        "make test-release is not passing --release:\n{body}"
+    );
+    // Every `cargo build` strips the hypervisor entitlement, so an unsigned
+    // release binary fails every test with HV_DENIED -- which reads as a broken
+    // backend and would very reasonably get the arm removed again.
+    assert!(
+        body.contains("codesign"),
+        "make test-release builds the HVF integration suite without re-signing \
+         it, so every test in it will fail with HV_DENIED:\n{body}"
+    );
+}
+
+/// A distinct, non-repeating byte in every lane of every vector register, so a
+/// wrong register index, a duplicated lane or a truncated write is as visible
+/// as a wrong ABI. A uniform pattern would let a setter that writes the same
+/// value 32 times pass.
+fn simd_pattern(reg: usize) -> [u8; 16] {
+    let mut v = [0u8; 16];
+    for (j, b) in v.iter_mut().enumerate() {
+        *b = ((reg * 16 + j) ^ 0x5a) as u8;
+    }
+    v
+}
+
+/// Every SIMD&FP register survives a `state()` / `set_state()` round trip.
+///
+/// This is the #357 guard at the level the snapshot path actually uses: HVF's
+/// setter takes its 16-byte value *by value*, which AAPCS64 passes in `v0`, and
+/// no stable-Rust `extern` declaration can express that. `ffi::set_simd_fp_reg`
+/// therefore loads `q0` in inline asm before the call. A declaration taking
+/// `[u8; 16]` measures 32/32 here and **0/32 at `-Os`** while still returning
+/// `HV_SUCCESS`, so this test alone cannot police the ABI -- see
+/// `the_simd_setter_passes_its_value_in_a_vector_register`, which reads the
+/// source, and the release arm of `make test-release`.
+#[test]
+fn every_simd_fp_register_survives_a_state_round_trip() {
+    let ram = HostRam::new(RAM_SIZE);
+    let ops = Arc::new(RecordingVmOps {
+        writes: Mutex::new(Vec::new()),
+    });
+    let (_vm, mut vcpu) = build_vm(&ram, ops);
+
+    let mut state = match vcpu.state().expect("state") {
+        CpuState::Hvf(s) => s,
+        #[allow(unreachable_patterns)]
+        _ => panic!("expected an HVF CpuState"),
+    };
+    let fp = state
+        .fp
+        .as_mut()
+        .expect("state() must capture the SIMD&FP register file");
+    assert_eq!(
+        fp.vregs.len(),
+        32,
+        "aarch64 has 32 SIMD&FP vector registers; capturing fewer silently \
+         drops guest state"
+    );
+    for (i, v) in fp.vregs.iter_mut().enumerate() {
+        *v = simd_pattern(i);
+    }
+    // FZ (bit 24) and the IXC cumulative flag (bit 4) are both writable, and
+    // `fpsr = 0x10` is precisely what real Graviton captures carry -- evidence
+    // that the guest did floating-point arithmetic before it was suspended.
+    fp.fpcr = 0x0100_0000;
+    fp.fpsr = 0x10;
+
+    vcpu.set_state(&CpuState::Hvf(state)).expect("set_state");
+
+    let back = match vcpu.state().expect("state after restore") {
+        CpuState::Hvf(s) => s,
+        #[allow(unreachable_patterns)]
+        _ => panic!("expected an HVF CpuState"),
+    };
+    let fp = back.fp.expect("fp must still be captured after a restore");
+
+    let mut wrong = Vec::new();
+    for (i, v) in fp.vregs.iter().enumerate() {
+        if *v != simd_pattern(i) {
+            wrong.push(format!("  v{i}: want {:02x?} got {:02x?}", simd_pattern(i), v));
+        }
+    }
+    assert!(
+        wrong.is_empty(),
+        "{} of 32 SIMD&FP registers did not survive the round trip -- the \
+         value is very likely not reaching `v0`:\n{}",
+        wrong.len(),
+        wrong.join("\n")
+    );
+    assert_eq!(fp.fpcr, 0x0100_0000, "FPCR did not survive the round trip");
+    assert_eq!(fp.fpsr, 0x10, "FPSR did not survive the round trip");
+}

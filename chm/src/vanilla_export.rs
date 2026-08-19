@@ -35,19 +35,24 @@
 //!
 //! # What this export cannot carry, said out loud
 //!
-//! Two things, both reported by name in [`Report::warnings`] rather than
-//! discovered later by a confused guest:
+//! One thing, reported by name in [`Report::warnings`] rather than discovered
+//! later by a confused guest:
 //!
-//! - **Floating-point / SIMD registers.** The HVF backend captures none, so
-//!   `core_regs` offset 336 keeps the ancestor's bytes. Stale, but arm64 Linux
-//!   keeps the authoritative copy of a descheduled task's FP state in its
-//!   `thread_struct` in RAM, and RAM *is* carried.
 //! - **In-flight interrupt state.** `gic-v3-its` is carried from the ancestor.
 //!   The ITS tables and register bases are boot-time facts, but a *pending*
 //!   interrupt raised on this Mac is not represented in the KVM ITS table
 //!   format we would have to write.
 //!
-//! Neither is silent, and neither is guessed at.
+//! It is not silent, and it is not guessed at.
+//!
+//! Floating-point / SIMD registers used to be the other entry here. HVF does
+//! expose them -- through a getter and a setter with an ABI sharp enough to
+//! need its own trampoline, see `hvf::ffi::set_simd_fp_reg` -- and #357 wired
+//! them through, so `core_regs` offset 336 is now written from the live vCPU
+//! rather than left at the ancestor's. The old caveat argued the staleness was
+//! harmless because Linux keeps a descheduled task's FP state in RAM. That is
+//! true and was never the whole picture: the task running *at* the instant of
+//! capture has its state in the registers and nowhere else.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -136,12 +141,6 @@ pub(crate) fn export(workspace: &Path, out: &Path) -> Result<Report, String> {
     patch_clock(&mut doc, &state, &ancestor)?;
 
     warnings.push(
-        "floating-point/SIMD registers are the ancestor's: the HVF backend \
-         captures none, so core_regs offset 336 was not re-measured. Linux \
-         keeps a descheduled task's FP state in RAM, which is carried."
-            .to_string(),
-    );
-    warnings.push(
         "gic-v3-its is the ancestor's: interrupts in flight on this Mac at the \
          instant of capture are not carried. The ITS tables and register bases \
          are boot-time facts and are correct."
@@ -226,6 +225,33 @@ fn patch_vcpus(
         for &(reg_id, value) in &kvm.sys {
             if !vcpu.set_sys_reg(reg_id, value) {
                 refused_sys += 1;
+            }
+        }
+        // The SIMD&FP block travels beside the id list, not inside it: a
+        // `ONE_REG` core id is fixed at `KVM_REG_SIZE_U64`, so there is no id
+        // that names a 128-bit vector register or a 32-bit `fpsr`/`fpcr`.
+        //
+        // Skipping it would leave the ancestor's bytes -- which was the
+        // documented behaviour until #357, and was wrong for exactly the same
+        // reason #257 was: state we did not carry came back as something else's.
+        // Every capture measured here has live FP state (up to 25 of 32 vector
+        // registers non-zero, `fpsr = 0x10` meaning real arithmetic raised
+        // IXC), so the ancestor's bytes describe the guest as it was at
+        // *capture*, not as it is now.
+        //
+        // `None` means the HVF state predates the field, so there is nothing to
+        // write and the ancestor's bytes remain the best answer available.
+        if let Some(fp) = &kvm.fp {
+            for (i, v) in fp.vregs.iter().enumerate() {
+                if !vcpu.set_core_bytes(translate::kvm_fp_vreg_offset(i), v) {
+                    refused_core += 1;
+                }
+            }
+            if !vcpu.set_core_bytes(translate::OFF_FPSR, &fp.fpsr.to_le_bytes()) {
+                refused_core += 1;
+            }
+            if !vcpu.set_core_bytes(translate::OFF_FPCR, &fp.fpcr.to_le_bytes()) {
+                refused_core += 1;
             }
         }
         // A vCPU that PSCI-parked itself must come back parked, or the cloud
@@ -490,6 +516,7 @@ fn copy_or_clone(src: &Path, dest: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hypervisor::hvf::{VcpuFpState, FP_VREG_COUNT};
 
     fn bitmap_with(sectors: &[u64], words: usize) -> Vec<u8> {
         let mut w = vec![0u64; words];
@@ -815,6 +842,106 @@ mod tests {
             );
             let back = kvm_ingest::snapshot_json_to_hvf(&json).expect("the reader must parse it");
             assert_eq!(back.mp_state_running, want, "reader disagreed for vcpu {id}");
+        }
+    }
+    /// A distinct byte for every (register, lane) pair, so a vector written to
+    /// the wrong offset -- or a block written with a single repeated value --
+    /// is visible rather than accidentally correct.
+    #[cfg(test)]
+    fn fp_pattern(reg: usize) -> [u8; 16] {
+        let mut q = [0u8; 16];
+        for (lane, b) in q.iter_mut().enumerate() {
+            *b = ((reg * 16 + lane) ^ 0x5a) as u8;
+        }
+        q
+    }
+
+    /// The SIMD&FP register file must reach the exported document.
+    ///
+    /// It cannot travel the ONE_REG id list -- `kvm_core_reg_id` hardcodes
+    /// `KVM_REG_SIZE_U64`, so no id names a 128-bit vector register -- so it
+    /// rides beside it and is written by byte offset. That makes this the only
+    /// block in `core_regs` whose delivery no id-driven test can observe, and
+    /// the offsets are the single thing standing between "restored the guest's
+    /// FP state" and "corrupted its `spsr` array".
+    #[test]
+    fn the_simd_registers_reach_the_exported_document() {
+        let bytes = std::fs::read("testdata/vanilla-state-2cpu-net.json").unwrap();
+        let mut doc = VanillaState::parse(&bytes).unwrap();
+        let ancestor_fp = doc.vcpu(doc.vcpu_ids()[0]).unwrap().core_bytes()[translate::OFF_FP_VREGS..]
+            .to_vec();
+
+        let mut cp = checkpoint_with_vtimer(2, 0x1, 0x1000);
+        for v in &mut cp.vcpus {
+            v.state.fp = Some(VcpuFpState {
+                vregs: (0..FP_VREG_COUNT).map(fp_pattern).collect(),
+                fpsr: 0x10,
+                fpcr: 0x0100_0000,
+            });
+        }
+
+        let (mut warns, mut sums) = (Vec::new(), Vec::new());
+        patch_vcpus(&mut doc, &cp, &mut warns, &mut sums).expect("the patch must apply");
+
+        for id in doc.vcpu_ids() {
+            let core = doc.vcpu(id).unwrap().core_bytes().to_vec();
+            for i in 0..FP_VREG_COUNT {
+                let off = translate::kvm_fp_vreg_offset(i);
+                assert_eq!(
+                    &core[off..off + 16],
+                    &fp_pattern(i)[..],
+                    "vcpu {id} vector register {i} did not reach the document"
+                );
+            }
+            let fpsr = u32::from_le_bytes(core[translate::OFF_FPSR..translate::OFF_FPSR + 4].try_into().unwrap());
+            let fpcr = u32::from_le_bytes(core[translate::OFF_FPCR..translate::OFF_FPCR + 4].try_into().unwrap());
+            assert_eq!(fpsr, 0x10, "vcpu {id} fpsr did not reach the document");
+            assert_eq!(fpcr, 0x0100_0000, "vcpu {id} fpcr did not reach the document");
+        }
+
+        // The fixture is a real Graviton capture, so its own FP block is live
+        // and non-zero. Without this, a patch that wrote nothing at all could
+        // still pass if the pattern happened to match -- and it also records
+        // that these bytes really were replaced, not merely confirmed.
+        assert_ne!(
+            ancestor_fp,
+            doc.vcpu(doc.vcpu_ids()[0]).unwrap().core_bytes()[translate::OFF_FP_VREGS..].to_vec(),
+            "the ancestor's FP block was already the pattern, so this test proved nothing"
+        );
+    }
+
+    /// A checkpoint with no SIMD state must leave the ancestor's bytes alone.
+    ///
+    /// `fp` is an `Option` for exactly this: a checkpoint written before #357
+    /// carries none, and the honest export of state we never captured is the
+    /// parent's answer -- not 32 zeroed vector registers, which would describe
+    /// a machine that never existed.
+    #[test]
+    fn a_checkpoint_with_no_simd_state_keeps_the_ancestors_bytes() {
+        let bytes = std::fs::read("testdata/vanilla-state-2cpu-net.json").unwrap();
+        let mut doc = VanillaState::parse(&bytes).unwrap();
+        let before: Vec<Vec<u8>> = doc
+            .vcpu_ids()
+            .iter()
+            .map(|id| doc.vcpu(*id).unwrap().core_bytes()[translate::OFF_FP_VREGS..].to_vec())
+            .collect();
+        assert!(
+            before[0].iter().any(|b| *b != 0),
+            "the fixture must carry live FP state, or this test cannot observe it being lost"
+        );
+
+        let cp = checkpoint_with_vtimer(2, 0x1, 0x1000);
+        assert!(cp.vcpus[0].state.fp.is_none(), "this test needs the pre-#357 shape");
+
+        let (mut warns, mut sums) = (Vec::new(), Vec::new());
+        patch_vcpus(&mut doc, &cp, &mut warns, &mut sums).expect("the patch must apply");
+
+        for (i, id) in doc.vcpu_ids().iter().enumerate() {
+            assert_eq!(
+                doc.vcpu(*id).unwrap().core_bytes()[translate::OFF_FP_VREGS..],
+                before[i][..],
+                "vcpu {id}: an absent FP block overwrote the ancestor's bytes"
+            );
         }
     }
 }
