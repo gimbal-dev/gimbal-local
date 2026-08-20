@@ -102,12 +102,11 @@ impl Distributor {
     /// The full 64-bit `GICD_IROUTER<intid>` value, or 0 for an INTID this
     /// distributor does not model.
     ///
-    /// [`Self::read`] cannot answer this: it is a 32-bit MMIO view and returns
-    /// the *low* word for both halves of the 64-bit register, so a writer
-    /// serializing the register pair would put the affinity bits in the high
-    /// word as well. A KVM distributor dump stores IROUTER as low-then-high
-    /// `u32`s (`translate::gic_ingest::dist_from_softgic`), so it needs the
-    /// value, not the MMIO view of it.
+    /// [`Self::read`] is a 32-bit MMIO view and can only ever hand back one
+    /// half at a time. A KVM distributor dump stores IROUTER as low-then-high
+    /// `u32`s (`translate::gic_ingest::dist_from_softgic`), so a serializer
+    /// wants the value in one piece rather than two MMIO reads it then has to
+    /// reassemble.
     pub fn router(&self, intid: u32) -> u64 {
         self.router.get(intid as usize).copied().unwrap_or(0)
     }
@@ -164,10 +163,24 @@ impl Distributor {
             // Third register in this model whose only job was to be read back,
             // in a model that until cold boot had only ever been written to.
             _ if (0x0C00..0x0D00).contains(&offset) => self.read_cfgr(offset - 0x0C00),
+            // GICD_IROUTER<n> is a 64-bit register and Linux reaches it as two
+            // 32-bit halves, so the half-selector decides which word to return.
+            //
+            // This used to divide by 8 and drop the remainder, returning the
+            // low word for both halves while `write` stored them correctly —
+            // an asymmetry a guest could see by writing an affinity route's
+            // high word and never reading it back. It went unnoticed because
+            // Aff2/Aff3 live in bits[47:32] and are zero on every topology
+            // measured here, so the wrong answer happened to equal the right
+            // one.
             _ if (0x6000..0x8000).contains(&offset) => {
-                // GICD_IROUTER<n> low word (64-bit reg; caller reads +0 / +4).
-                let intid = ((offset - 0x6000) / 8) as usize;
-                self.router.get(intid).copied().unwrap_or(0) as u32
+                let intid = ((offset - 0x6000) / 8) as u32;
+                let route = self.router(intid);
+                if (offset - 0x6000) % 8 >= 4 {
+                    (route >> 32) as u32
+                } else {
+                    route as u32
+                }
             }
             _ => 0,
         }
@@ -588,6 +601,38 @@ mod tests {
         d.write(0x6104, 0);
         d.write(0x6100, 1 << 31);
         assert_eq!(d.spi_target_affinity(32), None);
+    }
+
+    /// The MMIO read view of `GICD_IROUTER` must hand back the half the caller
+    /// asked for, not the low word twice.
+    ///
+    /// `irouter_is_64bit_and_reports_affinity` above cannot see this: it routes
+    /// to affinity `0x1`, which lives entirely in the low word, so a read path
+    /// that ignores the half-selector returns the right answer by accident.
+    /// Aff2/Aff3 are bits[47:32], so only a route with those set can tell the
+    /// two implementations apart.
+    #[test]
+    fn irouter_reads_back_both_halves() {
+        let mut d = Distributor::new(256);
+        // GICD_IROUTER32 @ 0x6000 + 32*8 = 0x6100.
+        // Aff0=0x05 Aff1=0x01 (low word) | Aff2=0x03 Aff3=0x02 (high word).
+        let lo = 0x0000_0105u32;
+        let hi = 0x0000_0203u32;
+        d.write(0x6100, lo);
+        d.write(0x6104, hi);
+
+        assert_eq!(d.read(0x6100), lo, "low half read back wrong");
+        assert_eq!(
+            d.read(0x6104),
+            hi,
+            "high half returned the low word: the read path dropped the \
+             half-selector that write honours"
+        );
+
+        // The two halves must reassemble to exactly what the model holds.
+        let reassembled = ((d.read(0x6104) as u64) << 32) | d.read(0x6100) as u64;
+        assert_eq!(reassembled, d.router(32));
+        assert_eq!(reassembled, ((hi as u64) << 32) | lo as u64);
     }
 
     #[test]
