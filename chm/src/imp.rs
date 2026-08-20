@@ -572,17 +572,22 @@ pub(crate) fn icache_detail() -> &'static str {
          \n\
              sudo env NODE_OPTIONS=--jitless npm i -g <package>\n\
          \n\
-         The same command with the variable set is what to put in \
-         /etc/profile.d/ inside the guest to make it stick.\n\
+         The same command is a reactive remedy, not a default. Do not put the \
+         variable in /etc/profile.d/ pre-emptively -- since the stride is \
+         corrected at restore, setting it everywhere only disables the JIT of \
+         every node process that would have been fine.\n\
          \n\
          That variable reaches node and nothing else, so it does not cover a tool \
          that runs its own compiled binary. The GitHub Copilot CLI installs a \
          174 MiB native platform package and execs it; measured with \
          NODE_OPTIONS=--jitless set, that binary died 5 runs out of 5 (4 SIGILL, \
          1 SIGBUS) and the CLI blamed a missing platform package that was in fact \
-         installed. That measurement predates the stride correction above and has \
-         not been repeated since, so treat it as the last known state of a native \
-         binary here rather than as the current one.\n\
+         installed. That measurement predates the stride correction above, and it \
+         HAS been repeated since: with the correction in place the same native \
+         binary ran 20 of 20, and an acceptance run installed the Copilot CLI and \
+         had it write and execute a program with no NODE_OPTIONS set at all \
+         (#286). Treat the native-binary failure as fixed rather than as the last \
+         known state.\n\
          \n\
          This warning covers freshly written code only. It used to also claim the \
          userspace crashes a rehydrated guest suffers under ordinary dd/sync/rm load, \
