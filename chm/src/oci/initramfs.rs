@@ -1185,7 +1185,7 @@ mod tests {
         let mut r = Rootfs::new();
         let (k, d) = f(&vec![0u8; 1000]);
         r.insert("a".to_string(), k, d);
-        let (k, d) = f(&vec![0u8; 24]);
+        let (k, d) = f(&[0u8; 24]);
         r.insert("b".to_string(), k, d);
         assert_eq!(r.content_bytes(), 1024);
     }

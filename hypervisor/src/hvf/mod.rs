@@ -1546,13 +1546,14 @@ mod usgic_redist_tests {
     const REGION: u64 = 0x0800_0000;
 
     fn gic_with(vcpus: usize, index: usize) -> UserGic {
-        let mut g = UserGic::default();
-        g.redists = Redists(Arc::new(
-            (0..vcpus).map(|_| Mutex::new(Redistributor::default())).collect(),
-        ));
-        g.redist_index = index;
-        g.gicr_base = REGION + index as u64 * FRAME;
-        g
+        UserGic {
+            redists: Redists(Arc::new(
+                (0..vcpus).map(|_| Mutex::new(Redistributor::default())).collect(),
+            )),
+            redist_index: index,
+            gicr_base: REGION + index as u64 * FRAME,
+            ..Default::default()
+        }
     }
 
     /// The bug this whole path exists for: `gic_iterate_rdists` runs on the

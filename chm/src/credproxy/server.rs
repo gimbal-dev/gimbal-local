@@ -1074,7 +1074,7 @@ mod tests {
                     }
                 }
             }
-            let _ = tls.conn.send_close_notify();
+            tls.conn.send_close_notify();
             let _ = tls.flush();
         });
 

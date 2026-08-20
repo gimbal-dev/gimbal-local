@@ -649,7 +649,7 @@ mod tests {
             patch_clock(&mut doc, &st, &ancestor).expect("the clock must be writable");
 
             let got = doc.clock().unwrap();
-            let want = base.cntvct + secs * u64::from(base.cntfrq);
+            let want = base.cntvct + secs * base.cntfrq;
             assert_eq!(got.cntvct, want, "after {secs}s the counter must advance by secs*cntfrq");
             assert_eq!(got.host_realtime_ns, now, "the capture instant must be the checkpoint's");
             assert_eq!(

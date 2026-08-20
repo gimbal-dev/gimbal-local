@@ -9,6 +9,21 @@
 //! The test binary must be code-signed with the `com.apple.security.hypervisor`
 //! entitlement before it can create a VM. See `hypervisor/tests/data/`.
 #![cfg(all(feature = "hvf", target_os = "macos", target_arch = "aarch64"))]
+// This file is an integration test, so it is its own crate and cannot inherit
+// the library's lint configuration.
+//
+//   absolute_paths  The library carries the same expectation; this test spells
+//                   out `std::` paths in the same style.
+//   identity_op     `itt + 0 * 8` and `itt + 1 * 8` are how the ITT entry
+//                   stride is shown; `(8192u64 << 16) | 0` shows the field that
+//                   is deliberately zero. Folding these away would hide the
+//                   layout the test exists to pin down.
+//   erasing_op      Same construct, same reason.
+#![allow(
+    clippy::absolute_paths,
+    clippy::identity_op,
+    clippy::erasing_op
+)]
 
 use std::ffi::c_void;
 use std::ptr;
@@ -2555,7 +2570,7 @@ fn hvf_rehydrate_stock_its_snapshot_usgic_smp() {
     let (setup_tx, setup_rx) = mpsc::channel::<(usize, UsgicCpuHandle)>();
     let mut go_txs = Vec::with_capacity(n);
     let mut threads = Vec::with_capacity(n);
-    for id in 0..n {
+    for (id, exit_counter) in exits.iter().enumerate() {
         let (go_tx, go_rx) = mpsc::channel::<Arc<Vec<UsgicCpuHandle>>>();
         go_txs.push(go_tx);
         let vm = vm.clone();
@@ -2564,7 +2579,7 @@ fn hvf_rehydrate_stock_its_snapshot_usgic_smp() {
         let vm_ops = vm_ops.clone();
         let clock = clock.clone();
         let setup_tx = setup_tx.clone();
-        let exits_c = exits[id].clone();
+        let exits_c = exit_counter.clone();
         let fault_c = faulted.clone();
         let running_c = running.clone();
         threads.push(thread::spawn(move || {
@@ -3845,14 +3860,14 @@ fn icache_swap_run(invalidate: bool) -> Vec<u32> {
             if invalidate {
                 // SAFETY: FFI; this range is inside `ram`, which outlives the call.
                 unsafe {
-                    sys_icache_invalidate(ram.ptr.add(VICTIM_OFF) as *mut c_void, VICTIM_NEW.len())
+                    sys_icache_invalidate(ram.ptr.add(VICTIM_OFF) as *mut c_void, VICTIM_NEW.len());
                 };
             }
         }
     }
     assert!(swapped, "the guest never reached the swap point");
-    let v = vm_ops.writes.lock().unwrap().clone();
-    v
+    
+    vm_ops.writes.lock().unwrap().clone()
 }
 
 /// Does host-side `sys_icache_invalidate` actually reach the lines a *guest*
@@ -4122,7 +4137,7 @@ fn hvf_overdue_vtimer_without_a_gic_still_retires_instructions() {
         let vm_ops = Arc::new(RecordingVmOps {
             writes: Mutex::new(Vec::new()),
         });
-        let (_vm, mut vcpu) = build_vm(&ram, vm_ops.clone());
+        let (_vm, vcpu) = build_vm(&ram, vm_ops.clone());
         vcpu.setup_regs(0, RAM_BASE, 0).expect("setup_regs");
         snapshot = vcpu.state().expect("capture state");
     }
@@ -4141,6 +4156,11 @@ fn hvf_overdue_vtimer_without_a_gic_still_retires_instructions() {
                 "build_vm must not create a vgic for this test to mean anything"
             );
         }
+        // `CpuState`'s variants are feature-gated, so with only `hvf` on
+        // this arm is unreachable -- but it is what keeps the match
+        // exhaustive once `kvm` or `mshv` is enabled too. Deleting it to
+        // satisfy the lint would break those configurations.
+        #[allow(unreachable_patterns)]
         _ => panic!("expected an HVF CpuState"),
     }
 
@@ -4318,7 +4338,7 @@ fn every_simd_fp_register_survives_a_state_round_trip() {
     let ops = Arc::new(RecordingVmOps {
         writes: Mutex::new(Vec::new()),
     });
-    let (_vm, mut vcpu) = build_vm(&ram, ops);
+    let (_vm, vcpu) = build_vm(&ram, ops);
 
     let mut state = match vcpu.state().expect("state") {
         CpuState::Hvf(s) => s,

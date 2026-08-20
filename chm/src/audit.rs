@@ -615,9 +615,11 @@ mod tests {
         assert_eq!(v["truncated"], false);
 
         // Truncation propagates from any session in the file.
-        let mut t = EgressTally::default();
-        t.truncated = true;
-        t.allowed = 9_000;
+        let t = EgressTally {
+            truncated: true,
+            allowed: 9_000,
+            ..Default::default()
+        };
         log.egress_summary(&t);
         let v: Value = serde_json::from_str(&trail_json(&ws, 10)).unwrap();
         assert_eq!(v["truncated"], true);

@@ -1783,8 +1783,8 @@ mod tests {
         for v in 0..n {
             let slice = reassemble_rdist_slice(&dump, n, v);
             assert_eq!(slice.len(), per, "slice for vcpu {v} must be one full vcpu");
-            for i in 0..rd {
-                assert_eq!(slice[i], 0x1000 + (v as u32) * 0x100 + i as u32);
+            for (i, got) in slice.iter().take(rd).enumerate() {
+                assert_eq!(*got, 0x1000 + (v as u32) * 0x100 + i as u32);
             }
             for i in 0..sgi {
                 assert_eq!(slice[rd + i], 0x2000 + (v as u32) * 0x100 + i as u32);

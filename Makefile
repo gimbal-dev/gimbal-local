@@ -32,10 +32,24 @@ chm-serve: chm
 	@test -n "$(DIR)" || { echo "usage: make chm-serve DIR=/path/to/library"; exit 2; }
 	@$(CHM_BIN) serve "$(DIR)" --socket "$(SOCKET)"
 
+# Lint every target we compile, test code included, and fail on warnings.
+#
+# --all-targets is not decoration here. Without it, `--bin chm` compiles the
+# binary target alone and every `#[cfg(test)]` module is invisible to the
+# linter: 842 test functions in chm and 326 in hypervisor, none of them looked
+# at. That is how an orphaned `#[test]` reached main three times. rustc
+# diagnosed it correctly on each occasion -- `duplicated attribute`, then
+# `dead_code` on the helper left behind -- into code this gate never built.
+#
+# `-D warnings` is the other half, and it is the half that is easy to miss.
+# Both of those diagnostics are warn-level, so with --all-targets alone the
+# gate prints them and still exits 0. Measured: a duplicated `#[test]` exits 0
+# without `-D warnings` and 101 with it. A gate that reports a defect and
+# passes anyway is a log line, not a gate.
 clippy:
-	cargo clippy -p gimbal-local --bin chm
-	cargo clippy -p hypervisor --no-default-features --features hvf,kvm-snapshot
-	cargo clippy -p arch --features hvf --all-targets
+	cargo clippy -p gimbal-local --bin chm --all-targets -- -D warnings
+	cargo clippy -p hypervisor --no-default-features --features hvf,kvm-snapshot --all-targets -- -D warnings
+	cargo clippy -p arch --features hvf --all-targets -- -D warnings
 
 # Security invariant I1 (docs/security-model.md): fail if host-filesystem
 # passthrough (virtiofs/9p/shared-folder) appears in the device model.
