@@ -168,6 +168,14 @@ mod vanilla;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vanilla_export;
 
+/// Originating a lineage here (#341): synthesizing a capture for a machine
+/// `chm` itself cold-booted, which has no ancestor to patch. Separate from
+/// `vanilla_export` because the two answer opposite questions -- that one
+/// rewrites a capture we did not author, this one describes a machine nobody
+/// else has ever seen.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod genesis;
+
 /// Properties of the test suite itself (#243).
 mod hygiene;
 

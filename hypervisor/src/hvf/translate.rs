@@ -543,6 +543,44 @@ pub mod gic_ingest {
         if idx == icc.len() { Some(out) } else { None }
     }
 
+    /// Serialize an HVF `VcpuHvfState.gic_icc` list into the KVM ICC register
+    /// vector a `Gicv3ItsState.icc` carries -- the inverse of [`icc_to_hvf`],
+    /// and deliberately its neighbour so the two walk orders cannot drift.
+    ///
+    /// The vector's *length* is not free: KVM emits the active-priority
+    /// registers only for the `PRIbits` the guest's `ICC_CTLR_EL1` advertises,
+    /// and [`icc_to_hvf`] reconstructs the register set from exactly that
+    /// field. So `ICC_CTLR_EL1` must be present in `icc`; without it there is
+    /// no way to know how long the vector should be, and `None` is returned
+    /// rather than a guess.
+    ///
+    /// Registers absent from `icc` are emitted as zero. That is honest for the
+    /// software-GIC path this exists to serve, which models five CPU-interface
+    /// registers (`PMR`, `BPR1`, `CTLR`, `SRE`, `IGRPEN1`) and genuinely has no
+    /// value for the rest -- but it does mean the round trip is
+    /// `icc_to_hvf(icc_from_hvf(x)) ⊇ x`, not equality: the result names every
+    /// register KVM would have dumped, with zeros where nothing was known.
+    pub fn icc_from_hvf(icc: &[(u16, u64)]) -> Option<Vec<u32>> {
+        let ctlr = icc
+            .iter()
+            .find(|(enc, _)| *enc == ICC_CTLR_EL1)
+            .map(|(_, v)| *v)?;
+        let pribits = ((ctlr >> 8) & 0x7) + 1;
+
+        let mut out = Vec::with_capacity(VGIC_ICC_ORDER.len());
+        for &enc in VGIC_ICC_ORDER {
+            if is_ap_r1(enc) && pribits < 6 {
+                continue;
+            }
+            if is_ap_r2_or_r3(enc) && pribits < 7 {
+                continue;
+            }
+            let v = icc.iter().find(|(e, _)| *e == enc).map_or(0, |(_, v)| *v);
+            out.push(v as u32);
+        }
+        Some(out)
+    }
+
     /// Build a fully GIC-aware HVF `VcpuHvfState` from a real cloud-hypervisor
     /// snapshot: the vCPU `CpuState` JSON (core + system registers) plus this
     /// vCPU's KVM ICC register vector (from the VGIC `Gicv3ItsState.icc`).
@@ -675,6 +713,53 @@ pub mod gic_ingest {
         if idx == dist.len() { Some(out) } else { None }
     }
 
+    /// Serialize the software distributor model into the KVM distributor dump a
+    /// `Gicv3ItsState.dist` carries -- the inverse of [`dist_to_hvf`], and its
+    /// neighbour so the two walks of `VGIC_DIST_REGS` cannot drift apart.
+    ///
+    /// The dump is a re-walk of the same offset list, in the same order, reading
+    /// each word out of the model instead of writing it in. Two registers are
+    /// not read through [`super::super::softgic::Distributor::read`]:
+    ///
+    /// * `GICD_IROUTER<n>` is 64-bit and KVM dumps it as low-then-high `u32`s,
+    ///   while the MMIO read view returns the low word for both halves, so the
+    ///   value is taken from
+    ///   [`super::super::softgic::Distributor::router`] and split here.
+    /// * `GICD_STATUSR`, `GICD_ISACTIVER` and `GICD_ICACTIVER` read as zero
+    ///   because the model holds no such state (`STATUSR` is RAZ/WI, and the
+    ///   software GIC tracks active interrupts as a per-vCPU priority stack
+    ///   rather than a distributor bitmap). They occupy their words in the dump
+    ///   regardless, because the reader's index walk depends on it.
+    ///
+    /// Returns `None` when the model's interrupt width is not one a KVM dump can
+    /// express -- checked by asking [`num_irq_from_dist_len`], the reader's own
+    /// width recovery, to agree about the vector just built, rather than by
+    /// restating the rule here.
+    pub fn dist_from_softgic(dist: &super::super::softgic::Distributor) -> Option<Vec<u32>> {
+        let num_irq = dist.num_irqs();
+        let mut out = Vec::new();
+        for reg in VGIC_DIST_REGS {
+            let start = reg.base + REG_SIZE * reg.bpi as u32;
+            let words = dist_reg_words(reg, num_irq);
+            if reg.bpi == 64 {
+                let mut intid = SPI_BASE;
+                let mut w = 0;
+                while w < words {
+                    let v = dist.router(intid);
+                    out.push(v as u32);
+                    out.push((v >> 32) as u32);
+                    w += 2;
+                    intid += 1;
+                }
+            } else {
+                for k in 0..words {
+                    out.push(dist.read(u64::from(start + k * REG_SIZE)));
+                }
+            }
+        }
+        (num_irq_from_dist_len(out.len()) == Some(num_irq)).then_some(out)
+    }
+
     /// One entry of cloud-hypervisor's `VGIC_RDIST_REGS` walk
     /// (`redist_regs.rs`): a GICR offset and its fixed byte length.
     struct RdistReg {
@@ -757,6 +842,39 @@ pub mod gic_ingest {
         Some(out)
     }
 
+    /// Serialize one vCPU's software redistributor model into its slice of the
+    /// KVM redistributor dump -- the inverse of [`redist_to_hvf`], and its
+    /// neighbour so the two walks of `VGIC_RDIST_REGS` cannot drift apart.
+    ///
+    /// Unlike the distributor there is no width to get wrong: the dump is always
+    /// [`redist_words_per_vcpu`] words. Both frames are emitted, RD_base first,
+    /// because the reader's index walk consumes them even though Apple's managed
+    /// GIC owns them; the model does hold `CTLR`, `WAKER`, `PROPBASER` and
+    /// `PENDBASER`, so those words carry real values rather than padding.
+    ///
+    /// The words the software model has no state for read back as zero:
+    /// `GICR_STATUSR` (RAZ/WI), `GICR_IGROUPR0`, `GICR_I{S,C}PENDR0`,
+    /// `GICR_I{S,C}ACTIVER0` and `GICR_IPRIORITYR0..7`. That is a real boundary
+    /// of what a software-GIC guest can be described as carrying, and callers
+    /// are expected to say so rather than let a reader assume the zeros are
+    /// measurements.
+    ///
+    /// **Caller's contract for SMP:** cloud-hypervisor serializes the dump in
+    /// two passes -- every vCPU's RD_base words, then every vCPU's SGI-frame
+    /// words (see [`redist_rd_base_words`]). This returns ONE vCPU's contiguous
+    /// slice; assembling `n` of them means interleaving the two halves, not
+    /// concatenating the slices.
+    pub fn redist_from_softgic(rd: &super::super::softgic::Redistributor) -> Vec<u32> {
+        let mut out = Vec::with_capacity(redist_words_per_vcpu());
+        for reg in VGIC_RDIST_REGS {
+            let words = reg.length as u32 / REG_SIZE;
+            for k in 0..words {
+                out.push(rd.read(u64::from(reg.base + k * REG_SIZE)));
+            }
+        }
+        out
+    }
+
     /// The architectural GICD register offsets a live distributor capture must
     /// read — exactly the offsets [`dist_to_hvf`] emits for a `num_irq`-wide
     /// GICv3, in the same order. Reading `hv_gic_get_distributor_reg(off)` for
@@ -837,6 +955,168 @@ pub mod gic_ingest {
             let restore_offsets: Vec<u32> =
                 redist_to_hvf(&dump).expect("dump translates").into_iter().map(|(o, _)| o).collect();
             assert_eq!(rdist_capture_offsets(), restore_offsets);
+        }
+    }
+
+    /// The writer direction: a software-GIC model serialized into the KVM dump
+    /// encoding, checked by feeding the result to the reader that consumes a
+    /// real capture. Every assertion here goes through `dist_to_hvf` /
+    /// `redist_to_hvf` / `icc_to_hvf` rather than re-deriving an offset, so a
+    /// writer that agreed only with itself would not pass.
+    #[cfg(test)]
+    mod inverse_tests {
+        use super::*;
+        use crate::hvf::softgic::{Distributor, GICR_SGI_OFFSET as SOFT_SGI_OFFSET, Redistributor};
+
+        /// The GICD offsets a guest programmed must come back out of the dump
+        /// with the values the model holds -- read through the reader, so this
+        /// cannot pass by the writer and the test sharing an offset table.
+        #[test]
+        fn a_distributor_dump_carries_what_the_guest_programmed() {
+            let mut d = Distributor::new(256);
+            d.write(0x0104, 1); // GICD_ISENABLER1: enable SPI 32
+            d.write(0x0420, 0x0000_00f0); // GICD_IPRIORITYR: SPI 32 priority 0xf0
+            d.write(0x0c08, 0x0000_0002); // GICD_ICFGR2: SPI 32 edge-triggered
+            // GICD_IROUTER32, deliberately with a non-zero Aff3 in the HIGH
+            // word: a writer that emitted the 32-bit MMIO read view twice would
+            // duplicate the low word here and nowhere else.
+            d.write(0x6100, 0x0000_0003);
+            d.write(0x6104, 0x0000_0007);
+
+            let dump = dist_from_softgic(&d).expect("256 IRQs is a KVM-expressible width");
+            assert_eq!(
+                num_irq_from_dist_len(dump.len()),
+                Some(256),
+                "the dump must be a width the reader can recover"
+            );
+
+            let regs: std::collections::BTreeMap<u32, u64> = dist_to_hvf(&dump)
+                .expect("dump translates")
+                .into_iter()
+                .collect();
+            assert_eq!(regs.get(&0x0104), Some(&1), "SPI 32 enable");
+            assert_eq!(regs.get(&0x0420), Some(&0xf0), "SPI 32 priority");
+            assert_eq!(regs.get(&0x0c08), Some(&0x2), "SPI 32 edge config");
+            assert_eq!(
+                regs.get(&0x6100),
+                Some(&0x0000_0007_0000_0003),
+                "IROUTER32 must reassemble to the full 64-bit affinity"
+            );
+        }
+
+        /// A width the KVM dump encoding cannot express is refused rather than
+        /// written as a dump nothing can read back.
+        #[test]
+        fn a_width_no_kvm_dump_can_express_is_refused() {
+            // `Distributor::new` clamps to INTID_LIMIT (1020), which is not a
+            // multiple of 32 and so matches no GICv3 dump length.
+            let d = Distributor::new(1024);
+            assert_eq!(d.num_irqs(), 1020, "the model clamps to the INTID limit");
+            assert!(
+                dist_from_softgic(&d).is_none(),
+                "1020 IRQs matches no dump length the reader recovers"
+            );
+        }
+
+        /// The per-vCPU redistributor, both frames: the SGI frame through the
+        /// reader, and the RD_base 64-bit `PROPBASER` through the raw word pair
+        /// (the reader drops RD_base, so nothing else can see that split).
+        #[test]
+        fn a_redistributor_dump_carries_both_frames() {
+            let mut r = Redistributor::new();
+            r.write(SOFT_SGI_OFFSET + 0x0100, 1 << 27); // enable PPI 27 (vtimer)
+            r.write(SOFT_SGI_OFFSET + 0x0c04, 0x1234_5678); // GICR_ICFGR1
+            r.write(0x0070, 0xabcd_e000); // PROPBASER low
+            r.write(0x0074, 0x0000_0042); // PROPBASER high
+            r.write(0x0000, 1); // GICR_CTLR.EnableLPIs
+
+            let dump = redist_from_softgic(&r);
+            assert_eq!(
+                dump.len(),
+                redist_words_per_vcpu(),
+                "a per-vCPU slice is exactly the reader's word count"
+            );
+            // RD_base walk order: STATUSR, WAKER, PROPBASER(2), PENDBASER(2), CTLR.
+            assert_eq!(dump[2], 0xabcd_e000, "PROPBASER low word");
+            assert_eq!(dump[3], 0x0000_0042, "PROPBASER high word");
+            assert_eq!(dump[6], 1, "GICR_CTLR.EnableLPIs");
+
+            let regs: std::collections::BTreeMap<u32, u64> = redist_to_hvf(&dump)
+                .expect("dump translates")
+                .into_iter()
+                .collect();
+            assert_eq!(
+                regs.get(&(SOFT_SGI_OFFSET as u32 + 0x0100)),
+                Some(&(1u64 << 27)),
+                "PPI 27 enable"
+            );
+            assert_eq!(
+                regs.get(&(SOFT_SGI_OFFSET as u32 + 0x0c04)),
+                Some(&0x1234_5678),
+                "GICR_ICFGR1"
+            );
+        }
+
+        /// The ICC vector's length is dictated by `ICC_CTLR_EL1.PRIbits`, and
+        /// every register handed in must survive the round trip through the
+        /// reader at each of the three lengths KVM can emit.
+        #[test]
+        fn an_icc_vector_round_trips_at_every_pribits_width() {
+            for (ctlr, expected_len) in [(0u64, 9usize), (5 << 8, 11), (6 << 8, 15)] {
+                let pairs = vec![
+                    (ICC_PMR_EL1, 0xf0u64),
+                    (ICC_BPR1_EL1, 0x6),
+                    (ICC_CTLR_EL1, ctlr),
+                    (ICC_SRE_EL1, 0x7),
+                    (ICC_IGRPEN1_EL1, 0x1),
+                ];
+                let v = icc_from_hvf(&pairs).expect("ICC_CTLR_EL1 is present");
+                assert_eq!(
+                    v.len(),
+                    expected_len,
+                    "PRIbits from ctlr={ctlr:#x} decides the vector length"
+                );
+                let back: std::collections::BTreeMap<u16, u64> = icc_to_hvf(&v)
+                    .expect("vector translates")
+                    .into_iter()
+                    .collect();
+                for (enc, value) in pairs {
+                    assert_eq!(
+                        back.get(&enc),
+                        Some(&value),
+                        "register {enc:#06x} lost in the round trip"
+                    );
+                }
+            }
+        }
+
+        /// Without `ICC_CTLR_EL1` the vector length is unknowable, so the answer
+        /// is a refusal and not a guess -- a wrong length makes `icc_to_hvf`
+        /// reject the whole vector, and the vCPU silently keeps default
+        /// CPU-interface state.
+        #[test]
+        fn an_icc_vector_without_ctlr_is_refused() {
+            assert!(icc_from_hvf(&[(ICC_PMR_EL1, 0xf0)]).is_none());
+            assert!(icc_from_hvf(&[]).is_none());
+        }
+
+        /// The CPU-interface encodings this module walks are the same values the
+        /// HVF side names, and the software GIC captures its `gic_icc` pairs
+        /// keyed by the `ffi` constants. Two spellings of one ABI encoding is
+        /// exactly the drift `icc_from_hvf` would translate wrongly and
+        /// silently.
+        #[test]
+        fn the_icc_encodings_match_the_hvf_ffi_names() {
+            use crate::hvf::ffi;
+            assert_eq!(ICC_PMR_EL1, ffi::GIC_ICC_PMR_EL1);
+            assert_eq!(ICC_BPR0_EL1, ffi::GIC_ICC_BPR0_EL1);
+            assert_eq!(ICC_BPR1_EL1, ffi::GIC_ICC_BPR1_EL1);
+            assert_eq!(ICC_CTLR_EL1, ffi::GIC_ICC_CTLR_EL1);
+            assert_eq!(ICC_SRE_EL1, ffi::GIC_ICC_SRE_EL1);
+            assert_eq!(ICC_IGRPEN0_EL1, ffi::GIC_ICC_IGRPEN0_EL1);
+            assert_eq!(ICC_IGRPEN1_EL1, ffi::GIC_ICC_IGRPEN1_EL1);
+            assert_eq!(ICC_AP0R0_EL1, ffi::GIC_ICC_AP0R0_EL1);
+            assert_eq!(ICC_AP1R0_EL1, ffi::GIC_ICC_AP1R0_EL1);
         }
     }
 }

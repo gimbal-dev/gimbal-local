@@ -99,6 +99,19 @@ impl Distributor {
         }
     }
 
+    /// The full 64-bit `GICD_IROUTER<intid>` value, or 0 for an INTID this
+    /// distributor does not model.
+    ///
+    /// [`Self::read`] cannot answer this: it is a 32-bit MMIO view and returns
+    /// the *low* word for both halves of the 64-bit register, so a writer
+    /// serializing the register pair would put the affinity bits in the high
+    /// word as well. A KVM distributor dump stores IROUTER as low-then-high
+    /// `u32`s (`translate::gic_ingest::dist_from_softgic`), so it needs the
+    /// value, not the MMIO view of it.
+    pub fn router(&self, intid: u32) -> u64 {
+        self.router.get(intid as usize).copied().unwrap_or(0)
+    }
+
     /// Read a 32-bit distributor register at byte `offset` within the GICD frame.
     pub fn read(&self, offset: u64) -> u32 {
         match offset {
