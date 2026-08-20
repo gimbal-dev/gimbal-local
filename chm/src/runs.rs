@@ -640,6 +640,11 @@ mod tests {
         // A PID-based liveness check would call this record live. `kill(1, 0)`
         // returns EPERM rather than 0 for a process we do not own, which is
         // exactly why the app's own check reads `== 0 || errno == EPERM`.
+        //
+        // SAFETY: `kill(pid, 0)` delivers no signal; it only asks whether the
+        // PID exists and whether we are permitted to signal it, so it cannot
+        // disturb PID 1. `libc::__error()` returns this thread's own errno
+        // location, which is valid to read for the length of this expression.
         let pid_check_says_alive =
             unsafe { libc::kill(1, 0) == 0 || *libc::__error() == libc::EPERM };
         assert!(
@@ -797,7 +802,7 @@ mod tests {
     /// reader. `read_dir` has no defined order, so this has to be imposed.
     #[test]
     fn runs_are_listed_oldest_first() {
-        let mut rs = vec![
+        let mut rs = [
             rec(101, 3000, "c"),
             rec(102, 1000, "a"),
             rec(103, 2000, "b"),

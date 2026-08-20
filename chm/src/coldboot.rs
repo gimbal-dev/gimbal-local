@@ -974,7 +974,7 @@ mod tests {
         hdr[1] = b'Z';
         hdr[8..16].copy_from_slice(&text_offset.to_le_bytes());
         hdr[16..24].copy_from_slice(&image_size.to_le_bytes());
-        hdr[ARM64_MAGIC_OFFSET as usize..ARM64_MAGIC_OFFSET as usize + 4]
+        hdr[ARM64_MAGIC_OFFSET..ARM64_MAGIC_OFFSET + 4]
             .copy_from_slice(&ARM64_MAGIC);
         let p = dir.join(name);
         let mut f = File::create(&p).unwrap();
@@ -1113,7 +1113,7 @@ mod tests {
         // magic at 0x38. Matches Documentation/arch/arm64/booting.rst.
         img[0x10..0x18].copy_from_slice(&image_size.to_le_bytes());
         img[0x18..0x20].copy_from_slice(&0xa_u64.to_le_bytes());
-        let m = ARM64_MAGIC_OFFSET as usize;
+        let m = ARM64_MAGIC_OFFSET;
         img[m..m + 4].copy_from_slice(&ARM64_MAGIC);
         std::fs::write(&p, &img).expect("writing a synthetic kernel");
         p

@@ -5255,6 +5255,9 @@ mod tests {
         let p = EgressPolicy::from_profile("deny", &["api.github.com:443".to_string()], &[], "t");
         let nic1 = Some(p);
         let nic2 = nic1.clone(); // exactly what the wiring loop does for NIC #2
+        // The literal `Some` is the subject here, not an oversight: the wiring
+        // holds an `Option<EgressPolicy>` and hands NIC #2 a clone of it.
+        #[expect(clippy::unnecessary_literal_unwrap)]
         let nic1 = nic1.unwrap();
         let nic2 = nic2.expect("second NIC must receive the policy, not None");
         assert!(nic1.decide_dns("api.github.com").is_allow());

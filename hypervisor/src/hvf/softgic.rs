@@ -622,11 +622,11 @@ mod tests {
         assert!(!r.is_ppi_enabled(27));
     }
 
-    /// Every register in this group exists only to be *discovered* — read by a
-    /// guest that has not yet decided this hardware is here. A rehydrated guest
-    /// never reads any of them, so all four were wrong until the first cold
-    /// boot asked. Together they cost a guest its interrupt controller, its
-    /// clocksource and its console.
+    // Every register in this group exists only to be *discovered* — read by a
+    // guest that has not yet decided this hardware is here. A rehydrated guest
+    // never reads any of them, so all four were wrong until the first cold
+    // boot asked. Together they cost a guest its interrupt controller, its
+    // clocksource and its console.
 
     /// `gic_validate_dist_version` masks GICD_PIDR2 with 0xf0 and accepts only
     /// 0x30 (GICv3) or 0x40 (GICv4). Anything else is

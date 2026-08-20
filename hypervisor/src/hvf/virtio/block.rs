@@ -811,7 +811,7 @@ mod tests {
         // Base: 4 sectors, each filled with its (index+1) byte value.
         let mut base_bytes = Vec::new();
         for s in 0..4u8 {
-            base_bytes.extend(std::iter::repeat(s + 1).take(SECTOR_SIZE as usize));
+            base_bytes.extend(std::iter::repeat_n(s + 1, SECTOR_SIZE as usize));
         }
         std::fs::File::create(&base_path).unwrap().write_all(&base_bytes).unwrap();
         let base_before = std::fs::read(&base_path).unwrap();
@@ -859,7 +859,7 @@ mod tests {
         // Base: 4 sectors, each filled with its (index+1) byte value.
         let mut base_bytes = Vec::new();
         for s in 0..4u8 {
-            base_bytes.extend(std::iter::repeat(s + 1).take(SECTOR_SIZE as usize));
+            base_bytes.extend(std::iter::repeat_n(s + 1, SECTOR_SIZE as usize));
         }
         std::fs::File::create(&base_path).unwrap().write_all(&base_bytes).unwrap();
 

@@ -13,6 +13,29 @@
 //! The binary must be code-signed with the `com.apple.security.hypervisor`
 //! entitlement before it can create a VM — see `scripts/build-chm.sh`.
 
+// Test code is linted too (see `clippy` in the Makefile). Two style lints fire
+// so densely there that they would bury the ones that catch a test which has
+// stopped testing -- `dead_code` and the `unused_*` family.
+//
+//   absolute_paths (259)              `std::...` spelled out inline in a test body.
+//   assertions_on_result_states (46)  `assert!(x.is_ok())`. Reads fine, but throws
+//                                     the error away on failure; worth converting
+//                                     on its own rather than inside this change.
+//   assertions_on_constants (2)       `assert!(CONST >= N, "why")`. Measured, not
+//                                     assumed: both still panic when the constant
+//                                     moves, so the guards do their job.
+//
+// Shipped code keeps all three denials. `--all-targets` also builds the plain
+// binary target, where cfg(test) is off and none of this applies.
+#![cfg_attr(
+    test,
+    allow(
+        clippy::absolute_paths,
+        clippy::assertions_on_result_states,
+        clippy::assertions_on_constants
+    )
+)]
+
 // The real implementation only compiles on macOS / Apple Silicon, where
 // Hypervisor.framework exists. On every other target the crate still builds
 // (so `cargo build --workspace` stays green in Linux CI) but `main` just

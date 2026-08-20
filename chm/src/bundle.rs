@@ -2217,7 +2217,7 @@ mod tests {
 
         let out = root.join("o");
         fs::create_dir_all(&out).unwrap();
-        let err = emit_file(&bundle, &out, &ef, None).err().expect("refused");
+        let err = emit_file(&bundle, &out, &ef, None).expect_err("refused");
         assert!(
             err.contains("v.raw") && err.contains(&ef.chunks[7]),
             "the refusal should name the file and the chunk: {err}"

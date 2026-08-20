@@ -500,8 +500,10 @@ mod tests {
             self.0
                 .iter()
                 .find(|(k, _)| k == key)
-                .map(|(_, v)| v.as_str())
-                .unwrap_or_else(|| panic!("the harness reported no {key}: {:?}", self.0))
+                .map_or_else(
+                    || panic!("the harness reported no {key}: {:?}", self.0),
+                    |(_, v)| v.as_str(),
+                )
         }
     }
 

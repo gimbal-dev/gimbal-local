@@ -131,6 +131,15 @@ app: Show cold-booted guests in the running list
 docs: Record rehydrated-agent acceptance
 ```
 
+`scripts/gitlint/rules/TitleStartsWithComponent.py` holds the accepted set and
+is the authority — the linter refuses anything absent from it, so a new
+component belongs there first. A test asserts that every prefix shown above is
+one that rule accepts, because the two drifting apart is a defect that only
+appears once someone's commit is rejected for following this guide.
+
+Several components may be combined (`chm, app:`), and a conventional-commits
+scope is accepted (`build(deps):`).
+
 Wrap commit bodies at 72 columns. The repository historically requested a
 `Signed-off-by:` trailer as a Developer Certificate of Origin attestation:
 

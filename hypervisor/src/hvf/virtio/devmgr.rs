@@ -831,7 +831,7 @@ mod tests {
         // Ship a 2-sector disk for `_disk0`: sector 0 = 0xC0, sector 1 = 0xC1.
         let sector = 512usize;
         let mut base = vec![0xC0u8; sector];
-        base.extend(std::iter::repeat(0xC1u8).take(sector));
+        base.extend(std::iter::repeat_n(0xC1u8, sector));
         let base_path = disks_dir.join("_disk0.raw");
         std::fs::File::create(&base_path).unwrap().write_all(&base).unwrap();
         let base_sha_before = std::fs::read(&base_path).unwrap();

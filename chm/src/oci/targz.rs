@@ -407,7 +407,7 @@ mod tests {
 
     #[test]
     fn a_header_cut_in_half_is_an_error_not_a_silent_stop() {
-        let tar = vec![1u8; 200];
+        let tar = [1u8; 200];
         assert!(read_layer(&tar[..], 1 << 20).is_err());
     }
 }
