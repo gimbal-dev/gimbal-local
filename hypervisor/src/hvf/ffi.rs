@@ -137,6 +137,46 @@ pub const SYSREG_TPIDR_EL0: u16 = 0xde82;
 pub const SYSREG_TPIDRRO_EL0: u16 = 0xde83;
 pub const SYSREG_SP_EL1: u16 = 0xe208;
 pub const SYSREG_MPIDR_EL1: u16 = 0xc005;
+
+// Pointer-authentication keys (FEAT_PAuth, Armv8.3). Five 128-bit keys, each a
+// Lo/Hi register pair: instruction-A/B, data-A/B, and the generic key.
+//
+// These are load-bearing for any guest that signs pointers, and their omission
+// is not a lossy nicety: a return address signed with one key and authenticated
+// with another raises an FPAC exception, and Linux takes that as an oops. A vCPU
+// resumed with fresh keys therefore dies at the first `AUTIASP` it executes,
+// which on an idle kernel is immediate.
+//
+// This could not surface on the path that has carried this project so far.
+// Neoverse-N1 is Armv8.2 and implements no pointer authentication at all, so a
+// guest captured on Graviton never signed a pointer and never missed these. Only
+// a guest that *booted* on Apple silicon — which does implement FEAT_PAuth, and
+// advertises it in `ID_AA64ISAR1_EL1` — enables PAC and depends on them, so the
+// gap became reachable exactly when a lineage could first be originated locally.
+pub const SYSREG_APIAKEYLO_EL1: u16 = 0xc108;
+pub const SYSREG_APIAKEYHI_EL1: u16 = 0xc109;
+pub const SYSREG_APIBKEYLO_EL1: u16 = 0xc10a;
+pub const SYSREG_APIBKEYHI_EL1: u16 = 0xc10b;
+pub const SYSREG_APDAKEYLO_EL1: u16 = 0xc110;
+pub const SYSREG_APDAKEYHI_EL1: u16 = 0xc111;
+pub const SYSREG_APDBKEYLO_EL1: u16 = 0xc112;
+pub const SYSREG_APDBKEYHI_EL1: u16 = 0xc113;
+pub const SYSREG_APGAKEYLO_EL1: u16 = 0xc118;
+pub const SYSREG_APGAKEYHI_EL1: u16 = 0xc119;
+
+/// The ten pointer-authentication key registers, in Lo/Hi pairs.
+pub const SYSREG_PAC_KEYS: &[u16] = &[
+    SYSREG_APIAKEYLO_EL1,
+    SYSREG_APIAKEYHI_EL1,
+    SYSREG_APIBKEYLO_EL1,
+    SYSREG_APIBKEYHI_EL1,
+    SYSREG_APDAKEYLO_EL1,
+    SYSREG_APDAKEYHI_EL1,
+    SYSREG_APDBKEYLO_EL1,
+    SYSREG_APDBKEYHI_EL1,
+    SYSREG_APGAKEYLO_EL1,
+    SYSREG_APGAKEYHI_EL1,
+];
 /// EL0 virtual counter (read-only). Carried in a KVM snapshot's register file;
 /// its captured value seeds the HVF vtimer offset on restore so the guest's
 /// CNTVCT_EL0 resumes continuously instead of restarting near zero.

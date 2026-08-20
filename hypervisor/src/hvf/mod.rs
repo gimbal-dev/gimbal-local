@@ -276,6 +276,19 @@ const SNAPSHOT_SYS_REGS: &[u16] = &[
     // with no tick and no deadline. See `SYSREG_CNTV_CTL_EL0`.
     SYSREG_CNTV_CVAL_EL0,
     SYSREG_CNTV_CTL_EL0,
+    // The pointer-authentication keys. See `SYSREG_PAC_KEYS`: a guest that
+    // booted on Apple silicon signs pointers, and resuming it with fresh keys
+    // kills it at the first `AUTIASP` with an FPAC oops.
+    SYSREG_APIAKEYLO_EL1,
+    SYSREG_APIAKEYHI_EL1,
+    SYSREG_APIBKEYLO_EL1,
+    SYSREG_APIBKEYHI_EL1,
+    SYSREG_APDAKEYLO_EL1,
+    SYSREG_APDAKEYHI_EL1,
+    SYSREG_APDBKEYLO_EL1,
+    SYSREG_APDBKEYHI_EL1,
+    SYSREG_APGAKEYLO_EL1,
+    SYSREG_APGAKEYHI_EL1,
 ];
 
 // ---------------------------------------------------------------------------
@@ -1408,8 +1421,8 @@ fn vtimer_needs_arming(sysregs: &[(u16, u64)]) -> bool {
 #[cfg(test)]
 mod snapshot_sys_reg_tests {
     use super::{
-        SNAPSHOT_SYS_REGS, SYSREG_CNTV_CTL_EL0, SYSREG_CNTV_CVAL_EL0, SYSREG_SCTLR_EL1,
-        vtimer_needs_arming,
+        SNAPSHOT_SYS_REGS, SYSREG_CNTV_CTL_EL0, SYSREG_CNTV_CVAL_EL0, SYSREG_PAC_KEYS,
+        SYSREG_SCTLR_EL1, vtimer_needs_arming,
     };
 
     /// A checkpoint must carry the guest's virtual-timer arming state.
@@ -1499,6 +1512,31 @@ mod snapshot_sys_reg_tests {
             (SYSREG_CNTV_CVAL_EL0, 0x1234),
             (SYSREG_CNTV_CTL_EL0, 1),
         ]));
+    }
+
+    /// A capture must carry the pointer-authentication keys.
+    ///
+    /// Alpine's 6.6 kernel signs return addresses with `APIAKey`. Those signed
+    /// pointers live on the guest's stack, so they travel inside guest RAM
+    /// whether we carry the keys or not; a vCPU restored with fresh keys then
+    /// fails the first `AUTIASP` it reaches and the guest dies with an FPAC
+    /// oops (ESR EC 0x1C) at an address that points at nothing useful.
+    ///
+    /// This could not have been found before now. Graviton2 is Neoverse-N1,
+    /// ARMv8.2, with no pointer authentication at all -- a cloud-captured guest
+    /// never signs a pointer, so every capture this project has ever restored
+    /// was structurally incapable of exposing the gap. Originating a lineage on
+    /// Apple silicon is the first thing that could.
+    #[test]
+    fn a_capture_carries_the_pointer_authentication_keys() {
+        for &key in SYSREG_PAC_KEYS {
+            assert!(
+                SNAPSHOT_SYS_REGS.contains(&key),
+                "PAC key {key:#x} is absent from the captured set, so a guest \
+                 restored from this capture will fail its first authenticated \
+                 return"
+            );
+        }
     }
 }
 
@@ -4593,6 +4631,18 @@ impl Vcpu for HvfVcpu {
                 // Read-only: not written as a sysreg. Its value seeds the vtimer
                 // offset below so the virtual counter resumes continuously.
                 snapshot_cntvct = Some(v);
+            } else if crate::hvf::ffi::SYSREG_PAC_KEYS.contains(&id) {
+                // Restored with a hard failure rather than best-effort, for the
+                // same reason as MPIDR above. A pointer-authentication key that
+                // silently fails to restore does not leave the guest degraded —
+                // it leaves every already-signed return address on every stack
+                // unauthenticatable, so the guest dies with an FPAC oops at some
+                // arbitrary later instruction with nothing pointing back here.
+                // A capture only carries these if it was taken on hardware that
+                // implements FEAT_PAuth, so a host that refuses them cannot run
+                // this guest at all, and failing by name is cheaper than an
+                // unexplained oops.
+                self.set_sysreg(id, v)?;
             } else if id == SYSREG_SCTLR_EL1 {
                 // See `ctr_trap_fixup`: a capture from Neoverse-N1 arrives with
                 // EL0 reads of CTR_EL0 trapped to a handler that reports a
