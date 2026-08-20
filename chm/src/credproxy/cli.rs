@@ -178,8 +178,8 @@ chm proxy — the credential-injecting egress proxy
 USAGE:
     chm proxy show [WORKSPACE_DIR|--workspace DIR] [--rules FILE] [--json]
     chm proxy ca   <WORKSPACE_DIR|--workspace DIR> [--out FILE] [--for-guest]
-    chm proxy check --host HOST [--port N] [--path P] [--rules FILE]
-                    [--control] [--json]
+    chm proxy check --host HOST [--port N] [--path P]
+                    [--workspace DIR] [--rules FILE] [--control] [--json]
 
 COMMANDS:
     show    What the rules would do, and whether each credential is available.
@@ -222,6 +222,20 @@ fn workspace_arg(args: &[String]) -> Option<&str> {
     flag(args, "--workspace").or_else(|| positional(args))
 }
 
+/// The workspace `chm proxy check` will read its rules from.
+///
+/// `--workspace` only, unlike `show`, which also takes the directory as a
+/// positional. Every argument to `check` is a flag with a value, so a bare
+/// path there is far more likely to be a misplaced value than an intended
+/// workspace, and silently adopting it would be the same class of mistake as
+/// #317 itself: acting confidently on an argument the user did not mean.
+///
+/// Split out so the resolution can be tested without opening a socket --
+/// `check` itself sends a real request, which is exactly why the bug survived.
+fn check_workspace(args: &[String]) -> Option<PathBuf> {
+    flag(args, "--workspace").map(PathBuf::from)
+}
+
 /// Reject flags this command does not know, naming the offender.
 /// What each subcommand accepts, named once.
 ///
@@ -232,6 +246,31 @@ fn workspace_arg(args: &[String]) -> Option<&str> {
 /// now holds them to the help text.
 const SHOW_FLAGS: &[&str] = &["--rules", "--json", "--workspace"];
 const CA_FLAGS: &[&str] = &["--out", "--workspace", "--for-guest"];
+const CHECK_FLAGS: &[&str] = &[
+    "--host",
+    "--port",
+    "--path",
+    "--rules",
+    "--workspace",
+    "--control",
+    "--json",
+];
+
+/// What one subcommand accepts, looked up rather than listed at the call site.
+///
+/// #317 was a subcommand with *no* allow-list at all: `check` never called
+/// `reject_unknown`, so `--workspace` was consumed and dropped and the command
+/// still printed a confident verdict. A table keyed by name lets the guard
+/// below ask "does every subcommand USAGE documents have one of these?", which
+/// is the question that catches a missing list rather than a wrong one.
+fn flags_for(cmd: &str) -> Option<&'static [&'static str]> {
+    match cmd {
+        "show" => Some(SHOW_FLAGS),
+        "ca" => Some(CA_FLAGS),
+        "check" => Some(CHECK_FLAGS),
+        _ => None,
+    }
+}
 
 /// The remedy `chm proxy ca` prints beside the certificate.
 ///
@@ -245,14 +284,26 @@ const CA_GUEST_HINT: &str = "\
 `chm proxy ca <WORKSPACE_DIR> --for-guest` prints an installer to
 paste into the guest console.";
 
-fn reject_unknown(cmd: &str, args: &[String], known: &[&str]) -> Result<(), ExitCode> {
-    for a in args {
-        if a.starts_with("--") && !known.contains(&a.as_str()) {
-            eprintln!("chm proxy {cmd}: unknown flag `{a}`\n\n{USAGE}");
-            return Err(ExitCode::FAILURE);
-        }
+fn reject_unknown(cmd: &str, args: &[String]) -> Result<(), ExitCode> {
+    if let Some(a) = first_unknown_flag(cmd, args) {
+        eprintln!("chm proxy {cmd}: unknown flag `{a}`\n\n{USAGE}");
+        return Err(ExitCode::FAILURE);
     }
     Ok(())
+}
+
+/// The first flag `cmd` does not accept, if any.
+///
+/// An unregistered subcommand gets an empty allow-list, so it refuses
+/// *everything* rather than accepting everything. #317 was the permissive
+/// version of that mistake: a command with no list took every flag it was
+/// handed and still printed a verdict. Failing closed turns the same omission
+/// into a command that visibly does not work.
+fn first_unknown_flag<'a>(cmd: &str, args: &'a [String]) -> Option<&'a str> {
+    let known = flags_for(cmd).unwrap_or(&[]);
+    args.iter()
+        .map(String::as_str)
+        .find(|a| a.starts_with("--") && !known.contains(a))
 }
 
 fn positional(args: &[String]) -> Option<&str> {
@@ -275,7 +326,7 @@ fn positional(args: &[String]) -> Option<&str> {
 }
 
 fn show(args: &[String]) -> ExitCode {
-    if let Err(e) = reject_unknown("show", args, SHOW_FLAGS) {
+    if let Err(e) = reject_unknown("show", args) {
         return e;
     }
     let workspace = workspace_arg(args).map(PathBuf::from);
@@ -419,7 +470,7 @@ fn quote(s: &str) -> String {
 }
 
 fn ca(args: &[String]) -> ExitCode {
-    if let Err(e) = reject_unknown("ca", args, CA_FLAGS) {
+    if let Err(e) = reject_unknown("ca", args) {
         return e;
     }
     let Some(ws) = workspace_arg(args) else {
@@ -739,20 +790,70 @@ fn base64_encode(bytes: &[u8]) -> String {
     out
 }
 
-fn check(args: &[String]) -> ExitCode {
-    let Some(host) = flag(args, "--host") else {
-        eprintln!("chm proxy check: --host is required\n\n{USAGE}");
-        return ExitCode::FAILURE;
-    };
-    let port: u16 = flag(args, "--port")
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(443);
-    let path = flag(args, "--path").unwrap_or("/");
-    let json = args.iter().any(|a| a == "--json");
-    let want_control = args.iter().any(|a| a == "--control");
-    let over = flag(args, "--rules").map(PathBuf::from);
+/// Everything `chm proxy check` decides before it opens a socket.
+#[derive(Debug)]
+struct CheckPlan<'a> {
+    host: &'a str,
+    port: u16,
+    path: &'a str,
+    json: bool,
+    want_control: bool,
+    over: Option<PathBuf>,
+    workspace: Option<PathBuf>,
+}
 
-    let outcome = match run_check(None, over.as_deref(), host, port, path, want_control) {
+/// Read `check`'s arguments, or say why they cannot be read.
+///
+/// Split out from `check` so the decisions are reachable from a test.
+/// #317 lived here: `workspace` was hardcoded to `None`, so `--workspace DIR`
+/// was accepted, dropped, and answered as "no rule matched" -- a legitimate
+/// outcome, indistinguishable from a dropped flag. It survived because the
+/// only way to observe it was to run the command, and running the command
+/// sends a real request to a real host.
+fn plan_check(args: &[String]) -> Result<CheckPlan<'_>, String> {
+    if let Some(f) = first_unknown_flag("check", args) {
+        return Err(format!("unknown flag `{f}`"));
+    }
+    let host = flag(args, "--host").ok_or("--host is required")?;
+    Ok(CheckPlan {
+        host,
+        port: flag(args, "--port")
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(443),
+        path: flag(args, "--path").unwrap_or("/"),
+        json: args.iter().any(|a| a == "--json"),
+        want_control: args.iter().any(|a| a == "--control"),
+        over: flag(args, "--rules").map(PathBuf::from),
+        workspace: check_workspace(args),
+    })
+}
+
+fn check(args: &[String]) -> ExitCode {
+    let plan = match plan_check(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("chm proxy check: {e}\n\n{USAGE}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let CheckPlan {
+        host,
+        port,
+        path,
+        json,
+        want_control,
+        over,
+        workspace,
+    } = plan;
+
+    let outcome = match run_check(
+        workspace.as_deref(),
+        over.as_deref(),
+        host,
+        port,
+        path,
+        want_control,
+    ) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("chm proxy check: {e}");
@@ -1365,13 +1466,13 @@ mod tests {
             .iter()
             .map(ToString::to_string)
             .collect();
-        assert!(reject_unknown("show", &args, SHOW_FLAGS).is_err());
+        assert!(reject_unknown("show", &args).is_err());
 
         let ok: Vec<String> = ["--workspace", "/ws", "--json"]
             .iter()
             .map(ToString::to_string)
             .collect();
-        assert!(reject_unknown("show", &ok, SHOW_FLAGS).is_ok());
+        assert!(reject_unknown("show", &ok).is_ok());
     }
 
     #[test]
@@ -1726,7 +1827,15 @@ mod tests {
     /// a restated expectation drifts with the thing it is meant to pin.
     #[test]
     fn usage_promises_only_flags_the_parser_accepts() {
-        for (cmd, known) in [("show", SHOW_FLAGS), ("ca", CA_FLAGS)] {
+        for cmd in subcommands_in_usage() {
+            let cmd = cmd.as_str();
+            let known = flags_for(cmd).unwrap_or_else(|| {
+                panic!(
+                    "USAGE documents `chm proxy {cmd}` but no allow-list is \
+                     registered for it in `flags_for`, so the parser cannot \
+                     refuse anything it is handed -- that was #317"
+                )
+            });
             let promised = flags_promised_for(cmd);
             assert!(
                 !promised.is_empty(),
@@ -1752,6 +1861,31 @@ mod tests {
                  `{f}`, which the parser refuses as unknown"
             );
         }
+    }
+
+    /// Every subcommand USAGE documents, read out of the synopsis block.
+    ///
+    /// Derived rather than listed so a new subcommand is covered the day it is
+    /// documented. #317 shipped because `check` was simply absent from a
+    /// hardcoded pair, and nothing noticed the omission.
+    fn subcommands_in_usage() -> Vec<String> {
+        let section = USAGE
+            .split_once("USAGE:\n")
+            .expect("USAGE: header")
+            .1
+            .split("\n\n")
+            .next()
+            .expect("a synopsis block");
+        let mut out: Vec<String> = section
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("chm proxy "))
+            .filter_map(|r| r.split_whitespace().next())
+            .filter(|v| v.chars().all(|c| c.is_ascii_lowercase()))
+            .map(str::to_string)
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// The flags USAGE offers for one subcommand, including continuation lines.
@@ -1789,6 +1923,79 @@ mod tests {
             .collect()
     }
 
+    /// `check` reads its rules from `--workspace`, the same directory `show` reads.
+    ///
+    /// This is #317 as a test. `chm proxy check --workspace DIR` accepted the
+    /// flag, dropped it, and reported `PASS-THROUGH (no-rule)` while
+    /// `chm proxy show --workspace DIR` listed a matching rule from the file in
+    /// that very directory. Two sibling commands disagreed about what
+    /// `--workspace` meant, and the one that disagreed is the *evidence*
+    /// command -- the one whose whole purpose is answering "is my credential
+    /// actually being injected?".
+    ///
+    /// What made it survive review is that `no-rule` is not an error. It is a
+    /// legitimate outcome meaning "nothing is configured for this host", so
+    /// there was no way to tell it apart from a flag that was silently
+    /// discarded. During the #286 acceptance run it was read as evidence the
+    /// proxy was misconfigured.
+    ///
+    /// Asserts on the plan rather than on the command, because running the
+    /// command opens a real connection to a real host -- which is exactly why
+    /// nothing exercised this path.
+    #[test]
+    fn check_reads_the_workspace_it_is_given() {
+        let args = vec![
+            "--workspace".to_string(),
+            "/tmp/ws-317".to_string(),
+            "--host".to_string(),
+            "api.github.com".to_string(),
+        ];
+        let plan = plan_check(&args).expect("a well-formed check");
+        assert_eq!(
+            plan.workspace.as_deref(),
+            Some(Path::new("/tmp/ws-317")),
+            "`check --workspace DIR` must resolve DIR; passing None here is \
+             #317, and it reports `no-rule` rather than failing"
+        );
+        assert_eq!(plan.host, "api.github.com");
+    }
+
+    /// An argument `check` does not understand is an error, not a shrug.
+    ///
+    /// `check` had no allow-list at all, so any flag at all was consumed and
+    /// the command still rendered a confident verdict below it. A wrong answer
+    /// from the evidence command is worse than no answer.
+    #[test]
+    fn check_refuses_a_flag_it_does_not_know() {
+        let args = vec![
+            "--host".to_string(),
+            "api.github.com".to_string(),
+            "--workspce".to_string(), // a plausible typo, not a wild string
+            "/tmp/ws-317".to_string(),
+        ];
+        let err = plan_check(&args).expect_err("a misspelled flag must not pass");
+        assert!(
+            err.contains("--workspce"),
+            "the refusal must name the offending flag, got: {err}"
+        );
+    }
+
+    /// A subcommand with no registered flags refuses everything.
+    ///
+    /// The failure mode this rules out is the one #317 shipped: a command that
+    /// accepts every flag it is handed. Failing closed makes the same omission
+    /// loudly broken instead of quietly permissive.
+    #[test]
+    fn an_unregistered_subcommand_accepts_nothing() {
+        assert!(flags_for("no-such-subcommand").is_none());
+        let args = vec!["--json".to_string()];
+        assert_eq!(
+            first_unknown_flag("no-such-subcommand", &args),
+            Some("--json"),
+            "an unregistered subcommand must reject flags, not wave them through"
+        );
+    }
+
     /// A workspace directory is positional *or* `--workspace`, and `--for-guest`
     /// must survive alongside either — the refusal fired before the handler,
     /// so neither form reached it.
@@ -1800,8 +2007,8 @@ mod tests {
             "/tmp/ws".to_string(),
             "--for-guest".to_string(),
         ];
-        assert!(reject_unknown("ca", &positional, CA_FLAGS).is_ok());
-        assert!(reject_unknown("ca", &flagged, CA_FLAGS).is_ok());
+        assert!(reject_unknown("ca", &positional).is_ok());
+        assert!(reject_unknown("ca", &flagged).is_ok());
         assert_eq!(workspace_arg(&positional), Some("/tmp/ws"));
         assert_eq!(workspace_arg(&flagged), Some("/tmp/ws"));
     }
