@@ -5,9 +5,14 @@ you are an agent starting a task — read this, then
 [`engineering-discipline.md`](engineering-discipline.md), then the domain guide
 for the area you are touching.
 
-**Last measured sweep:** 2026-08-13, against `ee3e6dde4` — the `v0.2.2` release
-commit on `main`.
-**Issue-state refresh:** 2026-08-13, via `gh issue view` / `gh pr view`.
+**Last measured sweep:** 2026-08-20, on the branch that becomes
+[#371](https://github.com/gimbal-dev/gimbal-local/pull/371). The gate numbers
+below include the changes merging with it, so they are true at the commit that
+introduces this line and not before.
+**Issue-state refresh:** 2026-08-20, swept from `gh issue list --state open`
+rather than transcribed by hand — the previous list was assembled by hand and
+every issue on it had closed
+([#368](https://github.com/gimbal-dev/gimbal-local/issues/368)).
 
 Everything in this document was measured on this machine. Where something is
 believed but not measured, it says so.
@@ -80,11 +85,11 @@ three ways:
 
 | Suite | Command | Measured result |
 | --- | --- | --- |
-| chm | `cd chm && cargo test` | **727** passed / 4 ignored (lib), plus **2** passed / 7 ignored (integration) |
-| hypervisor | `cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib` | **262** passed — also run by `make test-hvf` |
+| chm | `cd chm && cargo test` | **870** passed / 4 ignored (lib), plus **2** passed / 7 ignored (integration) |
+| hypervisor | `cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib` | **276** passed — also run by `make test-hvf` |
 | Swift app | `cd app/GimbalLocal && swift test` | **255** XCTest (3 skipped), plus **34** Swift Testing cases in 5 suites |
 | Lints | `make clippy` | **0** |
-| HVF gate | `make test-hvf` | **36** passed / 3 ignored (signed `hvf_boot`), then **262** passed (hypervisor lib). [#334](https://github.com/gimbal-dev/gimbal-local/issues/334) is fixed and merged |
+| HVF gate | `make test-hvf` | **41** passed / 3 ignored (signed `hvf_boot`), then **276** passed (hypervisor lib). [#334](https://github.com/gimbal-dev/gimbal-local/issues/334) is fixed and merged |
 
 `cargo test` and `swift test` each print **more than one** result line. Quote all
 of them, or say which you are quoting — a single number invites a false
@@ -129,62 +134,104 @@ or touch them.
 
 ## What is being worked on right now
 
-The first-run path track, **V9.18 — the first-run path actually works**, is now
-closed. A clean-machine acceptance run found that the obvious path a new user
-takes (build a container image → start it from the app → run an agent in it) had
-potholes at every step. None were hypervisor defects; together they decided
-whether the product felt finished.
+**V11 — the browser sandbox** is the newest shipped capability and the first
+workload built *on* this stack rather than into it: an agent gets a browser and
+nothing else, reachable over CDP from the host and nothing more. See
+[`browser-sandbox.md`](browser-sandbox.md) for how to build and drive one, and
+what its acceptance gate actually proves.
 
-Progress on that track:
-
-| Issue | State |
-| --- | --- |
-| [#226](https://github.com/gimbal-dev/gimbal-local/issues/226) — no controlling terminal, so Ctrl-C did nothing | **Closed** (PR #229) |
-| [#227](https://github.com/gimbal-dev/gimbal-local/issues/227) — a guest never configured its own NIC | **Closed** (PR #230, plus the static `nicfg` configurator) |
-| [#224](https://github.com/gimbal-dev/gimbal-local/issues/224) — agent workloads need a glibc rootfs | **Closed** (PR #236 — `chm image build` says which libc an image ships) |
-| [#220](https://github.com/gimbal-dev/gimbal-local/issues/220) — a zboot-wrapped kernel was refused as if it were x86 | **Closed** (PR #240) |
-| [#222](https://github.com/gimbal-dev/gimbal-local/issues/222) — container guests get no network or disk | **Closed** — `chm image build --modules <DIR>` bundles the virtio closure and the generated init loads it. Hardware-proved on both musl (`insmod` present) and glibc (`insmod` absent, via chm's own static loader) |
-| [#225](https://github.com/gimbal-dev/gimbal-local/issues/225) — app says "No sandboxes yet" while a guest it launched runs | **Closed** (PR #244 — the app shows a Running now section backed by the machine-wide run registry) |
+**Originating a lineage locally** closed with
+[#341](https://github.com/gimbal-dev/gimbal-local/issues/341): before it, a cold
+boot could never produce the first snapshot, so every lineage on this machine
+had to begin in the cloud. A Mac can now originate one.
 
 ### The live problem
 
-**#286 is closed** — on 2026-08-13 an agent worked inside a rehydrated Graviton2
-capture and, after a suspend and resume, read back its own file and extended it.
-The four pillars now stand up in one guest at the same time.
+The four pillars stand up together in one guest — on 2026-08-13 an agent worked
+inside a rehydrated Graviton2 capture and, after a suspend and resume, read back
+its own file and extended it.
 
-What that run exposed instead is a cluster of **first-contact friction around
-the credential proxy**, none of it hypothetical — each item cost real time
-during the run: [#315](https://github.com/gimbal-dev/gimbal-local/issues/315)
-(a workspace mints a CA the guest does not trust, and the failure is a bare
-curl error), [#316](https://github.com/gimbal-dev/gimbal-local/issues/316) (the
-CA install script `chm` prints is too large for `chm exec`, and there is no
-`chm cp`), [#317](https://github.com/gimbal-dev/gimbal-local/issues/317)
-(`chm proxy check` silently ignores `--workspace` and reports `no-rule` — the
-evidence command giving a wrong verdict), and
-[#318](https://github.com/gimbal-dev/gimbal-local/issues/318) (a client that
-gates on local auth never lets the proxy inject; the placeholder pattern that
-solves it is undocumented).
+What is unproven is the **return leg**. Nothing has yet shown upstream
+cloud-hypervisor accepting a snapshot this project originated
+([#372](https://github.com/gimbal-dev/gimbal-local/issues/372)), and an
+Apple-originated snapshot is expected to hard-fail on a non-PAC host, which
+cannot be measured on this hardware at all
+([#373](https://github.com/gimbal-dev/gimbal-local/issues/373)). Both are
+recorded as unmeasured rather than believed. Until the return leg is
+demonstrated, "cloud to Mac" is proved and "Mac back to cloud" is not.
 
-A second visible wart is [#310](https://github.com/gimbal-dev/gimbal-local/issues/310):
-a resumed guest can report an RCU stall that the detector classifies as benign,
-but the user-facing presentation still does not explain the difference.
+Two rehydration warts remain visible to a user:
+[#310](https://github.com/gimbal-dev/gimbal-local/issues/310) (a resumed guest
+reports an RCU stall the detector classifies as benign, and the presentation
+still does not explain the difference) and
+[#366](https://github.com/gimbal-dev/gimbal-local/issues/366)
+(`update-initramfs` segfaults about half the time in a rehydrated capture).
 
 ---
 
 ## The open issue list, grouped
 
-**First-run path (V9.18):** #220, #222, #224, #225 and #226 are closed.
-**Agent acceptance:** #286 closed 2026-08-13 — see above.
-**Credential-proxy first contact:** #315, #316, #317, #318 (all found by that run)
-**Correctness / honesty of our own gates:** #214 (debug-only tests)
-**CLI surface gaps:** #199 (`export --with-base`), #211 (import is 19× slower
-than export)
-**Sandbox spec alignment (V9.15):** #182–#189
-**Product tracks:** #155 (opt-in ingress), #156 (runtime-mutable egress), #157
-(MCP server surface), #159 (V10 Living Workspaces), #170, #171, #174, #238 (the
-generated init could install the proxy CA)
-**Security:** #36, #39
-**Control plane / cross-repo:** #5, #6, #20, #21
+Swept from `gh issue list --state open` on 2026-08-20. Six issues close with the
+PR introducing this section — #317, #341, #365, #369, #374 and #368 itself — so
+**31 remain open**, and every one of them is named below. Issue numbers are
+written individually rather than as ranges, so a checker can verify the list
+against `gh` without expanding anything.
+
+**Credential-proxy first contact:** [#315](https://github.com/gimbal-dev/gimbal-local/issues/315)
+(a workspace mints a CA the guest does not trust),
+[#316](https://github.com/gimbal-dev/gimbal-local/issues/316) (the CA install
+script is too large for `chm exec`, and there is no `chm cp`),
+[#318](https://github.com/gimbal-dev/gimbal-local/issues/318) (a client that
+gates on local auth never lets the proxy inject)
+
+**Rehydration fidelity:** [#279](https://github.com/gimbal-dev/gimbal-local/issues/279)
+(cure the ASID-width delta at capture time),
+[#287](https://github.com/gimbal-dev/gimbal-local/issues/287) (re-patch the
+guest kernel's elided `ic ivau` instead of working around DIC=0),
+[#310](https://github.com/gimbal-dev/gimbal-local/issues/310),
+[#366](https://github.com/gimbal-dev/gimbal-local/issues/366)
+
+**The return leg, unmeasured:** [#372](https://github.com/gimbal-dev/gimbal-local/issues/372),
+[#373](https://github.com/gimbal-dev/gimbal-local/issues/373)
+
+**Sandbox / browser defects:** [#360](https://github.com/gimbal-dev/gimbal-local/issues/360)
+(the app never stops the daemon it started),
+[#361](https://github.com/gimbal-dev/gimbal-local/issues/361) (a browser guest
+can be warm-resumable or keep its own sandbox, but not both),
+[#363](https://github.com/gimbal-dev/gimbal-local/issues/363) (`chm posture`
+reports only what chm does to a guest, never what the guest can do)
+
+**Sandbox spec alignment:** [#182](https://github.com/gimbal-dev/gimbal-local/issues/182)
+(umbrella), [#183](https://github.com/gimbal-dev/gimbal-local/issues/183)
+(extensions), [#184](https://github.com/gimbal-dev/gimbal-local/issues/184)
+(securityModules), [#185](https://github.com/gimbal-dev/gimbal-local/issues/185)
+(dataPolicy), [#186](https://github.com/gimbal-dev/gimbal-local/issues/186)
+(toolPolicy), [#187](https://github.com/gimbal-dev/gimbal-local/issues/187)
+(identity), [#188](https://github.com/gimbal-dev/gimbal-local/issues/188)
+(observability), [#189](https://github.com/gimbal-dev/gimbal-local/issues/189)
+(lifecycle hooks)
+
+**Product tracks:** [#155](https://github.com/gimbal-dev/gimbal-local/issues/155)
+(name guest ingress in the spec — the `--expose` mechanism ships, the spec
+surface does not), [#156](https://github.com/gimbal-dev/gimbal-local/issues/156)
+(change egress policy without restarting),
+[#157](https://github.com/gimbal-dev/gimbal-local/issues/157) (drive a sandbox
+as an MCP server), [#159](https://github.com/gimbal-dev/gimbal-local/issues/159)
+(V10 Living Workspaces),
+[#171](https://github.com/gimbal-dev/gimbal-local/issues/171) (measure vCPU WFI
+residency instead of console silence)
+
+**Security:** [#36](https://github.com/gimbal-dev/gimbal-local/issues/36)
+(signed snapshot manifest), [#39](https://github.com/gimbal-dev/gimbal-local/issues/39)
+(threat model + hardening checklist)
+
+**Docs:** [#368](https://github.com/gimbal-dev/gimbal-local/issues/368) — this
+section's own defect, closed by the change that introduced this list
+
+**Control plane / cross-repo:** [#5](https://github.com/gimbal-dev/gimbal-local/issues/5),
+[#6](https://github.com/gimbal-dev/gimbal-local/issues/6),
+[#20](https://github.com/gimbal-dev/gimbal-local/issues/20),
+[#21](https://github.com/gimbal-dev/gimbal-local/issues/21)
 
 ---
 

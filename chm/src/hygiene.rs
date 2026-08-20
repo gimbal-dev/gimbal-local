@@ -654,4 +654,132 @@ mod tests {
              catching there what this test only catches in chm (#365)"
         );
     }
+
+    /// Every page under `docs/` is reachable from `docs/README.md`.
+    ///
+    /// #368: the browser sandbox shipped as V11 — the newest headline
+    /// capability — with no page and no index entry, so `grep -ci browser
+    /// docs/README.md` returned 0 and a reader had no route to
+    /// `chm/src/oci/browser.rs` or the acceptance script at all. Writing the
+    /// page fixes that once; this guard is what stops the *next* page being
+    /// unreachable.
+    ///
+    /// **The honest limit, stated up front:** this pins structure, not
+    /// currency. It can prove a page is indexed and that its links resolve. It
+    /// cannot prove the page is true, or current, and claiming otherwise would
+    /// repeat #368's own failure one level up — a document asserting a state it
+    /// has not rechecked.
+    #[test]
+    fn every_doc_page_is_reachable_from_the_index() {
+        let docs = repo_root().join("docs");
+        let index = fs::read_to_string(docs.join("README.md")).expect("read docs/README.md");
+
+        let mut pages: Vec<String> = fs::read_dir(&docs)
+            .expect("read docs/")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "md"))
+            .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .filter(|n| n != "README.md" && n != "AGENTS.md")
+            .collect();
+        pages.sort();
+        assert!(
+            !pages.is_empty(),
+            "found no docs pages to check; the walk is broken"
+        );
+
+        let unindexed: Vec<&String> = pages.iter().filter(|n| !index.contains(*n)).collect();
+        assert!(
+            unindexed.is_empty(),
+            "docs/README.md does not link {unindexed:?}, so a reader browsing \
+             the index has no route to {} — the exact shape of #368, where the \
+             newest shipped capability was undiscoverable",
+            unindexed.len()
+        );
+    }
+
+    /// Every relative link in `docs/` resolves to a file that exists.
+    ///
+    /// A dead link is the same defect as a missing index entry wearing a
+    /// disguise: the reader is told a route exists and it does not. This also
+    /// keeps the index guard above honest, since that one is satisfied by the
+    /// *filename appearing* in `README.md` and would otherwise accept a link
+    /// pointing at nothing.
+    #[test]
+    fn every_doc_link_points_at_a_file_that_exists() {
+        let docs = repo_root().join("docs");
+        let mut broken: Vec<String> = Vec::new();
+        let mut checked = 0usize;
+
+        for entry in fs::read_dir(&docs).expect("read docs/").flatten() {
+            let path = entry.path();
+            if path.extension().is_none_or(|e| e != "md") {
+                continue;
+            }
+            let page = path
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            let text = fs::read_to_string(&path).expect("read a docs page");
+
+            for target in markdown_link_targets(&text) {
+                // Anchors, absolute URLs and mail links are not ours to resolve.
+                if target.starts_with('#')
+                    || target.contains("://")
+                    || target.starts_with("mailto:")
+                {
+                    continue;
+                }
+                let file = target.split('#').next().unwrap_or(&target);
+                if file.is_empty() {
+                    continue;
+                }
+                if !docs.join(file).exists() {
+                    broken.push(format!("{page} -> {file}"));
+                }
+                checked += 1;
+            }
+        }
+
+        // Without this the test passes when the parser finds nothing, which is
+        // the failure mode it is least likely to notice: an empty result set
+        // reads exactly like a clean one. The floor is deliberately far below
+        // the real count so it tracks a broken parser, not the doc set's size.
+        assert!(
+            checked > 20,
+            "only {checked} relative doc links were checked, which is too few to \
+             be real — the link parser has stopped finding links and this guard \
+             is passing on an empty set rather than on a clean one"
+        );
+
+        broken.sort();
+        assert!(
+            broken.is_empty(),
+            "these docs links point at files that do not exist: {broken:?}"
+        );
+    }
+
+    /// The targets of every inline markdown link `[text](target)` in `text`.
+    ///
+    /// Deliberately does not try to parse markdown. It finds `](` and reads to
+    /// the matching `)`, which is enough for the link forms these pages use and
+    /// fails toward a loud false positive rather than a quiet miss.
+    fn markdown_link_targets(text: &str) -> Vec<String> {
+        let bytes = text.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            if bytes[i] == b']' && bytes[i + 1] == b'(' {
+                let start = i + 2;
+                if let Some(len) = bytes[start..].iter().position(|&b| b == b')') {
+                    out.push(text[start..start + len].trim().to_string());
+                    i = start + len;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        out
+    }
 }
