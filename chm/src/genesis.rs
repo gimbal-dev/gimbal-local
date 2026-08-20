@@ -94,6 +94,7 @@ use hypervisor::hvf::VcpuHvfState;
 use hypervisor::hvf::checkpoint::CheckpointState;
 use hypervisor::hvf::rehydrate::{MemMapping, Snapshot};
 use hypervisor::hvf::translate::{self, gic_ingest, kvm_ingest, lower_to_kvm};
+use hypervisor::hvf::virtio::devmgr::SerialRegs;
 use serde_json::{Map, Value, json};
 
 use crate::vanilla::{CORE_REGS_LEN, VanillaState};
@@ -134,12 +135,22 @@ pub(crate) struct Genesis {
 /// pure data and can be tested for a machine other than the one running the
 /// test.
 ///
+/// `serial` is the PL011 configuration the guest programmed, read back off the
+/// live device model. It is a parameter for the same reason `ram` is: nothing
+/// in a `CheckpointState` carries it, because the software GIC and the vCPUs
+/// are all a *suspend* has ever needed. Getting it wrong is quiet -- a guest
+/// restored with `imsc` at its reset value executes perfectly and never
+/// receives a keystroke, because its driver unmasked the receive interrupt
+/// before the capture and does not do so again.
+///
 /// Every refusal below is a case where writing the document anyway would produce
 /// an artefact that reads back as a machine nobody asked for.
 pub(crate) fn synthesize(
     state: &CheckpointState,
     ram: &[MemMapping],
     cntfrq: u64,
+    serial: SerialRegs,
+    serial_intid: u32,
 ) -> Result<Genesis, String> {
     if ram.is_empty() {
         return Err(
@@ -260,8 +271,48 @@ pub(crate) fn synthesize(
                             "icc": gic.icc,
                         }
                     }))?,
+                    // The field names are cloud-hypervisor's, not ours, and
+                    // three of the six differ from the register they hold
+                    // (`int_enabled`, `lcr`, `ifl`). They are written here
+                    // and read by `devmgr::parse_serial_state`; the
+                    // round-trip test is what holds the two together, since
+                    // a rename on one side alone produces a node that
+                    // parses into silent defaults rather than an error.
+                    "__serial": leaf(&json!({
+                        "int_enabled": serial.imsc,
+                        "cr": serial.cr,
+                        "lcr": serial.lcr_h,
+                        "ibrd": serial.ibrd,
+                        "fbrd": serial.fbrd,
+                        "ifl": serial.ifls,
+                    }))?,
                 },
-                "snapshot_data": { "state": "{}" },
+                // cloud-hypervisor rebuilds its device manager from a
+                // configuration on restore and so re-derives the console's
+                // interrupt line rather than reading it back; a capture from it
+                // leaves `__serial.resources` empty. There is no configuration
+                // to rebuild from for a guest whose device tree we wrote, so the
+                // line is recorded here, in upstream's own `Resource::LegacyIrq`
+                // shape. Without it a restoring VMM has to guess, and a guess
+                // that is wrong delivers every keystroke to an interrupt no
+                // device owns: the guest runs perfectly and the console is deaf.
+                "snapshot_data": {
+                    "state": embed(&json!({
+                        "device_tree": {
+                            "__serial": {
+                                "id": "__serial",
+                                "resources": [{ "LegacyIrq": serial_intid }],
+                                "children": [],
+                            },
+                            "gic-v3-its": {
+                                "id": "gic-v3-its",
+                                "resources": [],
+                                "children": [],
+                            },
+                        },
+                        "device_id_cnt": 0,
+                    }))?,
+                },
             },
             "cpu-manager": {
                 "snapshots": Value::Object(cpu_nodes),
@@ -338,12 +389,21 @@ pub(crate) fn synthesize(
          them at the receiving VMM's own values.",
         sysreg_counts.iter().max().copied().unwrap_or(0)
     ));
+    if !serial.receives_by_interrupt() {
+        warnings.push(format!(
+            "the console's receive interrupt is masked (UARTIMSC = {:#x}). The \
+             capture carries that faithfully, but a guest restored from it will \
+             not be woken by a keystroke unless it polls -- so an interactive \
+             session may look wedged when it is only deaf.",
+            serial.imsc
+        ));
+    }
     warnings.push(
-        "this describes only the machine chm builds: guest RAM, the GIC and the \
-         vCPUs. Stock cloud-hypervisor also reads a node per device (serial, \
-         each virtio device, the ITS tables) and the rest of the \
-         memory-manager's state, none of which this build models -- so the \
-         capture is restorable by chm and not yet by the cloud."
+        "this describes only the machine chm builds: guest RAM, the GIC, the \
+         vCPUs and the serial port. Stock cloud-hypervisor also reads a node \
+         per virtio device, the ITS tables and the rest of the memory-manager's \
+         state, none of which this build models -- so the capture is restorable \
+         by chm and not yet by the cloud."
             .to_string(),
     );
 
@@ -718,8 +778,36 @@ mod tests {
         },
     ];
 
+    /// The console's interrupt line, as a fixture.
+    ///
+    /// Deliberately neither `coldboot::PL011_IRQ` (33, what origination really
+    /// writes) nor `console::DEFAULT_SERIAL_SPI` (43, what a reader falls back
+    /// to when a capture is silent). A test that passed either could go green
+    /// against a writer that dropped the value entirely and a reader that
+    /// guessed, which is the exact failure this field exists to end.
+    const SERIAL_LINE: u32 = 37;
+
+    /// A PL011 as a Linux guest leaves it once a getty has opened `ttyAMA0`:
+    /// RXIM|RTIM unmasked, port enabled, 8n1 with FIFOs.
+    ///
+    /// Every field holds a different value on purpose. Six registers written
+    /// through six differently-named JSON keys is exactly the shape where a
+    /// swapped pair round-trips perfectly and means something else entirely, so
+    /// the fixture is chosen so a swap cannot pass.
+    fn a_serial() -> SerialRegs {
+        SerialRegs {
+            imsc: 0x50,
+            cr: 0x301,
+            lcr_h: 0x70,
+            ibrd: 0x1a,
+            fbrd: 0x03,
+            ifls: 0x12,
+        }
+    }
+
     fn synthesized(n: usize) -> Genesis {
-        synthesize(&a_checkpoint(n), RAM, 24_000_000).expect("a cold machine synthesizes")
+        synthesize(&a_checkpoint(n), RAM, 24_000_000, a_serial(), SERIAL_LINE)
+            .expect("a cold machine synthesizes")
     }
 
     fn parsed(g: &Genesis) -> Snapshot {
@@ -734,7 +822,7 @@ mod tests {
     #[test]
     fn a_synthesized_capture_reads_back_as_the_machine_it_describes() {
         let ckpt = a_checkpoint(2);
-        let g = synthesize(&ckpt, RAM, 24_000_000).expect("synthesizes");
+        let g = synthesize(&ckpt, RAM, 24_000_000, a_serial(), SERIAL_LINE).expect("synthesizes");
         let snap = parsed(&g);
 
         // --- memory ---------------------------------------------------------
@@ -834,7 +922,8 @@ mod tests {
             size: 0x8000_0000,
             file_offset: 0,
         }];
-        let g = synthesize(&a_checkpoint(1), &cold, 24_000_000).expect("synthesizes");
+        let g = synthesize(&a_checkpoint(1), &cold, 24_000_000, a_serial(), SERIAL_LINE)
+            .expect("synthesizes");
         let snap = parsed(&g);
         assert_eq!(snap.num_vcpus(), 1);
         assert_eq!(snap.mem_mappings, cold);
@@ -874,20 +963,32 @@ mod tests {
     fn a_machine_that_cannot_be_described_is_refused_by_name() {
         let ckpt = a_checkpoint(1);
 
-        let e = refused(synthesize(&ckpt, &[], 24_000_000), "no RAM");
+        let e = refused(
+            synthesize(&ckpt, &[], 24_000_000, a_serial(), SERIAL_LINE),
+            "no RAM",
+        );
         assert!(e.contains("no guest RAM"), "{e}");
 
-        let e = refused(synthesize(&ckpt, RAM, 0), "no counter frequency");
+        let e = refused(
+            synthesize(&ckpt, RAM, 0, a_serial(), SERIAL_LINE),
+            "no counter frequency",
+        );
         assert!(e.contains("counter frequency"), "{e}");
 
         let mut no_vcpus = ckpt.clone();
         no_vcpus.vcpus.clear();
-        let e = refused(synthesize(&no_vcpus, RAM, 24_000_000), "no vCPUs");
+        let e = refused(
+            synthesize(&no_vcpus, RAM, 24_000_000, a_serial(), SERIAL_LINE),
+            "no vCPUs",
+        );
         assert!(e.contains("no vCPUs"), "{e}");
 
         let mut no_time = ckpt.clone();
         no_time.host_realtime_ns = None;
-        let e = refused(synthesize(&no_time, RAM, 24_000_000), "no capture time");
+        let e = refused(
+            synthesize(&no_time, RAM, 24_000_000, a_serial(), SERIAL_LINE),
+            "no capture time",
+        );
         assert!(e.contains("when it was taken"), "{e}");
 
         let mut no_counter = ckpt.clone();
@@ -895,27 +996,42 @@ mod tests {
             .state
             .sysregs
             .retain(|(enc, _)| *enc != SYSREG_CNTVCT_EL0);
-        let e = refused(synthesize(&no_counter, RAM, 24_000_000), "no CNTVCT");
+        let e = refused(
+            synthesize(&no_counter, RAM, 24_000_000, a_serial(), SERIAL_LINE),
+            "no CNTVCT",
+        );
         assert!(e.contains("CNTVCT_EL0"), "{e}");
 
         let mut managed = ckpt.clone();
         managed.usgic_cpus.clear();
-        let e = refused(synthesize(&managed, RAM, 24_000_000), "not a cold machine");
+        let e = refused(
+            synthesize(&managed, RAM, 24_000_000, a_serial(), SERIAL_LINE),
+            "not a cold machine",
+        );
         assert!(e.contains("software-GIC state for vCPU 0"), "{e}");
 
         let mut no_icc = ckpt.clone();
         no_icc.vcpus[0].state.gic_icc.clear();
-        let e = refused(synthesize(&no_icc, RAM, 24_000_000), "no ICC_CTLR_EL1");
+        let e = refused(
+            synthesize(&no_icc, RAM, 24_000_000, a_serial(), SERIAL_LINE),
+            "no ICC_CTLR_EL1",
+        );
         assert!(e.contains("ICC_CTLR_EL1"), "{e}");
 
         let mut widths = a_checkpoint(2);
         widths.usgic_cpus[1].dist = Distributor::new(64);
-        let e = refused(synthesize(&widths, RAM, 24_000_000), "two distributors");
+        let e = refused(
+            synthesize(&widths, RAM, 24_000_000, a_serial(), SERIAL_LINE),
+            "two distributors",
+        );
         assert!(e.contains("does not describe one machine"), "{e}");
 
         let mut declared = a_checkpoint(1);
         declared.num_irq = 128;
-        let e = refused(synthesize(&declared, RAM, 24_000_000), "width disagreement");
+        let e = refused(
+            synthesize(&declared, RAM, 24_000_000, a_serial(), SERIAL_LINE),
+            "width disagreement",
+        );
         assert!(e.contains("128 interrupt lines"), "{e}");
     }
 
@@ -927,13 +1043,13 @@ mod tests {
         let mut ckpt = a_checkpoint(1);
         ckpt.usgic_cpus[0].pending = vec![33];
         ckpt.usgic_cpus[0].active_stack = vec![27];
-        let g = synthesize(&ckpt, RAM, 24_000_000).expect("synthesizes");
+        let g = synthesize(&ckpt, RAM, 24_000_000, a_serial(), SERIAL_LINE).expect("synthesizes");
         let all = g.warnings.join("\n");
         for needle in [
             "GICR_IPRIORITYR0..7",
             "active-priority stack",
             "system register(s)",
-            "node per device",
+            "restorable by chm",
         ] {
             assert!(
                 all.contains(needle),
@@ -942,7 +1058,8 @@ mod tests {
         }
         // A quiescent machine has nothing in flight, so that warning must not
         // fire -- otherwise it is decoration rather than a report.
-        let quiet = synthesize(&a_checkpoint(1), RAM, 24_000_000).expect("synthesizes");
+        let quiet = synthesize(&a_checkpoint(1), RAM, 24_000_000, a_serial(), SERIAL_LINE)
+            .expect("synthesizes");
         assert!(
             !quiet.warnings.join("\n").contains("active-priority stack"),
             "an idle machine reported in-flight interrupts it does not have"
@@ -981,7 +1098,8 @@ mod tests {
                 file_offset: 0x8000_0000,
             },
         ];
-        let g = synthesize(&a_checkpoint(1), &want, 24_000_000).expect("synthesizes");
+        let g = synthesize(&a_checkpoint(1), &want, 24_000_000, a_serial(), SERIAL_LINE)
+            .expect("synthesizes");
         assert_eq!(parsed(&g).mem_mappings, want);
     }
 
@@ -999,7 +1117,10 @@ mod tests {
         };
 
         let empty = vec![one(0, 0x4000_0000, 0, 0)];
-        let e = refused(synthesize(&ckpt, &empty, 24_000_000), "a zero-byte region");
+        let e = refused(
+            synthesize(&ckpt, &empty, 24_000_000, a_serial(), SERIAL_LINE),
+            "a zero-byte region",
+        );
         assert!(e.contains("zero bytes"), "{e}");
 
         let overlap_gpa = vec![
@@ -1007,7 +1128,7 @@ mod tests {
             one(1, 0x5000_0000, 0x1000_0000, 0x2000_0000),
         ];
         let e = refused(
-            synthesize(&ckpt, &overlap_gpa, 24_000_000),
+            synthesize(&ckpt, &overlap_gpa, 24_000_000, a_serial(), SERIAL_LINE),
             "regions overlapping in guest-physical space",
         );
         assert!(e.contains("overlap in guest-physical space"), "{e}");
@@ -1017,21 +1138,21 @@ mod tests {
             one(1, 0x1_0000_0000, 0x1000_0000, 0x1fff_f000),
         ];
         let e = refused(
-            synthesize(&ckpt, &overlap_file, 24_000_000),
+            synthesize(&ckpt, &overlap_file, 24_000_000, a_serial(), SERIAL_LINE),
             "regions overlapping in the dump file",
         );
         assert!(e.contains("overlap in memory-ranges"), "{e}");
 
         let past_gpa_end = vec![one(0, u64::MAX - 0xfff, 0x2000, 0)];
         let e = refused(
-            synthesize(&ckpt, &past_gpa_end, 24_000_000),
+            synthesize(&ckpt, &past_gpa_end, 24_000_000, a_serial(), SERIAL_LINE),
             "a region past the end of guest-physical space",
         );
         assert!(e.contains("guest-physical address space"), "{e}");
 
         let past_file_end = vec![one(0, 0x4000_0000, 0x2000, u64::MAX - 0xfff)];
         let e = refused(
-            synthesize(&ckpt, &past_file_end, 24_000_000),
+            synthesize(&ckpt, &past_file_end, 24_000_000, a_serial(), SERIAL_LINE),
             "a region past the end of the dump file",
         );
         assert!(e.contains("memory-ranges file"), "{e}");
@@ -1075,11 +1196,120 @@ mod tests {
             v.state.sysregs.reverse();
         }
         assert_eq!(
-            synthesize(&reordered, RAM, 24_000_000)
+            synthesize(&reordered, RAM, 24_000_000, a_serial(), SERIAL_LINE)
                 .expect("synthesizes")
                 .bytes,
             synthesized(2).bytes,
             "the capture order of the system registers must not reach the bytes"
+        );
+    }
+    /// The load-bearing guard for the console.
+    ///
+    /// Six registers cross this boundary through JSON keys that are
+    /// cloud-hypervisor's names, and three of them differ from the register
+    /// they carry. Asking the production reader to parse what the production
+    /// writer emitted is the only check with power here: a rename or a swap on
+    /// the writing side alone produces a document that is still valid JSON and
+    /// still parses, into silent reset values, so nothing downstream reports it
+    /// and the guest simply comes back deaf.
+    #[test]
+    fn the_console_configuration_reads_back_exactly_as_it_was_captured() {
+        let g = synthesized(1);
+        let text = std::str::from_utf8(&g.bytes).expect("utf-8");
+        let back = hypervisor::hvf::virtio::devmgr::parse_serial_state(text)
+            .expect("the emitted capture must carry a serial node the restore path finds");
+        assert_eq!(
+            back,
+            a_serial(),
+            "every PL011 register must survive the round trip through the document"
+        );
+    }
+
+    /// The line the console asserts must survive the document, read back by the
+    /// restore path's own parser rather than by a second one written here.
+    ///
+    /// This is the guard the whole field exists for. Without the value on disk
+    /// a restoring VMM falls back to a constant derived from a cloud-hypervisor
+    /// capture's device order, and a cold-booted guest's PL011 does not sit
+    /// there -- so every keystroke lands on an interrupt no device owns and the
+    /// guest, which is running perfectly, answers nothing.
+    #[test]
+    fn the_line_the_console_asserts_reads_back_as_the_one_that_was_captured() {
+        let g = synthesized(1);
+        let text = std::str::from_utf8(&g.bytes).expect("utf-8");
+        let back = hypervisor::hvf::virtio::devmgr::parse_serial_intid(text)
+            .expect("the emitted capture must record the console's interrupt line");
+        assert_eq!(
+            back, SERIAL_LINE,
+            "the restore path must read back the line origination captured, not a default"
+        );
+    }
+
+    /// A capture that predates the field must read as "does not say", not as a
+    /// line number.
+    ///
+    /// Every snapshot cloud-hypervisor has ever written is this case, and the
+    /// reader has to be able to tell silence from an answer or it would hand a
+    /// zero to the interrupt controller and call it the console.
+    #[test]
+    fn a_capture_that_does_not_record_a_line_says_nothing_rather_than_zero() {
+        let text = r#"{"snapshots":{"device-manager":{"snapshots":{},
+            "snapshot_data":{"state":"{\"device_tree\":{\"__serial\":{\"id\":\"__serial\",\"resources\":[],\"children\":[]}}}"}}}}"#;
+        assert_eq!(
+            hypervisor::hvf::virtio::devmgr::parse_serial_intid(text),
+            None,
+            "an empty resources list is a capture declining to say, not a line 0"
+        );
+    }
+
+    /// A guest whose console is deaf must be described as one.    ///
+    /// `imsc` at its reset value is a legitimate capture -- a guest that polls
+    /// `UARTFR` reads input regardless -- so this is a warning and not a
+    /// refusal. It is worth stating because the failure it predicts is the
+    /// least legible one available: the guest executes perfectly and answers
+    /// nothing.
+    #[test]
+    fn a_masked_receive_interrupt_is_reported_rather_than_hidden() {
+        let deaf = SerialRegs {
+            imsc: 0,
+            ..a_serial()
+        };
+        let g =
+            synthesize(&a_checkpoint(1), RAM, 24_000_000, deaf, SERIAL_LINE).expect("synthesizes");
+        assert!(
+            g.warnings.iter().any(|w| w.contains("receive interrupt")),
+            "a capture with the receive interrupt masked must say so: {:?}",
+            g.warnings
+        );
+        assert!(
+            !synthesized(1)
+                .warnings
+                .iter()
+                .any(|w| w.contains("receive interrupt")),
+            "an interrupt-driven console must not draw the warning"
+        );
+    }
+
+    /// The completeness note must not keep claiming the serial port is missing.
+    ///
+    /// This document is the only place a caller is told what the artefact does
+    /// not carry, so a stale sentence there is worse than none: it sends a
+    /// reader looking for a cause that has already been fixed.
+    #[test]
+    fn the_completeness_note_does_not_still_disown_the_serial_port() {
+        let g = synthesized(1);
+        let note = g
+            .warnings
+            .iter()
+            .find(|w| w.contains("restorable by chm"))
+            .expect("the completeness note must be present");
+        assert!(
+            note.contains("serial"),
+            "the note must count the serial port among what is carried: {note}"
+        );
+        assert!(
+            !note.contains("node per device (serial"),
+            "the note must not still list the serial port as absent: {note}"
         );
     }
 }

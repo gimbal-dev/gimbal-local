@@ -1155,7 +1155,7 @@ const DELTA_CHUNK: usize = 64 * 1024;
 /// On APFS the clone is a copy-on-write reflink, so the unwritten majority costs
 /// no new blocks and the parent may still be pruned independently — clones are
 /// separate inodes sharing extents, not hard links.
-fn dump_guest_ram(
+pub(crate) fn dump_guest_ram(
     path: &Path,
     guest_mem: &GuestMemory,
     mem_mappings: &[MemMapping],
