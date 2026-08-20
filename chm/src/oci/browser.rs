@@ -975,8 +975,18 @@ else
     # VM is still the security boundary, which is the premise of #329 -- but
     # this is the weaker of the two paths and says so rather than passing the
     # flag quietly.
+    #
+    # The usual cause is not a kernel that lacks the feature. Ubuntu 24.04 ships
+    # kernel.apparmor_restrict_unprivileged_userns=1, which denies the syscall
+    # to unconfined processes; a rehydrated capture carries that setting in from
+    # the cloud host, while a container rootfs built here carries no AppArmor
+    # policy and so never hits it (#344). Name the remedy, because the stronger
+    # path is one command away and nobody can guess it from "no user namespace".
     echo "{tag}: no unprivileged user namespace; running as root with"
     echo "{tag}: --no-sandbox. The VM boundary is the only isolation here."
+    echo "{tag}: if this is a rehydrated Ubuntu 24.04 capture, run"
+    echo "{tag}:   sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
+    echo "{tag}: and restart, to get Chromium's own sandbox back as well."
     {dir}/headless_shell --no-sandbox "$@" &
 fi
 browser=$!
@@ -1934,6 +1944,40 @@ mod tests {
         assert!(
             BROWSER_URL.contains("chromium-headless-shell-linux-arm64"),
             "this must be the headless shell, arm64: {BROWSER_URL}"
+        );
+    }
+
+    /// #344: the fallback branch used to name the reason and withhold the
+    /// remedy, which is the shape this repo has shipped three times now (#304,
+    /// #305, #306). The cause is almost never a kernel without the feature --
+    /// Ubuntu 24.04 sets `kernel.apparmor_restrict_unprivileged_userns=1`, and
+    /// a rehydrated capture carries that in from the cloud host. Measured on
+    /// both round-2 Graviton captures: the sysctl reads 1 and `unshare --user`
+    /// exits 1. So the stronger path is one command away, and a reader who is
+    /// only told "no unprivileged user namespace" cannot possibly guess it.
+    ///
+    /// The needle is the sysctl assignment rather than the word "apparmor",
+    /// which appears in the branch's own explanatory comment -- a needle that
+    /// matches in more than one place cannot detect its removal from the one
+    /// that matters (#290's M5).
+    #[test]
+    fn the_root_fallback_names_the_sysctl_that_restores_the_sandbox() {
+        let s = launch_script();
+        let cure = format!(
+            "kernel.apparmor_restrict_{}=0",
+            "unprivileged_userns"
+        );
+        assert!(
+            s.contains(&cure),
+            "the --no-sandbox branch must hand over the one command that gets \
+             Chromium's own sandbox back:\n{s}"
+        );
+        let fallback = s.find("--no-sandbox").expect("no fallback branch");
+        let remedy = s.find(&cure).expect("no remedy");
+        assert!(
+            remedy > fallback,
+            "the remedy has to sit in the branch that took the weaker path, \
+             not somewhere a reader on that path never sees it:\n{s}"
         );
     }
 }

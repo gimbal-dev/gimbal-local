@@ -1,13 +1,25 @@
 # The first resume of a real cloud capture
 
 A snapshot captured on a cloud host arrives describing the machine it was
-captured from, not the machine you want. Three things stand between a freshly
+captured from, not the machine you want. A few things stand between a freshly
 rehydrated capture and installing a package, and none of them is a hypervisor
 defect. They are recorded here because each one cost a debugging cycle to find
 and each one is a single command to fix.
 
-Measured on `graviton-vanilla-2cpu-net` — a vanilla Cloud Hypervisor capture
-taken on an AWS Graviton2 host.
+Measured on the two round-2 vanilla Cloud Hypervisor captures taken on an AWS
+Graviton2 host, `graviton-vanilla-2cpu-net` and `graviton-vanilla-1cpu`. Where
+the two disagree, that is said explicitly — **it is the most useful fact on the
+page**, because a wall that appears on one capture and not the other is an
+accident of the moment that capture was taken, not something rehydration does
+to you.
+
+| § | Wall | Present on |
+| --- | --- | --- |
+| 1 | Root filesystem has no room | both |
+| 2 | DNS is dead | **neither** — see the section for what this used to be |
+| 3 | Package database arrives half-applied | **`2cpu-net` only** |
+| 4 | Chromium's sandbox cannot start | both |
+| 5 | JIT code executes stale instructions | workload-dependent |
 
 > If you cold-booted from a container image or a BYO kernel, none of this
 > applies: nothing was captured, so nothing arrived stale.
@@ -61,9 +73,11 @@ guest has to do it, from inside, while it is running.
 The notice goes quiet once the guest has rewritten its own partition table, so a
 capture you already grew will not nag you.
 
-## 2. DNS is dead while the network is fine — **not detected**
+## 2. DNS is dead while the network is fine — **withdrawn, and worth reading anyway**
 
-This is the worst of the three, because the symptom actively misleads.
+This section used to lead the page, and it described a capture whose
+`systemd-resolved` had not survived capture and restore. A genuinely dead
+resolver looks like this:
 
 ```
 $ getent hosts nodejs.org; echo $?
@@ -74,13 +88,37 @@ $ ip -br a
 ens3   UP   192.168.249.2/24
 ```
 
-`/etc/resolv.conf` points at `127.0.0.53`, the `systemd-resolved` stub, and
-`systemd-resolved` does not survive capture and restore. Every download then
-fails with `Could not resolve host`, which reads like "there is no network" —
-and the network is completely fine. Users conclude that networking is broken and
-file a bug against the part that works.
+**Neither round-2 capture behaves that way.** Measured directly:
 
-Point the guest at the gateway instead:
+| Reading | `2cpu-net` | `1cpu` |
+| --- | --- | --- |
+| `getent hosts ports.ubuntu.com` | `rc=0` | no NIC, not applicable |
+| `systemctl is-active systemd-resolved` | — | **`active`** |
+| `/etc/resolv.conf` | — | `nameserver 127.0.0.53` |
+
+So the `127.0.0.53` half of the old diagnosis is right and the load-bearing half
+is wrong: the stub resolver is up, and lookups through it succeed. **Do not
+overwrite `/etc/resolv.conf`.** On these captures that replaces a working
+configuration with a hand-rolled one, and you will not find out until something
+needs a search domain.
+
+**What this most likely was.** Round-1 captures were taken *mid-`cloud-init`* —
+that is the documented defect in our own capture request, corrected for round 2
+(`docs/graviton-capture-request.md`). A snapshot that lands while `cloud-init` is
+still bringing units up is exactly how you capture a `systemd-resolved` that
+never finishes starting. The section is kept rather than deleted because that
+class of capture still exists and the symptom is genuinely misleading: every
+download fails with `Could not resolve host`, which reads like "there is no
+network" while the network is completely fine.
+
+**Check before you change anything:**
+
+```sh
+systemctl is-active systemd-resolved   # expect: active
+getent hosts ports.ubuntu.com; echo $? # expect: 0
+```
+
+Only if the resolver is genuinely dead, point the guest at the gateway:
 
 ```sh
 echo "nameserver 192.168.249.1" | sudo tee /etc/resolv.conf
@@ -95,86 +133,156 @@ looked anything up yet are indistinguishable — neither sends a query. Warning 
 that would mean warning on every healthy idle guest, and a notice that fires
 when nothing is wrong stops being read. See #259.
 
-## 3. The capture may arrive with a broken package database — **not detected**
+## 3. One capture arrives with a half-applied package database — **not detected**
 
 ```
- linux-tools-6.8.0-137-generic : Depends: linux-tools-6.8.0-137 but it is not
-                                 going to be installed
 E: Unmet dependencies. Try 'apt --fix-broken install'
 ```
 
-The cloud instance was mid-upgrade when it was snapshotted, so its half-applied
-package state was captured along with everything else. `apt --fix-broken
-install` does not clear it, and removing the offending package fails on its own
-unmet dependency.
+Measured on `graviton-vanilla-2cpu-net`: the very first `apt-get install` of
+anything exits **100**, and the message blames your package list.
 
-This is inherited from the capture. `chm` cannot repair someone else's package
-state, and cannot see it either — reading it would mean mounting the guest's ext4
-filesystem from the host, which is the same hazard as §1.
+**The cloud instance was mid-`dpkg` transaction when it was snapshotted**, so a
+half-applied package state was captured along with everything else. That
+sentence is the one part of this section that has always been right.
 
-The reliable way past it is to bypass `apt` for the thing you actually need. For
-Node, the upstream tarball works:
+**The cure is one command, and you may have to run it twice:**
 
 ```sh
-curl -fsSLO https://nodejs.org/dist/v22.11.0/node-v22.11.0-linux-arm64.tar.xz
-sudo tar -xJf node-v22.11.0-linux-arm64.tar.xz -C /usr/local --strip-components=1
+sudo apt --fix-broken install -y
 ```
 
-Better: ask whoever produces your captures to take them from a settled instance,
-after `cloud-init` and any unattended upgrade have finished. A capture is only as
-clean as the moment it was taken.
+Measured returning `rc=0` and clearing the state completely — `dpkg -l | grep -v
+'^ii'` and `sudo dpkg --audit` both silent afterwards, and still silent after an
+intervening suspend and resume. The retry advice is not superstition: repairing
+this state runs `update-initramfs`, and `update-initramfs` was measured
+segfaulting **3 times in 6 consecutive runs** on a rehydrated capture (#366). A
+single failure means run it again, not that the cure does not work.
 
-## 4. And then: turn the JIT off
+**It is capture-specific, not something rehydration does to you.** The other
+round-2 capture, `graviton-vanilla-1cpu`, comes up with `dpkg -l | grep -v '^ii'`
+and `sudo dpkg --audit` both **empty** — a completely clean package database from
+the same capture pipeline. One capture caught a transaction in flight; the other
+did not.
 
-Not a first-resume wall so much as the next one. A guest captured on Graviton
-carries a kernel that elides instruction-cache maintenance this Mac needs, so
-JIT compilers execute stale code. `npm --version` failed **10 times out of 10**
-on a rehydrated capture, and succeeded **5 of 5** with:
+**The broken state is in the captured RAM, not on the disk.** Reading the raw
+disk image host-side shows `initramfs-tools` as `Status: install ok installed`,
+and the string `half-configured` appears **zero** times across the whole 8 GiB
+image — while the live guest calls that exact package `iF`. The divergence runs
+in both directions, which is the signature of an interrupted `dpkg --configure
+-a`. This is the project's own *"RAM and disk must be captured together"* hazard
+arriving from the cloud side.
+
+**Why this is not detected**, correctly, but not for the reason previously given
+here. The old text said reading the state would mean mounting the guest's ext4
+from the host. That is not true — `grep -a -b -o` on the raw image finds dpkg
+stanzas directly. The real reasons are worse:
+
+- the disk is **clean**, so a host-side scan reads a healthy package database and
+  reports nothing; and
+- once the guest repairs itself, every write lands in the copy-on-write overlay
+  while the base image still says what it always said — so a scan of the base
+  would nag forever about a problem that has been fixed.
+
+**The durable fix is at capture time.** Ask whoever produces your captures to
+take them from a settled instance: after `cloud-init`, after any unattended
+upgrade, with `sudo dpkg --audit` silent. A capture is only as clean as the
+moment it was taken, and this is now a stated requirement in
+`docs/graviton-capture-request.md`.
+
+## 4. Chromium's own sandbox cannot start — **not detected**
+
+```
+$ sysctl kernel.apparmor_restrict_unprivileged_userns
+kernel.apparmor_restrict_unprivileged_userns = 1
+$ unshare --user --map-root-user true
+unshare: write failed /proc/self/uid_map: Operation not permitted
+```
+
+Measured **identically on both round-2 captures**, so unlike §3 this one is a
+property of Ubuntu 24.04 rather than of a single snapshot. Ubuntu 24.04 restricts
+unprivileged user namespaces by default, and Chromium's layer-1 sandbox needs
+one. Without it the browser exits with `FATAL: ... No usable sandbox!`, which
+from the outside looks like the browser simply never came up — you only see the
+real reason if you read its stderr.
+
+Allow unprivileged user namespaces:
 
 ```sh
-echo 'export NODE_OPTIONS=--jitless' | sudo tee /etc/profile.d/jitless.sh
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 ```
 
-`chm` warns about this on every affected resume. The full measurement is in
-`docs/cpu-feature-deltas.md`; a cold-booted guest is immune.
+`--no-sandbox` also gets the browser running and is **the weaker answer**: it
+removes the browser's own privilege separation, so a renderer compromise is no
+longer contained by anything except the VM boundary. Prefer the sysctl, and treat
+`--no-sandbox` as a fallback for when you cannot set it.
 
-### What that variable does not cover
+> This does **not** contradict the container-image measurement recorded for the
+> browser sandbox image, where Chromium keeps its own sandbox running as an
+> unprivileged uid. A container rootfs built by `chm image build` carries no
+> AppArmor policy at all, so the restriction is simply not present there. The
+> difference is the rootfs, not the hypervisor. See #344.
 
-`NODE_OPTIONS` reaches `node`. It does not reach a program `node` runs, and a
-package that ships a compiled binary and execs it keeps its own JIT and its own
-exposure to this.
+## 5. JIT code, and why the `--jitless` advice is no longer the first answer
 
-The GitHub Copilot CLI is that shape: `npm i -g @github/copilot` installs a
-174 MiB native binary alongside the JavaScript, and running `copilot` execs it.
-Measured on a rehydrated capture **with `NODE_OPTIONS=--jitless` already set**,
-that binary died 5 runs out of 5 (4 `SIGILL`, 1 `SIGBUS`). `taskset -c 0`
-recovered it 2 runs out of 3, consistent with the stale-line mechanism.
+Not a first-resume wall so much as the next one, and the part of this page that
+has moved the most.
 
-The failure is worth recognising because the CLI does not report it as a crash:
+**The old advice was `NODE_OPTIONS=--jitless`, and the figures behind it are
+stale.** They were measured before the instruction-cache stride bug was found and
+fixed: a rehydrated Graviton guest was telling userspace the i-cache line was
+4096 bytes against a real granule of 64, so every maintenance loop in the guest
+invalidated one line in 64. `chm` now sets `SCTLR_EL1.UCT` at restore, which
+sends those reads to the hardware. Across that fix, on one binary and one
+revision with only an environment variable changed, `npm --version` went from
+**5 of 20** to **20 of 20**.
 
+A later acceptance run installed the GitHub Copilot CLI on a capture carrying 12
+days of AWS uptime and had it write and run a program — **without `--jitless`**.
+
+**So treat this as workload-dependent rather than solved.** Reach for
+`--jitless` when you actually see a `SIGILL`, not pre-emptively:
+
+```sh
+sudo env NODE_OPTIONS=--jitless npm i -g <package>
 ```
-GitHub Copilot CLI: no platform package found.
-Reinstall with `npm install -g @github/copilot`
-```
 
-The package **is** installed and **was** found — you can see it under
-`/usr/local/lib/node_modules/@github/copilot/node_modules/@github/`. Reinstalling
-cannot help. See [#261](https://github.com/gimbal-dev/gimbal-local/issues/261).
+That form matters: `sudo` strips `NODE_OPTIONS` from the environment, so
+`export`ing it and then running `sudo npm` silently drops it.
 
-**Today the answer for a native agent binary is to cold-boot instead of
-rehydrating.** A cold-booted guest reads this Mac's own `CTR_EL0`, keeps its
-`ic ivau`, and is immune by construction — which is why V7.1's end-to-end agent
-run was a cold boot.
+`chm` warns about the remaining hazard on every affected resume, and the full
+measurement is in `docs/cpu-feature-deltas.md`.
+
+### What is still genuinely exposed
+
+The fix corrects the stride userspace uses for its own cache maintenance. It does
+not restore the maintenance the guest kernel elided at boot on the assumption
+that its i-cache snooped. On the path where a program maps a page writable, writes
+code into it, then flips it executable with `mprotect(PROT_READ|PROT_EXEC)`, a
+rehydrated guest still reads stale instructions **998 times out of 1000**. See
+[#287](https://github.com/gimbal-dev/gimbal-local/issues/287).
+
+Node and npm do not take that path. A package that ships its own compiled binary
+and execs it may.
+
+**A cold-booted guest is immune to all of this by construction** — it reads this
+Mac's own `CTR_EL0` and keeps the maintenance its kernel would otherwise have
+elided. That is a real property to reach for if you are choosing between the two,
+but it is no longer the recommendation for running an agent, because a rehydrated
+capture has now done it.
 
 ## In short
 
 ```sh
 sudo sgdisk -e /dev/vda && sudo growpart /dev/vda 1 \
   && sudo partx -u /dev/vda && sudo resize2fs /dev/vda1
-echo "nameserver 192.168.249.1" | sudo tee /etc/resolv.conf
-echo 'export NODE_OPTIONS=--jitless' | sudo tee /etc/profile.d/jitless.sh
+sudo apt --fix-broken install -y      # only if apt exits 100; retry if it dies
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0   # only for Chromium
 ```
 
-Three lines, once, and a rehydrated cloud capture behaves like a machine you can
-work in — for anything that runs on `node` itself. A tool that ships its own
-compiled binary is still exposed; see *What that variable does not cover* above.
+The first line is the only one every capture needs. The second is for a capture
+that was taken mid-transaction, and the third only if you are running a browser.
+Do **not** overwrite `/etc/resolv.conf` and do **not** set `NODE_OPTIONS`
+pre-emptively — both were once standard advice on this page and both now make a
+working configuration worse. Reach for them only against the symptoms described
+in §2 and §5.

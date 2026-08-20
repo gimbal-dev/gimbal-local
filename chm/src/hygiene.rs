@@ -252,4 +252,137 @@ mod tests {
              (#335): {rejected:?}"
         );
     }
+
+    /// Collapse every run of whitespace to a single space.
+    ///
+    /// Prose wraps. A claim reinstated across a line break is the same claim to
+    /// a reader and a different string to `contains`, so a substring search over
+    /// raw markdown sails straight past it. That is not hypothetical: the
+    /// retraction guard in `cpu-feature-deltas.md` failed its own first mutation
+    /// for exactly this reason.
+    fn flattened(doc: &str) -> String {
+        doc.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    /// `docs/first-resume.md` states what was measured, not what was assumed.
+    ///
+    /// This page is the one a user reads on their first rehydrated capture, so
+    /// every sentence in it is an instruction someone will follow. Four of its
+    /// claims were measured false on real hardware and each one made a working
+    /// configuration worse:
+    ///
+    /// - it said `apt --fix-broken install` does not clear a half-applied
+    ///   package database. It does, in one command, durably across a suspend and
+    ///   resume (#343).
+    /// - it prescribed overwriting `/etc/resolv.conf`, on captures whose
+    ///   `systemd-resolved` is `active` and whose lookups return `rc=0`.
+    /// - it prescribed `NODE_OPTIONS=--jitless` from figures taken before the
+    ///   `SCTLR_EL1.UCT` fix (#290) moved `npm --version` from 5 of 20 to 20 of
+    ///   20.
+    /// - it routed anyone wanting a native agent binary to cold-boot instead of
+    ///   rehydrating, which is the opposite of the thing this project exists to
+    ///   make work — and which a rehydrated capture has since done.
+    ///
+    /// The absence half is the load-bearing half. A stale figure is not merely
+    /// out of date, it is an argument for a workaround the reader does not need,
+    /// and the way it comes back is by someone restoring a paragraph that reads
+    /// perfectly well on its own.
+    ///
+    /// Deliberately asserts *claims*, not the mere presence of a command. #284
+    /// is the standing lesson: a guard checking that four commands are named
+    /// stayed green while they were named in an order that silently did nothing.
+    #[test]
+    fn the_first_resume_guide_says_what_was_measured() {
+        let doc = flattened(include_str!("../../docs/first-resume.md"));
+
+        // The cures, as measured. Each is a command a reader will paste.
+        for needle in [
+            "sudo apt --fix-broken install -y",
+            "sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0",
+            "sudo sgdisk -e /dev/vda",
+        ] {
+            assert!(
+                doc.contains(needle),
+                "docs/first-resume.md no longer carries the measured cure \
+                 `{needle}`, so the page has stopped telling a user the thing \
+                 that was actually verified on hardware"
+            );
+        }
+
+        // The findings those cures rest on. Without these the commands are
+        // folklore a later reader cannot evaluate.
+        for (needle, why) in [
+            (
+                "means run it again",
+                "repairing the package state runs update-initramfs, which was \
+                 measured segfaulting 3 times in 6 runs (#366); without the \
+                 retry advice a user concludes the one-command cure does not \
+                 work",
+            ),
+            (
+                "captured RAM, not on the disk",
+                "the broken package state is in the snapshot's RAM while the \
+                 disk image is clean, which is why no host-side scan can ever \
+                 detect it and why the durable fix is at capture time",
+            ),
+            (
+                "graviton-capture-request.md",
+                "the capture-time quiescence requirement is the actual cure; \
+                 dropping the pointer leaves the guest-side repair looking like \
+                 the whole answer",
+            ),
+            (
+                "overwrite `/etc/resolv.conf`",
+                "the page has to actively warn against its own former advice, \
+                 because that advice replaces a working resolver configuration",
+            ),
+        ] {
+            assert!(
+                doc.contains(needle),
+                "docs/first-resume.md no longer says `{needle}`: {why}"
+            );
+        }
+
+        // Claims measured false. Each of these was in the document and each one
+        // sent a reader somewhere worse than where they started.
+        for (needle, why) in [
+            (
+                "does not clear it",
+                "`apt --fix-broken install -y` was measured returning rc=0 and \
+                 leaving `dpkg --audit` silent across a suspend and resume",
+            ),
+            (
+                "10 times out of 10",
+                "that npm figure predates the SCTLR_EL1.UCT fix (#290); the \
+                 same command was measured 20 of 20 afterwards",
+            ),
+            (
+                "5 runs out of 5",
+                "that native-binary figure predates #290 as well, and a \
+                 rehydrated capture has since run the Copilot CLI end to end",
+            ),
+            (
+                "profile.d/jitless.sh",
+                "prescribing --jitless for every session is a pre-emptive \
+                 workaround for a bug that was fixed; it also breaks under \
+                 sudo, which strips NODE_OPTIONS (#289)",
+            ),
+            (
+                "nodejs.org/dist",
+                "bypassing apt with an upstream tarball was the workaround for \
+                 a package database that turned out to be repairable in one \
+                 command",
+            ),
+            (
+                "no platform package found",
+                "that #261 symptom belonged to the pre-#290 stride bug; \
+                 reporting it as a live limitation sends readers to cold boot",
+            ),
+        ] {
+            assert!(
+                !doc.contains(needle),
+                "docs/first-resume.md has `{needle}` back in it: {why}"
+            );
+        }
+    }
 }
