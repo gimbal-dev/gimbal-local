@@ -35,8 +35,12 @@ use std::{env, fs};
 
 use hypervisor::arch::aarch64::gic::{GicState, Vgic, VgicConfig};
 use hypervisor::hvf::gic::{inject_lpi_via_lr, GICD_TYPER, HvfGicV3};
-use hypervisor::hvf::{icache_wx, HvfVcpu, VtimerClock, SYSREG_CNTV_CTL_EL0, SYSREG_CNTV_CVAL_EL0};
-use hypervisor::{CpuState, HypervisorVmConfig, HypervisorVmError, Vcpu, Vm, VmExit, VmOps};
+use hypervisor::hvf::{
+    icache_wx, HvfRegList, HvfVcpu, VtimerClock, SYSREG_CNTV_CTL_EL0, SYSREG_CNTV_CVAL_EL0,
+};
+use hypervisor::{
+    CpuState, HypervisorVmConfig, HypervisorVmError, RegList, Vcpu, Vm, VmExit, VmOps,
+};
 
 type VmOpsResult<T> = Result<T, HypervisorVmError>;
 
@@ -4388,4 +4392,184 @@ fn every_simd_fp_register_survives_a_state_round_trip() {
     );
     assert_eq!(fp.fpcr, 0x0100_0000, "FPCR did not survive the round trip");
     assert_eq!(fp.fpsr, 0x10, "FPSR did not survive the round trip");
+}
+
+/// System registers this host exposes that a snapshot deliberately leaves
+/// behind, each for a reason that is not "we forgot".
+///
+/// `CRn == 15` is IMPLEMENTATION DEFINED space -- on Apple silicon that is
+/// ~53 proprietary registers describing *this* part. `op0 == 3, op1 == 0,
+/// CRn == 0` is the CPU identity and feature bank, excluded because a capture
+/// describes a guest, not the silicon it last ran on (see #279 and
+/// `docs/cpu-feature-deltas.md`). Both are classes rather than lists so a
+/// different Mac does not fail this test for having different IMPDEF
+/// registers.
+///
+/// The five named below are individual acknowledgements. None of them appears
+/// in a real upstream `KVM_REG_ARM64_SYSREG` capture -- verified against
+/// `graviton-vanilla-1cpu`, which carries 234 of them -- so carrying them
+/// would put state into a snapshot that a cloud round trip discards anyway.
+const ACKNOWLEDGED_OMISSIONS: &[(u16, &str)] = &[
+    (0xc094, "SMPRI_EL1, SME priority; SME absent both ends"),
+    (0xc096, "SMCR_EL1, SME control; SME absent both ends"),
+    (0xc687, "SCXTNUM_EL1, not captured upstream"),
+    (0xde85, "TPIDR2_EL0, SME thread ptr; SME absent both ends"),
+    (0xde87, "SCXTNUM_EL0, not captured upstream"),
+];
+
+/// Every system register this host exposes is either captured or accounted
+/// for, and everything the capture requires can actually be read.
+///
+/// This is the guard that was missing. `HvfVcpu::state()` walked a curated
+/// list of 30 registers while `set_state` walked whatever the *incoming*
+/// snapshot carried, so rehydrating a cloud capture was fine and every
+/// HVF-side capture silently dropped live guest state -- `CNTKCTL_EL1` among
+/// it, which is the bit Linux sets so userspace can read the counter without
+/// trapping. Nothing compared the two sides, so nothing noticed.
+///
+/// It reads the production list through `get_reg_list()` rather than a copy,
+/// so it cannot drift from what `state()` actually captures, and it is
+/// expressed as an accounting rather than a fixed number: a register that
+/// appears on a future host, or one quietly dropped from the capture, lands
+/// in neither bucket and fails by name.
+/// A real capture carries exactly what `get_reg_list()` advertises.
+///
+/// `state()` walks `SNAPSHOT_SYS_REGS` and `SNAPSHOT_DEBUG_REGS` itself while
+/// `get_reg_list()` chains the same two lists separately, so they are two
+/// readers of one fact and can drift. That matters here because the coverage
+/// guard below asks `get_reg_list()` -- without this, editing the capture loop
+/// alone would leave the accounting perfectly green and the snapshot short.
+///
+/// Every register in the required tier must appear, because that tier is read
+/// with `?`. The debug tier is best-effort by design, so this asserts a
+/// capture is a *subset* of the advertised list and contains all of the
+/// required part, rather than demanding equality on a part that is allowed to
+/// be short on a part with fewer breakpoint slots.
+#[test]
+fn a_capture_carries_exactly_what_the_register_list_advertises() {
+    let ram = HostRam::new(RAM_SIZE);
+    let vm_ops = Arc::new(RecordingVmOps {
+        writes: Mutex::new(Vec::new()),
+    });
+    let (_vm, vcpu) = build_vm(&ram, vm_ops);
+
+    let mut list = RegList::Hvf(HvfRegList::default());
+    vcpu.get_reg_list(&mut list).expect("get_reg_list");
+    #[allow(irrefutable_let_patterns)]
+    let RegList::Hvf(advertised) = list else {
+        panic!("expected an HVF register list")
+    };
+    let advertised: std::collections::BTreeSet<u16> =
+        advertised.regs.iter().map(|&r| r as u16).collect();
+
+    let state = vcpu.state().expect("state");
+    #[allow(irrefutable_let_patterns)]
+    let CpuState::Hvf(state) = state else {
+        panic!("expected an HVF CpuState")
+    };
+    let carried: std::collections::BTreeSet<u16> =
+        state.sysregs.iter().map(|&(id, _)| id).collect();
+
+    let extra: Vec<String> = carried
+        .difference(&advertised)
+        .map(|r| format!("{r:#06x}"))
+        .collect();
+    assert!(
+        extra.is_empty(),
+        "a capture carries {} register(s) `get_reg_list()` does not \
+         advertise, so the coverage accounting cannot see them: {}",
+        extra.len(),
+        extra.join(", ")
+    );
+
+    // Every register this host could read had to be carried: on this part all
+    // 16 debug slots are readable, so a short capture is a dropped register
+    // rather than an absent slot.
+    let missing: Vec<String> = advertised
+        .iter()
+        .filter(|&&r| !carried.contains(&r))
+        .filter(|&&r| vcpu.get_sys_reg(u32::from(r)).is_ok())
+        .map(|r| format!("{r:#06x}"))
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "a capture dropped {} register(s) this host can read and \
+         `get_reg_list()` advertises: {}",
+        missing.len(),
+        missing.join(", ")
+    );
+
+    assert_eq!(
+        carried.len(),
+        state.sysregs.len(),
+        "a capture carries the same register twice"
+    );
+}
+
+#[test]
+fn every_register_this_host_exposes_is_captured_or_accounted_for() {
+    let ram = HostRam::new(RAM_SIZE);
+    let vm_ops = Arc::new(RecordingVmOps {
+        writes: Mutex::new(Vec::new()),
+    });
+    let (_vm, vcpu) = build_vm(&ram, vm_ops);
+
+    let mut list = RegList::Hvf(HvfRegList::default());
+    vcpu.get_reg_list(&mut list).expect("get_reg_list");
+    #[allow(irrefutable_let_patterns)]
+    let RegList::Hvf(captured) = list else {
+        panic!("expected an HVF register list")
+    };
+    let captured: std::collections::BTreeSet<u16> =
+        captured.regs.iter().map(|&r| r as u16).collect();
+
+    let readable: std::collections::BTreeSet<u16> = (0u16..=0xffff)
+        .filter(|&id| vcpu.get_sys_reg(u32::from(id)).is_ok())
+        .collect();
+
+    // The required tier is read with `?`, so a member this host cannot read
+    // would fail every capture rather than merely losing one register.
+    let unreadable: Vec<String> = captured
+        .difference(&readable)
+        .map(|r| format!("{r:#06x}"))
+        .collect();
+    assert!(
+        unreadable.is_empty(),
+        "the capture list names {} register(s) this host cannot read, so \
+         `state()` would fail outright: {}",
+        unreadable.len(),
+        unreadable.join(", ")
+    );
+
+    let acknowledged: std::collections::BTreeSet<u16> =
+        ACKNOWLEDGED_OMISSIONS.iter().map(|&(r, _)| r).collect();
+    let unaccounted: Vec<String> = readable
+        .iter()
+        .filter(|&&r| !captured.contains(&r))
+        .filter(|&&r| !acknowledged.contains(&r))
+        // IMPLEMENTATION DEFINED space -- describes this Apple part.
+        .filter(|&&r| (r >> 7) & 0xf != 15)
+        // The CPU identity and feature bank.
+        .filter(|&&r| !((r >> 14) & 3 == 3 && (r >> 11) & 7 == 0 && (r >> 7) & 0xf == 0))
+        .map(|&r| {
+            let (op0, op1, crn, crm, op2) = (
+                (r >> 14) & 3,
+                (r >> 11) & 7,
+                (r >> 7) & 0xf,
+                (r >> 3) & 0xf,
+                r & 7,
+            );
+            format!("{r:#06x} (S{op0}_{op1}_C{crn}_C{crm}_{op2})")
+        })
+        .collect();
+
+    assert!(
+        unaccounted.is_empty(),
+        "{} register(s) this host exposes are neither captured nor \
+         acknowledged. Either add them to the snapshot lists or, if a \
+         snapshot should not carry them, add them to \
+         ACKNOWLEDGED_OMISSIONS with the reason:\n{}",
+        unaccounted.len(),
+        unaccounted.join("\n")
+    );
 }

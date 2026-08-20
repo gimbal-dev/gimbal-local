@@ -289,7 +289,47 @@ const SNAPSHOT_SYS_REGS: &[u16] = &[
     SYSREG_APDBKEYHI_EL1,
     SYSREG_APGAKEYLO_EL1,
     SYSREG_APGAKEYHI_EL1,
+    // Architecturally mandatory EL1 state that HVF exposes and a real Graviton
+    // capture records, but that this list dropped until the coverage was
+    // measured. `SYSREG_CNTKCTL_EL1` is the one with teeth: without it a
+    // restored guest's userspace loses the vDSO clock. See the test module's `SYSREG_EL1_AUX`.
+    SYSREG_ACTLR_EL1,
+    SYSREG_AFSR0_EL1,
+    SYSREG_AFSR1_EL1,
+    SYSREG_PAR_EL1,
+    SYSREG_AMAIR_EL1,
+    SYSREG_CONTEXTIDR_EL1,
+    SYSREG_CNTKCTL_EL1,
+    SYSREG_CSSELR_EL1,
 ];
+
+/// The debug breakpoint and watchpoint bank, captured **best-effort**.
+///
+/// Unlike [`SNAPSHOT_SYS_REGS`], a read failure here is not a bug: the number of
+/// implemented slots is IMPLEMENTATION DEFINED (`ID_AA64DFR0_EL1.{BRPs,WRPs}`),
+/// so a part with fewer than [`DBG_SLOTS`] legitimately refuses the high
+/// encodings. Capture skips what it cannot read rather than failing, because a
+/// guest that is not using hardware debug must not be unsnapshottable on a Mac
+/// that implements fewer breakpoints than this one.
+///
+/// The value register precedes its control register for every slot, for the same
+/// reason `CNTV_CVAL_EL0` precedes `CNTV_CTL_EL0`: the control register carries
+/// the enable bit, and restoring it first would briefly arm a breakpoint against
+/// whatever address happened to be in the value register.
+const SNAPSHOT_DEBUG_REGS: [u16; (DBG_SLOTS * 4) as usize + 1] = {
+    let mut out = [0u16; (DBG_SLOTS * 4) as usize + 1];
+    let mut n = 0u16;
+    while n < DBG_SLOTS {
+        let i = (n * 4) as usize;
+        out[i] = sysreg_dbg(DBG_OP2_BVR, n);
+        out[i + 1] = sysreg_dbg(DBG_OP2_BCR, n);
+        out[i + 2] = sysreg_dbg(DBG_OP2_WVR, n);
+        out[i + 3] = sysreg_dbg(DBG_OP2_WCR, n);
+        n += 1;
+    }
+    out[(DBG_SLOTS * 4) as usize] = SYSREG_MDCCINT_EL1;
+    out
+};
 
 // ---------------------------------------------------------------------------
 // Hypervisor
@@ -1421,9 +1461,38 @@ fn vtimer_needs_arming(sysregs: &[(u16, u64)]) -> bool {
 #[cfg(test)]
 mod snapshot_sys_reg_tests {
     use super::{
-        SNAPSHOT_SYS_REGS, SYSREG_CNTV_CTL_EL0, SYSREG_CNTV_CVAL_EL0, SYSREG_PAC_KEYS,
-        SYSREG_SCTLR_EL1, vtimer_needs_arming,
+        DBG_OP2_BCR, DBG_OP2_BVR, DBG_OP2_WCR, DBG_OP2_WVR, DBG_SLOTS, SNAPSHOT_DEBUG_REGS,
+        SNAPSHOT_SYS_REGS, SYSREG_ACTLR_EL1, SYSREG_AFSR0_EL1, SYSREG_AFSR1_EL1, SYSREG_AMAIR_EL1,
+        SYSREG_CNTKCTL_EL1, SYSREG_CNTV_CTL_EL0, SYSREG_CNTV_CVAL_EL0, SYSREG_CONTEXTIDR_EL1,
+        SYSREG_CSSELR_EL1, SYSREG_PAC_KEYS, SYSREG_PAR_EL1, SYSREG_SCTLR_EL1, sysreg_dbg,
+        vtimer_needs_arming,
     };
+
+    /// The eight architecturally mandatory EL1 registers, as a list.
+    ///
+    /// This is the *expected set* for `a_capture_carries_the_mandatory_el1_state`
+    /// below, and it lives here rather than beside the constants themselves
+    /// because that is the whole of its job. `SNAPSHOT_SYS_REGS` names these
+    /// same eight inline and is the only list `HvfVcpu::state` walks, so a
+    /// copy kept next to the FFI constants reads like a second capture list
+    /// and is not one -- an edit to it changes nothing a guest can observe.
+    ///
+    /// The coupling this gives is real but weak in one direction only: it
+    /// catches a register dropped from `SNAPSHOT_SYS_REGS` and not from here,
+    /// and catches nothing if both are edited. The check with independent
+    /// authority is `every_register_this_host_exposes_is_captured_or_accounted_for`
+    /// in `tests/hvf_boot.rs`, which reads the live host and restates none of
+    /// this.
+    const SYSREG_EL1_AUX: &[u16] = &[
+        SYSREG_ACTLR_EL1,
+        SYSREG_AFSR0_EL1,
+        SYSREG_AFSR1_EL1,
+        SYSREG_PAR_EL1,
+        SYSREG_AMAIR_EL1,
+        SYSREG_CONTEXTIDR_EL1,
+        SYSREG_CNTKCTL_EL1,
+        SYSREG_CSSELR_EL1,
+    ];
 
     /// A checkpoint must carry the guest's virtual-timer arming state.
     ///
@@ -1527,6 +1596,19 @@ mod snapshot_sys_reg_tests {
     /// never signs a pointer, so every capture this project has ever restored
     /// was structurally incapable of exposing the gap. Originating a lineage on
     /// Apple silicon is the first thing that could.
+    /// A capture must carry the pointer-authentication keys.
+    ///
+    /// Alpine's 6.6 kernel signs return addresses with `APIAKey`. Those signed
+    /// pointers live on the guest's stack, so they travel inside guest RAM
+    /// whether we carry the keys or not; a vCPU restored with fresh keys then
+    /// fails the first `AUTIASP` it reaches and the guest dies with an FPAC
+    /// oops (ESR EC 0x1C) at an address that points at nothing useful.
+    ///
+    /// This could not have been found before now. Graviton2 is Neoverse-N1,
+    /// ARMv8.2, with no pointer authentication at all -- a cloud-captured guest
+    /// never signs a pointer, so every capture this project has ever restored
+    /// was structurally incapable of exposing the gap. Originating a lineage on
+    /// Apple silicon is the first thing that could.
     #[test]
     fn a_capture_carries_the_pointer_authentication_keys() {
         for &key in SYSREG_PAC_KEYS {
@@ -1535,6 +1617,118 @@ mod snapshot_sys_reg_tests {
                 "PAC key {key:#x} is absent from the captured set, so a guest \
                  restored from this capture will fail its first authenticated \
                  return"
+            );
+        }
+    }
+
+    /// A capture must carry the EL0 counter-access permissions.
+    ///
+    /// `CNTKCTL_EL1.EL0VCTEN` is what lets userspace execute `mrs cntvct_el0`
+    /// without trapping, and that instruction *is* the vDSO `clock_gettime` fast
+    /// path. The register resets to 0, so a guest whose kernel enabled EL0
+    /// counter access and was then captured without this register resumes with
+    /// every userspace clock read raising an undefined-instruction trap.
+    ///
+    /// Like the timer pair in #257, this could only ever be a *checkpoint* bug:
+    /// a KVM capture arrives carrying `CNTKCTL_EL1` (a real Graviton capture
+    /// records `0xc6`) and `set_state` writes back whatever the incoming list
+    /// holds, so rehydration was always fine. Only our own capture dropped it.
+    #[test]
+    fn a_capture_carries_the_el0_counter_access_permissions() {
+        assert!(
+            SNAPSHOT_SYS_REGS.contains(&SYSREG_CNTKCTL_EL1),
+            "without CNTKCTL_EL1 a resumed guest's userspace loses the vDSO clock"
+        );
+    }
+
+    /// Every architecturally mandatory EL1 register we identified as live guest
+    /// state must be captured.
+    ///
+    /// The measurement behind this list: HVF hands back 173 system registers on
+    /// this hardware, a real Graviton capture carries 234, and this list carried
+    /// 30. Of the 85 registers in all three intersections that were being
+    /// dropped, these 8 are the architecturally mandatory ones holding live
+    /// state rather than CPU identity.
+    #[test]
+    fn a_capture_carries_the_mandatory_el1_state() {
+        for &id in SYSREG_EL1_AUX {
+            assert!(
+                SNAPSHOT_SYS_REGS.contains(&id),
+                "{id:#x} is architecturally mandatory live EL1 state that HVF \
+                 exposes and a Graviton capture records, but this capture drops it"
+            );
+        }
+    }
+
+    /// CPU **identity/feature** registers are deliberately not captured.
+    ///
+    /// Upstream's list includes the whole `ID_*` bank, and it would be easy to
+    /// read the coverage gap as "match upstream exactly". These describe the
+    /// silicon the guest booted on, not anything the guest owns, and forcing an
+    /// Apple part's feature advertisement onto a destination CPU is the opposite
+    /// of portable: the destination must describe itself. HVF refuses to write
+    /// them anyway.
+    ///
+    /// The bank is `op0=3, op1=0, CRn=0, CRm>=1`. `CRm=0` is deliberately *not*
+    /// covered: it holds `MPIDR_EL1`, which despite sitting in the same CRn is
+    /// per-vCPU affinity — live guest state, captured on purpose, and hard-failed
+    /// on restore rather than dropped.
+    #[test]
+    fn a_capture_does_not_carry_cpu_identity_registers() {
+        for &id in SNAPSHOT_SYS_REGS {
+            let (op0, op1, crn, crm) = (
+                (id >> 14) & 3,
+                (id >> 11) & 7,
+                (id >> 7) & 0xf,
+                (id >> 3) & 0xf,
+            );
+            assert!(
+                !(op0 == 3 && op1 == 0 && crn == 0 && crm >= 1),
+                "{id:#x} is an ID/feature register describing the origin CPU; \
+                 carrying it would impose this Mac's identity on the destination"
+            );
+        }
+    }
+
+    /// A breakpoint's address must be restored before the control register that
+    /// enables it, for every slot.
+    ///
+    /// Same invariant as the timer pair above, and the same reason: the list
+    /// order is the restore write order, and `DBGBCR<n>_EL1` holds the enable
+    /// bit. Arming a breakpoint before its address is written points it at
+    /// whatever was in `DBGBVR<n>_EL1`.
+    #[test]
+    fn a_breakpoint_address_is_restored_before_it_is_enabled() {
+        for n in 0..DBG_SLOTS {
+            let vr = SNAPSHOT_DEBUG_REGS
+                .iter()
+                .position(|&r| r == sysreg_dbg(DBG_OP2_BVR, n))
+                .unwrap_or_else(|| panic!("DBGBVR{n} is captured"));
+            let cr = SNAPSHOT_DEBUG_REGS
+                .iter()
+                .position(|&r| r == sysreg_dbg(DBG_OP2_BCR, n))
+                .unwrap_or_else(|| panic!("DBGBCR{n} is captured"));
+            assert!(vr < cr, "slot {n}: write the address, then enable it");
+            let wvr = SNAPSHOT_DEBUG_REGS
+                .iter()
+                .position(|&r| r == sysreg_dbg(DBG_OP2_WVR, n))
+                .unwrap_or_else(|| panic!("DBGWVR{n} is captured"));
+            let wcr = SNAPSHOT_DEBUG_REGS
+                .iter()
+                .position(|&r| r == sysreg_dbg(DBG_OP2_WCR, n))
+                .unwrap_or_else(|| panic!("DBGWCR{n} is captured"));
+            assert!(wvr < wcr, "slot {n}: write the address, then enable it");
+        }
+    }
+
+    /// The two lists must not overlap: `state()` walks both, and a register in
+    /// both would be captured twice, with the best-effort copy last.
+    #[test]
+    fn the_required_and_best_effort_lists_are_disjoint() {
+        for &id in &SNAPSHOT_DEBUG_REGS {
+            assert!(
+                !SNAPSHOT_SYS_REGS.contains(&id),
+                "{id:#x} is in both the required and best-effort lists"
             );
         }
     }
@@ -4536,7 +4730,11 @@ impl Vcpu for HvfVcpu {
     fn get_reg_list(&self, reg_list: &mut RegList) -> CpuResult<()> {
         #[allow(irrefutable_let_patterns)]
         if let RegList::Hvf(list) = reg_list {
-            list.regs = SNAPSHOT_SYS_REGS.iter().map(|&r| r as u64).collect();
+            list.regs = SNAPSHOT_SYS_REGS
+                .iter()
+                .chain(SNAPSHOT_DEBUG_REGS.iter())
+                .map(|&r| r as u64)
+                .collect();
             Ok(())
         } else {
             Err(HypervisorCpuError::GetRegList(anyhow!(
@@ -4574,9 +4772,16 @@ impl Vcpu for HvfVcpu {
         for (i, slot) in gpr.iter_mut().enumerate() {
             *slot = self.get_reg(i as u32)?;
         }
-        let mut sysregs = Vec::with_capacity(SNAPSHOT_SYS_REGS.len());
+        let mut sysregs = Vec::with_capacity(SNAPSHOT_SYS_REGS.len() + SNAPSHOT_DEBUG_REGS.len());
         for &id in SNAPSHOT_SYS_REGS {
             sysregs.push((id, self.get_sysreg(id)?));
+        }
+        // The debug bank is best-effort: see `SNAPSHOT_DEBUG_REGS`. A slot this
+        // part does not implement is skipped, not fatal.
+        for &id in &SNAPSHOT_DEBUG_REGS {
+            if let Ok(v) = self.get_sysreg(id) {
+                sysregs.push((id, v));
+            }
         }
         // Capture the managed-GIC CPU-interface registers. These are absent on a
         // GIC-less VM; in that case the first read fails and we record none.

@@ -177,6 +177,67 @@ pub const SYSREG_PAC_KEYS: &[u16] = &[
     SYSREG_APGAKEYLO_EL1,
     SYSREG_APGAKEYHI_EL1,
 ];
+
+// Architecturally mandatory EL1 registers that carry live guest state and that
+// HVF hands back on this hardware, measured by `hvf_snapshot_covers_live_state`.
+//
+// Every one of these is also in a real Graviton capture, so a snapshot that
+// omits them describes less of the guest than the cloud already records.
+
+/// Auxiliary control. IMPLEMENTATION DEFINED, and zero on both Apple silicon and
+/// Neoverse-N1, but it is guest-writable state and cheap to carry.
+pub const SYSREG_ACTLR_EL1: u16 = 0xc081;
+/// Auxiliary fault status, EL1. IMPLEMENTATION DEFINED error syndrome.
+pub const SYSREG_AFSR0_EL1: u16 = 0xc288;
+/// Auxiliary fault status 1, EL1.
+pub const SYSREG_AFSR1_EL1: u16 = 0xc289;
+/// Physical address register: the result of the last `AT` address translation.
+/// A guest suspended between issuing `AT` and reading `PAR_EL1` reads back a
+/// stale translation if this is not carried.
+pub const SYSREG_PAR_EL1: u16 = 0xc3a0;
+/// Auxiliary memory attribute indirection.
+pub const SYSREG_AMAIR_EL1: u16 = 0xc518;
+/// Context ID. Linux keeps the current ASID here, and it is what a debugger and
+/// the trace hardware use to tell address spaces apart.
+pub const SYSREG_CONTEXTIDR_EL1: u16 = 0xc681;
+/// Counter-timer kernel control: which counters and timers **EL0 may read**.
+///
+/// This is the sharpest of the set. Linux sets `EL0VCTEN` here so userspace can
+/// execute `mrs x0, cntvct_el0` directly, which is exactly what the vDSO
+/// `clock_gettime` fast path does. Its reset value is 0. A guest captured with
+/// this register live and restored without it therefore resumes with every vDSO
+/// clock read trapping to EL1 as an undefined instruction — a running system
+/// whose userspace cannot ask the time. A real Graviton capture records
+/// `0xc6`; the value is not incidental.
+pub const SYSREG_CNTKCTL_EL1: u16 = 0xc708;
+/// Cache size selection: which cache `CCSIDR_EL1` currently describes.
+pub const SYSREG_CSSELR_EL1: u16 = 0xd000;
+
+/// Monitor DCC interrupt enable, EL1. Part of the debug bank below.
+pub const SYSREG_MDCCINT_EL1: u16 = 0x8010;
+
+/// `op2` selecting a debug breakpoint value register, `DBGBVR<n>_EL1`.
+pub const DBG_OP2_BVR: u16 = 4;
+/// `op2` selecting a debug breakpoint control register, `DBGBCR<n>_EL1`.
+pub const DBG_OP2_BCR: u16 = 5;
+/// `op2` selecting a debug watchpoint value register, `DBGWVR<n>_EL1`.
+pub const DBG_OP2_WVR: u16 = 6;
+/// `op2` selecting a debug watchpoint control register, `DBGWCR<n>_EL1`.
+pub const DBG_OP2_WCR: u16 = 7;
+
+/// The number of breakpoint/watchpoint slots in the debug bank.
+///
+/// The architecture allows up to 16 of each and reports the implemented count in
+/// `ID_AA64DFR0_EL1.{BRPs,WRPs}`. HVF answers a read for all 16 encodings on the
+/// hardware measured here, but a part that implements fewer is entirely legal,
+/// which is why the debug bank is captured best-effort rather than required.
+pub const DBG_SLOTS: u16 = 16;
+
+/// Encode a debug bank register: `op0=2, op1=0, CRn=0, CRm=n, op2`.
+pub const fn sysreg_dbg(op2: u16, n: u16) -> u16 {
+    (2 << 14) | (n << 3) | op2
+}
+
 /// EL0 virtual counter (read-only). Carried in a KVM snapshot's register file;
 /// its captured value seeds the HVF vtimer offset on restore so the guest's
 /// CNTVCT_EL0 resumes continuously instead of restarting near zero.
