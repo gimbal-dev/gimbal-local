@@ -209,17 +209,40 @@ That is not cosmetic. On resume, cloud-init picks up where it left off, finishes
 and **restarts `serial-getty@ttyAMA0`** — which kills the console session roughly
 113 s of real time after resume. It killed ours, mid-measurement.
 
-So before pausing, confirm all three of these in the guest:
+So before pausing, confirm all five of these in the guest:
 
 ```bash
 cloud-init status --wait          # must print: status: done
 systemctl is-system-running       # want: running  (degraded is OK, starting is NOT)
 systemd-analyze time              # startup should be finished
+sudo dpkg --audit                 # must print NOTHING
+systemctl is-active unattended-upgrades.service   # want: inactive
 ```
 
 Then give it ~10 s of genuine idle before `ch-remote pause`. If the script's own
 wait returned earlier than this, please say so — that is a bug in the script's
 banner matching and we want to fix it rather than have you work around it.
+
+#### Why the last two matter `[added after round 2]`
+
+**`graviton-vanilla-2cpu-net` was captured with a `dpkg` transaction in flight,
+and `graviton-vanilla-1cpu` was not.** Same round, same script, different
+outcome — so this is a per-capture accident, and the only thing that prevents it
+is checking before you pause.
+
+The consequence lands on whoever rehydrates it. The first `apt-get install` in
+that capture fails with exit 100 and a message about the package list, which
+sends the reader after their network. `docs/first-resume.md` §3 documents the
+cure; this check is how the next capture avoids needing one.
+
+Note what the disk alone will *not* tell you. Read that capture's disk image
+host-side and `initramfs-tools` says `install ok installed`, with
+`half-configured` appearing **zero** times across the whole 8 GiB — while the
+live guest calls the same version half-configured, and eleven GRUB/EFI packages
+that read `install ok unpacked` on disk are `ii` in the guest. The divergence
+runs in **both** directions because the in-flight transaction lives in captured
+RAM. So a post-hoc scan of the image cannot detect this, and the check has to
+happen in the running guest before the pause.
 
 ### What the script does (so you can sanity-check it)
 
@@ -618,10 +641,16 @@ df -h / && dpkg -l | grep -c '^ii'
 
 # 6. Quiescent (§3) — no cloud-init or apt still running.
 systemctl is-system-running          # expect running or degraded, NOT starting
+sudo dpkg --audit                    # MUST print nothing; see §3
+dpkg -l | grep -c '^i[^i]'           # expect 0 — anything else is a half-done transaction
 ```
 
 Check 1 is the one that decides the round. If `lspci` is empty, the kernel lacks
 PCI and nothing else matters.
+
+Check 6's last two lines are the ones round 2 needed and did not have.
+`systemctl is-system-running` returns `running` perfectly happily with a `dpkg`
+transaction half-applied, so it cannot carry that check on its own.
 
 ## 12. What we will do with it
 
