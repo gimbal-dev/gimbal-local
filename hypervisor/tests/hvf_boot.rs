@@ -4573,3 +4573,106 @@ fn every_register_this_host_exposes_is_captured_or_accounted_for() {
         unaccounted.join("\n")
     );
 }
+
+/// Captured registers that do not survive a write unchanged, with the reason.
+///
+/// Measured, not predicted: probing all 103 captured registers through
+/// `set_state` and reading them back showed 100 exact round trips and these
+/// three deviations. Two are this crate deliberately overriding the incoming
+/// value; the third is HVF declining the write.
+const WRITE_DEVIATIONS: &[(u16, &str)] = &[
+    (0xc080, "SCTLR_EL1, ctr_trap_fixup forces the UCT bit"),
+    (0xc081, "ACTLR_EL1, IMPDEF; HVF reads 0 and ignores writes"),
+    (0xdf19, "CNTV_CTL_EL0, rewritten by the vtimer restore path"),
+];
+
+/// Everything the capture carries can also be written back.
+///
+/// `state()` growing from 30 registers to 103 raised a question the read-side
+/// guards cannot answer: a register that reads but refuses to write means a
+/// snapshot claims state this host cannot restore. `set_state` is best effort
+/// for non-special registers, so a refused write is silent -- it cannot fail a
+/// restore, it just quietly loses the value.
+///
+/// So write a distinctive value into each captured register in turn, push the
+/// whole state through `set_state`, and read it back. Each iteration starts
+/// from the same base and rewrites every register, so nothing accumulates.
+///
+/// The exemptions are named individually rather than tolerated as a count,
+/// because the interesting failure is a *new* register joining them. Note
+/// `ACTLR_EL1` is IMPLEMENTATION DEFINED and reads 0 on this host; the real
+/// `graviton-vanilla-1cpu` capture also carries it as 0, so both ends agree
+/// and the ignored write loses nothing today. A host that ever read it
+/// non-zero would be silently unable to restore it, which is why it is
+/// recorded here rather than dropped from the capture.
+#[test]
+fn every_captured_register_survives_a_write_back() {
+    let ram = HostRam::new(RAM_SIZE);
+    let vm_ops = Arc::new(RecordingVmOps {
+        writes: Mutex::new(Vec::new()),
+    });
+    let (_vm, vcpu) = build_vm(&ram, vm_ops);
+
+    let state = vcpu.state().expect("state");
+    #[allow(irrefutable_let_patterns)]
+    let CpuState::Hvf(base) = state else {
+        panic!("expected an HVF CpuState")
+    };
+    assert!(
+        base.sysregs.len() > 100,
+        "expected the widened capture, got {} registers",
+        base.sysregs.len()
+    );
+
+    let exempt: std::collections::BTreeMap<u16, &str> = WRITE_DEVIATIONS.iter().copied().collect();
+    let mut refused = Vec::new();
+
+    for &(id, orig) in base.sysregs.iter() {
+        let probe = !orig ^ 0x5a5a_0000_0000_a5a5u64;
+        let mut mutated = base.clone();
+        for entry in mutated.sysregs.iter_mut() {
+            if entry.0 == id {
+                entry.1 = probe;
+            }
+        }
+        vcpu.set_state(&CpuState::Hvf(mutated))
+            .unwrap_or_else(|e| panic!("set_state rejected {id:#06x}: {e:?}"));
+
+        let read_back = vcpu.state().expect("state after set_state");
+        #[allow(irrefutable_let_patterns)]
+        let CpuState::Hvf(read_back) = read_back else {
+            panic!("expected an HVF CpuState")
+        };
+        let got = read_back
+            .sysregs
+            .iter()
+            .find(|e| e.0 == id)
+            .unwrap_or_else(|| panic!("{id:#06x} vanished from the capture"))
+            .1;
+
+        match (got == probe, exempt.get(&id)) {
+            (true, None) => {}
+            (true, Some(reason)) => panic!(
+                "{id:#06x} now round trips exactly but is still listed as a \
+                 deviation ({reason}); remove it from WRITE_DEVIATIONS"
+            ),
+            (false, Some(_)) => {}
+            (false, None) => refused.push(format!(
+                "{id:#06x} (S{}_{}_C{}_C{}_{}) wrote {probe:#x} read {got:#x}",
+                (id >> 14) & 3,
+                (id >> 11) & 7,
+                (id >> 7) & 0xf,
+                (id >> 3) & 0xf,
+                id & 7,
+            )),
+        }
+    }
+
+    assert!(
+        refused.is_empty(),
+        "{} captured register(s) do not survive a write back, so a snapshot \
+         claims state this host cannot restore:\n  {}",
+        refused.len(),
+        refused.join("\n  ")
+    );
+}
