@@ -20,8 +20,8 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
 
-    /// Every `.rs` file under `chm/src`.
-    fn sources() -> Vec<PathBuf> {
+    /// Every `.rs` file under `dir`.
+    fn sources_under(dir: &Path) -> Vec<PathBuf> {
         fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
             let Ok(entries) = fs::read_dir(dir) else {
                 return;
@@ -36,10 +36,15 @@ mod tests {
             }
         }
         let mut out = Vec::new();
-        walk(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"), &mut out);
+        walk(dir, &mut out);
         out.sort();
         assert!(!out.is_empty(), "found no sources to scan; the walk is broken");
         out
+    }
+
+    /// Every `.rs` file under `chm/src`.
+    fn sources() -> Vec<PathBuf> {
+        sources_under(&Path::new(env!("CARGO_MANIFEST_DIR")).join("src"))
     }
 
     /// No two temporary paths keyed by `process::id()` may share a prefix.
@@ -384,5 +389,269 @@ mod tests {
                 "docs/first-resume.md has `{needle}` back in it: {why}"
             );
         }
+    }
+
+    /// Blank out whole-line comments, preserving line numbering.
+    ///
+    /// A guard that reads source has to survive prose *about* the thing it
+    /// refuses. The allowance this one replaces is documented in `main.rs` by
+    /// quoting the very form being refused, and this module's own doc comments
+    /// do the same, so a scanner that cannot tell code from commentary would
+    /// report the explanation as the offence.
+    fn without_comment_lines(src: &str) -> String {
+        src.lines()
+            .map(|l| {
+                if l.trim_start().starts_with("//") {
+                    ""
+                } else {
+                    l
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Index just past a string literal opening at `at`, honouring escapes.
+    fn skip_string(chars: &[char], at: usize) -> Option<usize> {
+        let mut i = at + 1;
+        while i < chars.len() {
+            match chars[i] {
+                '\\' => i += 2,
+                '"' => return Some(i + 1),
+                _ => i += 1,
+            }
+        }
+        None
+    }
+
+    /// Index just past a `'x'` / `'\n'` literal at `at`, or `None` for a lifetime.
+    fn skip_char_literal(chars: &[char], at: usize) -> Option<usize> {
+        let mut i = at + 1;
+        if chars.get(i) == Some(&'\\') {
+            i += 1;
+        }
+        i += 1;
+        (chars.get(i) == Some(&'\'')).then_some(i + 1)
+    }
+
+    /// Index of the bracket closing the one opened just before `start`.
+    ///
+    /// Brackets inside string and character literals do not count, or
+    /// `assert!(s.contains(')'))` would appear to close early -- which would
+    /// truncate the argument and hide whatever followed.
+    fn matching_close(chars: &[char], start: usize) -> Option<usize> {
+        let mut depth = 1usize;
+        let mut i = start;
+        while i < chars.len() {
+            match chars[i] {
+                '"' => {
+                    i = skip_string(chars, i)?;
+                    continue;
+                }
+                '\'' => {
+                    if let Some(next) = skip_char_literal(chars, i) {
+                        i = next;
+                        continue;
+                    }
+                }
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return Some(i);
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// The sole argument of a macro call, or `None` when a message follows it.
+    ///
+    /// A trailing comma is not a message. `assert!(\n    x,\n)` is what rustfmt
+    /// produces from a long single-argument call, and reading that as
+    /// two arguments would let every wrapped offender through.
+    fn single_argument(arg: &str) -> Option<&str> {
+        let chars: Vec<char> = arg.chars().collect();
+        let mut depth = 0usize;
+        let mut i = 0usize;
+        while i < chars.len() {
+            match chars[i] {
+                '"' => {
+                    let Some(next) = skip_string(&chars, i) else {
+                        break;
+                    };
+                    i = next;
+                    continue;
+                }
+                '\'' => {
+                    if let Some(next) = skip_char_literal(&chars, i) {
+                        i = next;
+                        continue;
+                    }
+                }
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' => depth = depth.saturating_sub(1),
+                ',' if depth == 0 => {
+                    if !arg[i + 1..].trim().is_empty() {
+                        return None;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        Some(arg.trim().trim_end_matches(',').trim())
+    }
+
+    /// Every `assert!`-family invocation in `src`, as `(line, argument list)`.
+    ///
+    /// Spans lines deliberately. A guard defeated by a line break reports
+    /// safety it does not provide, and rustfmt will wrap a long assertion
+    /// across three lines without being asked -- so a line-at-a-time search
+    /// would go quiet the moment an offending call got long enough to matter.
+    fn assert_arguments(src: &str) -> Vec<(usize, String)> {
+        // Assembled, so this file is never its own offender (#241).
+        let open: Vec<char> = format!("assert{}(", "!").chars().collect();
+        let chars: Vec<char> = src.chars().collect();
+        let mut out = Vec::new();
+        let mut line = 1usize;
+        for i in 0..chars.len() {
+            if chars[i] == '\n' {
+                line += 1;
+            }
+            if chars[i..].starts_with(open.as_slice())
+                && let Some(end) = matching_close(&chars, i + open.len())
+            {
+                out.push((line, chars[i + open.len()..end].iter().collect()));
+            }
+        }
+        out
+    }
+
+    /// The parser has to tell an offence from an explanation of one.
+    ///
+    /// Written against synthetic input because the tree it polices has zero
+    /// offenders by the time this lands: a guard whose only evidence is "it
+    /// stayed quiet" cannot distinguish working from broken.
+    #[test]
+    fn the_scanner_reads_assertions_the_way_clippy_does() {
+        let ok = format!(".is{}()", "_ok");
+        let found = |src: &str| -> Vec<usize> {
+            assert_arguments(&without_comment_lines(src))
+                .into_iter()
+                .filter(|(_, arg)| single_argument(arg).is_some_and(|a| a.ends_with(&ok)))
+                .map(|(line, _)| line)
+                .collect()
+        };
+
+        let bare = format!("fn t() {{\n    assert{}(f(x){}());\n}}\n", "!", ".is_ok");
+        assert_eq!(
+            found(&bare),
+            vec![2],
+            "the plain single-line form must be caught"
+        );
+
+        let wrapped = format!(
+            "fn t() {{\n    assert{}(\n        f(x)\n        {}(),\n    );\n}}\n",
+            "!", ".is_ok"
+        );
+        assert_eq!(
+            found(&wrapped),
+            vec![2],
+            "a wrapped assertion must still be caught"
+        );
+
+        // Everything below stays out of scope on purpose.
+        let with_message = format!("assert{}(f(x){}(), \"why it should\");\n", "!", ".is_ok");
+        assert!(
+            found(&with_message).is_empty(),
+            "a custom message says something on failure"
+        );
+
+        let err = format!("assert{}(f(x).is{}());\n", "!", "_err");
+        assert!(
+            found(&err).is_empty(),
+            "the is_err form is deliberately still allowed"
+        );
+
+        let commented = format!("// assert{}(f(x){}());\n", "!", ".is_ok");
+        assert!(
+            found(&commented).is_empty(),
+            "prose about the form is not the form"
+        );
+
+        let parenthesised = format!("assert{}(s.contains(')'){}());\n", "!", ".is_ok");
+        assert_eq!(
+            found(&parenthesised).len(),
+            1,
+            "a bracket inside a literal must not truncate the argument"
+        );
+    }
+
+    /// No assertion may throw away the error it just caught.
+    ///
+    /// `assert!(x.is_ok())` prints `assertion failed: x.is_ok()` and nothing
+    /// else -- the error that explains *why* is dropped on the floor at exactly
+    /// the moment somebody needs it. `.unwrap()` prints it.
+    ///
+    /// This exists because the alternative was a comment. `main.rs` allows
+    /// `clippy::assertions_on_result_states` for the whole crate under
+    /// `cfg(test)`, narrowed by #365 to cover the `is_err()` form only -- and a
+    /// comment saying "is_err() only" stops being true the moment somebody
+    /// writes an `is_ok()`, silently, with the lint still switched off. Clippy
+    /// cannot split the two: the lint has no configuration. So the half that
+    /// was cleaned up is held cleaned up here instead of being asserted in
+    /// prose.
+    ///
+    /// Scoped to what clippy itself flags, which is narrower than it looks:
+    /// **an `assert!` carrying a custom message is not flagged**, because that
+    /// message is a human sentence and printing it is not silence. That is the
+    /// whole of the gap between #365's stated counts and the measured ones.
+    #[test]
+    fn no_assertion_discards_the_error_it_caught() {
+        let root = repo_root();
+
+        // Assembled from parts, so this test's own body is not an offender.
+        let ok_state = format!(".is{}()", "_ok");
+        let mut offenders = Vec::new();
+        for file in sources() {
+            let src = without_comment_lines(&fs::read_to_string(&file).expect("read source"));
+            for (line, arg) in assert_arguments(&src) {
+                if single_argument(&arg).is_some_and(|a| a.ends_with(&ok_state)) {
+                    let shown = file
+                        .strip_prefix(&root)
+                        .unwrap_or(&file)
+                        .display()
+                        .to_string();
+                    offenders.push(format!("  {shown}:{line}"));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these assertions discard the error they caught (#365). Use \
+             `.unwrap()`, which prints it, or add a message saying what was \
+             expected:\n{}",
+            offenders.join("\n")
+        );
+
+        // `hypervisor` needs no scanner: #365 deleted its allowance outright,
+        // because converting its two `is_err()` sites left nothing needing one.
+        // Clippy polices it directly from then on, and does it better than this
+        // test could -- a scanner reads every `cfg`, clippy reads the ones that
+        // are actually built. That division only holds while the allowance
+        // stays gone, so this is the half that has to be asserted here.
+        let lib = fs::read_to_string(root.join("hypervisor").join("src").join("lib.rs"))
+            .expect("read hypervisor/src/lib.rs");
+        let lint = format!("assertions_on{}", "_result_states");
+        assert!(
+            !flattened(&without_comment_lines(&lib)).contains(&lint),
+            "hypervisor/src/lib.rs allows `{lint}` again, so clippy has stopped \
+             catching there what this test only catches in chm (#365)"
+        );
     }
 }

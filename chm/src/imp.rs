@@ -4632,11 +4632,11 @@ mod tests {
         }
 
         // The real Graviton2 value: EL0 field 2 == AArch64 *and* AArch32.
-        assert!(aarch32_guard(&snap_with(0x1100_0000_1111_1112)).is_ok());
+        aarch32_guard(&snap_with(0x1100_0000_1111_1112)).unwrap();
         // EL0 field 1 == AArch64 only: nothing to warn about.
-        assert!(aarch32_guard(&snap_with(0x1100_0000_1111_1111)).is_ok());
+        aarch32_guard(&snap_with(0x1100_0000_1111_1111)).unwrap();
         // A capture with no ID_AA64PFR0_EL1 at all cannot be judged.
-        assert!(aarch32_guard(&snap_with_no_sysregs()).is_ok());
+        aarch32_guard(&snap_with_no_sysregs()).unwrap();
     }
 
     /// The real values, from `chm sysregs` against a Graviton2 capture: the
@@ -4668,11 +4668,11 @@ mod tests {
         }
 
         // Graviton2: DIC = 1, so the kernel patched `ic ivau` out. Warns.
-        assert!(icache_dic_guard(&snap_with_ctr(0xb444_c004)).is_ok());
+        icache_dic_guard(&snap_with_ctr(0xb444_c004)).unwrap();
         // A capture from DIC = 0 hardware keeps its maintenance. Silent.
-        assert!(icache_dic_guard(&snap_with_ctr(0x9444_c004)).is_ok());
+        icache_dic_guard(&snap_with_ctr(0x9444_c004)).unwrap();
         // No CTR_EL0 recorded at all: nothing to judge, so do not guess.
-        assert!(icache_dic_guard(&snap_with_no_sysregs()).is_ok());
+        icache_dic_guard(&snap_with_no_sysregs()).unwrap();
     }
 
     /// The ASID width is the one CPU-feature delta that corrupts memory rather
@@ -4929,8 +4929,8 @@ mod tests {
         let host = hvf_guest_cntfrq().unwrap();
         let matching =
             format!(r#"{{"snapshot_data":{{"state":"{{\"clock\":{{\"cntfrq\":{host}}}}}"}}}}"#);
-        assert!(cntfrq_guard(&matching).is_ok());
-        assert!(cntfrq_guard(r#"{"snapshot_data":{"state":"{}"}}"#).is_ok());
+        cntfrq_guard(&matching).unwrap();
+        cntfrq_guard(r#"{"snapshot_data":{"state":"{}"}}"#).unwrap();
     }
 
     /// The Graviton2 case, which is the one that actually happened: warn by

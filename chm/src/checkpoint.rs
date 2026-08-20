@@ -2645,7 +2645,7 @@ mod tests {
 
         // Unpinning is the documented way through, and it must actually work.
         pin_revision(&snap, &older.id, false).unwrap();
-        assert!(delete_revision(&snap, &older.id).is_ok());
+        delete_revision(&snap, &older.id).unwrap();
 
         let _ = fs::remove_dir_all(&snap);
     }
@@ -2716,7 +2716,7 @@ mod tests {
                 .is_none()
         );
         // Clearing an absent label is a no-op, not an error.
-        assert!(label_revision(&snap, &id, None).is_ok());
+        label_revision(&snap, &id, None).unwrap();
 
         let _ = fs::remove_dir_all(&snap);
     }
@@ -2740,7 +2740,7 @@ mod tests {
         }
         let long = "x".repeat(LABEL_MAX + 1);
         assert!(label_revision(&snap, &id, Some(&long)).is_err(), "too long");
-        assert!(label_revision(&snap, &id, Some(&"y".repeat(LABEL_MAX))).is_ok());
+        label_revision(&snap, &id, Some(&"y".repeat(LABEL_MAX))).unwrap();
 
         let _ = fs::remove_dir_all(&snap);
     }

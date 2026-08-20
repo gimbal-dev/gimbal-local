@@ -318,7 +318,7 @@ mod tests {
     fn guest_memory_rejects_out_of_range() {
         let mem = GuestMemory::new();
         mem.register_owned(0x4000_0000, 0x1000);
-        assert!(mem.read_u32(0x4000_0ffe).is_err()); // straddles the end
-        assert!(mem.read_u32(0x5000_0000).is_err()); // unbacked
+        mem.read_u32(0x4000_0ffe).unwrap_err(); // straddles the end
+        mem.read_u32(0x5000_0000).unwrap_err(); // unbacked
     }
 }

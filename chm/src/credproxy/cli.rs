@@ -1472,7 +1472,7 @@ mod tests {
             .iter()
             .map(ToString::to_string)
             .collect();
-        assert!(reject_unknown("show", &ok).is_ok());
+        reject_unknown("show", &ok).unwrap();
     }
 
     #[test]
@@ -2007,8 +2007,8 @@ mod tests {
             "/tmp/ws".to_string(),
             "--for-guest".to_string(),
         ];
-        assert!(reject_unknown("ca", &positional).is_ok());
-        assert!(reject_unknown("ca", &flagged).is_ok());
+        reject_unknown("ca", &positional).unwrap();
+        reject_unknown("ca", &flagged).unwrap();
         assert_eq!(workspace_arg(&positional), Some("/tmp/ws"));
         assert_eq!(workspace_arg(&flagged), Some("/tmp/ws"));
     }
