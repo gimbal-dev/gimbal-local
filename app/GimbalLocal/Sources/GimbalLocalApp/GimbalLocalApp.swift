@@ -9,10 +9,58 @@ import AppKit
 /// bundle's `CFBundleIconFile` already points Finder at the icon, but freshly
 /// built bundles can show a stale cached icon until this nudges it at launch.
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    /// Set by `GimbalLocalApp` once the model exists. Weak so the delegate does
+    /// not keep the model alive past the app.
+    weak var model: AppModel?
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         if let url = Bundle.main.url(forResource: "AppIcon", withExtension: "icns"),
            let image = NSImage(contentsOf: url) {
             NSApplication.shared.applicationIconImage = image
+        }
+    }
+
+    /// Stop the daemon this app started before the app goes away (#360).
+    ///
+    /// Without this, `chm serve` is reparented to launchd and runs forever,
+    /// holding the process-global HVF slot so the next `chm run` fails
+    /// `HV_BUSY` with nothing on screen to blame.
+    func applicationShouldTerminate(
+        _ sender: NSApplication
+    ) -> NSApplication.TerminateReply {
+        guard let model else { return .terminateNow }
+
+        switch QuitDisposition.decide(
+            startedDaemon: model.startedDaemon,
+            runningGuests: model.runningGuests
+        ) {
+        case .nothingToStop:
+            return .terminateNow
+
+        case .stopDaemon:
+            // The shutdown has to be awaited: quitting before it is delivered
+            // is the leak itself, so termination waits rather than racing.
+            Task { @MainActor in
+                await model.stopDaemonAndWait()
+                sender.reply(toApplicationShouldTerminate: true)
+            }
+            return .terminateLater
+
+        case .confirm(let running):
+            let alert = NSAlert()
+            alert.messageText = "Quit Gimbal Local?"
+            alert.informativeText = QuitDisposition.confirmationMessage(running: running)
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "Quit and Stop")
+            alert.addButton(withTitle: "Cancel")
+            guard alert.runModal() == .alertFirstButtonReturn else {
+                return .terminateCancel
+            }
+            Task { @MainActor in
+                await model.stopDaemonAndWait()
+                sender.reply(toApplicationShouldTerminate: true)
+            }
+            return .terminateLater
         }
     }
 }
@@ -29,6 +77,7 @@ struct GimbalLocalApp: App {
                 .environmentObject(model)
                 .frame(minWidth: 1120, minHeight: 760)
                 .task {
+                    appDelegate.model = model
                     await model.bootstrap()
                 }
         }

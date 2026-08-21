@@ -87,7 +87,7 @@ three ways:
 | --- | --- | --- |
 | chm | `cd chm && cargo test` | **870** passed / 4 ignored (lib), plus **2** passed / 7 ignored (integration) |
 | hypervisor | `cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib` | **276** passed — also run by `make test-hvf` |
-| Swift app | `cd app/GimbalLocal && swift test` | **255** XCTest (3 skipped), plus **34** Swift Testing cases in 5 suites |
+| Swift app | `cd app/GimbalLocal && swift test` | **263** XCTest (3 skipped), plus **34** Swift Testing cases in 5 suites |
 | Lints | `make clippy` | **0** |
 | HVF gate | `make test-hvf` | **41** passed / 3 ignored (signed `hvf_boot`), then **276** passed (hypervisor lib). [#334](https://github.com/gimbal-dev/gimbal-local/issues/334) is fixed and merged |
 

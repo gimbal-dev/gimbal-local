@@ -623,17 +623,34 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Does *this app* hold the daemon's process handle?
+    ///
+    /// Deliberately not "is a daemon reachable". The app adopts an already
+    /// running daemon rather than starting a second one, and stopping an engine
+    /// the user started elsewhere (a terminal, a previous session) on quit
+    /// would be acting on their behalf unannounced (#360).
+    var startedDaemon: Bool { daemonProcess != nil }
+
+    /// Stop the daemon and wait for it, for callers that must not return early.
+    ///
+    /// `shutdownDaemon()` fires a detached `Task` and returns immediately,
+    /// which is right for a button and wrong for app termination: the process
+    /// would exit before the shutdown was delivered, which is the leak in #360.
+    func stopDaemonAndWait() async {
+        do {
+            let output = try await chm.shutdown(settings: settings)
+            appendLog(output)
+        } catch {
+            appendLog("shutdown failed: \(error.localizedDescription)")
+            daemonProcess?.terminate()
+        }
+        daemonProcess = nil
+        daemonPID = nil
+    }
+
     func shutdownDaemon() {
         Task {
-            do {
-                let output = try await chm.shutdown(settings: settings)
-                appendLog(output)
-            } catch {
-                appendLog("shutdown failed: \(error.localizedDescription)")
-                daemonProcess?.terminate()
-            }
-            daemonProcess = nil
-            daemonPID = nil
+            await stopDaemonAndWait()
             await refreshLocal()
         }
     }
