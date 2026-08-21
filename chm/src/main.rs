@@ -64,6 +64,12 @@ mod console_filter;
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod exec;
 
+// Putting a host file into a running guest, chunked so each step frames inside
+// the tty's line limit and verified by digest (#316). The way in for anything
+// `chm exec` is structurally too small to carry.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod guestcp;
+
 // Delivering a spec's `env` and `postBootCommand` into a guest that is up
 // (#190). Reuses the `exec` framing, and establishes readiness by getting an
 // answer rather than by matching a prompt string no BYO image is obliged to

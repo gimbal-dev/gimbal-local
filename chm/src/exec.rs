@@ -151,6 +151,13 @@ impl Nonce {
         format!("{}{BEGIN}", self.0)
     }
 
+    /// The random token itself, for callers needing a collision-resistant name
+    /// rather than a frame — `chm cp`'s staging file, so two concurrent copies
+    /// cannot append into each other's.
+    pub(crate) fn token(&self) -> &str {
+        &self.0
+    }
+
     /// The prefix of the marker printed *after* it; the exit status follows.
     fn end_prefix(&self) -> String {
         format!("{}{END}:", self.0)
@@ -208,7 +215,7 @@ pub(crate) fn frame(nonce: &Nonce, fragment: &str) -> Result<String, String> {
     if line.len() > MAX_SCRIPT {
         return Err(format!(
             "command is too long for a guest terminal ({} bytes of framed input, limit {MAX_SCRIPT}); \
-             put it in a script and run that instead",
+             stage it with `chm cp <host-file> <guest-path>` and run that instead",
             line.len()
         ));
     }
@@ -659,5 +666,36 @@ mod tests {
         // would act on even before quoting.
         let n = Nonce::mint();
         assert!(n.0.chars().all(|c| c.is_ascii_alphanumeric()), "{}", n.0);
+    }
+
+    /// #316: the refusal has to leave the reader somewhere to go.
+    ///
+    /// This message used to say "put it in a script and run that instead",
+    /// which quietly assumed a way to get a script in. There was none, so the
+    /// advice was a dead end — and the reporter hit that wall twice, once for
+    /// the proxy CA and once staging an agent script. Asserting the sentence
+    /// merely *exists* would not have caught that; what makes it advice rather
+    /// than prose is that the command it names is one this binary dispatches,
+    /// so both halves are checked here.
+    #[test]
+    fn the_refusal_names_a_way_to_get_a_long_script_in() {
+        let err = frame(&Nonce::mint(), &"x".repeat(MAX_SCRIPT * 2))
+            .expect_err("an oversized fragment must be refused");
+
+        // Assembled rather than written out, so this assertion cannot be the
+        // occurrence that satisfies a later source-reading guard.
+        let remedy = format!("{} {}", "chm", "cp");
+        assert!(
+            err.contains(&remedy),
+            "the refusal does not name the way in: {err}"
+        );
+
+        let dispatch = include_str!("imp.rs");
+        let arm = format!("Some({:?}) =>", "cp");
+        assert!(
+            dispatch.contains(&arm),
+            "the refusal sends the reader at `{remedy}`, which imp.rs does not \
+             dispatch, so the remedy in the message is itself wrong"
+        );
     }
 }

@@ -31,6 +31,7 @@ use crate::capability;
 use crate::control_plane;
 use crate::credproxy;
 use crate::firewall;
+use crate::guestcp;
 use crate::limits;
 use crate::serve;
 use crate::spec;
@@ -1440,6 +1441,7 @@ pub fn main() -> ExitCode {
         Some("serve") => serve::serve_main(&raw[1..]),
         Some("ctl") => serve::ctl_main(&raw[1..]),
         Some("exec") => serve::exec_main(&raw[1..]),
+        Some("cp") => guestcp::cp_main(&raw[1..]),
         Some("ps") => runs::ps_main(&raw[1..]),
         Some("kernel") => kernelimage::kernel_main(&raw[1..]),
         Some("spec") => spec::spec_main(&raw[1..]),
@@ -1553,6 +1555,7 @@ fn usage() -> String {
          chm resume <SNAPSHOT_DIR> [OPTIONS]   (restore a saved checkpoint)\n    \
          chm connect <SNAPSHOT_DIR> [OPTIONS]  (interactive session)\n    \
          chm exec [OPTIONS] -- <CMD> [ARG...]  (run a command in the guest)\n    \
+         chm cp <HOST_FILE> <GUEST_PATH>       (put a file into the guest)\n    \
          chm ps [--json]                       (what is running right now)\n    \
          chm spec <COMMAND> [OPTIONS]          (describe a sandbox in a file)\n\
      \n\
@@ -1664,7 +1667,15 @@ fn usage() -> String {
          explicitly (`chm exec -- bash -lc '...'`) when you want one.\n      \
          124 means the guest did not answer in time and 125 means\n      \
          chm could not run it at all, so a transport failure is\n      \
-         never reported as success.\n\
+         never reported as success.\n    \
+         chm cp [--timeout N] <HOST_FILE> <GUEST_PATH>\n      \
+         Copy a file into the running guest over the same console\n      \
+         channel, in chunks small enough to survive a tty, and\n      \
+         verify it by comparing a SHA-256 taken here against one\n      \
+         the guest reports. This is how a script too long for\n      \
+         `chm exec` gets in. An unverifiable copy is a failure,\n      \
+         never a success: the guest needs `base64` and\n      \
+         `sha256sum`.\n\
      \n\
      NOTE: the binary must be code-signed with the\n      \
      `com.apple.security.hypervisor` entitlement (see scripts/build-chm.sh).\n"

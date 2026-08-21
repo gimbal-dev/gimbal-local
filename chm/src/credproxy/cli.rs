@@ -382,8 +382,11 @@ fn flags_for(cmd: &str) -> Option<&'static [&'static str]> {
 /// while the sentence the user actually reads sends them at a flag that does
 /// not work.
 const CA_GUEST_HINT: &str = "\
-`chm proxy ca <WORKSPACE_DIR> --for-guest` prints an installer to
-paste into the guest console.";
+`chm proxy ca <WORKSPACE_DIR> --for-guest` prints an installer for the guest.
+It is far longer than one console line will carry, so send it as a file:
+    chm proxy ca <WORKSPACE_DIR> --for-guest > ca.sh
+    chm cp ca.sh /tmp/ca.sh
+    chm exec -- sh /tmp/ca.sh";
 
 fn reject_unknown(cmd: &str, args: &[String]) -> Result<(), ExitCode> {
     if let Some(a) = first_unknown_flag(cmd, args) {
@@ -595,9 +598,11 @@ fn ca(args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if args.iter().any(|a| a == "--for-guest") {
-        // A single self-contained block, because the way this actually gets into
-        // a guest is a paste into the serial console — there is no shared
-        // filesystem to copy it through, by design.
+        // A single self-contained block, so that it is one file rather than a
+        // sequence a reader has to assemble. It is emitted on stdout precisely
+        // so it can be redirected and carried in by `chm cp` (#316): there is no
+        // shared filesystem, by design, and at ~4 KB it is too big to reach the
+        // guest as a console line — which is the wall the reporter hit.
         print!("{}", guest_install_script(&pem, &ca.fingerprint()));
         return ExitCode::SUCCESS;
     }
@@ -2289,5 +2294,39 @@ mod tests {
              banner; the banner claims injection is active and names a CA, which is \
              exactly the sentence #315 made true and useless"
         );
+    }
+
+    /// #316: the hint has to describe a route that exists end to end.
+    ///
+    /// It used to say the installer was something to "paste into the guest
+    /// console". It is ~4 KB, and a console line is capped at
+    /// [`exec::MAX_SCRIPT`], so the one instruction we gave was the one thing
+    /// that could not work. Every command the hint names is checked against
+    /// imp.rs's dispatch table, because the failure mode here is not a missing
+    /// sentence — it is a confident sentence naming a command that is not
+    /// there, which is the shape #210 already cost us once.
+    #[test]
+    fn every_command_the_ca_hint_names_is_one_this_binary_dispatches() {
+        let dispatch = include_str!("../imp.rs");
+
+        // Needles assembled at runtime: a literal would be found in this test's
+        // own text by any later source-reading guard, and would satisfy it
+        // without the hint containing anything at all.
+        let named: Vec<String> = ["cp", "exec"].iter().map(|c| c.to_string()).collect();
+
+        for cmd in &named {
+            let invocation = format!("{} {cmd} ", "chm");
+            assert!(
+                CA_GUEST_HINT.contains(&invocation),
+                "the hint no longer shows `{invocation}`, so the route it \
+                 describes is incomplete: {CA_GUEST_HINT}"
+            );
+            let arm = format!("Some({cmd:?}) =>");
+            assert!(
+                dispatch.contains(&arm),
+                "the hint tells the reader to run `chm {cmd}`, which imp.rs \
+                 does not dispatch"
+            );
+        }
     }
 }
