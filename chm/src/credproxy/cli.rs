@@ -28,7 +28,7 @@ use crate::audit::AuditLog;
 
 use super::ca::{CA_CERT_FILE, CA_KEY_FILE, ProxyCa};
 use super::nat::RuleDecider;
-use super::rules::{Destination, Disposition, RuleSet};
+use super::rules::{Destination, Disposition, PlaceholderEnv, RuleSet};
 use super::server::{self, ProxyConfig};
 
 /// Which authority supplied a piece of a run's configuration.
@@ -286,6 +286,9 @@ COMMANDS:
     show    What the rules would do, and whether each credential is available.
             Reads no credential values: an `exec` source is never run.
     ca      Print the workspace CA certificate, and how to install it in a guest.
+            --for-guest also seeds a worthless placeholder credential for any
+            client known to refuse to make a request without one (a proxy
+            cannot inject into a request that is never sent).
     check   Prove this machine can reach a host through the proxy. Sends a real
             HEAD request; injects only if a rule matches. Use --path to choose
             an endpoint whose answer differs with and without a credential
@@ -484,6 +487,22 @@ fn show(args: &[String]) -> ExitCode {
             .collect();
         println!("  never intercepted: {}", p.join(", "));
     }
+    // A client that gates on local auth is the most likely way a correct proxy
+    // looks broken (#318), so `show` names the variables the CA installer will
+    // seed rather than leaving the user to discover the pattern from the docs.
+    let seed = resolved.rules.placeholder_env();
+    if !seed.vars.is_empty() {
+        let names: Vec<&str> = seed.vars.iter().map(|(n, _)| n.as_str()).collect();
+        println!("\n  placeholder in the guest: {}", names.join(", "));
+        println!("      installed by `chm proxy ca --for-guest`; worth nothing, and");
+        println!("      replaced in flight by the real credential.");
+    }
+    for s in &seed.skipped {
+        println!("\n  note: {s} injects a bearer token.");
+        println!("        No client is known here to gate on a local credential for it.");
+        println!("        If one does, give the guest a worthless placeholder in the");
+        println!("        shape that client validates - docs/credential-proxy.md §6.");
+    }
     println!("\nEverything not listed above is relayed end-to-end; the proxy cannot read it.");
     ExitCode::SUCCESS
 }
@@ -603,7 +622,17 @@ fn ca(args: &[String]) -> ExitCode {
         // so it can be redirected and carried in by `chm cp` (#316): there is no
         // shared filesystem, by design, and at ~4 KB it is too big to reach the
         // guest as a console line — which is the wall the reporter hit.
-        print!("{}", guest_install_script(&pem, &ca.fingerprint()));
+        // The rule set is what says whether any client here gates on local auth,
+        // so the CA and the placeholder are decided together. They are also
+        // installed together on purpose: both are "make this guest able to use
+        // the proxy", and a guest with one and not the other fails in a way
+        // that names neither (#318).
+        let seed = resolve_rules(Some(Path::new(ws)), flag(args, "--rules").map(Path::new))
+            .ok()
+            .flatten()
+            .map(|r| r.rules.placeholder_env())
+            .unwrap_or_default();
+        print!("{}", guest_install_script(&pem, &ca.fingerprint(), &seed));
         return ExitCode::SUCCESS;
     }
     eprintln!("# sha256 {}", ca.fingerprint());
@@ -630,7 +659,12 @@ pub(crate) fn ca_json_for_daemon(workspace: &Path) -> String {
     match ProxyCa::load_existing(&dir) {
         Ok(Some(ca)) => {
             let pem = ca.cert_pem();
-            let script = guest_install_script(&pem, &ca.fingerprint());
+            let seed = resolve_rules(Some(workspace), None)
+                .ok()
+                .flatten()
+                .map(|r| r.rules.placeholder_env())
+                .unwrap_or_default();
+            let script = guest_install_script(&pem, &ca.fingerprint(), &seed);
             let lines: Vec<String> = guest_install_transfer(&script)
                 .iter()
                 .map(|l| quote(l))
@@ -666,7 +700,32 @@ pub(crate) fn ca_json_for_daemon(workspace: &Path) -> String {
 /// `openssl verify -CApath` is the check because it asks the question the guest
 /// will actually ask: does this certificate chain to something the store
 /// trusts? For a self-signed CA that is exactly "is it installed".
-fn guest_install_script(pem: &str, fingerprint: &str) -> String {
+fn guest_install_script(pem: &str, fingerprint: &str, seed: &PlaceholderEnv) -> String {
+    // Built here rather than inline in the script literal, because `${VAR:-…}`
+    // is full of braces and `format!` would need every one of them doubled.
+    let (seed_block, seed_report) = if seed.vars.is_empty() {
+        (
+            String::new(),
+            "placeholder:  none (no bearer rule names a client known to gate on local auth)"
+                .to_string(),
+        )
+    } else {
+        let mut lines = String::new();
+        for (name, value) in &seed.vars {
+            // `:-` so a value the operator put there deliberately wins. Seeding
+            // over a real credential would break the guest to fix a guest that
+            // was not broken.
+            lines.push_str(&format!("export {name}=\"${{{name}:-{value}}}\"\n"));
+        }
+        let names: Vec<&str> = seed.vars.iter().map(|(n, _)| n.as_str()).collect();
+        (
+            format!("$S tee -a {ENV_PATH} >/dev/null <<'GIMBAL_ENV_EOF'\n{lines}GIMBAL_ENV_EOF\n"),
+            format!(
+                "placeholder:  {} (worthless; the proxy substitutes the real one on the wire)",
+                names.join(" ")
+            ),
+        )
+    };
     format!(
         "set -e\n\
          # Root already, or borrow authority only if it is actually available.\n\
@@ -706,6 +765,11 @@ fn guest_install_script(pem: &str, fingerprint: &str) -> String {
          # A coding agent is a Node program, so leaving this out ships a guest\n\
          # where curl works and the agent does not.\n\
          printf 'export NODE_EXTRA_CA_CERTS=%s\\n' \"$CRT\" | $S tee {ENV_PATH} >/dev/null\n\
+         # A client that checks for a credential before it will make a request\n\
+         # never gives the proxy anything to inject into, so it needs to see\n\
+         # something. This is worth nothing: the proxy drops every guest copy of\n\
+         # a header it manages before attaching the real credential (#318).\n\
+         {seed_block}\
          $S mkdir -p /etc/profile.d \\\n\
          \x20 && $S cp {ENV_PATH} /etc/profile.d/gimbal-proxy-ca.sh 2>/dev/null || true\n\
          . {ENV_PATH}\n\
@@ -720,6 +784,7 @@ fn guest_install_script(pem: &str, fingerprint: &str) -> String {
          fi\n\
          echo \"system store: $SYS\"\n\
          echo \"node:         $NODE ($CRT)\"\n\
+         echo \"{seed_report}\"\n\
          GOT=$(openssl x509 -noout -fingerprint -sha256 -in \"$CRT\" 2>/dev/null \\\n\
          \x20 | tr -d ':' | tr 'A-Z' 'a-z' | sed 's/.*=//')\n\
          echo \"installed:    ${{GOT:-<no openssl here to read it back>}}\"\n\
@@ -1585,7 +1650,11 @@ mod tests {
     /// and `openssl verify` exited 0, via the direct-link fallback.
     #[test]
     fn the_ca_installer_verifies_against_the_trust_store_not_its_own_file() {
-        let script = guest_install_script("-----BEGIN CERTIFICATE-----\nAA\n", "beefcafe");
+        let script = guest_install_script(
+            "-----BEGIN CERTIFICATE-----\nAA\n",
+            "beefcafe",
+            &PlaceholderEnv::default(),
+        );
 
         // The check that matters: does this cert chain to the guest's store?
         assert!(
@@ -1679,7 +1748,11 @@ mod tests {
 
     #[test]
     fn the_ca_installer_does_not_assume_sudo_or_a_trust_store() {
-        let script = guest_install_script("-----BEGIN CERTIFICATE-----\nAA\n", "beefcafe");
+        let script = guest_install_script(
+            "-----BEGIN CERTIFICATE-----\nAA\n",
+            "beefcafe",
+            &PlaceholderEnv::default(),
+        );
 
         assert!(
             !script.contains("sudo tee") && !script.contains("sudo cp \"$CRT\" /usr"),
@@ -1713,7 +1786,11 @@ mod tests {
     /// is the workload.
     #[test]
     fn the_ca_installer_configures_node_as_well_as_the_system_store() {
-        let script = guest_install_script("-----BEGIN CERTIFICATE-----\nAA\n", "beefcafe");
+        let script = guest_install_script(
+            "-----BEGIN CERTIFICATE-----\nAA\n",
+            "beefcafe",
+            &PlaceholderEnv::default(),
+        );
 
         assert!(
             script.contains("NODE_EXTRA_CA_CERTS"),
@@ -1759,7 +1836,11 @@ mod tests {
     /// implementation again (`base64 -d`).
     #[test]
     fn the_install_transfer_reassembles_and_is_checked_before_it_runs() {
-        let script = guest_install_script("-----BEGIN CERTIFICATE-----\nQUJD\n", "beefcafe");
+        let script = guest_install_script(
+            "-----BEGIN CERTIFICATE-----\nQUJD\n",
+            "beefcafe",
+            &PlaceholderEnv::default(),
+        );
         let lines = guest_install_transfer(&script);
 
         // Reassemble exactly what the guest's file would hold.
@@ -2303,5 +2384,152 @@ mod tests {
                  does not dispatch"
             );
         }
+    }
+
+    // ---- #318: seeding a client that gates on local auth -------------------
+
+    fn gh_seed() -> PlaceholderEnv {
+        RuleSet::parse(r#"{"rules":[{"name":"gh","hosts":["api.github.com"],"env":"T"}]}"#)
+            .expect("parses")
+            .placeholder_env()
+    }
+
+    fn seeded_script() -> String {
+        guest_install_script("-----BEGIN CERTIFICATE-----\nAA\n", "beefcafe", &gh_seed())
+    }
+
+    /// The heredoc must be *quoted*, so `${VAR:-…}` reaches the file as text and
+    /// expands when the file is sourced. An unquoted one would expand at install
+    /// time, in the installer's own shell, and bake whatever was set there --
+    /// which for the variable we are seeding is very often nothing, writing an
+    /// empty default that silently defeats the whole mechanism.
+    #[test]
+    fn the_installer_writes_the_placeholder_as_a_default_not_an_assignment() {
+        let script = seeded_script();
+        for var in ["GITHUB_TOKEN", "GH_TOKEN", "COPILOT_GITHUB_TOKEN"] {
+            let want = format!("export {var}=\"${{{var}:-");
+            assert!(
+                script.contains(&want),
+                "{var} is not seeded as a fill-if-unset default:\n{script}"
+            );
+        }
+    }
+
+    /// `/etc/profile.d` is read by login shells and is how an interactive agent
+    /// session picks this up. It is populated by copying the env file, so a seed
+    /// written after the copy reaches one reader and not the other -- and the
+    /// reader it misses is the one a human is looking at.
+    #[test]
+    fn the_seed_is_written_before_the_file_is_copied_to_profile_d() {
+        let script = seeded_script();
+        let seed = script.find("tee -a").expect("a seed append");
+        let copy = script
+            .find("/etc/profile.d/gimbal-proxy-ca.sh")
+            .expect("a copy to profile.d");
+        assert!(
+            seed < copy,
+            "seed at {seed} must precede the profile.d copy at {copy}:\n{script}"
+        );
+    }
+
+    /// Asked of a real shell, because the whole value of `:-` is a semantic this
+    /// repo would otherwise be asserting from memory. Three cases, because the
+    /// middle one is the one that would break a working guest.
+    #[test]
+    fn the_seeded_env_file_fills_only_what_is_unset() {
+        let script = seeded_script();
+        let body = script
+            .split_once("<<'GIMBAL_ENV_EOF'\n")
+            .and_then(|(_, r)| r.split_once("GIMBAL_ENV_EOF"))
+            .map(|(b, _)| b.to_string())
+            .expect("a quoted heredoc body");
+        // Keyed by thread as well as process (#243), and sanitised: the debug
+        // form of a ThreadId is `ThreadId(1)`, and those parentheses turned the
+        // path below into a shell syntax error rather than a missing file.
+        let tid: String = format!("{:?}", std::thread::current().id())
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect();
+        let dir = std::env::temp_dir().join(format!("chm-g318-{}-{tid}", std::process::id()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let env_file = dir.join("proxy-ca.env");
+        fs::write(&env_file, &body).expect("write env file");
+        // Taken from the derivation rather than the constant: what this test is
+        // for is the wiring between them, and the constant's own shape is
+        // guarded where it is defined.
+        let expected = gh_seed()
+            .vars
+            .into_iter()
+            .find(|(n, _)| n == "GH_TOKEN")
+            .map(|(_, v)| v)
+            .expect("GH_TOKEN is seeded");
+        let run = |preset: Option<&str>| -> String {
+            let mut c = std::process::Command::new("/bin/sh");
+            c.env_clear().arg("-c").arg(format!(
+                ". '{}'; printf %s \"$GH_TOKEN\"",
+                env_file.display()
+            ));
+            if let Some(v) = preset {
+                c.env("GH_TOKEN", v);
+            }
+            let out = c.output().expect("run sh");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        assert_eq!(
+            run(Some("A_REAL_TOKEN")),
+            "A_REAL_TOKEN",
+            "a value the operator set deliberately must survive"
+        );
+        assert_eq!(run(None), expected, "an unset variable must be filled");
+        assert_eq!(
+            run(Some("")),
+            expected,
+            "an empty value fails the client's gate exactly like an unset one"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The script is assembled by string formatting, so a broken heredoc is one
+    /// edit away and its symptom appears only inside a guest.
+    #[test]
+    fn the_generated_installer_is_valid_shell() {
+        for (label, script) in [
+            ("seeded", seeded_script()),
+            (
+                "unseeded",
+                guest_install_script(
+                    "-----BEGIN CERTIFICATE-----\nAA\n",
+                    "beefcafe",
+                    &PlaceholderEnv::default(),
+                ),
+            ),
+        ] {
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-n")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .expect("run sh -n");
+            assert!(
+                out.status.success(),
+                "{label} installer is not valid shell: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// Silence would be indistinguishable from "the feature did not run".
+    #[test]
+    fn an_installer_with_no_gated_client_says_so_rather_than_saying_nothing() {
+        let script = guest_install_script(
+            "-----BEGIN CERTIFICATE-----\nAA\n",
+            "beefcafe",
+            &PlaceholderEnv::default(),
+        );
+        assert!(!script.contains("GITHUB_TOKEN"), "{script}");
+        assert!(
+            script.contains("placeholder:  none"),
+            "an unseeded installer must still report the placeholder line:\n{script}"
+        );
     }
 }
