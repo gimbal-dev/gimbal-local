@@ -44,6 +44,8 @@ use std::path::{Path, PathBuf};
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::credproxy::cli::inherit_ca;
+
 use hypervisor::hvf::checkpoint::{CHECKPOINT_VERSION, CheckpointState};
 use hypervisor::hvf::rehydrate::MemMapping;
 use hypervisor::hvf::virtio::GuestMemory;
@@ -1527,6 +1529,13 @@ pub(crate) fn workspace_from_image(image_dir: &Path, ws_dir: &Path) -> Result<()
             copy_tree(&overlays, &ws_dir.join(".chm-overlays"))?;
         }
     }
+
+    // The guest we just cloned may already trust the image's proxy CA, and a
+    // freshly minted one would not be it (#315). Unconditional in the sense that
+    // it always runs -- `inherit_ca` itself decides there is nothing to inherit
+    // when the image has no CA, which is the common case and correct: a guest
+    // that trusts nothing yet is not made worse by a new authority.
+    inherit_ca(image_dir, ws_dir)?;
     Ok(())
 }
 
@@ -1721,6 +1730,7 @@ mod tests {
     use std::thread;
     use std::time::Duration;
 
+    use crate::credproxy::cli::{ca_dir as proxy_ca_dir, inherited_ca_mismatch};
     // The real `image.json` writer, so the cold-boot detector is tested against
     // what `chm image build` actually emits rather than a copy of it (#180).
     use crate::oci::image::manifest as image_manifest;
@@ -2254,6 +2264,39 @@ mod tests {
             b"cloud-init-writes",
             "image overlay must be untouched by a workspace write"
         );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn workspace_from_image_inherits_the_images_proxy_ca() {
+        // The call-site half of #315. `inherit_ca` having the right behaviour is
+        // worth nothing if `workspace_from_image` stops calling it, and this
+        // repo has shipped that exact miss seven times: an assertion about an
+        // outcome structurally cannot see a path that is no longer taken.
+        let root = env::temp_dir().join(format!("chm-ws-ca-{}-{}", process::id(), now_ms()));
+        let image = root.join("image");
+        let ws = root.join("ws");
+        let _ = fs::remove_dir_all(&root);
+
+        fs::create_dir_all(image.join("snapshot")).unwrap();
+        fs::write(image.join("state.json"), b"{}").unwrap();
+        fs::write(image.join("snapshot/memory-ranges"), b"base-ram").unwrap();
+        let image_ca = proxy_ca_dir(&image);
+        fs::create_dir_all(&image_ca).unwrap();
+        fs::write(image_ca.join("proxy-ca.key"), b"image-key").unwrap();
+        fs::write(image_ca.join("proxy-ca.crt"), b"image-cert").unwrap();
+
+        workspace_from_image(&image, &ws).expect("create workspace");
+
+        assert_eq!(
+            fs::read(proxy_ca_dir(&ws).join("proxy-ca.crt")).unwrap(),
+            b"image-cert",
+            "a workspace must present the CA its image's guest already trusts"
+        );
+        // And the diagnosis for pre-existing workspaces must stay quiet for one
+        // this build made -- otherwise every correct workspace carries a warning.
+        assert!(inherited_ca_mismatch(&ws).is_none());
 
         let _ = fs::remove_dir_all(&root);
     }

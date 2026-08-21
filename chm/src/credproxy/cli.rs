@@ -13,6 +13,7 @@ use crate::oci::entry::EntryKind;
 use crate::oci::initramfs::{Rootfs, write_cpio};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -25,7 +26,7 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned, version
 
 use crate::audit::AuditLog;
 
-use super::ca::ProxyCa;
+use super::ca::{CA_CERT_FILE, CA_KEY_FILE, ProxyCa};
 use super::nat::RuleDecider;
 use super::rules::{Destination, Disposition, RuleSet};
 use super::server::{self, ProxyConfig};
@@ -107,6 +108,100 @@ pub(crate) fn ca_dir(workspace: &Path) -> PathBuf {
     workspace.join("proxy-ca")
 }
 
+/// Copy an image's proxy CA into a workspace being created from it (#315).
+///
+/// A workspace shares its image's base read-only and diverges from there, so
+/// the guest inside it is *the same guest*: if the image's rootfs was already
+/// provisioned to trust a CA, a workspace that mints a fresh one presents a
+/// certificate that guest will never accept. The failure surfaces as a generic
+/// curl message naming nothing, while `chm` has just printed a banner saying
+/// injection is ACTIVE — the two most visible facts contradict each other and
+/// only one of them is reachable without reading this codebase.
+///
+/// Copied rather than symlinked. [`ProxyCa::load_or_create`] writes into this
+/// directory (it tightens permissions, and mints the pair when either file is
+/// missing), so a symlink would let a workspace mutate the image every other
+/// workspace is sharing — the opposite of the read-only base contract the rest
+/// of `workspace_from_image` keeps.
+///
+/// Returns whether there was anything to inherit. An image with no CA is the
+/// ordinary case and not a problem: nothing in that guest trusts anything yet,
+/// so a freshly minted workspace CA is the right answer.
+pub(crate) fn inherit_ca(image_dir: &Path, ws_dir: &Path) -> Result<bool, String> {
+    let from = ca_dir(image_dir);
+    let (key, cert) = (from.join(CA_KEY_FILE), from.join(CA_CERT_FILE));
+    // Both halves or neither. A cert without its key cannot sign a leaf, so
+    // copying half a CA would replace a working mint-fresh path with a proxy
+    // that fails at the first interception instead of at creation.
+    if !key.exists() || !cert.exists() {
+        return Ok(false);
+    }
+    let to = ca_dir(ws_dir);
+    fs::create_dir_all(&to).map_err(|e| format!("create {}: {e}", to.display()))?;
+    // Tightened here rather than left to the next `load_or_create`, which is
+    // what the running proxy calls: between creating the workspace and starting
+    // a VM in it, a 0755 directory holding a CA private key is readable by
+    // anyone on the host, and a readable CA key impersonates every intercepted
+    // host to the guest.
+    let _ = fs::set_permissions(&to, fs::Permissions::from_mode(0o700));
+    for (src, name) in [(&key, CA_KEY_FILE), (&cert, CA_CERT_FILE)] {
+        let dst = to.join(name);
+        fs::copy(src, &dst)
+            .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+    }
+    let _ = fs::set_permissions(to.join(CA_KEY_FILE), fs::Permissions::from_mode(0o600));
+    Ok(true)
+}
+
+/// The image directory a workspace shares its base with, or `None` when this
+/// does not look like a workspace created by `chm workspace`.
+///
+/// Recovered from the `state.json` symlink rather than recorded in a file of
+/// our own: the symlink is what actually makes the workspace share that base,
+/// so it cannot go stale relative to the thing it describes. A recorded origin
+/// could disagree with where the base really is, and would then name the wrong
+/// directory in exactly the diagnosis below.
+pub(crate) fn base_image_dir(workspace: &Path) -> Option<PathBuf> {
+    let target = fs::read_link(workspace.join("state.json")).ok()?;
+    target.parent().map(Path::to_path_buf)
+}
+
+/// Why the CA this workspace presents is not the one its base image carries, or
+/// `None` when they agree, when there is nothing to compare, or when this is
+/// not a workspace at all.
+///
+/// [`inherit_ca`] means a workspace created by this build always agrees. This
+/// exists for the ones that already exist: a workspace made by an earlier build
+/// stays broken across the upgrade, and without this it stays broken *silently*,
+/// which is the whole of what #315 cost.
+///
+/// Compares the certificate bytes, not fingerprint strings, so the comparison
+/// cannot be defeated by a formatting change on either side.
+pub(crate) fn inherited_ca_mismatch(workspace: &Path) -> Option<String> {
+    let image = base_image_dir(workspace)?;
+    let theirs = fs::read(ca_dir(&image).join(CA_CERT_FILE)).ok()?;
+    let ours = fs::read(ca_dir(workspace).join(CA_CERT_FILE)).ok()?;
+    if theirs == ours {
+        return None;
+    }
+    // Stated as a conditional, because the host cannot read the guest's trust
+    // store from here. A user who deliberately re-minted this workspace's CA
+    // *and* reinstalled it in the guest is fine, and telling them their setup is
+    // broken would be a false alarm. What is certain is which two things differ.
+    Some(format!(
+        "chm: [proxy] this workspace's CA is not the one its base image carries.\n\
+         \x20 workspace {}\n\
+         \x20 image     {}\n\
+         \x20 If the guest's trust store came from that image, every intercepted\n\
+         \x20 request will fail with a generic certificate error naming nothing.\n\
+         \x20 Install this workspace's CA in the guest:\n\
+         \x20     chm proxy ca --workspace {}",
+        ca_dir(workspace).display(),
+        ca_dir(&image).display(),
+        workspace.display(),
+    ))
+}
+
 /// A started proxy and the hook that routes flows to it. The proxy is returned
 /// so the caller can keep it alive for the life of the VM.
 pub(crate) type StartedProxy = (server::RunningProxy, Arc<dyn InterceptDecider>);
@@ -153,6 +248,12 @@ pub(crate) fn start_resolved(
         resolved.origin,
         ca.fingerprint()
     );
+    // Immediately after the banner, because the banner is the claim this
+    // contradicts: it says injection is active and names a CA, and #315 was
+    // exactly the case where that sentence was true and useless.
+    if let Some(why) = inherited_ca_mismatch(workspace) {
+        eprintln!("{why}");
+    }
     Ok(Some((proxy, decider)))
 }
 
@@ -2013,4 +2114,180 @@ mod tests {
         assert_eq!(workspace_arg(&flagged), Some("/tmp/ws"));
     }
 
+    /// A CA directory holding both halves, so a test can assert on inheritance
+    /// without minting a real key pair (`load_or_create` is slow and its output
+    /// is not what any of these assertions are about).
+    fn seed_ca(dir: &Path, key: &[u8], cert: &[u8]) {
+        let ca = ca_dir(dir);
+        fs::create_dir_all(&ca).unwrap();
+        fs::write(ca.join(CA_KEY_FILE), key).unwrap();
+        fs::write(ca.join(CA_CERT_FILE), cert).unwrap();
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "chm-ca-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn an_image_ca_is_inherited_by_a_workspace_made_from_it() {
+        // #315: the guest inside a workspace is the image's guest, so it already
+        // trusts the image's CA. Minting a fresh one hands that guest a
+        // certificate chain it will refuse, and the refusal names nothing.
+        let root = scratch("inherit");
+        let (image, ws) = (root.join("image"), root.join("ws"));
+        seed_ca(&image, b"image-key", b"image-cert");
+        fs::create_dir_all(&ws).unwrap();
+
+        assert!(
+            inherit_ca(&image, &ws).unwrap(),
+            "there was a CA to inherit"
+        );
+        assert_eq!(
+            fs::read(ca_dir(&ws).join(CA_CERT_FILE)).unwrap(),
+            b"image-cert"
+        );
+        assert_eq!(
+            fs::read(ca_dir(&ws).join(CA_KEY_FILE)).unwrap(),
+            b"image-key",
+            "the key travels too, or the proxy holds a cert it cannot sign with"
+        );
+
+        // Copied, not shared: a workspace must not be able to write through to
+        // the image every other workspace is sharing read-only.
+        assert!(
+            !fs::symlink_metadata(ca_dir(&ws).join(CA_CERT_FILE))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::write(ca_dir(&ws).join(CA_CERT_FILE), b"diverged").unwrap();
+        assert_eq!(
+            fs::read(ca_dir(&image).join(CA_CERT_FILE)).unwrap(),
+            b"image-cert"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_image_with_no_ca_leaves_the_workspace_to_mint_its_own() {
+        // The ordinary case, and deliberately not an error: a guest that trusts
+        // nothing yet is not harmed by a new authority. The bug only bites when
+        // the image carries one the guest was provisioned against.
+        let root = scratch("nothing");
+        let (image, ws) = (root.join("image"), root.join("ws"));
+        fs::create_dir_all(&image).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+
+        assert!(!inherit_ca(&image, &ws).unwrap());
+        assert!(
+            !ca_dir(&ws).exists(),
+            "an empty CA directory would make `load_or_create` mint into a path \
+             that implies it inherited something"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn half_a_ca_is_not_inherited() {
+        // A cert without its key cannot sign a leaf. Copying it would replace a
+        // working mint-fresh path with a proxy that fails at the first
+        // interception -- later, and further from the cause.
+        let root = scratch("half");
+        let (image, ws) = (root.join("image"), root.join("ws"));
+        fs::create_dir_all(ca_dir(&image)).unwrap();
+        fs::write(ca_dir(&image).join(CA_CERT_FILE), b"orphan-cert").unwrap();
+        fs::create_dir_all(&ws).unwrap();
+
+        assert!(!inherit_ca(&image, &ws).unwrap());
+        assert!(!ca_dir(&ws).exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_inherited_ca_keeps_its_private_key_unreadable() {
+        // Tightened at copy time rather than at the next `load_or_create`: a
+        // workspace can sit between creation and its first run for any length of
+        // time, and a host-readable CA key impersonates every intercepted host.
+        let root = scratch("perms");
+        let (image, ws) = (root.join("image"), root.join("ws"));
+        seed_ca(&image, b"k", b"c");
+        fs::create_dir_all(&ws).unwrap();
+        inherit_ca(&image, &ws).unwrap();
+
+        let mode = |p: PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(ca_dir(&ws)), 0o700);
+        assert_eq!(mode(ca_dir(&ws).join(CA_KEY_FILE)), 0o600);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_workspace_presenting_a_different_ca_from_its_image_is_named() {
+        // For the workspaces that already exist. `inherit_ca` means a workspace
+        // created by this build always agrees; one created by an earlier build
+        // stays broken across the upgrade, and without this it stays broken
+        // *silently*, which is the whole of what #315 cost.
+        let root = scratch("mismatch");
+        let (image, ws) = (root.join("image"), root.join("ws"));
+        fs::create_dir_all(&image).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(image.join("state.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink(image.join("state.json"), ws.join("state.json")).unwrap();
+        seed_ca(&image, b"image-key", b"image-cert");
+        seed_ca(&ws, b"ws-key", b"ws-cert");
+
+        let why = inherited_ca_mismatch(&ws).expect("the two CAs differ");
+        assert!(why.contains(&ca_dir(&ws).display().to_string()));
+        assert!(
+            why.contains(&ca_dir(&image).display().to_string()),
+            "naming only one side leaves the reader with nothing to compare"
+        );
+
+        // Agreement is silent -- which is what every workspace made by this
+        // build looks like.
+        fs::write(ca_dir(&ws).join(CA_CERT_FILE), b"image-cert").unwrap();
+        assert!(inherited_ca_mismatch(&ws).is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_directory_that_is_not_a_workspace_is_not_diagnosed() {
+        // No `state.json` symlink means no base image, so there is no second CA
+        // to disagree with. Reporting one here would be inventing a comparison.
+        let root = scratch("standalone");
+        seed_ca(&root, b"k", b"c");
+        assert!(base_image_dir(&root).is_none());
+        assert!(inherited_ca_mismatch(&root).is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_proxy_banner_is_followed_by_the_mismatch_diagnosis() {
+        // `start_resolved` binds a listener and needs a resolved rule set, so no
+        // unit test can call it — and deleting its call to `inherited_ca_mismatch`
+        // left all 877 tests green. An assertion about an outcome structurally
+        // cannot see a path that is no longer taken, so this reads the source.
+        //
+        // The needle is assembled from parts: a literal written out here would
+        // match this assertion's own text and could never detect its removal
+        // from the place that matters.
+        let src = include_str!("cli.rs");
+        let needle = format!("if let Some(why) = {}(workspace)", "inherited_ca_mismatch");
+        assert!(
+            src.contains(&needle),
+            "start_resolved must print the #315 mismatch right after the injection \
+             banner; the banner claims injection is active and names a CA, which is \
+             exactly the sentence #315 made true and useless"
+        );
+    }
 }
