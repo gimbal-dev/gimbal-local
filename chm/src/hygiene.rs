@@ -881,4 +881,78 @@ mod tests {
              same implementation reached by a second name"
         );
     }
+
+    /// `docs/credential-proxy.md` teaches the commands that exist, not
+    /// workarounds for bugs that are fixed.
+    ///
+    /// The page's "doing it from the CLI alone" section spent three releases
+    /// telling a reader to hand-roll a base64 chunk loop because `chm cp` did
+    /// not exist (#316), and to distrust `chm proxy check` because it ignored
+    /// `--workspace` (#317). Both shipped; the advice did not move (#377).
+    ///
+    /// The absence half is the load-bearing half, and for the same reason
+    /// `the_first_resume_guide_says_what_was_measured` gives above: a
+    /// superseded procedure reads perfectly well on its own, so nothing about
+    /// the paragraph itself invites a reader to delete it. The way it comes
+    /// back is by someone restoring a section that looks fine.
+    ///
+    /// Telling a user to distrust `chm proxy check` is the sharpest of the
+    /// three: it is the command reached for as *evidence*, so the advice does
+    /// not merely waste time, it withdraws the tool's own answer.
+    ///
+    /// `flattened` is load-bearing, not tidiness: prose wraps, so a reinstated
+    /// claim arrives split across a newline and sails past a raw `contains`.
+    /// Mutation-proved by re-adding the distrust sentence with a line break in
+    /// the middle of the needle.
+    #[test]
+    fn the_credential_proxy_guide_names_the_commands_that_exist() {
+        let doc = flattened(include_str!("../../docs/credential-proxy.md"));
+
+        // The sequence a reader will paste, in the form it was measured.
+        for (needle, why) in [
+            (
+                "chm cp ./ca-install.sh /tmp/ca.sh",
+                "the transfer step must be `chm cp` (#316), which verifies by \
+                 SHA-256 on both sides, not a hand-rolled chunk loop",
+            ),
+            (
+                "chm proxy check --workspace ./ws",
+                "the page must show how to confirm injection, now that \
+                 `--workspace` is honoured (#317)",
+            ),
+        ] {
+            assert!(
+                doc.contains(needle),
+                "docs/credential-proxy.md no longer shows `{needle}`, so it has \
+                 stopped teaching the working path: {why}"
+            );
+        }
+
+        // The superseded advice, which must not return. Each needle is unique
+        // to the workaround itself, never to the note explaining that the bug
+        // behind it was fixed -- a needle matching both cannot detect the one
+        // that matters (the #290 doc-guard lesson).
+        for (needle, why) in [
+            (
+                "fold -w 1200",
+                "the manual base64 chunking recipe is superseded by `chm cp`",
+            ),
+            (
+                "/tmp/ca.b64",
+                "the chunk-append scratch file belongs to the recipe `chm cp` \
+                 replaced",
+            ),
+            (
+                "until it is fixed, do not trust it",
+                "`chm proxy check --workspace` works (#317); telling a reader \
+                 to distrust it withdraws the evidence the page exists to give",
+            ),
+        ] {
+            assert!(
+                !doc.to_lowercase().contains(needle),
+                "docs/credential-proxy.md has reinstated superseded advice \
+                 (`{needle}`): {why}"
+            );
+        }
+    }
 }
