@@ -49,8 +49,8 @@ const CA_VALIDITY_SECS: i64 = 2 * 365 * 24 * 60 * 60;
 /// behind the host does not reject a freshly minted certificate.
 const BACKDATE_SECS: i64 = 3600;
 
-const CA_KEY_FILE: &str = "proxy-ca.key";
-const CA_CERT_FILE: &str = "proxy-ca.crt";
+pub(crate) const CA_KEY_FILE: &str = "proxy-ca.key";
+pub(crate) const CA_CERT_FILE: &str = "proxy-ca.crt";
 
 /// A minted server certificate and the private key that goes with it.
 #[derive(Clone)]

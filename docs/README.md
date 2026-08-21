@@ -26,6 +26,7 @@ evidence, not as polished product copy.
 | --- | --- |
 | Install and understand the project | [`../README.md`](../README.md) |
 | Run a coding agent in a disposable local VM | [`running-agents.md`](running-agents.md) |
+| Give an agent a browser and nothing else | [`browser-sandbox.md`](browser-sandbox.md) |
 | Build a sandbox from an OCI/Docker image | [`container-images.md`](container-images.md) |
 | Resume a Cloud Hypervisor snapshot on a Mac | [`hvf-compatible-snapshots.md`](hvf-compatible-snapshots.md) |
 | Understand the current measured state | [`project-state.md`](project-state.md) |
@@ -37,6 +38,7 @@ These are written for people trying to use or evaluate Gimbal Local.
 | Doc | What it covers |
 | --- | --- |
 | [`running-agents.md`](running-agents.md) | Interactive `chm serve` / `chm ctl console`, headless `chm exec`, and the measured cold-boot and rehydrated-agent acceptance paths. |
+| [`browser-sandbox.md`](browser-sandbox.md) | `chm image build --browser`: a guest that is a browser and nothing else, reached over CDP through `--expose`, and the four-check acceptance gate behind that claim. |
 | [`container-images.md`](container-images.md) | `chm image build`: kernels, modules, initramfs vs `--disk`, networking, libc, and the measured Copilot CLI path. |
 | [`hvf-compatible-snapshots.md`](hvf-compatible-snapshots.md) | The snapshot contract: vanilla upstream ITS/LPI captures are preferred; legacy GICv2M captures still work. |
 | [`first-resume.md`](first-resume.md) | What to check on the first resume of a real cloud capture: filesystem growth, DNS, package state, and JIT exposure. |

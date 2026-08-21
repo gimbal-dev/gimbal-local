@@ -31,6 +31,7 @@ use crate::capability;
 use crate::control_plane;
 use crate::credproxy;
 use crate::firewall;
+use crate::guestcp;
 use crate::limits;
 use crate::serve;
 use crate::spec;
@@ -1440,6 +1441,7 @@ pub fn main() -> ExitCode {
         Some("serve") => serve::serve_main(&raw[1..]),
         Some("ctl") => serve::ctl_main(&raw[1..]),
         Some("exec") => serve::exec_main(&raw[1..]),
+        Some("cp") => guestcp::cp_main(&raw[1..]),
         Some("ps") => runs::ps_main(&raw[1..]),
         Some("kernel") => kernelimage::kernel_main(&raw[1..]),
         Some("spec") => spec::spec_main(&raw[1..]),
@@ -1553,6 +1555,7 @@ fn usage() -> String {
          chm resume <SNAPSHOT_DIR> [OPTIONS]   (restore a saved checkpoint)\n    \
          chm connect <SNAPSHOT_DIR> [OPTIONS]  (interactive session)\n    \
          chm exec [OPTIONS] -- <CMD> [ARG...]  (run a command in the guest)\n    \
+         chm cp <HOST_FILE> <GUEST_PATH>       (put a file into the guest)\n    \
          chm ps [--json]                       (what is running right now)\n    \
          chm spec <COMMAND> [OPTIONS]          (describe a sandbox in a file)\n\
      \n\
@@ -1664,7 +1667,15 @@ fn usage() -> String {
          explicitly (`chm exec -- bash -lc '...'`) when you want one.\n      \
          124 means the guest did not answer in time and 125 means\n      \
          chm could not run it at all, so a transport failure is\n      \
-         never reported as success.\n\
+         never reported as success.\n    \
+         chm cp [--timeout N] <HOST_FILE> <GUEST_PATH>\n      \
+         Copy a file into the running guest over the same console\n      \
+         channel, in chunks small enough to survive a tty, and\n      \
+         verify it by comparing a SHA-256 taken here against one\n      \
+         the guest reports. This is how a script too long for\n      \
+         `chm exec` gets in. An unverifiable copy is a failure,\n      \
+         never a success: the guest needs `base64` and\n      \
+         `sha256sum`.\n\
      \n\
      NOTE: the binary must be code-signed with the\n      \
      `com.apple.security.hypervisor` entitlement (see scripts/build-chm.sh).\n"
@@ -3384,6 +3395,10 @@ pub(crate) fn run_usgic_engine(
         router: spi_router,
     });
     let serial_wake: Option<Arc<dyn Fn() + Send + Sync>> = Some(wake0);
+    // Resolved once from the capture rather than three times from a constant:
+    // three independent reads is three chances for the stdin pump, the reassert
+    // thread and the daemon's console input to aim at different interrupts.
+    let serial_spi = console::serial_spi_for(&loaded.state_json);
     // Terminal ownership is the CLI's alone. The daemon must not put the
     // service manager's stdin into raw mode, install console signal handlers,
     // or race a stdin pump for bytes it does not own.
@@ -3395,7 +3410,7 @@ pub(crate) fn run_usgic_engine(
             serial_sink.clone(),
             raw.handle(),
             serial_wake.clone(),
-            console::serial_spi(),
+            serial_spi,
         );
         raw
     });
@@ -3407,12 +3422,12 @@ pub(crate) fn run_usgic_engine(
         serial_sink.clone(),
         serial_wake.clone(),
         running.clone(),
-        console::serial_spi(),
+        serial_spi,
     );
     // Also available to a non-interactive supervisor (the daemon), so a console
     // consumer can type into the guest without owning this process's stdin.
     let console_input =
-        console::console_input(uart.clone(), serial_sink, serial_wake, console::serial_spi());
+        console::console_input(uart.clone(), serial_sink, serial_wake, serial_spi);
     if !cfg.quiet {
         eprintln!(
             "chm: interactive console active — close this window or press Ctrl-A x \
@@ -4085,7 +4100,7 @@ pub(crate) fn apply_psci_cpu_on_state(
 
 /// One vCPU's userspace-GIC suspend capture: its register file plus its
 /// software distributor/redistributor models, or why the capture failed.
-type UsgicCapture =
+pub(crate) type UsgicCapture =
     Result<(hvf_checkpoint::VcpuCheckpoint, hvf_checkpoint::UsgicCheckpoint), String>;
 
 /// Gather the per-vCPU userspace-GIC captures (in id order) into a
@@ -4096,7 +4111,7 @@ type UsgicCapture =
 /// GICv3 model lives in userspace and each vCPU already serialized its view of
 /// it. Called at suspend, after every vCPU thread has sent its capture and
 /// joined, while the VM (and so guest RAM) is still alive.
-fn collect_usgic_checkpoint(
+pub(crate) fn collect_usgic_checkpoint(
     captured_rx: &mpsc::Receiver<(usize, UsgicCapture)>,
     num_irq: u32,
     n: usize,
@@ -4628,11 +4643,11 @@ mod tests {
         }
 
         // The real Graviton2 value: EL0 field 2 == AArch64 *and* AArch32.
-        assert!(aarch32_guard(&snap_with(0x1100_0000_1111_1112)).is_ok());
+        aarch32_guard(&snap_with(0x1100_0000_1111_1112)).unwrap();
         // EL0 field 1 == AArch64 only: nothing to warn about.
-        assert!(aarch32_guard(&snap_with(0x1100_0000_1111_1111)).is_ok());
+        aarch32_guard(&snap_with(0x1100_0000_1111_1111)).unwrap();
         // A capture with no ID_AA64PFR0_EL1 at all cannot be judged.
-        assert!(aarch32_guard(&snap_with_no_sysregs()).is_ok());
+        aarch32_guard(&snap_with_no_sysregs()).unwrap();
     }
 
     /// The real values, from `chm sysregs` against a Graviton2 capture: the
@@ -4664,11 +4679,11 @@ mod tests {
         }
 
         // Graviton2: DIC = 1, so the kernel patched `ic ivau` out. Warns.
-        assert!(icache_dic_guard(&snap_with_ctr(0xb444_c004)).is_ok());
+        icache_dic_guard(&snap_with_ctr(0xb444_c004)).unwrap();
         // A capture from DIC = 0 hardware keeps its maintenance. Silent.
-        assert!(icache_dic_guard(&snap_with_ctr(0x9444_c004)).is_ok());
+        icache_dic_guard(&snap_with_ctr(0x9444_c004)).unwrap();
         // No CTR_EL0 recorded at all: nothing to judge, so do not guess.
-        assert!(icache_dic_guard(&snap_with_no_sysregs()).is_ok());
+        icache_dic_guard(&snap_with_no_sysregs()).unwrap();
     }
 
     /// The ASID width is the one CPU-feature delta that corrupts memory rather
@@ -4925,8 +4940,8 @@ mod tests {
         let host = hvf_guest_cntfrq().unwrap();
         let matching =
             format!(r#"{{"snapshot_data":{{"state":"{{\"clock\":{{\"cntfrq\":{host}}}}}"}}}}"#);
-        assert!(cntfrq_guard(&matching).is_ok());
-        assert!(cntfrq_guard(r#"{"snapshot_data":{"state":"{}"}}"#).is_ok());
+        cntfrq_guard(&matching).unwrap();
+        cntfrq_guard(r#"{"snapshot_data":{"state":"{}"}}"#).unwrap();
     }
 
     /// The Graviton2 case, which is the one that actually happened: warn by

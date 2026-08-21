@@ -365,7 +365,7 @@ mod tests {
             allow: vec!["github.com".to_string(), "api.github.com:443".to_string()],
             ..Default::default()
         };
-        assert!(doc.validate().is_ok());
+        doc.validate().unwrap();
     }
 
     #[test]

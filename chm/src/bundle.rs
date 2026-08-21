@@ -1435,7 +1435,7 @@ mod tests {
         assert!(safe_relative("/etc/passwd").is_err());
         assert!(safe_relative("overlays/../../x").is_err());
         assert!(safe_relative("").is_err());
-        assert!(safe_relative("overlays/disk0.cow").is_ok());
+        safe_relative("overlays/disk0.cow").unwrap();
     }
 
     #[test]

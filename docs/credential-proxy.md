@@ -134,44 +134,51 @@ Two things the trust-store check has to be, learned by getting both wrong:
 
 ### Doing it from the CLI alone, without the app
 
-The app's *Install CA in guest* button does all of the above for you. Doing it
-by hand hits three walls that are not obvious, all of them measured while
-closing [#286](https://github.com/gimbal-dev/gimbal-local/issues/286):
-
-**1. A workspace does not inherit the image's CA.** `chm workspace IMAGE WS`
-symlinks `state.json`, `snapshot/` and `disks/`, but **mints a fresh proxy CA**.
-A guest that already trusted the image's CA will not trust the workspace's, and
-the failure surfaces as a bare `curl` error naming nothing. Install the CA the
-*workspace* is serving, not one you installed earlier
-([#315](https://github.com/gimbal-dev/gimbal-local/issues/315)).
-
-**2. The install script is bigger than `chm exec` can carry, and there is no
-`chm cp`.** Framed input tops out at **4000 bytes**
-([#316](https://github.com/gimbal-dev/gimbal-local/issues/316)). Get the file in
-by appending base64 in chunks, then verify it arrived intact — do not skip the
-hash, because a dropped chunk becomes an unexplained TLS error much later:
+The app's *Install CA in guest* button does all of the above for you. By hand it
+is three commands against a running sandbox:
 
 ```sh
-# host: split the script into ~1200-char base64 chunks
-base64 -i ca-install.sh | fold -w 1200 > /tmp/chunks
+# 1. emit the installer for the CA this workspace is actually serving
+chm proxy ca ./ws --for-guest > ca-install.sh
 
-# guest: start clean, then append each chunk
-chm exec -- bash -lc 'rm -f /tmp/ca.b64'
-while read -r c; do
-  chm exec -- bash -lc "printf %s '$c' >> /tmp/ca.b64"
-done < /tmp/chunks
+# 2. copy it in — chm cp verifies by SHA-256 on both sides itself
+chm cp ./ca-install.sh /tmp/ca.sh
 
-chm exec -- bash -lc 'base64 -d /tmp/ca.b64 > /tmp/ca-install.sh && md5sum /tmp/ca-install.sh'
-md5 -q ca-install.sh   # host side: these two must match
+# 3. run it
+chm exec -- sh /tmp/ca.sh
 ```
 
-**3. `chm proxy check --workspace WS` silently ignores `--workspace`** and
-answers `no-rule` for a workspace that has a perfectly good rule
-([#317](https://github.com/gimbal-dev/gimbal-local/issues/317)). That is worse
-than a missing feature, because it is the command you would reach for as
-*evidence*. Until it is fixed, do not trust it — prove injection the way
-[§7](#proving-it-works-before-trusting-it-with-anything) describes, with a
-control.
+Then confirm, rather than assuming:
+
+```sh
+chm proxy check --workspace ./ws --host api.github.com
+#   disposition: INJECT Authorization (github)
+```
+
+Three things that used to make this hard are worth naming, because earlier
+revisions of this page taught workarounds for them and you may have followed
+one:
+
+- **A workspace used to mint its own CA**, so a guest that trusted the image
+  did not trust the workspace built from it. It now **inherits** the image's CA
+  ([#315](https://github.com/gimbal-dev/gimbal-local/issues/315)), so there is
+  no second certificate to chase.
+- **The installer is larger than `chm exec` can carry** — framed input tops out
+  at 4000 bytes — which is why step 2 is `chm cp` and not an `exec`
+  ([#316](https://github.com/gimbal-dev/gimbal-local/issues/316)). `chm cp`
+  compares a SHA-256 taken here against one the guest reports, so a dropped
+  chunk is named at the moment it happens rather than surfacing later as an
+  unexplained TLS error.
+- **`chm proxy check --workspace` used to ignore its own flag** and answer
+  `no-rule` for a workspace with a perfectly good rule
+  ([#317](https://github.com/gimbal-dev/gimbal-local/issues/317)). It is
+  trustworthy again — but §7's control-based proof is still the stronger
+  evidence, because it observes an actual request rather than a decision.
+
+`--for-guest` also seeds a worthless placeholder credential for any client that
+checks for a local token *before* making the request the proxy would have fixed
+([#318](https://github.com/gimbal-dev/gimbal-local/issues/318)); see
+[§6](#the-honest-limitations).
 
 
 

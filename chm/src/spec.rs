@@ -1855,7 +1855,7 @@ mod tests {
         let err = SandboxSpec::parse(r#"{"specVersion": 99}"#, Path::new("x")).unwrap_err();
         assert!(err.contains("newer chm"), "{err}");
         // Older is read: compatibility with what is on disk is the point.
-        assert!(SandboxSpec::parse(r#"{"specVersion": 0}"#, Path::new("x")).is_ok());
+        SandboxSpec::parse(r#"{"specVersion": 0}"#, Path::new("x")).unwrap();
     }
 
     /// The central rule of this module: a spec section we have not built is

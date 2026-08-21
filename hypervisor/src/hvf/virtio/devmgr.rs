@@ -201,6 +201,26 @@ pub struct SerialRegs {
     pub ifls: u32,
 }
 
+impl SerialRegs {
+    /// Whether the guest reads its console through the receive interrupt.
+    ///
+    /// A capture of a machine whose console is interrupt-driven must carry
+    /// `imsc`, or the restored guest never learns that a keystroke arrived.
+    /// `false` is not automatically wrong -- a guest that polls `UARTFR` reads
+    /// input either way -- but on a Linux guest with a getty it means the
+    /// console will be deaf, which is worth saying out loud at the moment of
+    /// capture rather than discovering at restore.
+    ///
+    /// The masks come from the device model itself rather than being restated
+    /// here, so this predicate and the model's own
+    /// [`crate::hvf::devices::Pl011::rx_irq_pending`] cannot disagree about
+    /// which bits mean "interrupt-driven".
+    pub fn receives_by_interrupt(&self) -> bool {
+        use crate::hvf::devices::{INT_RT, INT_RX};
+        (self.imsc & (INT_RX | INT_RT)) != 0
+    }
+}
+
 /// Parse the `__serial` device node's captured PL011 register state, if present.
 ///
 /// cloud-hypervisor serializes the UART under
@@ -220,6 +240,37 @@ pub fn parse_serial_state(state_json: &str) -> Option<SerialRegs> {
         fbrd: u32_at("fbrd").unwrap_or(0),
         ifls: u32_at("ifl").unwrap_or(0),
     })
+}
+
+/// The interrupt line the captured serial console asserts, if the capture
+/// records one.
+///
+/// A restoring VMM has to aim a host keystroke at *some* INTID, and the number
+/// depends entirely on the device/IRQ allocation order of the VMM that captured
+/// the machine. cloud-hypervisor re-derives it on restore by rebuilding its
+/// device manager from the same configuration, so it has never needed to write
+/// the number down and a capture from it carries an empty `resources` list on
+/// `__serial`. We do not rebuild from a configuration -- there is none for a
+/// guest whose device tree we wrote ourselves -- so a capture chm originates
+/// records the line here instead. `Resource::LegacyIrq` is cloud-hypervisor's
+/// own vocabulary for exactly this (`vm-device/src/lib.rs`), so the node stays
+/// a shape upstream can deserialize rather than one only we understand.
+///
+/// `None` means "this capture does not say", which is the honest answer for
+/// every capture written before this existed; the caller keeps its own default.
+pub fn parse_serial_intid(state_json: &str) -> Option<u32> {
+    let root: Value = serde_json::from_str(state_json).ok()?;
+    let tree = root
+        .pointer("/snapshots/device-manager/snapshot_data/state")
+        .and_then(Value::as_str)
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())?;
+    let resources = tree
+        .pointer("/device_tree/__serial/resources")?
+        .as_array()?;
+    resources
+        .iter()
+        .find_map(|r| r.get("LegacyIrq").and_then(Value::as_u64))
+        .map(|v| v as u32)
 }
 
 /// Parse the device-manager `device_tree` into a map of transport id -> ITS

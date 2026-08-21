@@ -126,7 +126,12 @@ fn full_chain(e: &dyn std::error::Error) -> String {
 
 /// One guest-RAM region: where it maps in guest-physical space and where its
 /// bytes live inside the `memory-ranges` file.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` because a layout that is written into a capture and read back
+/// out of it must be comparable as one value: a mistake in these four numbers
+/// is invisible (the capture parses, resumes, and has the guest's memory in the
+/// wrong place), so the only useful test is equality against the input.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MemMapping {
     /// Hypervisor memory-slot index.
     pub slot: u32,

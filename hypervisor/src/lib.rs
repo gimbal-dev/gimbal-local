@@ -30,20 +30,12 @@
 //                                The redundant term is how the register's field
 //                                layout is made legible; folding it away hides
 //                                which bits the test is placing.
-//   assertions_on_result_states  `assert!(x.is_ok())`, as in chm.
 //   assertions_on_constants      `assert!(CONST > CONST, "why")`, which still
 //                                panics when either constant moves.
 //
-// Shipped code keeps all three denials: `--all-targets` builds the non-test
+// Shipped code keeps both denials: `--all-targets` builds the non-test
 // library target as well, where cfg(test) is off.
-#![cfg_attr(
-    test,
-    allow(
-        clippy::identity_op,
-        clippy::assertions_on_result_states,
-        clippy::assertions_on_constants
-    )
-)]
+#![cfg_attr(test, allow(clippy::identity_op, clippy::assertions_on_constants))]
 
 /// Architecture specific definitions
 #[macro_use]
