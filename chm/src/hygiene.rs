@@ -782,4 +782,103 @@ mod tests {
         }
         out
     }
+
+    /// The base64 alphabet may be written down exactly once.
+    ///
+    /// #375: this crate carried two encoders — `credproxy::base64::encode` and a
+    /// private `base64_encode` in `credproxy/cli.rs` — that were the same
+    /// algorithm line for line. They agreed. Nothing made them keep agreeing,
+    /// and nothing would have reported it if they stopped: the tests for each
+    /// copy say nothing about the other.
+    ///
+    /// The asymmetry is what makes this a lint rather than tidiness. One copy
+    /// builds HTTP Basic headers on the credential-injection path, so it
+    /// encodes secrets; the other builds the console transfer that installs the
+    /// proxy CA into a guest. A divergence in either is security-relevant.
+    ///
+    /// Guarding the *alphabet* rather than the function name is deliberate: a
+    /// third encoder will not be called `base64_encode`, but it cannot avoid
+    /// writing the alphabet down.
+    #[test]
+    fn the_base64_alphabet_is_written_down_exactly_once() {
+        // Assembled at runtime so this guard is not satisfied by its own source
+        // (#241): a literal here would itself be a second occurrence.
+        let upper: String = (b'A'..=b'Z').map(char::from).collect();
+        let lower: String = (b'a'..=b'z').map(char::from).collect();
+        let digits: String = (b'0'..=b'9').map(char::from).collect();
+        let alphabet = format!("{upper}{lower}{digits}+/");
+
+        let carriers: Vec<String> = sources()
+            .into_iter()
+            .filter(|p| {
+                fs::read_to_string(p)
+                    .expect("read source")
+                    .contains(&alphabet)
+            })
+            .map(|p| p.display().to_string())
+            .collect();
+
+        assert_eq!(
+            carriers.len(),
+            1,
+            "the base64 alphabet must appear in exactly one file, found it in {carriers:?}; \
+             call credproxy::base64::encode instead of writing another encoder"
+        );
+        assert!(
+            carriers[0].ends_with("credproxy/base64.rs"),
+            "the one base64 alphabet should live in credproxy/base64.rs, found it in {}",
+            carriers[0]
+        );
+    }
+
+    /// `state_cdn` keeps its own decoder on purpose, and that is load-bearing.
+    ///
+    /// `cli.rs`'s transfer test encodes with `credproxy::base64::encode` and
+    /// decodes with `state_cdn::base64_decode`, because an encoder checked
+    /// against its own inverse proves nothing — the two would have to agree even
+    /// if both were wrong. The guest then uses a third implementation
+    /// (`base64 -d`), which is the one that actually has to match.
+    ///
+    /// This guard exists because consolidating those two decoders makes the
+    /// suite **greener and weaker with no failure**: the reassembly test would
+    /// still pass, having quietly become a check of one module against itself.
+    /// A reviewer tidying `state_cdn` would see a duplicate and be right about
+    /// the code and wrong about the consequence, so the reason has to be
+    /// enforced rather than written in a comment in a different file.
+    #[test]
+    fn the_transfer_test_decodes_with_an_independent_implementation() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let cdn = fs::read_to_string(src.join("state_cdn.rs")).expect("read state_cdn.rs");
+        let cli = fs::read_to_string(src.join("credproxy/cli.rs")).expect("read cli.rs");
+
+        // Assembled from parts so neither needle matches this guard's own text.
+        let owns_decoder = format!("fn {}_decode(", "base64");
+        assert!(
+            cdn.contains(&owns_decoder),
+            "state_cdn must keep its own base64 decoder: it is the independent \
+             oracle the transfer reassembly test checks the encoder against"
+        );
+
+        let cross_module = format!("crate::state_cdn::{}_decode(", "base64");
+        assert!(
+            cli.contains(&cross_module),
+            "the transfer reassembly test must decode with state_cdn's decoder, \
+             not with credproxy::base64::decode, or it checks the encoder \
+             against its own inverse and proves nothing"
+        );
+
+        // Surviving by name is not enough. The tidy-up most likely to be
+        // attempted is to keep the signature and have the body delegate, which
+        // leaves both assertions above green while deleting the very thing they
+        // are protecting.
+        let start = cdn.find(&owns_decoder).expect("decoder located above");
+        let body = &cdn[start..];
+        let end = body.find("\n}\n").expect("decoder has a closing brace");
+        assert!(
+            !body[..end].contains("credproxy"),
+            "state_cdn's base64 decoder must not delegate to credproxy: a \
+             decoder that forwards is not an independent oracle, it is the \
+             same implementation reached by a second name"
+        );
+    }
 }

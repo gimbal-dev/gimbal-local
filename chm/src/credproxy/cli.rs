@@ -847,7 +847,7 @@ pub(crate) fn guest_install_transfer(script: &str) -> Vec<String> {
     // Short enough that a whole line is well inside any plausible terminal
     // input limit, long enough that a ~1.6 KB payload is ~10 lines.
     const CHUNK: usize = 160;
-    let b64 = base64_encode(script.as_bytes());
+    let b64 = super::base64::encode(script.as_bytes());
     let digest: String = digest(&SHA256, b64.as_bytes())
         .as_ref()
         .iter()
@@ -869,31 +869,6 @@ pub(crate) fn guest_install_transfer(script: &str) -> Vec<String> {
          else echo \"TRANSFER CORRUPT: the console dropped characters (got $CS)\"; fi"
     ));
     lines
-}
-
-/// Standard base64, because the guest decodes it with `base64 -d`.
-fn base64_encode(bytes: &[u8]) -> String {
-    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for group in bytes.chunks(3) {
-        let b0 = u32::from(group[0]);
-        let b1 = group.get(1).map_or(0, |b| u32::from(*b));
-        let b2 = group.get(2).map_or(0, |b| u32::from(*b));
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(char::from(A[((n >> 18) & 63) as usize]));
-        out.push(char::from(A[((n >> 12) & 63) as usize]));
-        out.push(if group.len() > 1 {
-            char::from(A[((n >> 6) & 63) as usize])
-        } else {
-            '='
-        });
-        out.push(if group.len() > 2 {
-            char::from(A[(n & 63) as usize])
-        } else {
-            '='
-        });
-    }
-    out
 }
 
 /// Everything `chm proxy check` decides before it opens a socket.
