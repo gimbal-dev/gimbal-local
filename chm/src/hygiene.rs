@@ -1106,6 +1106,35 @@ mod tests {
                 "docs/release-facts.md no longer carries `{needle}`: {why}"
             );
         }
+
+        // The page tells a releaser how much lead time the warning gives them,
+        // and the script is where that number really lives. Read it out rather
+        // than restating it, so the two cannot drift into disagreeing about a
+        // renewal deadline.
+        let warning_days: String = script
+            .split_once("signing_expiry_warning_days=")
+            .expect(
+                "scripts/release-macos.sh no longer defines \
+                 `signing_expiry_warning_days`, so the certificate-expiry \
+                 preflight that docs/release-facts.md describes has gone",
+            )
+            .1
+            .chars()
+            .take_while(char::is_ascii_digit)
+            .collect();
+        assert!(
+            !warning_days.is_empty(),
+            "`signing_expiry_warning_days` in scripts/release-macos.sh is no \
+             longer a plain number of days, so docs/release-facts.md cannot be \
+             held to it"
+        );
+        assert!(
+            doc.contains(&format!("**{warning_days}** days")),
+            "docs/release-facts.md does not say the release preflight warns \
+             `**{warning_days}** days` ahead, which is the window the script \
+             actually applies -- a reader would plan the renewal against the \
+             wrong lead time"
+        );
     }
 
     /// #376: two statements welded onto one line by a bad edit.

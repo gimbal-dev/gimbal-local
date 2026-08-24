@@ -46,6 +46,7 @@ cd "$repo_root"
 
 step() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 die() { printf '\n\033[1;31mrelease-macos.sh: %s\033[0m\n' "$1" >&2; exit 1; }
+warn() { printf '\n\033[1;33mrelease-macos.sh: %s\033[0m\n' "$1" >&2; }
 usage() {
     echo "usage: release-macos.sh [--version X.Y.Z]"
     echo "       release-macos.sh --promote METADATA [--version X.Y.Z]"
@@ -254,6 +255,130 @@ if [[ "$mode" == "promote" && "$meta_identity" != "$identity" ]]; then
     die "release metadata names a different signing identity:
       expected: $identity
       metadata: $meta_identity"
+fi
+
+# Print one "<expired|expiring|valid> <notAfter>" line for every certificate in
+# the keychain whose common name is exactly $1, classified against a window of
+# $2 seconds. All of the date arithmetic is openssl's `-checkend`, so nothing
+# here has to parse "Feb  1 22:12:15 2027 GMT" -- the notAfter text is only ever
+# carried through to be shown to a human.
+signing_certificate_states() {
+    local cn_wanted="$1" window_secs="$2" dir cert cn state end
+    dir="$(mktemp -d)"
+    # `security find-certificate` applies no validity filter, and that is the
+    # whole point: an expired certificate is invisible to `find-identity -v`,
+    # and naming it is the case this exists for.
+    security find-certificate -a -c "$cn_wanted" -p 2>/dev/null \
+        | awk -v dir="$dir" \
+            '/BEGIN CERTIFICATE/ { n++ } n { print > sprintf("%s/%04d.pem", dir, n) }' \
+        || true
+    for cert in "$dir"/*.pem; do
+        [[ -e "$cert" ]] || break
+        # `-c` matches the needle as a *substring of the common name*, so this
+        # returns every certificate whose CN merely contains the identity.
+        # Measured: a keychain holding only
+        #     CN=Developer ID Application: Acme (AAAA111111) Staging (BBBB222222)
+        # answers a query for "Developer ID Application: Acme (AAAA111111)"
+        # with that certificate and its own 2029 notAfter -- a different team's
+        # deadline, and wrong in the reassuring direction. Not reachable for
+        # this project's identity, which is 64 characters and so already at
+        # X.509's commonName ceiling, but it costs one comparison to be right
+        # for a shorter one.
+        cn="$(openssl x509 -in "$cert" -noout -subject -nameopt multiline 2>/dev/null \
+            | sed -n 's/^ *commonName *= //p')" || true
+        [[ "$cn" == "$cn_wanted" ]] || continue
+        end="$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null \
+            | sed 's/^notAfter=//')" || true
+        if ! openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1; then
+            state="expired"
+        elif ! openssl x509 -in "$cert" -noout -checkend "$window_secs" >/dev/null 2>&1; then
+            state="expiring"
+        else
+            state="valid"
+        fi
+        printf '%s %s\n' "$state" "$end"
+    done
+    rm -rf "$dir"
+}
+
+# Runway before "expiring" stops being information and becomes a release that
+# cannot be cut. Apple usually issues a replacement Developer ID the same day,
+# but the account-level problems that block one -- a lapsed membership, an
+# unaccepted agreement -- are not same-day, and this certificate's validity is
+# only about six months (docs/release-facts.md), so a much shorter window would
+# spend nearly the whole of its life saying nothing.
+signing_expiry_warning_days=45
+
+if [[ "$mode" == "build" ]]; then
+    # A Developer ID certificate is a deadline, not a recall. codesign takes a
+    # secure timestamp from Apple by default, so everything already published
+    # stays signed, stapled and installable after this date passes; what stops
+    # is the *next* release, including a security fix, on a day nobody chose.
+    # The cost of learning about it late is therefore never a broken artifact --
+    # it is a renewal sitting on the critical path of whatever the release was
+    # for.
+    #
+    # Deliberately checked here and not in the test suite. A date-based
+    # assertion in the suite would fail on every contributor's machine over a
+    # private keychain fact none of them has, and this is the one place that
+    # actually needs the certificate to work.
+    #
+    # The position in this file is load-bearing, not incidental: the identity
+    # check below runs `find-identity -v`, which lists *valid* identities only,
+    # so an expired certificate makes it die with "no codesigning identity
+    # matches" -- true, and it names the symptom while hiding the cause. Run
+    # this first or the precise diagnosis is unreachable.
+    signing_cert_states="$(signing_certificate_states "$identity" \
+        "$((signing_expiry_warning_days * 86400))" || true)"
+
+    if [[ -z "$signing_cert_states" ]]; then
+        # No certificate in the keychain carries this common name at all, which
+        # is not an expiry question. The identity check below is the one that
+        # should speak, and it already lists what is actually installed.
+        :
+    elif ! grep -q '^valid ' <<<"$signing_cert_states"; then
+        signing_cert_dates="$(sed 's/^[a-z]* /      /' <<<"$signing_cert_states")"
+        if ! grep -q '^expiring ' <<<"$signing_cert_states"; then
+            die "the Developer ID certificate for this identity has expired:
+      $identity
+
+  Expired:
+$signing_cert_dates
+
+  Nothing already published is affected. codesign timestamps its signatures, so
+  every release on the download page stays signed, stapled and installable.
+  What has stopped is cutting a new one.
+
+  Request a replacement Developer ID Application certificate:
+      https://developer.apple.com/account/resources/certificates
+
+  Then true up the recorded dates, which chm's own hygiene suite pins so that a
+  renewal cannot land unrecorded:
+      docs/release-facts.md
+      chm/src/hygiene.rs"
+        fi
+        warn "the Developer ID certificate for this identity expires in under \
+$signing_expiry_warning_days days:
+      $identity
+
+  Expires:
+$signing_cert_dates
+
+  This is a deadline, not a recall: codesign timestamps its signatures, so every
+  release already published stays signed, stapled and installable past that
+  date. What stops is cutting a new one, including a security fix, so the
+  renewal is worth starting before it is on the critical path of one.
+
+  Request a replacement Developer ID Application certificate:
+      https://developer.apple.com/account/resources/certificates
+
+  Then true up the recorded dates, which chm's own hygiene suite pins so that a
+  renewal cannot land unrecorded:
+      docs/release-facts.md
+      chm/src/hygiene.rs
+
+  This build continues -- the certificate still signs today."
+    fi
 fi
 
 if [[ "$mode" == "build" ]] \

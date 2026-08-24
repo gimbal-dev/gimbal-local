@@ -31,7 +31,7 @@ repository would disclose something publishing does not already disclose. Find
 it locally with `xcrun notarytool history --keychain-profile gimbal-notary`,
 which fails without it.
 
-## The certificate expires 2027-02-01, and nothing watches it
+## The certificate expires 2027-02-01, and the release script says so first
 
 ```console
 $ security find-certificate -c "Developer ID Application" -p \
@@ -40,14 +40,23 @@ notBefore=Aug  6 12:18:54 2026 GMT
 notAfter=Feb  1 22:12:15 2027 GMT
 ```
 
-That is **161 days** of runway from the date this page was written. When it
-passes, `release-macos.sh` can no longer sign anything and there is no
-automated warning anywhere -- this paragraph is currently the only record.
+That is **161 days** of runway from the date this page was written, out of a
+total validity of about 179 -- the certificate is only issued for six months,
+which is short enough that a window measured in weeks would spend nearly all of
+its life silent.
 
-**Builds already published keep working**, and that is a measured property
-rather than an assumption. Signing uses a secure timestamp from Apple's
-timestamp authority, so Gatekeeper can still establish that the signature was
-made while the certificate was valid:
+`release-macos.sh` now reads that date out of the keychain in preflight and
+warns from **45** days out, then refuses once it has passed. It reads the live
+certificate rather than the number above, so this page can go stale without the
+warning going wrong. The window is deliberately generous: Apple usually issues a
+replacement the same day, but the account-level problems that block one -- a
+lapsed membership, an unaccepted agreement -- are not same-day, and a false
+alarm costs one yellow line where a miss costs a blocked release.
+
+The expiry is a **deadline, not a recall**. Builds already published keep
+working, and that is a measured property rather than an assumption: signing uses
+a secure timestamp from Apple's timestamp authority, so Gatekeeper can still
+establish that the signature was made while the certificate was valid.
 
 ```console
 $ codesign -dvvv /Applications/GimbalLocal.app
