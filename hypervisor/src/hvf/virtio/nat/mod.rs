@@ -1212,7 +1212,8 @@ mod tests {
     }
 
     #[test]
-    fn allowed_syn_arms_a_listener() {        let mut nat = NatResponder::new(
+    fn allowed_syn_arms_a_listener() {
+        let mut nat = NatResponder::new(
             [192, 168, 249, 1],
             [0x02, 0, 0, 0, 0, 1],
             EgressPolicy::allow_all(),

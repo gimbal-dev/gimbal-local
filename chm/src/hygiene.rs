@@ -1107,4 +1107,109 @@ mod tests {
             );
         }
     }
+
+    /// #376: two statements welded onto one line by a bad edit.
+    ///
+    /// An `edit` whose `old_str` ends in a newline and whose `new_str` does not
+    /// joins the two lines around it. The result compiles, `cargo build` is
+    /// silent, and clippy says nothing -- so it survives every gate this repo
+    /// runs and is only ever found by a human reading the file. Five had
+    /// accumulated across three crates before anyone noticed, one of them
+    /// welding a doc comment onto the item below it so the doc described the
+    /// wrong thing.
+    ///
+    /// rustfmt would also split these, but the repo has no fmt gate and a
+    /// measured whole-tree drift of ~54 files, so "run rustfmt" is not a
+    /// control that exists here. This is the narrow, zero-false-positive
+    /// subset: a statement keyword four or more spaces after an opening brace
+    /// is never deliberate formatting.
+    #[test]
+    fn no_source_line_welds_a_statement_onto_an_opening_brace() {
+        let root = repo_root();
+        let mut welded = Vec::new();
+        for dir in ["chm/src", "hypervisor/src", "arch/src"] {
+            let dir = root.join(dir);
+            if !dir.is_dir() {
+                continue;
+            }
+            for path in sources_under(&dir) {
+                let Ok(text) = fs::read_to_string(&path) else {
+                    continue;
+                };
+                for (n, line) in text.lines().enumerate() {
+                    if welds_a_statement(line) {
+                        welded.push(format!("{}:{}: {}", path.display(), n + 1, line.trim()));
+                    }
+                }
+            }
+        }
+        assert!(
+            welded.is_empty(),
+            "{} line(s) weld a statement onto an opening brace -- almost certainly a bad \
+             edit rather than intent, and it hides what the line actually does:\n{}",
+            welded.len(),
+            welded.join("\n")
+        );
+    }
+
+    /// `{` then four or more spaces then a statement keyword.
+    ///
+    /// Split out so the predicate is testable: the guard above can only ever
+    /// report that today's tree is clean, which is exactly the shape that
+    /// cannot tell a working check from a broken one.
+    fn welds_a_statement(line: &str) -> bool {
+        // A line comment ends the code, so anything after it is prose.
+        let code = line.split_once("//").map_or(line, |(before, _)| before);
+        let bytes = code.as_bytes();
+        let mut in_string = false;
+        let mut escaped = false;
+        for (i, &b) in bytes.iter().enumerate() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match b {
+                b'\\' if in_string => escaped = true,
+                b'"' => in_string = !in_string,
+                // A `{` inside a string literal is a format placeholder, not an
+                // opening brace -- the commonest false positive by far, and the
+                // reason this walks the line instead of splitting on the first
+                // brace. Splitting naively also *missed* the real weld that
+                // motivated this guard, because it carried `Some("audit")`
+                // ahead of its brace.
+                b'{' if !in_string => {
+                    let rest = &code[i + 1..];
+                    let trimmed = rest.trim_start();
+                    let gap = rest.len() - trimmed.len();
+                    if gap >= 4
+                        && rest.starts_with(' ')
+                        && ["let ", "if ", "return ", "for ", "match ", "while "]
+                            .iter()
+                            .any(|kw| trimmed.starts_with(kw))
+                    {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
+    }
+
+    #[test]
+    fn the_weld_predicate_sees_a_weld_and_ignores_ordinary_code() {
+        assert!(welds_a_statement(
+            "    pub fn new(n: u32) -> Self {        let x = 1;"
+        ));
+        assert!(welds_a_statement(
+            "    if a == Some(\"audit\") {        let tail = rest"
+        ));
+        // Ordinary formatting: the statement is on its own line.
+        assert!(!welds_a_statement("    fn new() -> Self {"));
+        assert!(!welds_a_statement("        let x = 1;"));
+        // A brace inside a string is not an opening brace.
+        assert!(!welds_a_statement(r#"    println!("{}        let x", v);"#));
+        // Two spaces is alignment, not a weld.
+        assert!(!welds_a_statement("    fn f() {  let x = 1;"));
+    }
 }

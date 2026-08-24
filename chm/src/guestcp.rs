@@ -151,40 +151,8 @@ fn cp_client(raw: &[String]) -> Result<(), String> {
     let plan = parse_cp_args(&rest)?;
 
     let bytes = fs::read(&plan.host).map_err(|e| format!("read {}: {e}", plan.host.display()))?;
-    let want = sha256_hex(&bytes);
+    let want = transfer(&socket, &bytes, &plan.guest, plan.timeout)?;
 
-    let staging = staging_path();
-    let steps = transfer_steps(&bytes, &staging, &plan.guest)?;
-
-    let n = steps.len();
-    for (i, step) in steps.into_iter().enumerate() {
-        let timeout = if i + 1 == n {
-            plan.timeout
-        } else {
-            CHUNK_TIMEOUT
-        };
-        run(&socket, timeout, &step, i + 1, n)?;
-    }
-
-    // Read the digest back and decide here. Asking the guest whether its own
-    // copy matches would let the thing under test answer the question.
-    let out = run(
-        &socket,
-        plan.timeout,
-        &sh(&format!("sha256sum {}", exec::shell_quote(&plan.guest))),
-        n,
-        n,
-    )
-    .map_err(|e| {
-        format!(
-            "{} bytes reached {} but nothing has checked them: {e}\n\
-             the guest needs `sha256sum` for this copy to be verifiable",
-            bytes.len(),
-            plan.guest
-        )
-    })?;
-
-    verify_digest(&out, &want, &plan.guest)?;
     eprintln!(
         "chm cp: {} -> {} ({} bytes, sha256 {want})",
         plan.host.display(),
@@ -192,6 +160,54 @@ fn cp_client(raw: &[String]) -> Result<(), String> {
         bytes.len()
     );
     Ok(())
+}
+
+/// Carry `bytes` into the guest at `guest`, and return the digest both sides
+/// agree on.
+///
+/// Factored out of [`cp_client`] rather than copied, because the proxy CA
+/// installer (#376) has exactly this problem and had been solving it a weaker
+/// way: typing the payload at the console and letting the *guest* compare the
+/// digest at the end. One implementation is what stops that drifting back to a
+/// check the thing under test answers for itself.
+///
+/// Every failure names the step it happened at, so a partial transfer is
+/// reported as a partial transfer rather than as a corrupt file.
+pub(crate) fn transfer(
+    socket: &Path,
+    bytes: &[u8],
+    guest: &str,
+    timeout: u64,
+) -> Result<String, String> {
+    let want = sha256_hex(bytes);
+    let staging = staging_path();
+    let steps = transfer_steps(bytes, &staging, guest)?;
+
+    let n = steps.len();
+    for (i, step) in steps.into_iter().enumerate() {
+        let step_timeout = if i + 1 == n { timeout } else { CHUNK_TIMEOUT };
+        run(socket, step_timeout, &step, i + 1, n)?;
+    }
+
+    // Read the digest back and decide here. Asking the guest whether its own
+    // copy matches would let the thing under test answer the question.
+    let out = run(
+        socket,
+        timeout,
+        &sh(&format!("sha256sum {}", exec::shell_quote(guest))),
+        n,
+        n,
+    )
+    .map_err(|e| {
+        format!(
+            "{} bytes reached {guest} but nothing has checked them: {e}\n\
+             the guest needs `sha256sum` for this copy to be verifiable",
+            bytes.len(),
+        )
+    })?;
+
+    verify_digest(&out, &want, guest)?;
+    Ok(want)
 }
 
 /// Run one framed step, turning a non-zero guest status into a named failure.
@@ -246,16 +262,11 @@ fn staging_path() -> String {
     format!("/tmp/.chm-cp-{}", exec::Nonce::mint().token())
 }
 
-/// Every framed step of one transfer, in order, except the final digest read.
-///
-/// Separated from the socket so the whole plan is testable: the properties that
-/// matter — a truncating first step, chunks that frame, a decode that removes
-/// its own staging file — are all decided here.
 /// Decide whether the guest's copy is the file we sent.
 ///
-/// Pure, and separated from [`cp_client`] deliberately. The comparison is the
+/// Pure, and separated from [`transfer`] deliberately. The comparison is the
 /// only thing standing between "the bytes moved" and "the right bytes moved",
-/// and `cp_client` needs a live daemon so no unit test can reach it — an
+/// and `transfer` needs a live daemon so no unit test can reach it — an
 /// unreachable decision is one that cannot be proved to fire. Taking the guest's
 /// raw `sha256sum` line rather than a pre-extracted field keeps the parsing here
 /// too, since a line we failed to understand must not read as a match.
@@ -275,6 +286,11 @@ pub(crate) fn verify_digest(reported: &str, want: &str, guest: &str) -> Result<(
     ))
 }
 
+/// Every framed step of one transfer, in order, except the final digest read.
+///
+/// Separated from the socket so the whole plan is testable: the properties that
+/// matter — a truncating first step, chunks that frame, a decode that removes
+/// its own staging file — are all decided here.
 pub(crate) fn transfer_steps(
     bytes: &[u8],
     staging: &str,
@@ -601,14 +617,30 @@ mod tests {
     /// because an assertion about an outcome structurally cannot see a path that
     /// is no longer taken — this repo has now paid for that eight times. The
     /// needle is assembled so it is not satisfied by its own appearance here.
+    ///
+    /// #376 added a second reporter: `chm proxy ca --install` carries its
+    /// payload through the same [`transfer`]. So the guard now has to hold two
+    /// things — that `transfer` compares, and that `cp_client` still goes
+    /// through `transfer` rather than growing its own copy of the sequence,
+    /// which is how the CA install came to have a weaker check in the first
+    /// place.
     #[test]
     fn the_transfer_cannot_report_success_without_comparing_the_digest() {
         let src = include_str!("guestcp.rs");
-        let call = format!("{}(&out, &want, &plan.guest)?", "verify_digest");
+        let call = format!("{}(&out, &want, guest)?", "verify_digest");
         assert!(
             src.contains(&call),
-            "cp_client no longer compares the digest, so it reports success for \
-             any bytes that arrive"
+            "transfer no longer compares the digest, so every caller reports \
+             success for any bytes that arrive"
+        );
+        let via = format!(
+            "{}(&socket, &bytes, &plan.guest, plan.timeout)?",
+            "transfer"
+        );
+        assert!(
+            src.contains(&via),
+            "cp_client no longer goes through transfer, so `chm cp` and the CA \
+             install can drift apart again"
         );
     }
 }

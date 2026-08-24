@@ -1249,7 +1249,8 @@ mod tests {
     }
 
     #[test]
-    fn lower_routes_core_vs_sysreg_blocks_correctly() {        let hvf = VcpuHvfState {
+    fn lower_routes_core_vs_sysreg_blocks_correctly() {
+        let hvf = VcpuHvfState {
             gpr: [7u64; 31],
             pc: 0xabc,
             cpsr: 0x3c5,
