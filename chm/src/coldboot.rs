@@ -388,16 +388,33 @@ pub const EPOCH_KEY: &str = "gimbal.epoch";
 /// exactly how this was measured on node:22-slim at 768 MiB.
 pub const CA_SENT_KEY: &str = "gimbal.ca";
 
-/// Whether a command line already carries an epoch key of its own.
+/// Whether a command line already assigns `key` itself.
 ///
 /// Word-wise rather than a substring search: `console=ttyAMA0` must not be
-/// mistaken for an epoch, and neither must a key that merely *ends* with our
-/// name. A caller who sets this deliberately keeps it — the point of the check
-/// is to leave a caller's own clock alone, not to guess at one.
-pub fn mentions_epoch(cmdline: &str) -> bool {
+/// mistaken for an epoch, and neither must a key that merely *ends* with the
+/// name being looked for. A caller who sets one of these deliberately keeps it
+/// — the point of every check built on this is to leave a caller's own choice
+/// alone, not to guess at one.
+fn mentions_key(cmdline: &str, key: &str) -> bool {
     cmdline
         .split_whitespace()
-        .any(|w| w.split('=').next() == Some(EPOCH_KEY))
+        .any(|w| w.split('=').next() == Some(key))
+}
+
+/// Whether a command line already carries an epoch key of its own.
+pub fn mentions_epoch(cmdline: &str) -> bool {
+    mentions_key(cmdline, EPOCH_KEY)
+}
+
+/// Whether a command line already names a root filesystem.
+///
+/// This is the question that decides whether [`implied_root_args`] has anything
+/// to add. It is deliberately *not* "did the caller pass `--cmdline`": naming a
+/// console is not choosing a root device, and a caller who passes a disk has
+/// said what they want mounted. See the call site in `create.rs` for why that
+/// distinction was worth a bug.
+pub fn mentions_root(cmdline: &str) -> bool {
+    mentions_key(cmdline, "root")
 }
 
 /// The clock argument for a guest booting now, or `None` if the host clock is
