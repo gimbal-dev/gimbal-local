@@ -1338,7 +1338,39 @@ pub(crate) struct WiredVirtio {
 /// anyway. A guest transmit wakes it immediately (see [`NetKick`]), so this only
 /// bounds how long host-side arrivals — which have no readiness signal we can
 /// wait on — can sit unnoticed on an otherwise silent link.
-const NET_SERVICE_INTERVAL: Duration = Duration::from_millis(2);
+pub(crate) const NET_SERVICE_INTERVAL: Duration = Duration::from_millis(2);
+
+/// One pass of the net service loop: advance every device's NAT, record every
+/// decision it made, and report whether a frame reached the guest.
+///
+/// Servicing and recording are deliberately one operation. The NAT buffers
+/// every egress decision until somebody takes them, so a caller that services
+/// without draining grows an unbounded `Vec` for the life of the guest -- and a
+/// deadline-free run is the shape both callers are normally used in. Keeping
+/// the two halves here means neither loop can do half of it.
+///
+/// It is shared rather than written twice because [`NetIo`] exists precisely so
+/// that one service loop can serve both transports; a cold-booted guest's
+/// virtio-mmio NIC and a resumed one's virtio-pci NIC owe the audit trail the
+/// same records. Two renderings of that drift, and the drift is invisible until
+/// a sandbox that was supposed to be recording reaches a host with an empty
+/// trail behind it.
+pub(crate) fn net_service_pass<'a>(
+    devices: impl IntoIterator<Item = &'a dyn NetIo>,
+    tally: &mut audit::EgressTally,
+    audit: &audit::AuditLog,
+) -> bool {
+    let mut delivered = false;
+    for dev in devices {
+        if dev.service_net() {
+            delivered = true;
+        }
+        // Draining is not optional: it is what bounds the NAT's event buffer
+        // over a long session, whether or not a workspace is recording.
+        audit::record_egress(dev.drain_egress_events(), tally, audit);
+    }
+    delivered
+}
 
 /// Spawn the net service thread: it advances each net device's userspace NAT
 /// (relaying host-socket bytes into the guest's RX queue) and nudges the vCPUs
@@ -1383,24 +1415,8 @@ fn spawn_net_service(
                 // not partway through publishing a frame into guest memory, and
                 // therefore the only safe place to hold it for a RAM dump.
                 quiesce.park_if_paused();
-                let mut delivered = false;
-                for dev in &net_devices {
-                    if dev.service_net() {
-                        delivered = true;
-                    }
-                    // Drain egress decisions and audit them. Draining also
-                    // bounds the NAT's event buffer over a long session.
-                    for ev in dev.drain_egress_events() {
-                        if !tally.observe(ev.domain, &ev.target, &ev.rule, ev.allowed) {
-                            continue;
-                        }
-                        if ev.allowed {
-                            audit.egress_allow(ev.domain, &ev.target, &ev.rule, &ev.policy);
-                        } else {
-                            audit.egress_deny(ev.domain, &ev.target, &ev.rule, &ev.policy);
-                        }
-                    }
-                }
+                let delivered =
+                    net_service_pass(net_devices.iter().map(AsRef::as_ref), &mut tally, &audit);
                 if delivered {
                     // Force any running vCPU to re-enter and take the pending RX
                     // SPI now; an idle (WFI-parked) vCPU picks it up on its own
@@ -6143,5 +6159,146 @@ mod vanilla_args_tests {
                 "VANILLA_USAGE line {n} is indented: {line:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod net_service_pass_tests {
+    use super::*;
+    use hypervisor::hvf::virtio::nat::{EgressEvent, InterceptDecider};
+    use hypervisor::hvf::virtio::net::NetKick;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A NIC that reports what the pass did to it. `service_net` returns
+    /// whatever the test asked for, and the buffer models the NAT's: it holds
+    /// events until somebody takes them.
+    struct FakeNic {
+        name: String,
+        delivers: bool,
+        buffered: Mutex<Vec<EgressEvent>>,
+        serviced: AtomicUsize,
+        drained: AtomicUsize,
+    }
+
+    impl FakeNic {
+        fn new(name: &str, delivers: bool, events: Vec<EgressEvent>) -> Self {
+            Self {
+                name: name.into(),
+                delivers,
+                buffered: Mutex::new(events),
+                serviced: AtomicUsize::new(0),
+                drained: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl NetIo for FakeNic {
+        fn name(&self) -> &str {
+            &self.name
+        }
+        fn set_net_kick(&self, _kick: Arc<NetKick>) {}
+        fn service_net(&self) -> bool {
+            self.serviced.fetch_add(1, Ordering::Relaxed);
+            self.delivers
+        }
+        fn drain_egress_events(&self) -> Vec<EgressEvent> {
+            self.drained.fetch_add(1, Ordering::Relaxed);
+            std::mem::take(&mut self.buffered.lock().unwrap())
+        }
+        fn set_net_intercept(&self, _decider: Option<Arc<dyn InterceptDecider>>) {}
+    }
+
+    fn event(target: &str, allowed: bool) -> EgressEvent {
+        EgressEvent {
+            domain: "dns",
+            target: target.to_string(),
+            allowed,
+            rule: if allowed {
+                "allow".into()
+            } else {
+                "default-deny".into()
+            },
+            policy: "test-policy".into(),
+        }
+    }
+
+    /// The defect the shared pass exists to prevent: servicing a device without
+    /// draining it. The NAT buffers every decision until somebody takes them, so
+    /// a loop that only services grows that buffer for the life of the guest --
+    /// and a `--seconds 0` cold boot is exactly that life.
+    ///
+    /// Draining is asserted on the *disabled* audit handle, because that is the
+    /// path where nothing is written and so the one where an implementation is
+    /// most tempted to skip the work.
+    #[test]
+    fn a_pass_drains_every_device_it_serviced() {
+        let audit = crate::audit::AuditLog::default();
+        let mut tally = crate::audit::EgressTally::default();
+        let a = FakeNic::new("nic0", false, vec![event("a.example", false)]);
+        let b = FakeNic::new("nic1", false, vec![event("b.example", false)]);
+
+        net_service_pass([&a as &dyn NetIo, &b as &dyn NetIo], &mut tally, &audit);
+
+        assert_eq!(
+            a.serviced.load(Ordering::Relaxed),
+            1,
+            "nic0 was not serviced"
+        );
+        assert_eq!(
+            b.serviced.load(Ordering::Relaxed),
+            1,
+            "nic1 was not serviced"
+        );
+        assert_eq!(a.drained.load(Ordering::Relaxed), 1, "nic0 was not drained");
+        assert_eq!(b.drained.load(Ordering::Relaxed), 1, "nic1 was not drained");
+        assert!(
+            a.buffered.lock().unwrap().is_empty() && b.buffered.lock().unwrap().is_empty(),
+            "the buffers must be empty afterwards -- that is what bounds them"
+        );
+        // The tally having seen both is the observable proof that the drain
+        // reached the events rather than merely emptying the buffer.
+        assert!(
+            !tally.observe("dns", "a.example", "default-deny", false)
+                && !tally.observe("dns", "b.example", "default-deny", false),
+            "both events must already have been observed by the pass"
+        );
+    }
+
+    /// The return value is what the cold-boot loop uses to decide whether to
+    /// wake the vCPUs and go straight round again, so a pass that delivered
+    /// must say so -- and one that delivered on *any* device must say so, not
+    /// only the last one asked.
+    #[test]
+    fn a_pass_reports_delivery_from_any_device() {
+        let audit = crate::audit::AuditLog::default();
+        let mut tally = crate::audit::EgressTally::default();
+
+        let quiet_a = FakeNic::new("nic0", false, vec![]);
+        let quiet_b = FakeNic::new("nic1", false, vec![]);
+        assert!(
+            !net_service_pass(
+                [&quiet_a as &dyn NetIo, &quiet_b as &dyn NetIo],
+                &mut tally,
+                &audit,
+            ),
+            "no device delivered, so the loop must be free to sleep"
+        );
+
+        let busy = FakeNic::new("nic0", true, vec![]);
+        let quiet = FakeNic::new("nic1", false, vec![]);
+        assert!(
+            net_service_pass(
+                [&busy as &dyn NetIo, &quiet as &dyn NetIo],
+                &mut tally,
+                &audit,
+            ),
+            "the first device delivered; a later quiet one must not erase that"
+        );
+        assert_eq!(
+            quiet.serviced.load(Ordering::Relaxed),
+            1,
+            "an early delivery must not short-circuit the rest of the pass"
+        );
     }
 }

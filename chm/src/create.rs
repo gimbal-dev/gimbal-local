@@ -47,11 +47,9 @@ use hypervisor::hvf::virtio::block::{BlockDevice, FileBackend};
 use hypervisor::hvf::virtio::devcore::{Backend, MsiSink, MsiSpiInjector};
 use hypervisor::hvf::virtio::devmgr::{self, SerialRegs};
 use hypervisor::hvf::virtio::mmio::{self, MmioParams, VirtioMmioDevice, device_id};
-use hypervisor::hvf::virtio::nat::{
-    EgressEvent, EgressPolicy, INGRESS_BIND_ADDR, NatLimits, NatResponder,
-};
+use hypervisor::hvf::virtio::nat::{EgressPolicy, INGRESS_BIND_ADDR, NatLimits, NatResponder};
 use hypervisor::hvf::virtio::net::{NetDevice, NetKick};
-use hypervisor::hvf::virtio::{GuestMemory, features};
+use hypervisor::hvf::virtio::{GuestMemory, NetIo, features};
 use hypervisor::hvf::{
     HvfHypervisor, UsgicCpuHandle, UsgicSpiRouter, VtimerClock, host_counter_hz, rehydrate,
 };
@@ -61,8 +59,9 @@ use crate::audit::{AuditLog, EgressTally};
 use crate::coldboot::{ColdBootConfig, VirtioKind};
 use crate::console::RawConsole;
 use crate::imp::{
-    CpuPowerSlot, PL011_BASE, PL011_SIZE, PsciCoordinator, UsgicCapture, apply_psci_cpu_on_state,
-    collect_usgic_checkpoint, egress_posture_line, wait_for_cpu_on_request,
+    CpuPowerSlot, NET_SERVICE_INTERVAL, PL011_BASE, PL011_SIZE, PsciCoordinator, UsgicCapture,
+    apply_psci_cpu_on_state, collect_usgic_checkpoint, egress_posture_line, net_service_pass,
+    wait_for_cpu_on_request,
 };
 use crate::oci::initramfs::installs_proxy_ca;
 use crate::oci::modules;
@@ -87,10 +86,6 @@ pub const GUEST_IP: [u8; 4] = [192, 168, 249, 2];
 pub const GUEST_PREFIX_LEN: u8 = 24;
 const GATEWAY_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
 const GUEST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 2];
-
-/// How long the net service thread waits for a guest transmit before servicing
-/// anyway. Matches the restore path's interval; a transmit wakes it at once.
-const NET_SERVICE_INTERVAL: Duration = Duration::from_millis(2);
 
 /// An [`MsiSink`] that hands an `INTID` to the userspace GIC's SPI router, so a
 /// device thread's completion is delivered on the vCPU the interrupt is routed
@@ -1274,6 +1269,10 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         for dev in &net_devices {
             dev.set_net_kick(kick.clone());
         }
+        // Collected before the loop rather than shared behind a lock: every
+        // vCPU has already reported in by here (the `setup_rx` drain above is
+        // synchronous), so the set is complete and never changes again.
+        let exits: Vec<Arc<dyn Fn() + Send + Sync>> = exits.iter().flatten().cloned().collect();
         // A workspace is where an audit trail can live; without one the handle
         // records nothing. Draining is *not* conditional on that, because the
         // NAT buffers every decision until somebody takes them — an undrained
@@ -1293,11 +1292,32 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                     // allowed host writes one record rather than eighty.
                     let mut tally = EgressTally::default();
                     while running.load(Ordering::Acquire) {
-                        for dev in &net_devices {
-                            service_and_record(dev, &mut tally, &audit);
+                        let delivered = net_service_pass(
+                            net_devices.iter().map(|d| d.as_ref() as &dyn NetIo),
+                            &mut tally,
+                            &audit,
+                        );
+                        if delivered {
+                            // The frame is in the ring and the SPI is raised,
+                            // but a vCPU parked in WFI does not see either until
+                            // something takes it out of `hv_vcpu_run`. Waiting
+                            // for its own poll to expire is a latency the guest
+                            // pays on every inbound packet.
+                            for exit in &exits {
+                                exit();
+                            }
+                            // And go straight round again: a bulk transfer is
+                            // many chains, and sleeping the interval between
+                            // them caps inbound throughput at one chain per
+                            // interval no matter how much is waiting.
+                            continue;
                         }
                         kick.wait(NET_SERVICE_INTERVAL);
                     }
+                    // The per-flow lines above are the detail; without this the
+                    // trail has no totals, so a reader cannot tell a complete
+                    // record from a truncated one.
+                    audit.egress_summary(&tally);
                 })
                 .map_err(|e| format!("spawning the net service thread: {e}"))?,
         )
@@ -1556,47 +1576,6 @@ fn await_ready(ready: &Arc<(Mutex<bool>, Condvar)>) {
     let mut done = lock.lock().unwrap();
     while !*done {
         done = cv.wait(done).unwrap();
-    }
-}
-
-/// Service a NAT device and record every decision it made.
-///
-/// Servicing and recording are deliberately one operation. The NAT buffers
-/// every egress decision until somebody takes them, so a caller that services
-/// without draining grows an unbounded `Vec` for the life of the guest — and
-/// `--seconds 0` is the shape this path is normally run in. Keeping the two
-/// halves in one function means the call site cannot do half of it.
-fn service_and_record(
-    dev: &VirtioMmioDevice,
-    tally: &mut EgressTally,
-    audit: &AuditLog,
-) {
-    dev.service_net();
-    record_egress(dev.drain_egress_events(), tally, audit);
-}
-
-/// Write one audit record per *distinct* egress decision.
-///
-/// The tally deduplicates, so a page opening eighty connections to one allowed
-/// host writes one record rather than eighty. An [`AuditLog`] with no workspace
-/// behind it drops everything, which is why there is no `Option` here: the
-/// no-workspace case is the disabled handle, not a branch.
-///
-/// [`AuditLog`]: crate::audit::AuditLog
-fn record_egress(
-    events: Vec<EgressEvent>,
-    tally: &mut EgressTally,
-    audit: &AuditLog,
-) {
-    for ev in events {
-        if !tally.observe(ev.domain, &ev.target, &ev.rule, ev.allowed) {
-            continue;
-        }
-        if ev.allowed {
-            audit.egress_allow(ev.domain, &ev.target, &ev.rule, &ev.policy);
-        } else {
-            audit.egress_deny(ev.domain, &ev.target, &ev.rule, &ev.policy);
-        }
     }
 }
 
@@ -2564,7 +2543,11 @@ mod tests {
         let audit = crate::audit::AuditLog::open(&dir);
         let mut tally = crate::audit::EgressTally::default();
 
-        super::record_egress(vec![egress_event("dns", "neverssl.com", false)], &mut tally, &audit);
+        crate::audit::record_egress(
+            vec![egress_event("dns", "neverssl.com", false)],
+            &mut tally,
+            &audit,
+        );
 
         let trail = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap_or_default();
         assert!(
@@ -2585,7 +2568,7 @@ mod tests {
         let mut tally = crate::audit::EgressTally::default();
 
         for _ in 0..80 {
-            super::record_egress(
+            crate::audit::record_egress(
                 vec![egress_event("tcp", "10.0.0.1:443", true)],
                 &mut tally,
                 &audit,
@@ -2615,7 +2598,7 @@ mod tests {
             egress_event("dns", "b.example", false),
         ];
 
-        super::record_egress(events, &mut tally, &audit);
+        crate::audit::record_egress(events, &mut tally, &audit);
 
         // `record_egress` takes the vector by value, so consuming it is what
         // bounds the buffer; the tally having seen both is the observable proof
@@ -2630,11 +2613,19 @@ mod tests {
         );
     }
 
-    /// Servicing a NAT device without draining it is the defect. This asserts
-    /// the two cannot be separated at the call site: `service_and_record` is
-    /// the only thing the cold-net loop calls, and it does both.
+    /// The cold-boot net loop lives inside a four-hundred-line function no test
+    /// can call, so the only way to hold it to its contract is to read it. Four
+    /// claims, each of which was false on this path until V11.3:
+    ///
+    /// 1. it services through the shared pass, which drains as it goes;
+    /// 2. it never services a device directly, the shape that leaves
+    ///    `drain_egress_events()` uncalled and the NAT's buffer growing;
+    /// 3. it wakes the vCPUs when a pass delivered, because a frame sitting in
+    ///    the ring behind a parked vCPU has not arrived;
+    /// 4. it writes the totals, without which a cold boot's trail has per-flow
+    ///    lines and no way to tell a complete record from a truncated one.
     #[test]
-    fn the_net_loop_cannot_service_without_recording() {
+    fn the_cold_net_loop_services_the_way_the_restore_path_does() {
         let src = include_str!("create.rs");
         // Assembled from parts so this literal is not itself a match (the file
         // reads its own source), and asserted unique so a second occurrence
@@ -2647,19 +2638,43 @@ mod tests {
             "the cold-net loop's tally must be the only match for {spawn:?}, \
              or this guard reads a region that is not the loop"
         );
-        let loop_body = src
+        let body = src
             .split(&spawn)
             .nth(1)
-            .and_then(|s| s.split("kick.wait(NET_SERVICE_INTERVAL)").next())
-            .expect("the cold-net loop must still spawn with a tally and a kick");
+            .and_then(|s| s.split("spawning the net service thread").next())
+            .expect("the cold-net loop must still spawn with a tally");
         assert!(
-            loop_body.contains(&format!("{}(dev,", "service_and_record")),
-            "the cold-net loop must service through service_and_record, which drains"
+            body.contains(&format!("{}(", "net_service_pass")),
+            "the cold-net loop must service through the shared pass, which drains"
         );
         assert!(
-            !loop_body.contains("dev.service_net()"),
+            !body.contains(&format!(".{}()", "service_net")),
             "the cold-net loop must not service a device directly -- that is the \
              shape that leaves drain_egress_events() uncalled and the buffer growing"
+        );
+        assert!(
+            body.contains(&format!("for exit in &{}", "exits")),
+            "a delivered frame must take the vCPUs out of WFI; otherwise the guest \
+             pays its own poll interval as latency on every inbound packet"
+        );
+        assert!(
+            body.contains(&format!("audit.{}(&tally)", "egress_summary")),
+            "the cold-boot trail must carry totals, or a reader cannot tell a \
+             complete record from a truncated one"
+        );
+    }
+
+    /// The interval is the restore path's, imported rather than restated. A
+    /// second declaration is two numbers that can drift, and the drift would be
+    /// invisible: both loops would keep working, at different rates, and only a
+    /// throughput measurement across the two paths would ever show it.
+    #[test]
+    fn the_service_interval_is_not_restated_here() {
+        let src = include_str!("create.rs");
+        assert!(
+            !src.contains(&format!("const {}", "NET_SERVICE_INTERVAL")),
+            "the cold-boot path must import the interval from imp, not declare \
+             its own copy of it"
         );
     }
 
