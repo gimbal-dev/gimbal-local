@@ -25,6 +25,7 @@ use rustls::pki_types::{CertificateDer, ServerName};
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned, version};
 
 use crate::audit::AuditLog;
+use crate::{exec, guestcp, serve};
 
 use super::ca::{CA_CERT_FILE, CA_KEY_FILE, ProxyCa};
 use super::nat::RuleDecider;
@@ -279,6 +280,7 @@ chm proxy — the credential-injecting egress proxy
 USAGE:
     chm proxy show [WORKSPACE_DIR|--workspace DIR] [--rules FILE] [--json]
     chm proxy ca   <WORKSPACE_DIR|--workspace DIR> [--out FILE] [--for-guest]
+    chm proxy ca   --install [--socket PATH] [--timeout SECONDS]
     chm proxy check --host HOST [--port N] [--path P]
                     [--workspace DIR] [--rules FILE] [--control] [--json]
 
@@ -289,6 +291,10 @@ COMMANDS:
             --for-guest also seeds a worthless placeholder credential for any
             client known to refuse to make a request without one (a proxy
             cannot inject into a request that is never sent).
+            --install does the whole thing against the running guest: it takes
+            the CA from the daemon, so it cannot install one the running proxy
+            does not sign with, carries it in with a verified transfer, and
+            exits non-zero unless the guest's own trust store accepted it.
     check   Prove this machine can reach a host through the proxy. Sends a real
             HEAD request; injects only if a rule matches. Use --path to choose
             an endpoint whose answer differs with and without a credential
@@ -349,7 +355,14 @@ fn check_workspace(args: &[String]) -> Option<PathBuf> {
 /// as unknown — the handler was unreachable. `usage_promises_only_flags_the_parser_accepts`
 /// now holds them to the help text.
 const SHOW_FLAGS: &[&str] = &["--rules", "--json", "--workspace"];
-const CA_FLAGS: &[&str] = &["--out", "--workspace", "--for-guest"];
+const CA_FLAGS: &[&str] = &[
+    "--out",
+    "--workspace",
+    "--for-guest",
+    "--install",
+    "--socket",
+    "--timeout",
+];
 const CHECK_FLAGS: &[&str] = &[
     "--host",
     "--port",
@@ -385,8 +398,11 @@ fn flags_for(cmd: &str) -> Option<&'static [&'static str]> {
 /// while the sentence the user actually reads sends them at a flag that does
 /// not work.
 const CA_GUEST_HINT: &str = "\
-`chm proxy ca <WORKSPACE_DIR> --for-guest` prints an installer for the guest.
-It is far longer than one console line will carry, so send it as a file:
+To install this in a running guest:
+    chm proxy ca --install
+That takes the CA from the daemon, so it cannot install one the running proxy
+does not sign with, and it exits non-zero unless the guest trusts it.
+By hand, against a guest this host is not serving:
     chm proxy ca <WORKSPACE_DIR> --for-guest > ca.sh
     chm cp ca.sh /tmp/ca.sh
     chm exec -- sh /tmp/ca.sh";
@@ -596,6 +612,9 @@ fn ca(args: &[String]) -> ExitCode {
     if let Err(e) = reject_unknown("ca", args) {
         return e;
     }
+    if args.iter().any(|a| a == "--install") {
+        return ca_install(args);
+    }
     let Some(ws) = workspace_arg(args) else {
         eprintln!("chm proxy ca: a workspace directory is required\n\n{USAGE}");
         return ExitCode::FAILURE;
@@ -641,6 +660,195 @@ fn ca(args: &[String]) -> ExitCode {
     }
     print!("{pem}");
     ExitCode::SUCCESS
+}
+
+/// Where the installer is staged inside the guest.
+const CA_GUEST_PATH: &str = "/tmp/gimbal-ca-install.sh";
+
+/// The installer runs `openssl`, `update-ca-certificates` and a `node` parse
+/// check, so it is slower than a shell command but far short of a build.
+const CA_INSTALL_TIMEOUT: u64 = 120;
+
+/// Install the running guest's proxy CA, in one command, and refuse to claim
+/// success the guest has not demonstrated.
+///
+/// The CA comes from the **daemon**, never from a workspace path on this side.
+/// That is not a convenience: `ca_json_for_daemon` records the measured footgun
+/// — a caller resolving the library root got `898b834b…` while the running
+/// guest's proxy signed with `79f85a28…`, so the guest ends up trusting a CA
+/// nothing uses and every intercepted connection fails a certificate check
+/// *after* the installer reported success. Only the daemon knows which
+/// workspace is running, so taking the CA from it makes that class unreachable
+/// rather than documented.
+fn ca_install(args: &[String]) -> ExitCode {
+    let socket = flag(args, "--socket").map_or_else(serve::default_socket, PathBuf::from);
+    let timeout = match flag(args, "--timeout").map(str::parse::<u64>) {
+        None => CA_INSTALL_TIMEOUT,
+        Some(Ok(n)) if n > 0 => n,
+        Some(_) => {
+            eprintln!("chm proxy ca --install: --timeout takes a whole number of seconds");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    let reply = match serve::ask_json(&socket, "proxy-ca-json") {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("chm proxy ca --install: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let (script, fingerprint) = match ca_from_daemon(&reply) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("chm proxy ca --install: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
+    // Carry it in with the same verified transfer `chm cp` uses, so a dropped
+    // chunk is named as a dropped chunk rather than surfacing later as an
+    // unexplained certificate error.
+    if let Err(e) = guestcp::transfer(&socket, script.as_bytes(), CA_GUEST_PATH, timeout) {
+        eprintln!("chm proxy ca --install: {e}");
+        return ExitCode::FAILURE;
+    }
+
+    let argv = vec![
+        "sh".to_string(),
+        "-c".to_string(),
+        format!(
+            "sh {p}; rc=$?; rm -f {p}; exit $rc",
+            p = exec::shell_quote(CA_GUEST_PATH)
+        ),
+    ];
+    let reply = match serve::exec_once(&socket, timeout, &argv) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("chm proxy ca --install: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let output = reply
+        .get("output")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    print!("{output}");
+    if !output.is_empty() && !output.ends_with('\n') {
+        println!();
+    }
+
+    match install_verdict(output, &fingerprint) {
+        Ok(note) => {
+            eprintln!("chm proxy ca: {note}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("chm proxy ca --install: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Pull the installer and the fingerprint out of the daemon's `proxy-ca-json`.
+///
+/// Separated so the "no CA yet" and "old daemon" cases are testable: both are
+/// reachable in the field and neither may present as a transfer failure.
+fn ca_from_daemon(reply: &serde_json::Value) -> Result<(String, String), String> {
+    if let Some(e) = reply.get("error").and_then(|v| v.as_str()) {
+        return Err(e.to_string());
+    }
+    // Measured on the daemon, not assumed: with no guest running, `proxy_ca_json`
+    // falls back to `library-root` and answers confidently about a workspace
+    // nothing is using. Installing *that* is the `898b834b…` vs `79f85a28…`
+    // failure exactly -- so the check has to be "the daemon assessed a running
+    // VM", not "the daemon answered".
+    match reply.get("assessed").and_then(|v| v.as_str()) {
+        Some("running-vm") => {}
+        Some(other) => {
+            return Err(format!(
+                "the daemon has no guest running (it assessed the {other}), so there is no \
+                 proxy to trust yet -- start the sandbox first"
+            ));
+        }
+        None => {
+            return Err(
+                "the daemon did not say which workspace it assessed (it is an older build), \
+                 so this cannot tell the running guest's CA from the library root's"
+                    .to_string(),
+            );
+        }
+    }
+    if reply.get("present").and_then(serde_json::Value::as_bool) == Some(false) {
+        return Err(
+            "the running workspace has no proxy CA yet -- start the guest with credential \
+             injection configured, so the proxy mints one"
+                .to_string(),
+        );
+    }
+    let script = reply
+        .get("installer")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or(
+            "the daemon did not send an installer script (it is an older build) -- \
+             `chm proxy ca <WORKSPACE_DIR> --for-guest > ca.sh` and carry it in with `chm cp`",
+        )?;
+    let fingerprint = reply
+        .get("sha256")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    Ok((script.to_string(), fingerprint.to_string()))
+}
+
+/// Decide whether the guest's own trust store accepted the CA.
+///
+/// Pure, because this is the only thing standing between "the script ran" and
+/// "the guest trusts the proxy", and the install path needs a live daemon so no
+/// unit test can reach it -- the same argument as `guestcp::verify_digest`.
+///
+/// **`installed, unverified` is a failure, deliberately.** The installer says
+/// that when the guest has no `openssl` to read the certificate back, so there
+/// is no evidence either way -- and this command exists precisely because the
+/// old console path could only ever say "CA script sent". Exiting 0 on an
+/// unverifiable install would rebuild the thing being replaced.
+fn install_verdict(output: &str, want_fingerprint: &str) -> Result<String, String> {
+    let field = |name: &str| {
+        output
+            .lines()
+            .find_map(|l| l.trim().strip_prefix(name))
+            .map(|v| v.trim().to_string())
+    };
+    let Some(system) = field("system store:") else {
+        return Err(
+            "the guest ran the installer but reported no verdict -- its output is above, and \
+             the transfer itself was verified, so the script did not reach its own summary"
+                .to_string(),
+        );
+    };
+    if system != "trusted" {
+        return Err(format!(
+            "the guest's trust store did not accept the CA (system store: {system})"
+        ));
+    }
+    // A `trusted` verdict is about the file on disk. If that file is not the CA
+    // the running proxy signs with, the guest trusts a certificate nothing
+    // presents -- the exact failure `ca_json_for_daemon` was written to prevent,
+    // arriving one step later.
+    if let Some(installed) = field("installed:")
+        && !want_fingerprint.is_empty()
+        && installed != want_fingerprint
+    {
+        return Err(format!(
+            "the guest trusts a different CA: it installed {installed}, and the running \
+             proxy signs with {want_fingerprint}"
+        ));
+    }
+    let node = field("node:").unwrap_or_default();
+    Ok(format!(
+        "the guest's trust store accepted {want_fingerprint} (node: {})",
+        node.split_whitespace().next().unwrap_or("unreported")
+    ))
 }
 
 /// The CA the *running* proxy would actually sign with, as JSON, for the daemon.
@@ -2530,6 +2738,125 @@ mod tests {
         assert!(
             script.contains("placeholder:  none"),
             "an unseeded installer must still report the placeholder line:\n{script}"
+        );
+    }
+
+    /// The real shape of a good install, so the happy path is pinned too.
+    fn good_output(fp: &str) -> String {
+        format!(
+            "system store: trusted\nnode:         configured (/usr/local/share/ca.crt)\n\
+             placeholder:  none\ninstalled:    {fp}\nexpected:     {fp}\n"
+        )
+    }
+
+    #[test]
+    fn a_trusted_store_with_the_right_fingerprint_is_the_only_success() {
+        let note = install_verdict(&good_output("beefcafe"), "beefcafe")
+            .expect("a trusted store carrying our own CA is the success case");
+        assert!(note.contains("beefcafe"), "{note}");
+        assert!(
+            note.contains("configured"),
+            "the node verdict is worth reporting: {note}"
+        );
+    }
+
+    #[test]
+    fn a_refusing_trust_store_is_a_failure() {
+        let out = good_output("beefcafe").replace("trusted", "NOT TRUSTED");
+        let e = install_verdict(&out, "beefcafe").unwrap_err();
+        assert!(
+            e.contains("NOT TRUSTED"),
+            "the guest's own verdict must be quoted: {e}"
+        );
+    }
+
+    /// #376: "the script ran" is not "the guest trusts the proxy".
+    ///
+    /// The installer says `installed, unverified` when the guest has no
+    /// `openssl` to read the certificate back, so there is no evidence either
+    /// way. Exiting 0 there would rebuild the thing this command replaces --
+    /// the console path that could only ever say "CA script sent".
+    #[test]
+    fn an_unverifiable_install_is_not_reported_as_success() {
+        let out =
+            good_output("beefcafe").replace("trusted", "installed, unverified (no openssl here)");
+        assert!(
+            install_verdict(&out, "beefcafe").is_err(),
+            "an install nobody could check must not exit 0"
+        );
+    }
+
+    #[test]
+    fn a_guest_that_never_reached_its_summary_is_a_failure() {
+        let e = install_verdict("openssl: command not found\n", "beefcafe").unwrap_err();
+        assert!(e.contains("no verdict"), "{e}");
+    }
+
+    /// The `898b834b...` footgun, arriving one step later than `ca_json_for_daemon`
+    /// prevents it: a store that trusts a CA the running proxy does not sign with.
+    #[test]
+    fn trusting_the_wrong_ca_is_a_failure_even_though_the_store_said_trusted() {
+        let out = good_output("898b834b");
+        let e = install_verdict(&out, "79f85a28").unwrap_err();
+        assert!(
+            e.contains("898b834b") && e.contains("79f85a28"),
+            "name both: {e}"
+        );
+    }
+
+    /// With no guest running the daemon answers about the *library root*, and
+    /// answers confidently. Taking that would install a CA nothing signs with.
+    #[test]
+    fn the_library_root_is_refused_as_a_source() {
+        let reply = serde_json::json!({
+            "assessed": "library-root",
+            "present": true,
+            "installer": "#!/bin/sh\n",
+            "sha256": "beefcafe",
+        });
+        let e = ca_from_daemon(&reply).unwrap_err();
+        assert!(e.contains("no guest running"), "{e}");
+    }
+
+    #[test]
+    fn an_older_daemon_that_does_not_say_what_it_assessed_is_refused() {
+        let reply = serde_json::json!({ "present": true, "installer": "x", "sha256": "a" });
+        let e = ca_from_daemon(&reply).unwrap_err();
+        assert!(e.contains("older build"), "{e}");
+    }
+
+    #[test]
+    fn a_running_guest_with_no_ca_yet_says_so_rather_than_failing_at_transfer() {
+        let reply = serde_json::json!({ "assessed": "running-vm", "present": false });
+        let e = ca_from_daemon(&reply).unwrap_err();
+        assert!(e.contains("no proxy CA yet"), "{e}");
+    }
+
+    #[test]
+    fn the_running_guests_installer_is_taken_whole() {
+        let reply = serde_json::json!({
+            "assessed": "running-vm",
+            "present": true,
+            "installer": "#!/bin/sh\necho hi\n",
+            "sha256": "79f85a28",
+        });
+        let (script, fp) = ca_from_daemon(&reply).expect("a running guest with a CA is usable");
+        assert_eq!(fp, "79f85a28");
+        assert!(script.contains("echo hi"));
+    }
+
+    /// #376: the install has to keep using the verified transfer.
+    ///
+    /// Swapping `guestcp::transfer` for a console-typed sequence is exactly the
+    /// weaker shape this replaced, and it leaves every assertion above green --
+    /// they all describe the verdict, not how the bytes got there.
+    #[test]
+    fn the_install_carries_the_script_with_the_verified_transfer() {
+        let src = include_str!("cli.rs");
+        let call = format!("{}::{}(&socket, script.as_bytes()", "guestcp", "transfer");
+        assert!(
+            src.contains(&call),
+            "the CA install no longer uses the digest-verified transfer"
         );
     }
 }

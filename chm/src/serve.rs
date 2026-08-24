@@ -1612,7 +1612,8 @@ fn ctl_command(rest: &[String]) -> Result<String, String> {
 
     // `audit [<dir>] [--tail N]`: the trail that matters is the one the running
     // guest is writing to, which only the daemon can name.
-    if rest.first().map(String::as_str) == Some("audit") {        let tail = rest
+    if rest.first().map(String::as_str) == Some("audit") {
+        let tail = rest
             .iter()
             .position(|a| a == "--tail")
             .and_then(|i| rest.get(i + 1))
@@ -1768,15 +1769,29 @@ pub(crate) fn exec_once(
     timeout: u64,
     argv: &[String],
 ) -> Result<serde_json::Value, String> {
+    ask_json(
+        socket,
+        &format!("exec-json {timeout} {}", exec::encode_argv(argv)),
+    )
+}
+
+/// Send one line to the daemon and parse its whole reply as JSON.
+///
+/// The transport half of [`exec_once`], shared because the CA install (#376)
+/// has to ask the daemon which CA the *running* guest's proxy signs with before
+/// it can carry anything in. Resolving that from a workspace path on this side
+/// is the measured footgun recorded on `ca_json_for_daemon`: install the wrong
+/// one and the guest ends up trusting a CA nothing uses, with every intercepted
+/// connection failing a certificate check *after* the installer said it worked.
+pub(crate) fn ask_json(socket: &Path, command: &str) -> Result<serde_json::Value, String> {
     let mut stream = UnixStream::connect(socket).map_err(|e| {
         format!(
             "cannot connect to daemon at {}: {e} (is `chm serve` running?)",
             socket.display()
         )
     })?;
-    let request = format!("exec-json {timeout} {}\n", exec::encode_argv(argv));
     stream
-        .write_all(request.as_bytes())
+        .write_all(format!("{command}\n").as_bytes())
         .map_err(|e| format!("send command: {e}"))?;
     stream.flush().ok();
 
