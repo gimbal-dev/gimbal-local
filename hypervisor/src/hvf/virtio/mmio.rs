@@ -106,6 +106,73 @@ struct MmioRegs {
     interrupt_status: u32,
 }
 
+/// One virtqueue exactly as the driver programmed it, for a snapshot.
+///
+/// This is [`QueueSetup`] made public, and it is deliberately the *driver's*
+/// writes rather than the [`Queue`] they produce. See
+/// [`MmioTransportState::queues`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmioQueueState {
+    /// Ring size in descriptors.
+    pub size: u16,
+    /// Descriptor table GPA (`QueueDescLow`/`High`).
+    pub desc: u64,
+    /// Available ring GPA (`QueueDriverLow`/`High`).
+    pub driver: u64,
+    /// Used ring GPA (`QueueDeviceLow`/`High`).
+    pub device: u64,
+    /// Whether the driver has finished naming this ring (`QueueReady`).
+    pub ready: bool,
+}
+
+/// Everything about a live `virtio-mmio` device that a resume has to replay.
+///
+/// The counterpart of [`super::devmgr::VirtioDeviceDesc`], which describes a
+/// device read *out of* a cloud-hypervisor `state.json`. This describes one
+/// read out of a device this build is currently running, so a cold-booted guest
+/// can originate a snapshot (#378).
+///
+/// **What is deliberately not here.** The [`Queue`]s in [`DeviceCore`] are
+/// absent, because they are not independent state: [`VirtioMmioDevice::publish_queue`]
+/// derives each one from `queues[i]` plus `driver_features`, and a restore can
+/// re-derive them by running that same function. Recording both would be two
+/// descriptions of one machine with no way to tell which was right if they
+/// disagreed -- the failure mode `genesis`'s memory layout is written to avoid.
+///
+/// The ring *indices* (`next_avail`/`next_used`) are absent for a different and
+/// stronger reason: they live in guest RAM, which the snapshot dumps verbatim,
+/// and [`Queue::restore`] reads them back from there. Serializing them here
+/// would be copying a value out of the authoritative store into a second one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MmioTransportState {
+    /// Device name, e.g. `_disk0`.
+    pub name: String,
+    /// virtio device type (1 = net, 2 = block).
+    pub device_id: u32,
+    /// The full feature set this device offered.
+    pub device_features: u64,
+    /// The subset the driver acknowledged. Authoritative for ring features.
+    pub driver_features: u64,
+    /// `DeviceFeaturesSel` as last written.
+    pub device_features_sel: u32,
+    /// `DriverFeaturesSel` as last written.
+    pub driver_features_sel: u32,
+    /// `QueueSel` as last written.
+    pub queue_sel: u16,
+    /// `InterruptStatus`, so a resume does not lose an interrupt the driver had
+    /// not yet acknowledged.
+    pub interrupt_status: u32,
+    /// `Status`, which is what tells a resume whether the driver ever finished
+    /// bringing this device up.
+    pub device_status: u8,
+    /// Device-specific config generation counter.
+    pub config_generation: u8,
+    /// Per-queue driver programming, index == queue select.
+    pub queues: Vec<MmioQueueState>,
+    /// Device-specific configuration space (e.g. `virtio_blk_config`).
+    pub device_config: Vec<u8>,
+}
+
 /// A `virtio-mmio` device: the register map, plus the shared device model.
 pub struct VirtioMmioDevice {
     name: String,
@@ -187,6 +254,56 @@ impl VirtioMmioDevice {
     /// The device's name (for diagnostics).
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Read this device's replayable state, for originating a snapshot (#378).
+    ///
+    /// Takes both locks, `regs` first and then `core`, which is the order every
+    /// other path in this file uses (`publish_queue`, `write_status`). Taking
+    /// them in the opposite order here would be a lock-ordering inversion and a
+    /// deadlock waiting for the one interleaving that hits it.
+    pub fn state(&self) -> MmioTransportState {
+        let regs = self.regs.lock().unwrap();
+        let queues = regs
+            .setups
+            .iter()
+            .map(|s| MmioQueueState {
+                size: s.size,
+                desc: s.desc,
+                driver: s.driver,
+                device: s.device,
+                ready: s.ready,
+            })
+            .collect();
+        let (
+            device_features_sel,
+            driver_features_sel,
+            driver_features,
+            queue_sel,
+            interrupt_status,
+        ) = (
+            regs.device_features_sel,
+            regs.driver_features_sel,
+            regs.driver_features,
+            regs.queue_sel,
+            regs.interrupt_status,
+        );
+        drop(regs);
+        let core = self.core.lock().unwrap();
+        MmioTransportState {
+            name: self.name.clone(),
+            device_id: self.device_id,
+            device_features: self.device_features,
+            driver_features,
+            device_features_sel,
+            driver_features_sel,
+            queue_sel,
+            interrupt_status,
+            device_status: core.common.device_status,
+            config_generation: core.common.config_generation,
+            queues,
+            device_config: core.device_config.clone(),
+        }
     }
 
     /// Replace the interrupt injector with one that reaches a real GIC.
@@ -652,5 +769,85 @@ mod tests {
         // be rejected as a descriptor loop.
         assert!(QUEUE_NUM_MAX <= u32::from(u16::MAX));
         assert!(QUEUE_NUM_MAX.is_power_of_two());
+    }
+
+    /// The guard #378 rests on: what a driver programmed is what a snapshot
+    /// reports.
+    ///
+    /// Drives the device through the sequence a real `virtio_mmio` driver uses
+    /// -- negotiate features, program a ring, set `QueueReady`, then `DRIVER_OK`
+    /// -- and asserts every field of [`MmioTransportState`] came back. If any
+    /// one of them is dropped on the floor, a cold-booted guest originates a
+    /// snapshot that resumes into a device the driver no longer recognises.
+    #[test]
+    fn the_state_a_snapshot_records_is_what_the_driver_programmed() {
+        let (d, _m) = dev();
+        write32(&d, 0x024, 0); // DriverFeaturesSel = 0
+        write32(&d, 0x020, 0x1000_0000); // RING_INDIRECT_DESC
+        write32(&d, 0x024, 1); // DriverFeaturesSel = 1
+        write32(&d, 0x020, 0x0000_0001); // VERSION_1
+        write32(&d, 0x070, 0x8); // FEATURES_OK
+        write32(&d, 0x030, 0); // QueueSel = 0
+        write32(&d, 0x038, 64); // QueueNum
+        write32(&d, 0x080, 0x2000); // QueueDescLow
+        write32(&d, 0x090, 0x3000); // QueueDriverLow
+        write32(&d, 0x0a0, 0x4000); // QueueDeviceLow
+        write32(&d, 0x044, 1); // QueueReady
+        write32(&d, 0x070, 0xf); // ACKNOWLEDGE|DRIVER|FEATURES_OK|DRIVER_OK
+
+        let s = d.state();
+        assert_eq!(s.name, "blk0");
+        assert_eq!(s.device_id, device_id::BLOCK);
+        assert_eq!(
+            s.driver_features,
+            super::super::features::RING_INDIRECT_DESC | super::super::features::VERSION_1,
+            "the acked set is what ring features are derived from on resume"
+        );
+        assert_eq!(s.driver_features_sel, 1, "last DriverFeaturesSel written");
+        assert_eq!(s.queue_sel, 0);
+        assert_eq!(
+            s.device_status, 0xf,
+            "DRIVER_OK must survive into the snapshot"
+        );
+        assert_eq!(s.queues.len(), 1);
+        assert_eq!(
+            s.queues[0],
+            MmioQueueState {
+                size: 64,
+                desc: 0x2000,
+                driver: 0x3000,
+                device: 0x4000,
+                ready: true
+            }
+        );
+        assert_eq!(
+            s.device_config,
+            blk_config(8),
+            "config space is what tells a resumed driver the disk's capacity"
+        );
+    }
+
+    /// A queue the driver never finished naming must be recorded as not ready.
+    ///
+    /// The inverse of the guard above, and the one that matters for
+    /// correctness: `notify` refuses to walk a ring whose `ready` is false, so a
+    /// snapshot that recorded `ready: true` for a half-programmed queue would
+    /// resume into a device that walks a ring at an address the driver never
+    /// finished writing.
+    #[test]
+    fn a_half_programmed_queue_is_recorded_as_not_ready() {
+        let (d, _m) = dev();
+        write32(&d, 0x030, 0);
+        write32(&d, 0x038, 64);
+        write32(&d, 0x080, 0xdead_0000); // addresses started, QueueReady never set
+        let s = d.state();
+        assert!(
+            !s.queues[0].ready,
+            "an unfinished ring must not be marked ready"
+        );
+        assert_eq!(
+            s.device_status, 0,
+            "a driver that never came up must say so"
+        );
     }
 }
