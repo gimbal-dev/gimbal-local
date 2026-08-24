@@ -82,6 +82,11 @@ const FIRST_INO: u32 = 11;
 /// Revision 1 ("dynamic"), which is what allows a stated inode size.
 const REV_DYNAMIC: u32 = 1;
 const INODE_SIZE: u16 = 128;
+/// Inodes per block, which is the granularity ext4 measures the inode table
+/// in. `s_itb_per_group` is a *truncating* division by this, so a group's
+/// inode count must be a whole multiple of it or the driver believes the table
+/// is one block shorter than it is.
+const INODES_PER_BLOCK: u32 = BLOCK_SIZE / INODE_SIZE as u32;
 /// Block group descriptors are 32 bytes each in ext2.
 const DESC_SIZE: u32 = 32;
 
@@ -417,9 +422,20 @@ pub fn write_ext2<W: Write + Seek>(
         let gdt_blocks = ((groups * DESC_SIZE) as u64).div_ceil(bs) as u32;
         let ipg = {
             let raw = inodes_count.div_ceil(groups);
+            // A whole number of blocks, not merely a whole number of bitmap
+            // bytes. ext4 derives the inode table's extent by *truncating*
+            // (`s_itb_per_group = s_inodes_per_group / s_inodes_per_block`)
+            // while a table big enough to hold them all needs the rounded-up
+            // count, so a group holding a partial last block makes the driver
+            // and this writer disagree about the table's size -- which
+            // `ext4_init_inode_table` reports as an `EXT4-fs error` on every
+            // boot. A multiple of `INODES_PER_BLOCK` is also a multiple of 8,
+            // so the inode bitmap stays byte aligned.
+            //
             // The inode bitmap is one block, so a group cannot hold more inodes
             // than a block has bits.
-            raw.next_multiple_of(8).clamp(8, BLOCK_SIZE * 8)
+            raw.next_multiple_of(INODES_PER_BLOCK)
+                .clamp(INODES_PER_BLOCK, BLOCK_SIZE * 8)
         };
         let itb = ((ipg as u64 * INODE_SIZE as u64).div_ceil(bs)) as u32;
         let mut overhead = 0u64;
@@ -1008,5 +1024,55 @@ mod tests {
         // The image is exactly as long as the superblock claims.
         let blocks = u32_at(&img, 1024 + 4) as usize;
         assert_eq!(img.len(), blocks * BLOCK_SIZE as usize, "image length matches s_blocks_count");
+    }
+
+    /// The check `ext4_init_inode_table` runs on every group, transcribed.
+    ///
+    /// The ext4 driver -- which is what mounts our ext2 images -- derives the
+    /// inode table's extent by truncating (`s_itb_per_group =
+    /// s_inodes_per_group / s_inodes_per_block`) while the table has to be big
+    /// enough to hold every inode, so it compares that against a rounded-up
+    /// count and calls the difference an error. A group whose inode count is
+    /// not a whole multiple of the inodes-per-block makes the two disagree and
+    /// puts an `EXT4-fs error` line in front of every guest that boots the
+    /// image.
+    ///
+    /// Asserted as the kernel's own inequality rather than as
+    /// `ipg % INODES_PER_BLOCK == 0`, so it keeps holding if a future writer
+    /// starts filling in `bg_itable_unused`.
+    #[test]
+    fn no_group_holds_a_partial_block_of_inodes() {
+        let img = build(&[(
+            "etc/hostname",
+            EntryKind::File {
+                mode: 0o644,
+                size: 6,
+            },
+            b"gimbal",
+        )]);
+
+        let ipg = u32_at(&img, 1024 + 40);
+        assert!(ipg > 0, "s_inodes_per_group");
+        // s_first_data_block is 0 above 1 KiB blocks, so the group descriptor
+        // table is block 1.
+        let gdt = BLOCK_SIZE as usize;
+        let groups = u32_at(&img, 1024 + 4).div_ceil(u32_at(&img, 1024 + 32));
+
+        // What ext4 believes the table is, and what it actually has to be.
+        let itb_per_group = ipg / INODES_PER_BLOCK;
+
+        for g in 0..groups as usize {
+            let desc = gdt + g * DESC_SIZE as usize;
+            let itable_unused = u16_at(&img, desc + 28) as u32;
+            let used_blks = (ipg - itable_unused).div_ceil(INODES_PER_BLOCK);
+            assert!(
+                used_blks <= itb_per_group,
+                "group {g}: ext4_init_inode_table would report `used itable \
+                 blocks: {used_blks}; itable unused count: {itable_unused}` \
+                 because s_itb_per_group is {itb_per_group} \
+                 (s_inodes_per_group {ipg} is not a multiple of \
+                 {INODES_PER_BLOCK})"
+            );
+        }
     }
 }
