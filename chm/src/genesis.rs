@@ -94,18 +94,13 @@ use serde_json::{Map, Value, json};
 
 use crate::vanilla::{CORE_REGS_LEN, VanillaState};
 
-/// The prefix every emitted virtio device node carries.
+/// The prefix a virtio-mmio device node is recorded under.
 ///
-/// Deliberately *not* `_virtio-pci-`, which is what a real cloud-hypervisor
-/// capture uses and what [`hypervisor::hvf::virtio::devmgr::parse_devices`]
-/// matches on. A cold-booted guest discovered its devices over `virtio-mmio`
-/// and its drivers are bound to MMIO windows, so a snapshot of it describes an
-/// MMIO machine. Emitting the PCI prefix would hand the PCI parser a node whose
-/// transport it would then get wrong -- and it would get it wrong *quietly*,
-/// because the two transports share `DeviceCore` and the resulting device would
-/// look entirely well-formed. A distinct prefix makes that misreading
-/// impossible rather than unlikely.
-pub(crate) const VIRTIO_MMIO_NODE_PREFIX: &str = "_virtio-mmio-";
+/// Re-exported from the reader rather than restated here. The writer and
+/// the restore path have to agree on this string exactly or an originated
+/// lineage records devices nothing will look for, and two copies of a
+/// constant is how that disagreement becomes possible.
+pub(crate) use hypervisor::hvf::virtio::devmgr::VIRTIO_MMIO_NODE_PREFIX;
 
 /// One cold-booted virtio device, as the emitted document will describe it.
 ///
@@ -115,6 +110,7 @@ pub(crate) const VIRTIO_MMIO_NODE_PREFIX: &str = "_virtio-mmio-";
 /// gives about guest RAM: a second derivation of a value the machine already
 /// decided is a second chance to disagree with it, and a device node that
 /// names a window the guest's driver is not bound to resumes without complaint.
+#[derive(Clone)]
 pub(crate) struct VirtioNode {
     /// What the driver negotiated and programmed, read off the live transport.
     pub transport: MmioTransportState,
@@ -1068,6 +1064,20 @@ mod tests {
             NO_VIRTIO,
         )
         .expect("a cold machine synthesizes")
+    }
+
+    /// The synthesized document as the text a restoring VMM would read.
+    fn synthesized_with(virtio: &[VirtioNode]) -> String {
+        let g = synthesize(
+            &a_checkpoint(1),
+            RAM,
+            24_000_000,
+            a_serial(),
+            SERIAL_LINE,
+            virtio,
+        )
+        .expect("a machine with devices synthesizes");
+        String::from_utf8(g.bytes).expect("utf-8")
     }
 
     fn parsed(g: &Genesis) -> Snapshot {
@@ -2033,6 +2043,88 @@ mod tests {
             empty.is_err_and(|e| e.contains("device-manager state")),
             "a document with no device-manager state must be refused, not \
              silently agreed with"
+        );
+    }
+
+    /// The load-bearing guard of the whole originate path: what the writer
+    /// emits, the restore path's own parser reads back unchanged.
+    ///
+    /// Every other check here compares the writer against a hand-written
+    /// expectation, and a writer and an expectation that move together agree
+    /// about a bug too. This one crosses the crate boundary into the code a
+    /// resuming VMM actually runs, so a field the writer renames, reorders or
+    /// drops stops being readable rather than merely stops matching prose.
+    #[test]
+    fn the_restore_parser_reads_back_exactly_what_the_writer_emitted() {
+        let node = a_block_device();
+        let out = synthesized_with(std::slice::from_ref(&node));
+        let parsed = hypervisor::hvf::virtio::devmgr::parse_mmio_devices(&out)
+            .expect("the reader has to accept what the writer wrote");
+        assert_eq!(parsed.len(), 1, "one device in, one device out");
+        let got = &parsed[0];
+        assert_eq!(got.name, node.transport.name);
+        assert_eq!(
+            got.base, node.base,
+            "the window the guest's driver is bound to"
+        );
+        assert_eq!(got.size, node.size);
+        assert_eq!(got.intid, node.intid, "the SPI the device must raise");
+        assert_eq!(
+            got.transport, node.transport,
+            "every guest-observable field has to survive the round trip, or the \
+             guest resumes against a device it never programmed"
+        );
+    }
+
+    /// Two devices are told apart by their own windows, not by document order.
+    #[test]
+    fn each_device_keeps_its_own_window_and_interrupt() {
+        let mut a = a_block_device();
+        a.transport.name = "blk0".to_string();
+        let mut b = a_block_device();
+        b.transport.name = "net0".to_string();
+        b.transport.device_id = 1;
+        b.base = DEV_BASE + DEV_SIZE;
+        b.intid = DEV_INTID + 1;
+
+        let out = synthesized_with(&[b.clone(), a.clone()]);
+        let parsed = hypervisor::hvf::virtio::devmgr::parse_mmio_devices(&out).expect("readable");
+        // The reader sorts by window, so the emitted order must not matter.
+        let names: Vec<&str> = parsed.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(names, vec!["blk0", "net0"]);
+        assert_eq!(parsed[0].intid, DEV_INTID);
+        assert_eq!(parsed[1].intid, DEV_INTID + 1);
+        assert_eq!(parsed[1].base, DEV_BASE + DEV_SIZE);
+    }
+
+    /// A disk's capacity travels in the config space the guest read, so the
+    /// restored device reports the size the guest's filesystem was built
+    /// against -- not whatever the host file happens to be now.
+    #[test]
+    fn a_restored_disk_keeps_the_capacity_the_guest_was_told() {
+        let mut node = a_block_device();
+        let sectors: u64 = 4096;
+        node.transport.device_config = sectors.to_le_bytes().to_vec();
+        let out = synthesized_with(&[node]);
+        let parsed = hypervisor::hvf::virtio::devmgr::parse_mmio_devices(&out).expect("readable");
+        match &parsed[0].backend {
+            hypervisor::hvf::virtio::devmgr::BackendKind::Block { nsectors, .. } => {
+                assert_eq!(*nsectors, sectors);
+            }
+            other => panic!("a device_id of 2 has to be a block device, got {other:?}"),
+        }
+    }
+
+    /// A real capture is `_virtio-pci-*`, and the MMIO reader must not claim it.
+    #[test]
+    fn the_mmio_reader_finds_nothing_in_a_real_pci_capture() {
+        let capture = include_str!("../testdata/vanilla-state-2cpu-net.json");
+        let parsed = hypervisor::hvf::virtio::devmgr::parse_mmio_devices(capture)
+            .expect("a PCI capture is well-formed, just not MMIO");
+        assert!(
+            parsed.is_empty(),
+            "a PCI capture has no virtio-mmio devices; claiming one would wire \
+             a guest to a transport it never used"
         );
     }
 }

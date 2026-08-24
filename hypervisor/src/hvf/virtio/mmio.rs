@@ -251,6 +251,101 @@ impl VirtioMmioDevice {
         }
     }
 
+    /// Rebuild a device from the state a snapshot recorded (#378), driving
+    /// `backend`.
+    ///
+    /// Only the backend is supplied by the caller: it is a *host* resource (an
+    /// open file, a NAT responder) that no snapshot can carry. Everything the
+    /// guest can observe — name, device id, features, config space, queue
+    /// programming, status — comes from `state`, so a restored device is
+    /// described by exactly one authority.
+    ///
+    /// `core.queues` is **derived** from the stored `setups` plus
+    /// `driver_features`, the same way [`Self::publish_queue`] derives it when a
+    /// driver programs the device live. Deserializing the queues directly would
+    /// be a second, independent description of a value that already has one, and
+    /// the two would drift silently: the ring features come from what the driver
+    /// *acknowledged*, not from what the device offered.
+    ///
+    /// The progress cursors are the one thing that cannot come from the
+    /// document. They live in the guest's own rings, so a ready queue reads them
+    /// back out of guest RAM ([`Queue::restore`]) rather than resuming at zero
+    /// and re-consuming requests the device already completed.
+    pub fn restored(backend: Backend, mem: Arc<GuestMemory>, state: &MmioTransportState) -> Self {
+        let acked = state.driver_features;
+        let n = state.queues.len();
+        let queues = state
+            .queues
+            .iter()
+            .map(|qs| {
+                let mut q = Queue {
+                    size: qs.size,
+                    desc: qs.desc,
+                    avail: qs.driver,
+                    used: qs.device,
+                    event_idx: acked & super::features::RING_EVENT_IDX != 0,
+                    indirect: acked & super::features::RING_INDIRECT_DESC != 0,
+                    next_avail: 0,
+                    next_used: 0,
+                };
+                // Only a queue the driver marked ready has rings in guest RAM to
+                // read: an unready queue's addresses are whatever half-written
+                // state the driver had reached, and reading them would seed the
+                // cursors from an address that means nothing.
+                if qs.ready {
+                    let _ = q.restore(&mem);
+                }
+                q
+            })
+            .collect();
+        let setups = state
+            .queues
+            .iter()
+            .map(|qs| QueueSetup {
+                size: qs.size,
+                desc: qs.desc,
+                driver: qs.driver,
+                device: qs.device,
+                ready: qs.ready,
+            })
+            .collect();
+        let core = DeviceCore {
+            common: VirtioConfig {
+                device_feature_select: state.device_features_sel,
+                driver_feature_select: state.driver_features_sel,
+                device_features: state.device_features,
+                driver_features: acked,
+                msix_config: 0,
+                num_queues: n as u16,
+                device_status: state.device_status,
+                config_generation: state.config_generation,
+                queue_select: state.queue_sel,
+            },
+            queues,
+            queue_vectors: vec![0; n],
+            backend,
+            device_config: state.device_config.clone(),
+            isr_status: 0,
+            mem,
+            injector: Box::new(LoggingInjector::new(state.name.clone())),
+        };
+        Self {
+            name: state.name.clone(),
+            device_id: state.device_id,
+            device_features: state.device_features,
+            core: Mutex::new(core),
+            regs: Mutex::new(MmioRegs {
+                device_features_sel: state.device_features_sel,
+                driver_features_sel: state.driver_features_sel,
+                driver_features: acked,
+                queue_sel: state.queue_sel,
+                setups,
+                interrupt_status: state.interrupt_status,
+            }),
+            kick: Mutex::new(None),
+        }
+    }
+
     /// The device's name (for diagnostics).
     pub fn name(&self) -> &str {
         &self.name
@@ -849,5 +944,178 @@ mod tests {
             s.device_status, 0,
             "a driver that never came up must say so"
         );
+    }
+
+    /// A restored device is described by the document, not by a second
+    /// hand-written description of it. Comparing the whole state — rather than
+    /// the handful of fields a reviewer thinks to check — is what makes this
+    /// guard see a field that is added later and never carried across.
+    #[test]
+    fn a_restored_device_describes_itself_exactly_as_the_one_it_came_from() {
+        // Every field carries a value it could not have taken by default, so
+        // dropping any one of them changes the answer. A fixture built by
+        // driving a fresh device would leave the rarely-written registers
+        // (`interrupt_status`, `config_generation`) at zero, and a guard cannot
+        // see a field zeroed to the value it already held.
+        let captured = MmioTransportState {
+            name: "blk7".into(),
+            device_id: device_id::NET,
+            device_features: 0x0000_0003_8000_0021,
+            driver_features: 0x0000_0001_8000_0001,
+            device_features_sel: 1,
+            driver_features_sel: 1,
+            queue_sel: 1,
+            interrupt_status: 0x3,
+            device_status: 0xf,
+            config_generation: 5,
+            queues: vec![
+                MmioQueueState {
+                    size: 64,
+                    desc: RING_DESC,
+                    driver: RING_AVAIL,
+                    device: RING_USED,
+                    ready: true,
+                },
+                MmioQueueState {
+                    size: 32,
+                    desc: RING_DESC + 0x4000,
+                    driver: RING_AVAIL + 0x4000,
+                    device: RING_USED + 0x4000,
+                    ready: false,
+                },
+            ],
+            device_config: vec![0xde, 0xad, 0xbe, 0xef, 0x01],
+        };
+        let (back, _m) = restored_from(&captured);
+        assert_eq!(
+            back.state(),
+            captured,
+            "every field a snapshot recorded has to come back, or the guest \
+             resumes against a device it never programmed"
+        );
+    }
+
+    /// The one thing the document cannot carry: the rings are the guest's, and
+    /// their indices live in guest RAM. A device that resumed at zero would
+    /// re-consume every request it had already completed.
+    #[test]
+    fn a_restored_queue_resumes_where_the_guest_left_off() {
+        let mut s = a_ready_queue_state();
+        let (d, mem) = restored_from_with_used_idx(&s, 7);
+        {
+            let core = d.core.lock().unwrap();
+            assert_eq!(
+                (core.queues[0].next_used, core.queues[0].next_avail),
+                (7, 7),
+                "both cursors seed from the live used.idx the guest published"
+            );
+        }
+        // And the reading is of RAM, not of a constant: a different guest is at
+        // a different point in its own ring.
+        s.queues[0].ready = true;
+        mem.write_u16(RING_USED + 2, 19).expect("write used.idx");
+        let d2 = VirtioMmioDevice::restored(a_backend(), mem.clone(), &s);
+        assert_eq!(d2.core.lock().unwrap().queues[0].next_used, 19);
+    }
+
+    /// A queue the driver never finished bringing up has no rings to read: its
+    /// addresses are whatever half-written state the driver had reached, and
+    /// seeding a cursor from one would be reading an address that means nothing.
+    #[test]
+    fn an_unready_queue_is_not_seeded_from_addresses_the_driver_never_wrote() {
+        let mut s = a_ready_queue_state();
+        s.queues[0].ready = false;
+        let (d, _m) = restored_from_with_used_idx(&s, 7);
+        let core = d.core.lock().unwrap();
+        assert_eq!(
+            (core.queues[0].next_used, core.queues[0].next_avail),
+            (0, 0),
+            "an unready queue stays at zero rather than reading a stale address"
+        );
+    }
+
+    /// The point of restoring the status byte: the guest comes back believing it
+    /// finished bringing this device up, and it will never do so again.
+    #[test]
+    fn a_restored_device_is_already_brought_up() {
+        let s = a_ready_queue_state();
+        let (d, _m) = restored_from(&s);
+        assert!(
+            d.driver_ok(),
+            "DRIVER_OK has to survive, or the resumed guest waits forever for a \
+             device it already configured"
+        );
+    }
+
+    /// Ring features come from what the driver acknowledged, never from what the
+    /// device offered: a driver is free to decline EVENT_IDX, and a restored
+    /// queue that believed otherwise would read an index the driver never
+    /// writes.
+    #[test]
+    fn a_restored_queue_takes_its_ring_features_from_the_acked_set() {
+        let mut s = a_ready_queue_state();
+        s.device_features = super::super::features::RING_EVENT_IDX
+            | super::super::features::RING_INDIRECT_DESC
+            | super::super::features::VERSION_1;
+        s.driver_features = super::super::features::VERSION_1;
+        let (d, _m) = restored_from(&s);
+        let core = d.core.lock().unwrap();
+        assert!(
+            !core.queues[0].event_idx && !core.queues[0].indirect,
+            "the device offered both and the driver took neither"
+        );
+    }
+
+    // ---- restore fixtures -------------------------------------------------
+
+    const RING_DESC: u64 = 0x4000_1000;
+    const RING_AVAIL: u64 = 0x4000_2000;
+    const RING_USED: u64 = 0x4000_3000;
+
+    fn a_backend() -> Backend {
+        Backend::Block(BlockDevice::new(
+            Box::new(MemDisk(vec![0xabu8; 512 * 8])),
+            "disk0",
+        ))
+    }
+
+    /// A device state as a driver that finished bring-up would leave it.
+    fn a_ready_queue_state() -> MmioTransportState {
+        MmioTransportState {
+            name: "blk0".into(),
+            device_id: device_id::BLOCK,
+            device_features: super::super::features::VERSION_1,
+            driver_features: super::super::features::VERSION_1,
+            device_features_sel: 1,
+            driver_features_sel: 1,
+            queue_sel: 0,
+            interrupt_status: 0,
+            device_status: 0xf,
+            config_generation: 0,
+            queues: vec![MmioQueueState {
+                size: 64,
+                desc: RING_DESC,
+                driver: RING_AVAIL,
+                device: RING_USED,
+                ready: true,
+            }],
+            device_config: blk_config(8),
+        }
+    }
+
+    fn restored_from(s: &MmioTransportState) -> (VirtioMmioDevice, Arc<GuestMemory>) {
+        restored_from_with_used_idx(s, 0)
+    }
+
+    fn restored_from_with_used_idx(
+        s: &MmioTransportState,
+        used_idx: u16,
+    ) -> (VirtioMmioDevice, Arc<GuestMemory>) {
+        let mem = Arc::new(GuestMemory::new());
+        mem.register_owned(0x4000_0000, 0x2_0000);
+        mem.write_u16(RING_USED + 2, used_idx)
+            .expect("seed used.idx");
+        let d = VirtioMmioDevice::restored(a_backend(), mem.clone(), s);
+        (d, mem)
     }
 }

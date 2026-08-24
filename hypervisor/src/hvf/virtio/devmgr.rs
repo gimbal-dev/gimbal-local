@@ -18,6 +18,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use super::block::{BlockBackend, BlockDevice, FileBackend, OverlayBackend};
+use super::mmio::{MmioQueueState, MmioTransportState};
 use super::nat::{EgressPolicy, NatLimits, NatResponder};
 use super::net::NetDevice;
 use super::pathsafe;
@@ -697,6 +698,210 @@ fn sanitize(s: &str) -> String {
         .collect()
 }
 
+/// The MMIO prefix a locally-originated lineage records its devices under.
+///
+/// A capture taken on a KVM host carries `_virtio-pci-*` transports, because
+/// that is what cloud-hypervisor gives a guest. A lineage originated here
+/// carries `_virtio-mmio-*`, because a cold-booted guest's kernel bound its
+/// drivers to MMIO windows and that binding lives in the RAM dump.
+///
+/// Emitting the PCI prefix instead would hand [`parse_devices`] a node whose
+/// transport it would then get wrong -- and it would get it wrong *quietly*,
+/// because the two transports share `DeviceCore` and the resulting device would
+/// look entirely well-formed. A distinct prefix makes that misreading
+/// impossible rather than unlikely.
+///
+/// The writer (chm's `genesis`) re-exports this rather than restating it: the
+/// two halves must agree on the string exactly, and two copies of a constant is
+/// how that agreement becomes optional.
+pub const VIRTIO_MMIO_NODE_PREFIX: &str = "_virtio-mmio-";
+
+/// A fully-parsed virtio-mmio device ready to be turned into a live device.
+///
+/// Deliberately flatter than [`VirtioDeviceDesc`]: there is no BAR, no MSI-X
+/// table and no ITS `DeviceID`, because an MMIO transport has none of them. It
+/// occupies one window and raises one wired SPI.
+#[derive(Debug, Clone)]
+pub struct VirtioMmioDeviceDesc {
+    /// Device name (e.g. `blk0`), as the guest's driver knows it.
+    pub name: String,
+    /// Base address of the device's MMIO window.
+    pub base: u64,
+    /// Length of that window.
+    pub size: u64,
+    /// The wired SPI this device raises.
+    pub intid: u32,
+    /// Everything guest-observable about the transport.
+    pub transport: MmioTransportState,
+    /// The backend to attach.
+    pub backend: BackendKind,
+}
+
+/// Read one `MmioAddressRange` + `LegacyIrq` pair out of a device-tree node.
+///
+/// Both are required. A window with no interrupt is a device the guest can
+/// program and never hear from, and an interrupt with no window is one it
+/// cannot reach at all; either is a device that would look present and be
+/// useless, so both are refused by name rather than defaulted.
+fn mmio_placement(node: &Value) -> Result<(u64, u64, u32), DevMgrError> {
+    let resources = node
+        .get("resources")
+        .and_then(Value::as_array)
+        .ok_or_else(|| malformed("virtio-mmio node has no resources array"))?;
+    let mut window = None;
+    let mut irq = None;
+    for r in resources {
+        if let Some(m) = r.get("MmioAddressRange") {
+            window = Some((u64_at(m, "base")?, u64_at(m, "size")?));
+        } else if let Some(i) = r.get("LegacyIrq").and_then(Value::as_u64) {
+            irq = Some(
+                u32::try_from(i).map_err(|_| malformed(format!("LegacyIrq {i} is not an SPI")))?,
+            );
+        }
+    }
+    let (base, size) =
+        window.ok_or_else(|| malformed("virtio-mmio node has no MmioAddressRange"))?;
+    let intid = irq.ok_or_else(|| malformed("virtio-mmio node has no LegacyIrq"))?;
+    if size == 0 {
+        return Err(malformed(format!(
+            "virtio-mmio device at {base:#x} has a zero-length window, so nothing could reach it"
+        )));
+    }
+    Ok((base, size, intid))
+}
+
+fn u16_at(v: &Value, key: &str) -> Result<u16, DevMgrError> {
+    u16::try_from(u64_at(v, key)?).map_err(|_| malformed(format!("`{key}` does not fit a u16")))
+}
+
+/// Choose the backend for a virtio-mmio device from its virtio device type.
+///
+/// Same authority as the PCI path: the type the guest negotiated decides, and
+/// an unmodelled type becomes [`BackendKind::Unsupported`] so it is refused by
+/// name at build time rather than mismodelled into something that half works.
+fn mmio_backend(device_id: u32, state: &Value, config: &[u8]) -> BackendKind {
+    match device_id {
+        VIRTIO_TYPE_NET => BackendKind::Net,
+        VIRTIO_TYPE_RNG => BackendKind::Rng,
+        VIRTIO_TYPE_BLOCK => {
+            // Capacity comes from the device config space the guest read, not
+            // from the host file's current length: the guest sized its
+            // filesystem against that number and a disk that grew underneath
+            // the snapshot must not silently change it.
+            let nsectors = config
+                .get(..8)
+                .map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap_or([0; 8])));
+            BackendKind::Block {
+                disk_path: state
+                    .get("backing")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                nsectors,
+            }
+        }
+        other => BackendKind::Unsupported { virtio_type: other },
+    }
+}
+
+/// Parse every `_virtio-mmio-*` device in a `state.json` into descriptors.
+///
+/// The twin of [`parse_devices`], and deliberately a separate function rather
+/// than a branch inside it: the two transports share no resource shape, so a
+/// merged parser would be two parsers behind one name.
+pub fn parse_mmio_devices(state_json: &str) -> Result<Vec<VirtioMmioDeviceDesc>, DevMgrError> {
+    let root: Value = serde_json::from_str(state_json)
+        .map_err(|e| malformed(format!("invalid state.json: {e}")))?;
+    let dm = root
+        .get("snapshots")
+        .and_then(|s| s.get("device-manager"))
+        .and_then(|d| d.get("snapshots"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| malformed("missing device-manager snapshots"))?;
+    let tree = root
+        .pointer("/snapshots/device-manager/snapshot_data/state")
+        .and_then(Value::as_str)
+        .and_then(|s| serde_json::from_str::<Value>(s).ok());
+    let tree = tree
+        .as_ref()
+        .and_then(|v| v.get("device_tree"))
+        .and_then(Value::as_object);
+
+    let mut out = Vec::new();
+    for (key, node) in dm {
+        let Some(name) = key.strip_prefix(VIRTIO_MMIO_NODE_PREFIX) else {
+            continue;
+        };
+        let tree_node = tree.and_then(|t| t.get(key)).ok_or_else(|| {
+            malformed(format!(
+                "virtio-mmio device `{name}` has no device-tree node, so its window is unknown"
+            ))
+        })?;
+        let (base, size, intid) = mmio_placement(tree_node)?;
+        let state = embedded(node)?;
+
+        let device_id = u32::try_from(u64_at(&state, "device_id")?)
+            .map_err(|_| malformed("device_id does not fit a u32"))?;
+        let device_config: Vec<u8> = state
+            .get("device_config")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_u64)
+                    .map(|b| b as u8)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let queues = state
+            .get("queues")
+            .and_then(Value::as_array)
+            .ok_or_else(|| malformed(format!("virtio-mmio device `{name}` records no queues")))?
+            .iter()
+            .map(|q| {
+                Ok(MmioQueueState {
+                    size: u16_at(q, "size")?,
+                    desc: u64_at(q, "desc_table")?,
+                    driver: u64_at(q, "avail_ring")?,
+                    device: u64_at(q, "used_ring")?,
+                    ready: q.get("ready").and_then(Value::as_bool).unwrap_or(false),
+                })
+            })
+            .collect::<Result<Vec<_>, DevMgrError>>()?;
+
+        let backend = mmio_backend(device_id, &state, &device_config);
+        out.push(VirtioMmioDeviceDesc {
+            name: name.to_string(),
+            base,
+            size,
+            intid,
+            transport: MmioTransportState {
+                name: name.to_string(),
+                device_id,
+                device_features: u64_at(&state, "device_features")?,
+                driver_features: u64_at(&state, "driver_features")?,
+                device_features_sel: u32::try_from(u64_at(&state, "device_features_sel")?)
+                    .map_err(|_| malformed("device_features_sel does not fit a u32"))?,
+                driver_features_sel: u32::try_from(u64_at(&state, "driver_features_sel")?)
+                    .map_err(|_| malformed("driver_features_sel does not fit a u32"))?,
+                queue_sel: u16_at(&state, "queue_sel")?,
+                interrupt_status: u32::try_from(u64_at(&state, "interrupt_status")?)
+                    .map_err(|_| malformed("interrupt_status does not fit a u32"))?,
+                device_status: u8::try_from(u64_at(&state, "device_status")?)
+                    .map_err(|_| malformed("device_status does not fit a u8"))?,
+                config_generation: u8::try_from(u64_at(&state, "config_generation")?)
+                    .map_err(|_| malformed("config_generation does not fit a u8"))?,
+                queues,
+                device_config,
+            },
+            backend,
+        });
+    }
+    // Stable order (window address) so wiring is deterministic.
+    out.sort_by_key(|d| d.base);
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -764,7 +969,10 @@ mod tests {
         ))
         .expect("parse block");
         match &blk[0].backend {
-            BackendKind::Block { nsectors, disk_path } => {
+            BackendKind::Block {
+                nsectors,
+                disk_path,
+            } => {
                 assert_eq!(*nsectors, 2048);
                 assert_eq!(disk_path, "/x.raw");
             }
@@ -998,5 +1206,233 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A document whose one virtio-mmio device is described by `state` (the
+    /// embedded per-device state) and `resources` (the device-tree entry).
+    fn mmio_doc(state: &str, resources: &str) -> String {
+        let tree =
+            format!(r#"{{"device_tree":{{"_virtio-mmio-blk0":{{"resources":{resources}}}}}}}"#);
+        serde_json::json!({
+            "snapshots": {
+                "device-manager": {
+                    "snapshots": {
+                        "_virtio-mmio-blk0": {
+                            "snapshot_data": { "state": state }
+                        }
+                    },
+                    "snapshot_data": { "state": tree }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    /// A driver-programmed block transport, as the writer records one.
+    fn mmio_state() -> String {
+        r#"{"device_id":2,"device_features":68,"driver_features":4,
+            "device_features_sel":1,"driver_features_sel":0,"queue_sel":0,
+            "interrupt_status":1,"device_status":15,"config_generation":3,
+            "queues":[{"size":128,"desc_table":1090519040,"avail_ring":1124073472,
+                       "used_ring":1107296256,"ready":true}],
+            "device_config":[1,0,0,0,0,0,0,0],"backing":"/disks/blk0.raw"}"#
+            .to_string()
+    }
+
+    const GOOD_RESOURCES: &str =
+        r#"[{"MmioAddressRange":{"base":1073741824,"size":512}},{"LegacyIrq":35}]"#;
+
+    fn mmio_refused(doc: &str, what: &str) -> String {
+        match parse_mmio_devices(doc) {
+            Ok(v) => panic!("{what} was accepted, and produced {} device(s)", v.len()),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// The ring addresses are three differently-named keys holding three
+    /// same-typed values, which is exactly the shape where a transposed pair
+    /// reads back perfectly and points the device at the wrong ring.
+    #[test]
+    fn each_ring_address_lands_in_the_field_that_names_it() {
+        let doc = mmio_doc(&mmio_state(), GOOD_RESOURCES);
+        let d = &parse_mmio_devices(&doc).expect("well-formed")[0];
+        let q = &d.transport.queues[0];
+        assert_eq!(q.desc, 0x4100_0000, "desc_table");
+        assert_eq!(q.driver, 0x4300_0000, "avail_ring");
+        assert_eq!(q.device, 0x4200_0000, "used_ring");
+        assert_eq!(q.size, 128);
+        assert!(q.ready, "the driver had brought this queue up");
+    }
+
+    /// The window and the interrupt come from the device tree, not the state.
+    #[test]
+    fn the_window_and_the_interrupt_come_from_the_device_tree() {
+        let doc = mmio_doc(&mmio_state(), GOOD_RESOURCES);
+        let d = &parse_mmio_devices(&doc).expect("well-formed")[0];
+        assert_eq!(d.base, 0x4000_0000);
+        assert_eq!(d.size, 0x200);
+        assert_eq!(d.intid, 35, "the SPI the guest's driver expects");
+    }
+
+    /// A device with a window and no interrupt is one the guest can program and
+    /// never hear from -- a silent hang, so it is refused by name.
+    #[test]
+    fn a_device_with_no_interrupt_is_refused_rather_than_wired_deaf() {
+        let doc = mmio_doc(
+            &mmio_state(),
+            r#"[{"MmioAddressRange":{"base":1073741824,"size":512}}]"#,
+        );
+        let msg = mmio_refused(&doc, "a device with no LegacyIrq");
+        assert!(msg.contains("LegacyIrq"), "{msg}");
+    }
+
+    /// Likewise an interrupt with no window: unreachable, not merely degraded.
+    #[test]
+    fn a_device_with_no_window_is_refused_rather_than_wired_unreachable() {
+        let doc = mmio_doc(&mmio_state(), r#"[{"LegacyIrq":35}]"#);
+        let msg = mmio_refused(&doc, "a device with no MmioAddressRange");
+        assert!(msg.contains("MmioAddressRange"), "{msg}");
+    }
+
+    /// A zero-length window accepts no access at all, so a device behind one is
+    /// present in the document and absent from the machine.
+    #[test]
+    fn a_zero_length_window_is_refused() {
+        let doc = mmio_doc(
+            &mmio_state(),
+            r#"[{"MmioAddressRange":{"base":1073741824,"size":0}},{"LegacyIrq":35}]"#,
+        );
+        let msg = mmio_refused(&doc, "a zero-length window");
+        assert!(msg.contains("zero-length"), "{msg}");
+    }
+
+    /// A device recorded with no device-tree node has no window to be placed
+    /// in. Defaulting one would put it wherever we guessed, which is not where
+    /// the guest's driver is bound.
+    #[test]
+    fn a_device_with_no_device_tree_node_is_refused_rather_than_placed_by_guess() {
+        let doc = serde_json::json!({
+            "snapshots": { "device-manager": {
+                "snapshots": { "_virtio-mmio-blk0": {
+                    "snapshot_data": { "state": mmio_state() } } },
+                "snapshot_data": { "state": r#"{"device_tree":{}}"# }
+            } }
+        })
+        .to_string();
+        let msg = mmio_refused(&doc, "a device with no device-tree node");
+        assert!(msg.contains("blk0") && msg.contains("device-tree"), "{msg}");
+    }
+
+    /// A virtio type this build does not model must be refused by name at build
+    /// time, not quietly turned into a device of some other kind.
+    #[test]
+    fn an_unmodelled_virtio_type_is_carried_through_as_unsupported() {
+        let state = mmio_state().replace("\"device_id\":2", "\"device_id\":9");
+        let doc = mmio_doc(&state, GOOD_RESOURCES);
+        let d = &parse_mmio_devices(&doc).expect("well-formed")[0];
+        match d.backend {
+            BackendKind::Unsupported { virtio_type } => assert_eq!(virtio_type, 9),
+            ref other => panic!("virtio type 9 is not modelled here, got {other:?}"),
+        }
+    }
+
+    /// The per-device state is a JSON *string* inside the document, so a reader
+    /// that forgets the second parse sees an opaque scalar and finds nothing.
+    #[test]
+    fn the_per_device_state_is_parsed_out_of_its_string() {
+        let doc = mmio_doc(&mmio_state(), GOOD_RESOURCES);
+        let d = &parse_mmio_devices(&doc).expect("well-formed")[0];
+        assert_eq!(d.transport.device_features, 68);
+        assert_eq!(d.transport.driver_features, 4);
+        assert_eq!(d.transport.device_features_sel, 1);
+        assert_eq!(d.transport.device_status, 0xf);
+        assert_eq!(d.transport.config_generation, 3);
+        assert_eq!(d.transport.interrupt_status, 1);
+    }
+
+    /// The guest sized its filesystem against the capacity it read out of
+    /// config space. Recomputing it from the host file's current length is a
+    /// second derivation of a number the guest already committed to, and a
+    /// disk that grew under the snapshot would silently move the end of the
+    /// filesystem the guest believes in.
+    #[test]
+    fn a_disk_keeps_the_capacity_the_guest_was_told() {
+        // 4096 sectors, little-endian, exactly as config space carries it.
+        let state = mmio_state().replace(
+            r#""device_config":[1,0,0,0,0,0,0,0]"#,
+            r#""device_config":[0,16,0,0,0,0,0,0]"#,
+        );
+        let doc = mmio_doc(&state, GOOD_RESOURCES);
+        let d = &parse_mmio_devices(&doc).expect("well-formed")[0];
+        match &d.backend {
+            BackendKind::Block {
+                nsectors,
+                disk_path,
+            } => {
+                assert_eq!(*nsectors, 4096, "read from device_config, LE");
+                assert_eq!(disk_path, "/disks/blk0.raw");
+            }
+            other => panic!("device_id 2 is a block device, got {other:?}"),
+        }
+    }
+
+    /// A JSON object has no order, so a parser that reports devices in map
+    /// order reports them in whatever order the serializer happened to choose.
+    /// Two runs over the same document then wire the same machine differently.
+    #[test]
+    fn devices_come_back_in_window_order_whatever_the_document_says() {
+        // The names are deliberately in the OPPOSITE order to the windows.
+        // serde_json keys a map with a BTreeMap, so a parser with no sort
+        // reports alphabetically -- and a fixture whose names ascend with its
+        // bases would read back correctly with the sort deleted.
+        let tree = r#"{"device_tree":{
+            "_virtio-mmio-aa":{"resources":[{"MmioAddressRange":{"base":1073741824,"size":512}},{"LegacyIrq":35}]},
+            "_virtio-mmio-zz":{"resources":[{"MmioAddressRange":{"base":536870912,"size":512}},{"LegacyIrq":36}]}}}"#;
+        let doc = serde_json::json!({
+            "snapshots": { "device-manager": {
+                "snapshots": {
+                    "_virtio-mmio-aa": { "snapshot_data": { "state": mmio_state() } },
+                    "_virtio-mmio-zz": { "snapshot_data": { "state": mmio_state() } },
+                },
+                "snapshot_data": { "state": tree }
+            } }
+        })
+        .to_string();
+        let found = parse_mmio_devices(&doc).expect("well-formed");
+        let bases: Vec<u64> = found.iter().map(|d| d.base).collect();
+        assert_eq!(bases, vec![0x2000_0000, 0x4000_0000], "ascending by window");
+        assert_eq!(found[0].name, "zz", "the low window, despite the late name");
+        assert_eq!(found[0].intid, 36, "each device keeps its own interrupt");
+        assert_eq!(found[1].name, "aa");
+        assert_eq!(found[1].intid, 35);
+    }
+
+    /// The other direction, and the one that does real damage: if the MMIO
+    /// reader claimed a `_virtio-pci-*` node, `parse_devices` would claim it
+    /// too and the same backend would be wired twice onto one guest -- two
+    /// devices driving one disk, which is corruption rather than a refusal.
+    #[test]
+    fn the_mmio_parser_does_not_claim_a_pci_node() {
+        let doc = mmio_doc(&mmio_state(), GOOD_RESOURCES)
+            .replace(VIRTIO_MMIO_NODE_PREFIX, "_virtio-pci-");
+        let found = parse_mmio_devices(&doc).expect("well-formed, just not MMIO");
+        assert!(
+            found.is_empty(),
+            "the MMIO reader claimed {} PCI node(s); the PCI reader will claim \
+             them as well, and one backend would be wired to two devices",
+            found.len()
+        );
+    }
+
+    /// The PCI parser and the MMIO parser must not claim each other's nodes.
+    #[test]
+    fn the_pci_parser_does_not_claim_an_mmio_document() {
+        let doc = mmio_doc(&mmio_state(), GOOD_RESOURCES);
+        let pci = parse_devices(&doc).expect("well-formed, just not PCI");
+        assert!(
+            pci.is_empty(),
+            "a virtio-mmio device read as PCI would be given a BAR and an ITS \
+             DeviceID it does not have"
+        );
     }
 }
