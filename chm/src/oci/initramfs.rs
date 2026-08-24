@@ -551,6 +551,57 @@ fi
 {cd}exec {entrypoint}
 }}
 
+# Stop the machine, rather than letting init exit.
+#
+# PID 1 exiting is a kernel panic by definition, so `exit` here ends every
+# session -- a typed `exit`, a Ctrl-C, an entrypoint that finished -- in
+# "Attempted to kill init!" and an immediate reboot. That reboot is a power cut:
+# a writable rootfs is unjournalled ext2, so the next mount reports `mounting
+# unchecked fs` and carries lost inodes forever, and there is no e2fsck on the
+# host to repair it with.
+#
+# `sync` is the load-bearing line: it is the only one that runs on every image,
+# and the disk damage is the part that does not heal. The stops after it are
+# layered because none is available everywhere -- sysrq is a direct kernel call
+# and needs no working userland, but the key must be permitted first (there is
+# no systemd here to apply a sysctl, so the compile-time mask is not ours to
+# assume); busybox has `poweroff -f`; a systemd userland's `poweroff` is a
+# systemctl shim that fails without a running manager. Whichever works never
+# returns.
+gimbal_halt() {{
+    sync
+    echo "gimbal: session ended (rc=$1); stopping the machine"
+    # End what the session left behind. Nothing else will: every stop below is
+    # an immediate power-off, and a browser leaves a tree of children that init
+    # inherited when the session leader exited. They are also what holds the
+    # root filesystem busy, so this is what lets the remount below succeed.
+    kill -TERM -1 2>/dev/null
+    sleep 2 2>/dev/null
+    kill -KILL -1 2>/dev/null
+    sync
+    # Mark the filesystem clean. A power-off unmounts nothing, so without this
+    # the next boot warns that the fs is unchecked and asks for an e2fsck this
+    # platform does not have. Report a failure rather than swallowing it: the
+    # warning would otherwise arrive a boot later with nothing to explain it.
+    if ! mount -o remount,ro / 2>/dev/null; then
+        echo "gimbal: could not remount / read-only; the next boot will report an unchecked filesystem"
+    fi
+    echo 1 > /proc/sys/kernel/sysrq 2>/dev/null
+    echo o > /proc/sysrq-trigger 2>/dev/null
+    poweroff -f 2>/dev/null
+    halt -f -p 2>/dev/null
+    # sysrq powers the machine down asynchronously -- the write returns and the
+    # shell runs on -- so wait before concluding that nothing worked. Without
+    # this the line below prints on a *successful* stop, and a failure message
+    # that lies is worse than no message at all.
+    sleep 5 2>/dev/null
+    # Nothing worked. Exiting still panics, but the sync above has already made
+    # that survivable for the disk. Say so, rather than letting the panic be
+    # the only account of what happened.
+    echo "gimbal: could not stop the machine; init is exiting and the kernel will panic"
+    exit $1
+}}
+
 # Re-entry. The mounts below have already run in the parent, so skip straight
 # to the handover, leaving a marker to say the session really started.
 if [ "$1" = "--gimbal-session" ]; then
@@ -787,10 +838,10 @@ if [ -c /dev/ttyAMA0 ]; then
     # marker and that is what decides.
     #
     # The bias is deliberate. Falling through when the session did run costs a
-    # second shell, which is odd and harmless; exiting when it never ran means
-    # init exits and the kernel panics with no shell at all.
+    # second shell, which is odd and harmless; halting when it never ran stops
+    # the machine with no shell at all.
     if [ -e /dev/.gimbal-session ]; then
-        exit $_rc
+        gimbal_halt $_rc
     fi
 fi
 
@@ -1619,11 +1670,135 @@ mod tests {
              responses -- so a marker must decide:\n{s}"
         );
         // The bias must be toward running the entrypoint again, never toward
-        // init exiting: the first costs a second shell, the second is a kernel
-        // panic with no shell at all.
+        // stopping the machine: the first costs a second shell, the second
+        // leaves no shell at all.
         assert!(
-            s.contains("if [ -e /dev/.gimbal-session ]; then\n        exit $_rc"),
-            "init may only exit when the session provably ran:\n{s}"
+            s.contains("if [ -e /dev/.gimbal-session ]; then\n        gimbal_halt $_rc"),
+            "init may only stop the machine when the session provably ran:\n{s}"
+        );
+    }
+
+    /// A session ending must stop the machine, never let init exit.
+    ///
+    /// PID 1 exiting is a kernel panic by definition, and the reboot that
+    /// follows is a power cut on an unjournalled ext2 rootfs -- so a typed
+    /// `exit`, or a Ctrl-C reaching a non-interactive entrypoint, damaged the
+    /// disk and reported `guest powered off` while doing it (#384).
+    #[test]
+    fn a_session_ending_stops_the_machine_rather_than_exiting() {
+        let s = default_init("/bin/sh", &[], None, &[]);
+
+        let halt = s
+            .find("gimbal_halt() {\n")
+            .expect("no gimbal_halt in the generated init");
+        let body = &s[halt..];
+        let end = body.find("\n}\n").expect("gimbal_halt is unterminated");
+        let body = &body[..end];
+
+        // `sync` is the load-bearing line: it is the only one that runs on
+        // every image, and the disk damage is what does not heal.
+        let sync = body.find("sync\n").expect("gimbal_halt does not sync");
+        let stops = ["/proc/sysrq-trigger", "poweroff -f", "halt -f"];
+        let mut last_stop = 0;
+        for stop in stops {
+            let at = body
+                .find(stop)
+                .unwrap_or_else(|| panic!("gimbal_halt does not try `{stop}`:\n{body}"));
+            assert!(
+                sync < at,
+                "gimbal_halt must sync before `{stop}`, or the flush never \
+                 happens:\n{body}"
+            );
+            last_stop = last_stop.max(at);
+        }
+
+        // Every stop above is an immediate power-off that unmounts nothing, so
+        // the read-only remount is the only thing that marks the filesystem
+        // clean. Without it the next boot warns that the fs is unchecked --
+        // measured, and there is no e2fsck on this platform to answer it.
+        let remount = body
+            .find("remount,ro")
+            .expect("gimbal_halt does not remount the root read-only:\n{body}");
+        assert!(
+            sync < remount && remount < last_stop,
+            "the read-only remount must sit between the sync and the stops:\n{body}"
+        );
+
+        // The remount only succeeds once nothing holds the root busy. A browser
+        // session leaves a tree of children that init inherits when the session
+        // leader exits, and they keep profile files open for writing --
+        // measured: with the remount alone the next boot still warned, and
+        // ending the leftovers first is what cleared it.
+        let term = body
+            .find(&format!("kill -TERM {}", "-1"))
+            .unwrap_or_else(|| panic!("gimbal_halt does not end the leftovers:\n{body}"));
+        let killed = body
+            .find(&format!("kill -KILL {}", "-1"))
+            .unwrap_or_else(|| panic!("gimbal_halt never insists:\n{body}"));
+        assert!(
+            term < killed && killed < remount,
+            "the session's leftovers must be ended before the remount, or the \
+             remount is refused and the next boot warns:\n{body}"
+        );
+        assert!(
+            body[..remount].matches("sync\n").count() >= 2,
+            "gimbal_halt must sync again after ending the leftovers, or their \
+             last writes are lost:\n{body}"
+        );
+
+        // A refused remount has to say so. The warning it prevents arrives a
+        // whole boot later, with nothing on screen to connect it to this stop.
+        let refused = body
+            .find("could not remount")
+            .unwrap_or_else(|| panic!("gimbal_halt swallows a failed remount:\n{body}"));
+        assert!(
+            remount < refused,
+            "a failed remount must be reported after the attempt:\n{body}"
+        );
+
+        // The sysrq key has to be permitted before it is pressed. There is no
+        // systemd here to apply a sysctl, so the kernel's compile-time mask is
+        // whatever it is, and writing the trigger alone can silently do
+        // nothing -- which is exactly how the first fix still panicked.
+        let permit = body
+            .find("/proc/sys/kernel/sysrq")
+            .expect("gimbal_halt does not permit the sysrq key:\n{body}");
+        let trigger = body.find("/proc/sysrq-trigger").expect("checked above");
+        assert!(
+            permit < trigger,
+            "the sysrq key must be permitted before it is pressed:\n{body}"
+        );
+
+        // Exiting is the last resort, after every stop has been tried -- an
+        // earlier one would panic while a working power-off sat below it.
+        let exit = body
+            .rfind(&format!("{} $1", "exit"))
+            .expect("gimbal_halt has no final exit");
+        assert!(
+            last_stop < exit,
+            "exiting must come after every power-off attempt:\n{body}"
+        );
+
+        // And the failure report must come after a wait. sysrq powers the
+        // machine down asynchronously, so a message emitted straight after the
+        // attempts prints on a *successful* stop too -- measured, the first
+        // version of this fix did exactly that.
+        let wait = body
+            .rfind("sleep ")
+            .expect("gimbal_halt gives up without waiting for an async stop");
+        let gave_up = body
+            .find("could not stop the machine")
+            .expect("gimbal_halt never reports that it failed");
+        assert!(
+            last_stop < wait && wait < gave_up,
+            "gimbal_halt must wait between its last stop attempt and saying it \
+             failed, or it reports failure on a successful power-off:\n{body}"
+        );
+
+        // And nothing else may exit on the session's behalf.
+        assert!(
+            !s.contains("exit $_rc"),
+            "a session's status must reach gimbal_halt, not `exit`:\n{s}"
         );
     }
 
