@@ -18,7 +18,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use super::block::{BlockBackend, BlockDevice, FileBackend, OverlayBackend};
-use super::mmio::{MmioQueueState, MmioTransportState};
+use super::mmio::{MmioQueueState, MmioTransportState, VirtioMmioDevice};
 use super::nat::{EgressPolicy, NatLimits, NatResponder};
 use super::net::NetDevice;
 use super::pathsafe;
@@ -480,22 +480,101 @@ pub fn build_device(
         .map(|qs| restore_queue(qs, desc.features, &mem))
         .collect::<Vec<_>>();
 
-    let (backend, device_config) = match &desc.backend {
+    let backend = build_backend(
+        &desc.name,
+        &desc.backend,
+        desc.features,
+        overlay_dir,
+        resume,
+        net_policy,
+        net_limits,
+        allow_local_egress,
+    )?;
+    let device_config = match &desc.backend {
+        BackendKind::Block { nsectors, .. } => blk_device_config(*nsectors),
+        _ => Vec::new(),
+    };
+    let dev = Arc::new(VirtioPciDevice::new(
+        desc.name.clone(),
+        backend,
+        mem,
+        RestoreParams {
+            features: desc.features,
+            queues,
+            queue_vectors: desc.queue_vectors.clone(),
+            device_status: desc.device_status,
+            device_config,
+        },
+    ));
+    Ok((desc.bar_base, CAPABILITY_BAR_SIZE, dev))
+}
+
+/// Build one virtio-mmio device from its captured transport state.
+///
+/// The counterpart of [`build_device`], and deliberately much shorter: an MMIO
+/// device has no BAR, no MSI-X table and no ITS `DeviceID`, so there is nothing
+/// to place. The transport state carries the guest-observable device
+/// configuration verbatim, so unlike the PCI path nothing is recomputed here --
+/// the guest already negotiated it, and recomputing would let this build's
+/// opinion overwrite what the guest was actually told.
+pub fn build_mmio_device(
+    desc: &VirtioMmioDeviceDesc,
+    mem: Arc<GuestMemory>,
+    overlay_dir: &std::path::Path,
+    resume: bool,
+    net_policy: Option<EgressPolicy>,
+    net_limits: NatLimits,
+    allow_local_egress: bool,
+) -> Result<Arc<VirtioMmioDevice>, DevMgrError> {
+    let backend = build_backend(
+        &desc.name,
+        &desc.backend,
+        desc.transport.driver_features,
+        overlay_dir,
+        resume,
+        net_policy,
+        net_limits,
+        allow_local_egress,
+    )?;
+    Ok(Arc::new(VirtioMmioDevice::restored(
+        backend,
+        mem,
+        &desc.transport,
+    )))
+}
+
+/// Build the backend a device of `kind` should be attached to.
+///
+/// Shared by both transports on purpose. Everything decided here -- which file
+/// a disk is really opened against, the NAT's gateway address, the egress
+/// policy and the lines that report it, and the refusal for a virtio type this
+/// build does not model -- is a property of the *device*, not of how the guest
+/// reaches it. Rendering it twice is how a virtio-mmio guest ends up quietly
+/// governed by a different posture than a virtio-pci one.
+#[allow(clippy::too_many_arguments)]
+pub fn build_backend(
+    name: &str,
+    kind: &BackendKind,
+    features: u64,
+    overlay_dir: &std::path::Path,
+    resume: bool,
+    net_policy: Option<EgressPolicy>,
+    net_limits: NatLimits,
+    allow_local_egress: bool,
+) -> Result<Backend, DevMgrError> {
+    let backend = match kind {
         BackendKind::Block {
             disk_path,
             nsectors,
         } => {
             let (backend, _backing) =
-                resolve_block_backend(overlay_dir, &desc.name, disk_path, *nsectors, resume)?;
-            (
-                Backend::Block(BlockDevice::new(backend, &desc.name)),
-                blk_device_config(*nsectors),
-            )
+                resolve_block_backend(overlay_dir, name, disk_path, *nsectors, resume)?;
+            Backend::Block(BlockDevice::new(backend, name))
         }
         BackendKind::Rng => {
             let src = UrandomSource::open()
                 .map_err(|e| DevMgrError::Io(format!("open /dev/urandom: {e}")))?;
-            (Backend::Rng(RngDevice::new(Box::new(src))), Vec::new())
+            Backend::Rng(RngDevice::new(Box::new(src)))
         }
         BackendKind::Net => {
             // The gateway the resumed guest talks to. Capture-side cloud-init
@@ -517,48 +596,37 @@ pub fn build_device(
                     // constant reporting a sandbox that was not running.
                     "chm: virtio-net {} governed by egress policy {} — {} \
                      (enforced at the NAT)",
-                    desc.name,
+                    name,
                     policy.label(),
                     policy.posture_summary()
                 );
             }
             if allow_local_egress {
                 eprintln!(
-                    "chm: virtio-net {} — local egress ALLOWED (reserved-address \
-                     guard disabled); the guest can reach host loopback/LAN",
-                    desc.name
+                    "chm: virtio-net {name} — local egress ALLOWED (reserved-address \
+                     guard disabled); the guest can reach host loopback/LAN"
                 );
             }
-            let responder = NatResponder::new([192, 168, 249, 1], [0x02, 0, 0, 0, 0, 1], policy, net_limits);
-            (
-                Backend::Net(NetDevice::new(Box::new(responder)).with_features(desc.features)),
-                Vec::new(),
-            )
+            let responder = NatResponder::new(
+                [192, 168, 249, 1],
+                [0x02, 0, 0, 0, 0, 1],
+                policy,
+                net_limits,
+            );
+            Backend::Net(NetDevice::new(Box::new(responder)).with_features(features))
         }
         BackendKind::Unsupported { virtio_type } => {
             return Err(DevMgrError::Unsupported(format!(
                 "device `{}` is virtio type {virtio_type} (PCI Device ID \
                  {:#06x}), which this build does not model; refusing to \
                  mismodel it",
-                desc.name,
+                name,
                 0x1040 + virtio_type
             )));
         }
     };
 
-    let dev = Arc::new(VirtioPciDevice::new(
-        desc.name.clone(),
-        backend,
-        mem,
-        RestoreParams {
-            features: desc.features,
-            queues,
-            queue_vectors: desc.queue_vectors.clone(),
-            device_status: desc.device_status,
-            device_config,
-        },
-    ));
-    Ok((desc.bar_base, CAPABILITY_BAR_SIZE, dev))
+    Ok(backend)
 }
 
 /// Which host backing a virtio-blk device resolved to. Surfaced so the wiring
@@ -1453,6 +1521,150 @@ mod tests {
             pci.is_empty(),
             "a virtio-mmio device read as PCI would be given a BAR and an ITS \
              DeviceID it does not have"
+        );
+    }
+
+    /// One virtio-mmio device, parsed out of a document, ready to build.
+    fn an_mmio_desc(state: &str) -> VirtioMmioDeviceDesc {
+        parse_mmio_devices(&mmio_doc(state, GOOD_RESOURCES))
+            .expect("well-formed")
+            .remove(0)
+    }
+
+    /// The refusal for a virtio type this build does not model has to reach the
+    /// mmio path too. A transport that quietly built *something* for an
+    /// unmodelled type would hand the guest a device that answers wrongly --
+    /// worse than the device being absent, because the driver binds to it.
+    #[test]
+    fn an_unmodelled_device_is_refused_on_the_mmio_transport_as_well() {
+        // device_id 9 is virtio-9p, which this build does not model.
+        let desc = an_mmio_desc(&mmio_state().replace(r#""device_id":2"#, r#""device_id":9"#));
+        let dir = std::env::temp_dir().join(format!("chm-mmioref-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // `VirtioMmioDevice` has no `Debug`, so `expect_err` does not compile.
+        let msg = match build_mmio_device(
+            &desc,
+            Arc::new(GuestMemory::new()),
+            &dir,
+            false,
+            None,
+            NatLimits::default(),
+            false,
+        ) {
+            Err(e) => format!("{e:?}"),
+            Ok(_) => panic!("an unmodelled virtio type must be refused, not mismodelled"),
+        };
+        assert!(msg.contains("blk0"), "names the device: {msg}");
+        assert!(msg.contains('9'), "names the virtio type: {msg}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A shipped disk is an immutable base with a per-run CoW overlay over it.
+    /// If the mmio path opened the backing file directly it would write through
+    /// to the user's disk and diverge from the RAM the same snapshot restores,
+    /// so the overlay's existence is the observable proof the shared resolver
+    /// was reached rather than re-derived.
+    #[test]
+    fn an_mmio_disk_is_opened_as_a_copy_on_write_overlay() {
+        use std::io::Write;
+
+        let root = std::env::temp_dir().join(format!("chm-mmiocow-{}", std::process::id()));
+        let overlay_dir = root.join(".chm-overlays");
+        let disks = root.join("disks");
+        std::fs::create_dir_all(&overlay_dir).unwrap();
+        std::fs::create_dir_all(&disks).unwrap();
+        let base = disks.join("blk0.raw");
+        std::fs::File::create(&base)
+            .unwrap()
+            .write_all(&[0xC0u8; 512])
+            .unwrap();
+
+        let dev = build_mmio_device(
+            &an_mmio_desc(&mmio_state()),
+            Arc::new(GuestMemory::new()),
+            &overlay_dir,
+            false,
+            None,
+            NatLimits::default(),
+            false,
+        )
+        .expect("a block device with a shipped disk builds");
+        assert_eq!(dev.name(), "blk0");
+        assert!(
+            overlay_dir.join("blk0-cow.raw").exists(),
+            "a shipped disk must be opened through a per-run overlay, not in place"
+        );
+        assert_eq!(
+            std::fs::read(&base).unwrap(),
+            vec![0xC0u8; 512],
+            "the shipped disk is the immutable base and must not be written"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The guest negotiated its config space before the capture and sized its
+    /// filesystem against what it read there. Recomputing it from `nsectors`
+    /// would let this build's opinion overwrite what the guest was told, so the
+    /// fixture deliberately carries a capacity the backend kind disagrees with.
+    #[test]
+    fn an_mmio_device_serves_the_config_space_the_guest_was_given() {
+        use crate::hvf::devices::MmioDevice;
+
+        // Capacity is *derived* from config space, so a capacity assertion
+        // agrees with any recomputation by construction and cannot fail. The
+        // distinguishing byte is `blk_size` at offset 20: this build renders
+        // 512 there, so the fixture says 4096 -- a value a recomputation
+        // cannot produce.
+        let mut cfg = vec![0u8; 24];
+        cfg[..8].copy_from_slice(&4096u64.to_le_bytes());
+        cfg[20..24].copy_from_slice(&4096u32.to_le_bytes());
+        let state = mmio_state().replace(
+            r#""device_config":[1,0,0,0,0,0,0,0]"#,
+            &format!(r#""device_config":{cfg:?}"#),
+        );
+        let dir = std::env::temp_dir().join(format!("chm-mmiocfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dev = build_mmio_device(
+            &an_mmio_desc(&state),
+            Arc::new(GuestMemory::new()),
+            &dir,
+            false,
+            None,
+            NatLimits::default(),
+            false,
+        )
+        .expect("a block device with no shipped disk still builds");
+        let mut got = [0u8; 8];
+        dev.read(0x100, &mut got);
+        assert_eq!(
+            u64::from_le_bytes(got),
+            4096,
+            "capacity is served from the transport state"
+        );
+        let mut blk = [0u8; 4];
+        dev.read(0x100 + 20, &mut blk);
+        assert_eq!(
+            u32::from_le_bytes(blk),
+            4096,
+            "the guest's own block size survives; this build must not render \
+             its own 512 over it"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Both transports must reach one backend builder. Two renderings of "which
+    /// file is this disk really" or "what may this NIC reach" drift, and the
+    /// drift is invisible until an mmio guest is governed by a posture nobody
+    /// chose. An outcome assertion cannot see a path that stops being taken, so
+    /// this reads the source.
+    #[test]
+    fn both_transports_build_a_backend_the_same_way() {
+        let src = include_str!("devmgr.rs");
+        let needle = format!("{}(", "build_backend");
+        assert_eq!(
+            src.matches(&needle).count(),
+            3,
+            "expected the definition plus one call from each transport builder"
         );
     }
 }
