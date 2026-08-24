@@ -402,6 +402,24 @@ pub trait Vcpu: Send + Sync {
     fn run_progress(&self) -> Option<Arc<AtomicU64>> {
         None
     }
+    /// Return a monotonic counter of nanoseconds this vCPU has spent parked in
+    /// the host-side wait-for-interrupt idle path.
+    ///
+    /// This is the direct measurement of "is the guest actually idle". A
+    /// supervisor watching console silence cannot tell a guest waiting at a
+    /// login prompt from one doing silent compute — an agent thinking, a
+    /// compile, a package resolve — because both emit nothing. A vCPU executing
+    /// guest code is not parked, so residency across a window separates them.
+    ///
+    /// The counter only ever increases, so a reader samples it at both ends of a
+    /// window and divides the delta by the window; it does not need to be reset
+    /// and several readers cannot disturb each other. Backends without a
+    /// host-side idle park return `None` (the default) — a supervisor that gets
+    /// `None` has no residency signal and must not infer idleness from its
+    /// absence.
+    fn wfi_parked_ns(&self) -> Option<Arc<AtomicU64>> {
+        None
+    }
     /// Return this vCPU's userspace-GIC cross-thread injection queue, if it has
     /// one. A device or console thread pushes a resolved INTID (a line/message
     /// SPI such as the serial console's, or an ITS-resolved LPI) and wakes the
