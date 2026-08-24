@@ -391,6 +391,76 @@ mod tests {
         }
     }
 
+    /// The first-resume guide must name the tags the hypervisor really prints.
+    ///
+    /// #310's whole point is that a reader who sees `[stall]` on their console
+    /// can tell it apart from `[wedge]` without reading hypervisor source. That
+    /// only holds while the page and the code agree, and they live in different
+    /// crates -- so the needles are read **out of the hypervisor** rather than
+    /// retyped here. A tag renamed on one side and not the other then fails
+    /// loudly instead of quietly leaving a user with an alarming line and no
+    /// page that mentions it.
+    ///
+    /// The tags are extracted from their `const` declarations, so a build that
+    /// changes what is printed changes what this test demands.
+    #[test]
+    fn the_first_resume_guide_names_the_tags_the_hypervisor_prints() {
+        let src = include_str!("../../hypervisor/src/hvf/mod.rs");
+        let doc = flattened(include_str!("../../docs/first-resume.md"));
+
+        // Assembled from parts: a literal needle would match this test's own
+        // source if the guard were ever pointed at the file it reads.
+        for name in ["WEDGE", "RECOVERED"] {
+            let decl = format!("const {name}_REPORT_TAG: &str = \"");
+            let Some(tag) = src
+                .split_once(&decl)
+                .and_then(|(_, rest)| rest.split_once('"'))
+                .map(|(tag, _)| tag)
+            else {
+                panic!(
+                    "hypervisor no longer declares {name}_REPORT_TAG as a \
+                     string const, so this guard can no longer read what \
+                     the console will actually say"
+                )
+            };
+            assert!(
+                doc.contains(tag),
+                "the hypervisor prints `{tag}` but docs/first-resume.md never \
+                 mentions it, so a user who sees that line has nowhere to look"
+            );
+        }
+
+        // Naming both tags is not enough: #310 is about telling them apart, so
+        // the page has to say what to *do* about each. These two sentences are
+        // the whole actionable content, and each appears exactly once -- unlike
+        // the tags themselves, which recur throughout the section and so cannot
+        // detect the loss of the sentence that matters (the #290 M5 lesson).
+        for (needle, why) in [
+            (
+                ["The guest's complaint is behind it.", "**Nothing to do.**"].join(" "),
+                "the page must say plainly that a [stall] line needs no action, \
+                 or a reader who was just alarmed by a kernel stall trace is \
+                 left to guess. The needle carries the preceding sentence \
+                 because `Nothing to do` alone also appears in the disk-grow \
+                 section, where resize2fs says it -- a needle that occurs twice \
+                 cannot detect its removal from the one place that matters",
+            ),
+            (
+                ["Report", "that one"].join(" "),
+                "the page must say plainly that a [wedge] line should be \
+                 reported, or the one report we actually want goes unfiled",
+            ),
+            (
+                ["CHM_FORCE_RESUME_ADVANCE_S", "3600"].join("="),
+                "the caveat has to keep the measurement that backs it, so a \
+                 later tidy cannot quietly upgrade a guess about the cause \
+                 into a fact",
+            ),
+        ] {
+            assert!(doc.contains(&needle), "docs/first-resume.md: {why}");
+        }
+    }
+
     /// Blank out whole-line comments, preserving line numbering.
     ///
     /// A guard that reads source has to survive prose *about* the thing it
