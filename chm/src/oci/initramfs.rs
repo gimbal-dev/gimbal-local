@@ -462,17 +462,17 @@ pub fn default_init(
     let cd = workdir.map_or_else(String::new, |d| format!("cd {} 2>/dev/null\n", sh_quote(d)));
 
     // Make the entrypoint survive the console reset, when the entrypoint is not
-    // a shell.
+    // an interactive shell.
     //
     // `ETX` is the only state-independent console reset chm has, and every
     // framed write opens with it (`exec.rs:62`). The line discipline turns it
-    // into `SIGINT` for the foreground process group. Against a shell that
-    // costs a prompt and nothing else, which is the precondition `exec.rs`
-    // reasons from. Against anything else `SIGINT` is fatal by default, and
-    // when the foreground process is PID 1's only child, killing it takes the
-    // machine: #385 measured the readiness probe's own reset ending a browser
-    // guest in `Attempted to kill init!` before the post-boot command was ever
-    // delivered.
+    // into `SIGINT` for the foreground process group. Against a shell sitting
+    // at a prompt that costs a prompt and nothing else, which is the
+    // precondition `exec.rs` reasons from. Against anything else `SIGINT` is
+    // fatal by default, and when the foreground process is PID 1's only child,
+    // killing it takes the machine: #385 measured the readiness probe's own
+    // reset ending a browser guest in `Attempted to kill init!` before the
+    // post-boot command was ever delivered.
     //
     // A `SIG_IGN` disposition survives `exec` -- POSIX requires signals set to
     // be ignored to stay ignored across it -- so trapping here, in the shell
@@ -481,17 +481,17 @@ pub fn default_init(
     // gets, so it is the ordinary disposition for this kind of process rather
     // than a special case invented for chm.
     //
-    // Decided by the same predicate that prints the build-time "this is not a
-    // shell" warning, so the warning and the trap cannot drift into disagreeing
-    // about what a shell is. A shell deliberately keeps the default
-    // disposition: `SIGINT` is both how the reset returns it from `PS2` to
-    // `PS1` and how a human types Ctrl-C.
-    let sigint = if super::image::entrypoint_is_shell(entrypoint) {
+    // "Interactive" is the load-bearing word: `sh -c 'node app.js'` is a shell
+    // by name and dies like any other program, so it needs this too. An
+    // interactive shell deliberately keeps the default disposition, because
+    // `SIGINT` is both how the reset returns it from `PS2` to `PS1` and how a
+    // human types Ctrl-C.
+    let sigint = if super::image::entrypoint_is_interactive_shell(entrypoint) {
         String::new()
     } else {
-        "# Not a shell, so SIGINT would be fatal. chm's console reset sends one\n\
-         # before every framed write; SIG_IGN is inherited across the handover\n\
-         # below. See #385.\n\
+        "# Not an interactive shell, so SIGINT would be fatal. chm's console\n\
+         # reset sends one before every framed write; SIG_IGN is inherited\n\
+         # across the handover below. See #385.\n\
          trap '' INT\n"
             .to_string()
     };
@@ -1378,12 +1378,14 @@ mod tests {
     /// chm opens every framed console write with `ETX`, and the line discipline
     /// turns that into `SIGINT` for the foreground process group.
     ///
-    /// Pinned in **both** directions, because a trap that is always set is as
-    /// wrong as one that is never set. Against a shell the reset is the
-    /// mechanism, not a hazard: `SIGINT` is what returns it from `PS2` to `PS1`,
-    /// so ignoring it there would break the thing `CONSOLE_RESET` exists to do.
+    /// Pinned in **all three** directions, because a trap that is always set is
+    /// as wrong as one that is never set. Against an interactive shell the reset
+    /// is the mechanism, not a hazard: `SIGINT` is what returns it from `PS2` to
+    /// `PS1`, so ignoring it there would break the thing `CONSOLE_RESET` exists
+    /// to do. Against `sh -c` it is a hazard again -- that shell never prompts,
+    /// never reads the console, and dies like any other program.
     #[test]
-    fn a_non_shell_entrypoint_ignores_sigint_and_a_shell_keeps_it() {
+    fn only_an_interactive_shell_keeps_the_default_sigint_disposition() {
         let not_a_shell = start_body("/opt/gimbal-browser/start");
         assert!(
             not_a_shell.contains("trap '' INT"),
@@ -1401,10 +1403,21 @@ mod tests {
         let a_shell = start_body("/bin/sh");
         assert!(
             !a_shell.contains("trap '' INT"),
-            "a shell must keep the default SIGINT disposition: it is how the \
-             console reset returns it from PS2 to PS1, and how a human types \
-             Ctrl-C.\n{a_shell}"
+            "an interactive shell must keep the default SIGINT disposition: it is \
+             how the console reset returns it from PS2 to PS1, and how a human \
+             types Ctrl-C.\n{a_shell}"
         );
+
+        for e in ["/bin/sh -c 'node app.js'", "sh -lc 'exec node app.js'"] {
+            let body = start_body(e);
+            assert!(
+                body.contains("trap '' INT"),
+                "`{e}` is a shell by name and a non-interactive program by \
+                 behaviour -- it never prompts and dies on SIGINT, taking PID 1 \
+                 with it. It is also how a large share of container images spell \
+                 their entrypoint.\n{body}"
+            );
+        }
     }
 
     /// The entrypoint that made #385 real, named rather than described.
