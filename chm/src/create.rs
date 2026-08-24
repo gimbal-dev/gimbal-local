@@ -954,10 +954,15 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     // nothing and behaves exactly as before.
     let tail: Option<Arc<ConsoleTail>> =
         (!args.postboot.is_empty()).then(|| Arc::new(ConsoleTail::default()));
+    // Unlike the tail, this is armed on every run: a panic is exactly the
+    // outcome a caller most needs to hear about, and it costs one scan of bytes
+    // that are being copied to stdout anyway.
+    let panic_watch = Arc::new(PanicWatch::default());
     let console = {
         let uart = uart.clone();
         let running = running.clone();
         let tail = tail.clone();
+        let panic_watch = panic_watch.clone();
         thread::Builder::new()
             .name("cold-console".into())
             .spawn(move || {
@@ -971,6 +976,7 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                     if let Some(t) = &tail {
                         t.push(&bytes);
                     }
+                    panic_watch.push(&bytes);
                     let _ = out.write_all(&bytes);
                     let _ = out.flush();
                 }
@@ -979,6 +985,7 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                     if let Some(t) = &tail {
                         t.push(&rest);
                     }
+                    panic_watch.push(&rest);
                     let _ = out.write_all(&rest);
                     let _ = out.flush();
                 }
@@ -1115,8 +1122,18 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                         while running.load(Ordering::Acquire) {
                             match vcpu.run() {
                                 Ok(VmExit::Ignore) => {}
-                                Ok(VmExit::Shutdown | VmExit::Reset) => {
+                                Ok(VmExit::Shutdown) => {
                                     *outcome.lock().unwrap() = Some(Ok("guest powered off".into()));
+                                    running.store(false, Ordering::Release);
+                                    break;
+                                }
+                                Ok(VmExit::Reset) => {
+                                    // Not the same event, and conflating them is
+                                    // what let a kernel panic read as a clean
+                                    // stop: a panic reboots, so it arrives here.
+                                    // `chm create` does not restart the guest, so
+                                    // this is still the end of the run.
+                                    *outcome.lock().unwrap() = Some(Ok("guest reset".into()));
                                     running.store(false, Ordering::Release);
                                     break;
                                 }
@@ -1468,6 +1485,18 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     }
 
     let result = outcome.lock().unwrap().take();
+    // The console has been fully drained by now -- `console.join()` is above --
+    // so these are the last word rather than a race with a line still in flight.
+    //
+    // A dirty rootfs is a warning about a *previous* run, so it is printed
+    // alongside whatever this run did rather than replacing it. A panic is about
+    // this run, and outranks whatever the exit reason looked like.
+    if panic_watch.unchecked_fs() {
+        println!("\nchm create: {}", unchecked_fs_report());
+    }
+    if panic_watch.panicked() {
+        return Err(panic_report());
+    }
     match result {
         Some(Ok(msg)) => {
             println!("\nchm create: {msg}");
@@ -1490,6 +1519,101 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
 /// Release everyone waiting on the vCPU thread's setup, whether it succeeded or
 /// not: a failed vCPU still has to unblock the threads that would otherwise
 /// wait out the whole deadline for it.
+/// Notices the two kernel lines a caller must not miss, as the console streams
+/// past.
+///
+/// **The panic.** A panic and a deliberate `reboot` both leave through PSCI
+/// `SYSTEM_RESET`, so [`VmExit`] cannot tell them apart -- the console is the
+/// only channel that names one.
+///
+/// **The unchecked filesystem.** A guest that was power-cut rather than stopped
+/// leaves its rootfs marked dirty, and the kernel says so on the *next* boot.
+/// Nothing surfaced it, so the damage announced itself only to a reader of the
+/// scrollback -- and there is no `e2fsck` on macOS to answer it with, which is
+/// exactly why the user needs to be told while they still have the choice.
+///
+/// Reading the console is trusting guest output, which is why this changes only
+/// what is *reported*: a guest that prints these lines without meaning them has
+/// misdescribed its own console, and repeating what it said is still the honest
+/// answer.
+///
+/// Streaming rather than buffered, because unlike [`ConsoleTail`] this runs on
+/// every guest: it keeps only enough of the previous write to catch a line split
+/// across two.
+#[derive(Default)]
+struct PanicWatch {
+    panicked: AtomicBool,
+    unchecked_fs: AtomicBool,
+    carry: Mutex<String>,
+}
+
+impl PanicWatch {
+    /// The stable half of `Kernel panic - not syncing: <reason>`. The reason
+    /// varies with the cause (`Attempted to kill init!`, `VFS: Unable to mount
+    /// root fs`); this prefix comes from `panic()` itself.
+    const PANIC: &'static str = "Kernel panic - not syncing";
+    /// `ext4_fill_super` emits this when the superblock's `EXT4_VALID_FS` bit is
+    /// clear, i.e. the previous mount was never cleanly ended.
+    const UNCHECKED: &'static str = "mounting unchecked fs";
+
+    fn push(&self, bytes: &[u8]) {
+        let mut carry = self.carry.lock().unwrap();
+        carry.push_str(&String::from_utf8_lossy(bytes));
+        for (needle, flag) in [
+            (Self::PANIC, &self.panicked),
+            (Self::UNCHECKED, &self.unchecked_fs),
+        ] {
+            if carry.contains(needle) {
+                flag.store(true, Ordering::Relaxed);
+            }
+        }
+        // Keep only what a line straddling this write could still need.
+        let keep = Self::PANIC.len().max(Self::UNCHECKED.len()) - 1;
+        if carry.len() > keep {
+            let mut cut = carry.len() - keep;
+            // Trim on a char boundary: a guest can print UTF-8, and splitting
+            // mid-codepoint would panic in here rather than report one.
+            while cut < carry.len() && !carry.is_char_boundary(cut) {
+                cut += 1;
+            }
+            let kept = carry.split_off(cut);
+            *carry = kept;
+        }
+    }
+
+    fn panicked(&self) -> bool {
+        self.panicked.load(Ordering::Relaxed)
+    }
+
+    fn unchecked_fs(&self) -> bool {
+        self.unchecked_fs.load(Ordering::Relaxed)
+    }
+}
+
+/// What to say about a guest that panicked.
+///
+/// Named as an error rather than folded into the success message because the
+/// exit status is the only part a script reads, and reporting a panic as `0` is
+/// the specific defect this exists to close.
+fn panic_report() -> String {
+    "the guest kernel panicked; the run did not end cleanly.\n  \
+     A panic reboots immediately, so anything the guest had not written to disk \
+     is gone, and\n  a writable rootfs is left marked dirty -- the next boot \
+     will report an unchecked\n  filesystem, and there is no e2fsck on macOS to \
+     repair it with.\n  The panic reason is in the console output above, on the \
+     `Kernel panic - not syncing` line."
+        .into()
+}
+
+/// What to say about a guest whose rootfs arrived dirty.
+fn unchecked_fs_report() -> String {
+    "the guest reported `mounting unchecked fs` -- this disk was power-cut \
+     rather than\n  stopped, by an earlier run. Its rootfs may carry lost \
+     inodes, and there is no\n  e2fsck on macOS to repair it. Rebuild the image \
+     if the guest starts misbehaving."
+        .into()
+}
+
 /// A bounded copy of what the console printed, so post-boot delivery can read
 /// the guest's answers without taking bytes off the operator's screen.
 ///
@@ -3013,5 +3137,146 @@ mod tests {
             "the note must carry the remedy: a true sentence that leaves the \
              reader with no next step is what #305 and #306 were about"
         );
+    }
+
+    /// A panic banner rarely arrives in one write: the UART is drained in
+    /// whatever chunks the guest happened to produce.
+    #[test]
+    fn a_panic_banner_split_across_writes_is_still_seen() {
+        let w = PanicWatch::default();
+        w.push(b"[   12.3] Kernel pa");
+        assert!(!w.panicked(), "half a banner is not a panic");
+        w.push(b"nic - not syncing: Attempted to kill init!\n");
+        assert!(
+            w.panicked(),
+            "the two halves join at the carry, or every panic split by a UART \
+             read boundary is reported as a clean stop -- which is the defect"
+        );
+    }
+
+    /// The carry must not be able to grow without bound: this runs on every
+    /// guest, and a guest can print forever.
+    #[test]
+    fn a_long_clean_transcript_neither_fires_nor_accumulates() {
+        let w = PanicWatch::default();
+        for _ in 0..1000 {
+            w.push(b"[    0.000000] a perfectly ordinary line of boot output\n");
+        }
+        assert!(!w.panicked(), "ordinary boot output is not a panic");
+        assert!(
+            !w.unchecked_fs(),
+            "ordinary boot output is not a dirty rootfs"
+        );
+        let held = w.carry.lock().unwrap().len();
+        assert!(
+            held < 64,
+            "the carry keeps only what a split line could need, but held {held} \
+             bytes -- an unbounded carry is a leak on every run"
+        );
+    }
+
+    #[test]
+    fn a_dirty_rootfs_is_noticed_separately_from_a_panic() {
+        let w = PanicWatch::default();
+        w.push(b"[    0.6] EXT4-fs (vda): warning: mounting unchecked fs, running e2fsck is recommended\n");
+        assert!(
+            w.unchecked_fs(),
+            "the warning is the only notice this damage gets"
+        );
+        assert!(
+            !w.panicked(),
+            "a dirty rootfs is a report about an earlier run; calling it a panic \
+             would blame this one for something it did not do"
+        );
+    }
+
+    /// Both reports have to leave the reader with a next step, not just a fact.
+    #[test]
+    fn both_reports_name_the_consequence_and_the_missing_repair() {
+        let panic = panic_report();
+        let dirty = unchecked_fs_report();
+        for (what, text) in [("panic", &panic), ("unchecked fs", &dirty)] {
+            assert!(
+                text.contains("e2fsck"),
+                "the {what} report must say the repair does not exist here, or \
+                 the reader goes looking for a tool macOS has never had"
+            );
+        }
+        assert!(
+            panic.contains("Kernel panic - not syncing"),
+            "the panic report must name the line to look for, since the reason \
+             itself is only ever on the console"
+        );
+        assert!(
+            dirty.contains("Rebuild the image"),
+            "with no repair tool, rebuilding is the only remedy there is -- a \
+             report with no remedy is the shape #305 and #306 were about"
+        );
+    }
+
+    /// The two exits are different events and the flattening of them is exactly
+    /// what let a kernel panic read as `guest powered off`, rc=0.
+    #[test]
+    fn a_reset_is_not_reported_as_a_power_off() {
+        let src = include_str!("create.rs");
+        // Assembled: a literal would be matched by this assertion's own text.
+        let flattened = format!("VmExit::Shutdown {} VmExit::Reset", "|");
+        assert!(
+            !src.contains(&flattened),
+            "a panic reboots, so it arrives as Reset; sharing an arm with \
+             Shutdown is what reported it as a clean power-off"
+        );
+        assert!(
+            src.contains(&format!("Ok(\"guest {}\".into())", "reset")),
+            "Reset needs its own message, or splitting the arm changes nothing \
+             a caller can see"
+        );
+    }
+
+    /// The panic verdict is read after the console thread has been joined. Read
+    /// before, it would race the banner still sitting in the UART.
+    #[test]
+    fn the_panic_verdict_is_read_after_the_console_is_drained() {
+        let src = include_str!("create.rs");
+        let joined = src
+            .find(&format!("let _ = console.{}();", "join"))
+            .expect("the console thread is joined somewhere");
+        let read = src
+            .rfind(&format!("if panic_watch.{}() {{", "panicked"))
+            .expect("something consults the panic watch");
+        assert!(
+            joined < read,
+            "the verdict is read at {read} but the console is only drained at \
+             {joined}: a panic printed in the last write would be missed, and \
+             missing it is the whole defect"
+        );
+        let returned = format!("return Err(panic_{}())", "report");
+        assert!(
+            src.contains(&returned),
+            "a panic has to leave through the error path: the exit status is the \
+             only part a script reads, and rc=0 for a panic is the defect"
+        );
+    }
+
+    /// The banner lands in the *final* drain, because the kernel prints it and
+    /// resets, which is what ends the loop. Watching only the loop body would
+    /// miss every panic there has ever been.
+    #[test]
+    fn both_console_drains_feed_the_panic_watch() {
+        let src = include_str!("create.rs");
+        let call = format!("panic_watch.{}(&", "push");
+        let sites = src.matches(&call).count();
+        assert_eq!(
+            sites, 2,
+            "expected the loop body and the post-loop drain to both feed the \
+             watch, found {sites} call sites"
+        );
+        for (what, arg) in [("the loop body", "bytes"), ("the final drain", "rest")] {
+            assert!(
+                src.contains(&format!("{call}{arg});")),
+                "{what} does not feed the watch: a panic printed there is \
+                 reported as a clean stop, which is the defect"
+            );
+        }
     }
 }
