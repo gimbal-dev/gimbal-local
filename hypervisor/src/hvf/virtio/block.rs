@@ -244,7 +244,8 @@ impl BlockDevice {
         VIRTIO_BLK_S_OK
     }
 
-    fn do_get_id(&mut self, mem: &GuestMemory, chain: &DescChain) -> (u8, u32) {        let writable: Vec<_> = chain.writable().copied().collect();
+    fn do_get_id(&mut self, mem: &GuestMemory, chain: &DescChain) -> (u8, u32) {
+        let writable: Vec<_> = chain.writable().copied().collect();
         let Some((_status, data_segs)) = writable.split_last() else {
             return (VIRTIO_BLK_S_IOERR, 0);
         };
