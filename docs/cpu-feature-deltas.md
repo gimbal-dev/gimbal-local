@@ -484,7 +484,7 @@ stride — the opposite of what was recorded when the two were first linked.
 **This is the cause of the crashes Finding 2 wrongly claimed.** It is the same
 *class* of bug — a CPU feature the guest kernel latched at boot on the capture
 host, faithfully restored, and wrong here — but a different register, and a
-worse failure mode: it corrupts memory rather than killing a fetch.
+failure mode that kills processes without the guest kernel ever noticing.
 
 ### Measured
 
@@ -510,21 +510,71 @@ register and stores it to MMIO (`hvf_host_mmu_feature_register` in
 `hypervisor/tests/hvf_boot.rs`, which pins this host at 8 bits so a future part
 that changes it fails a test rather than passing a guard silently).
 
-### Why it corrupts memory
+### The mechanism, and what measurement did and did not support
 
 The TLB tags each entry with the ASID of the address space that created it, and
 compares **only the bits the hardware implements**. The guest allocates context
 ids across a 16-bit space; the hardware compares 8. Two processes whose ASIDs
 differ only above bit 7 — say `0x0142` and `0x0242` — are indistinguishable to
-the TLB, so one can hit an entry created by the other and read and write its
-pages.
-
-It needs more than 256 live address spaces to bite, which is why an idle guest
-looks perfect and a guest under fork pressure falls apart.
+the TLB, so one can hit an entry created by the other.
 
 Kernel mappings are global (TTBR1, `nG = 0`) and carry no ASID, which is exactly
 why **the guest never oopses while its userspace dies** — the observation that
 made this look like a userspace-only problem such as a stale I-cache.
+
+> ⚠️ **The obvious consequence of that mechanism was looked for directly, and not
+> found.** An earlier version of this section stated that a colliding process
+> "can read and write its pages". `scripts/hvf/asid-aliasing-probe.py` was
+> written to catch exactly that: each of N children owns a `MAP_PRIVATE` page,
+> writes a private marker into it in a tight spin, and reads it straight back.
+> Across roughly **535 million samples** on a rehydrated Graviton capture, at
+> N from 120 to 400, the mismatch count was **zero**.
+>
+> That is a real negative rather than a silent one, because the same probe in the
+> same guest was made to report a positive first: run with `selftest` it maps the
+> page `MAP_SHARED`, and reported **11,932,361** mismatches on the long-form probe
+> and **40/40** children on the compact one. A detector that cannot be shown to
+> fire is indistinguishable from a detector that is not working.
+>
+> So the **register delta is measured fact** and the **cold-versus-rehydrated
+> crash contrast is measured fact**, but *silent cross-process data aliasing* is
+> not the demonstrated mechanism. What the probe does see on a rehydrated guest,
+> and never on a cold-booted one, is children dying — every one of them
+> `SIGSEGV`, never `SIGABRT`, and **sporadic rather than monotone in N**. A
+> translation that goes stale and faults fits that; one that silently redirects a
+> write does not, and would have shown up as a mismatch.
+
+It needs a large number of live address spaces to bite, which is why an idle
+guest looks perfect and a guest under fork pressure falls apart. Note that the
+relevant quantity is the **spread** of ASIDs across concurrently live address
+spaces, not the live *count*: ids are handed out roughly sequentially from a
+bitmap sized `1 << asid_bits`, so ~100 live processes drawn from a window ~1700
+wide is not the same thing as 100 ids in a 256-entry space.
+
+### The cold-boot controls, and the confounds they remove
+
+A cold-booted guest is the natural control: same host, same hypervisor, same
+probe, `256 entries` instead of `32768`. But "cold" changed three things at once
+— ASID width, libc, and kernel version — so each was removed in turn. Every arm
+below gates on the probe's md5 matching the host's copy and on `selftest`
+reporting a positive **in that same guest** before any zero is accepted.
+
+| arm | kernel | libc | ASID entries | `killed` |
+| --- | --- | --- | --- | --- |
+| rehydrated Graviton capture | 6.8.0-136 Ubuntu | glibc | **32768** | sporadic `SIGSEGV` |
+| cold, Alpine rootfs | 6.6 Alpine | musl | 256 | **0** across 6 points |
+| cold, Debian rootfs | 6.6 Alpine | glibc 2.41 | 256 | **0** across 8 points |
+| cold, Debian rootfs on the Ubuntu kernel | **6.8.0-71 Ubuntu** | glibc 2.41 | 256 | **0** across 8 points |
+
+Row 3 removes libc; row 4 removes kernel version, matching the capture's own 6.8
+series. Nothing that dies on the rehydrated guest dies on any of them, at N up to
+400 and with the detector proven live in each.
+
+What still differs between the last row and the first is **rehydration itself**
+and the **ASID width it carries**. That is not the same as having isolated ASID
+width as the cause — a rehydrated guest differs from a cold one in many ways —
+but it is what is left after the two obvious alternatives were tested and
+eliminated rather than argued away.
 
 ### What we do about it
 
@@ -609,7 +659,7 @@ uses comes from `CTR_EL0` (Finding 2), which matches.
 | 3 | `DCZID_EL0` | ✅ Identical. Hazard closed by measurement. |
 | 4 | AArch32 ID block (20 regs) | ✅ Refused, harmless. |
 | 5 | `REVIDR`/`CLIDR`/`CCSIDR` | ✅ Cosmetic. |
-| 6 | `ID_AA64MMFR0_EL1.ASIDBits` | 🔴 **Real bug.** Guest uses 16-bit ASIDs, this Mac compares 8, so past ~256 live address spaces unrelated processes share TLB entries and corrupt each other. 27-30 processes killed in 16 min vs 0 cold-booted. Warned at load; `CHM_STRICT_ASID=1` refuses. Cold boot is immune. |
+| 6 | `ID_AA64MMFR0_EL1.ASIDBits` | 🔴 **Real bug.** Guest uses 16-bit ASIDs, this Mac compares 8, so unrelated processes can share TLB entries. Processes die on a rehydrated capture and not on a cold-booted one, with libc and kernel version eliminated as confounds; silent cross-process data aliasing was looked for over ~535M samples and **not** found. Warned at load; `CHM_STRICT_ASID=1` refuses. Cold boot is immune. |
 | — | `CNTFRQ_EL0` | ✅ Known; corrected at runtime (V1.2/V1.3). |
 | — | all `ID_AA64*`, `MIDR`, `MPIDR` | ✅ Restored exactly — the reason this project works. |
 
