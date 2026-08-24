@@ -636,15 +636,11 @@ pub(crate) fn resolve_block_backend(
 /// The enclosing `disks/` directory may itself be a symlink (the trusted
 /// read-only base in the workspace model); only the disk *file* is constrained.
 /// `dev_name` is sanitized, so the candidate cannot traverse out of `disks/`.
-fn shipped_backing(
+pub fn shipped_backing(
     overlay_dir: &std::path::Path,
     dev_name: &str,
 ) -> Result<Option<std::path::PathBuf>, DevMgrError> {
-    let Some(disks) = overlay_dir.parent().map(|p| p.join("disks")) else {
-        return Ok(None);
-    };
-    for ext in ["raw", "img"] {
-        let cand = disks.join(format!("{}.{ext}", sanitize(dev_name)));
+    for cand in shipped_backing_candidates(overlay_dir, dev_name) {
         match std::fs::symlink_metadata(&cand) {
             Ok(md) if md.file_type().is_symlink() => {
                 return Err(DevMgrError::Io(format!(
@@ -657,6 +653,30 @@ fn shipped_backing(
         }
     }
     Ok(None)
+}
+
+/// The paths [`shipped_backing`] will consider for `dev_name`, in the order it
+/// considers them.
+///
+/// A writer producing a snapshot must ship its disk to the **first** of these.
+/// Taking the location from the same function the reader walks is the whole
+/// point: a writer that restated the layout could put a real disk somewhere
+/// the restore path never looks, and the guest would then come back on a
+/// sparse zero overlay against RAM that has its filesystem's metadata cached.
+/// That resumes, and reads `Input/output error` on files the guest can see in
+/// its own page cache -- a failure that looks like disk corruption and is
+/// really a naming disagreement between two halves of one format.
+pub fn shipped_backing_candidates(
+    overlay_dir: &std::path::Path,
+    dev_name: &str,
+) -> Vec<std::path::PathBuf> {
+    let Some(disks) = overlay_dir.parent().map(|p| p.join("disks")) else {
+        return Vec::new();
+    };
+    ["raw", "img"]
+        .iter()
+        .map(|ext| disks.join(format!("{}.{ext}", sanitize(dev_name))))
+        .collect()
 }
 
 /// Create `path` as a sparse file of `nsectors * 512` bytes if it does not yet
