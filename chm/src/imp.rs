@@ -52,10 +52,11 @@ use hypervisor::hvf::host_counter_hz;
 use hypervisor::hvf::UsgicSpiRouter;
 use hypervisor::hvf::virtio::GuestMemory;
 use hypervisor::hvf::icache_wx;
+use hypervisor::hvf::virtio::mmio::VirtioMmioDevice;
 use hypervisor::hvf::virtio::nat::{EgressPolicy, NatLimits};
 use hypervisor::hvf::virtio::net::NetKick;
 use hypervisor::hvf::virtio::pci::{MsiSink, MsiSpiInjector, VirtioPciDevice};
-use hypervisor::hvf::virtio::{devmgr, its};
+use hypervisor::hvf::virtio::{NetIo, devmgr, its};
 use hypervisor::{HypervisorVmError, StandardRegisters, Vcpu, VmExit, VmOps};
 
 /// cloud-hypervisor's arm64 PL011 lives at the base of the mapped-IO window.
@@ -828,6 +829,19 @@ fn ensure_private_overlay_dir(overlay_dir: &Path) -> Result<(), String> {
         .map_err(|e| format!("create overlay dir {}: {e}", overlay_dir.display()))
 }
 
+/// Whether this run attaches a NIC on either transport.
+///
+/// Both lists have to be consulted: a lineage originated from a cold boot
+/// carries its NIC as a virtio-mmio node, so a check that saw only the PCI
+/// devices would report "no network" for exactly the guests this path exists
+/// to resume -- and silently withhold the egress posture from them.
+fn run_has_a_nic(pci: &[devmgr::VirtioDeviceDesc], mmio: &[devmgr::VirtioMmioDeviceDesc]) -> bool {
+    pci.iter()
+        .map(|d| &d.backend)
+        .chain(mmio.iter().map(|d| &d.backend))
+        .any(|b| matches!(b, devmgr::BackendKind::Net))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn wire_virtio(
     bus: &MmioBus,
@@ -841,10 +855,20 @@ pub(crate) fn wire_virtio(
     allow_local_egress: bool,
     lpi_sink_override: Option<Arc<dyn its::LpiSink>>,
     cli_proxy_rules: Option<&Path>,
+    // Where a virtio-mmio device's completion SPI is delivered. The `gic`
+    // parameter cannot serve: it is `None` on the userspace-GIC resume path,
+    // which is exactly the path a cold-booted lineage resumes down.
+    spi_sink: Option<&Arc<dyn MsiSink>>,
 ) -> Result<WiredVirtio, String> {
     let descs =
         devmgr::parse_devices(state_json).map_err(|e| format!("parse virtio devices: {e}"))?;
-    if descs.is_empty() {
+    // A snapshot carries one transport or the other, never both: a cold-booted
+    // guest's kernel bound its drivers to mmio windows and that binding lives in
+    // the RAM the dump captured, while a stock cloud-hypervisor capture is pci
+    // throughout. Both are read here so the caller does not have to know which.
+    let mmio_descs = devmgr::parse_mmio_devices(state_json)
+        .map_err(|e| format!("parse virtio-mmio devices: {e}"))?;
+    if descs.is_empty() && mmio_descs.is_empty() {
         return Ok(WiredVirtio::default());
     }
     ensure_private_overlay_dir(overlay_dir)?;
@@ -853,11 +877,15 @@ pub(crate) fn wire_virtio(
     // Net devices carry a userspace NAT that must be polled off the vCPU thread
     // (host sockets deliver asynchronously); collected here so the caller can
     // spawn the net service thread.
-    let mut net_devices: Vec<Arc<VirtioPciDevice>> = Vec::new();
+    let mut net_devices: Vec<Arc<dyn NetIo>> = Vec::new();
     // Devices whose in-flight queues should be drained once on resume (only the
     // deliverable message-SPI path; the logging ITS fallback has nothing to
     // deliver). Drained after the whole tree is wired and the GIC is live.
     let mut drainable: Vec<Arc<VirtioPciDevice>> = Vec::new();
+    // Held apart from `drainable` only because the two transports are distinct
+    // types; `drain_on_resume` is deliberately not on `NetIo`, which describes
+    // the net service's surface and nothing else.
+    let mut mmio_drainable: Vec<Arc<VirtioMmioDevice>> = Vec::new();
     // An enabled gic-v3-its means completions are LPI-routed. On the managed GIC
     // those resolve through the ITS but cannot be delivered, so they fall back to
     // the logging sink; on the userspace GIC the caller passes a deliverable LPI
@@ -921,10 +949,7 @@ pub(crate) fn wire_virtio(
     // Report the posture once, and only when this run actually has a NIC:
     // telling someone about egress on a sandbox with no network is noise that
     // teaches them to skip the line that matters.
-    if descs
-        .iter()
-        .any(|d| matches!(d.backend, devmgr::BackendKind::Net))
-    {
+    if run_has_a_nic(&descs, &mmio_descs) {
         eprintln!("chm: {}", egress_posture_line(enforced_policy.as_ref()));
     }
 
@@ -990,10 +1015,71 @@ pub(crate) fn wire_virtio(
         }
         summary.push(format!("{kind} @ BAR {base:#x}"));
     }
+    // The mmio half of the same tree. Deliberately not a separate entry point:
+    // everything above -- the overlay dir, the egress policy, the posture line --
+    // is a property of the sandbox, not of the bus, and a second entry point is
+    // a second place for those to drift.
+    for desc in &mmio_descs {
+        let kind = match &desc.backend {
+            devmgr::BackendKind::Block { nsectors, .. } => {
+                format!("virtio-blk {} ({} sectors)", desc.name, nsectors)
+            }
+            devmgr::BackendKind::Net => format!("virtio-net {}", desc.name),
+            devmgr::BackendKind::Rng => format!("virtio-rng {}", desc.name),
+            devmgr::BackendKind::Unsupported { virtio_type } => {
+                format!("virtio type {virtio_type} {}", desc.name)
+            }
+        };
+        let is_net = matches!(desc.backend, devmgr::BackendKind::Net);
+        let policy = if is_net {
+            enforced_policy.clone()
+        } else {
+            None
+        };
+        let dev_limits = if is_net {
+            net_limits.clone()
+        } else {
+            NatLimits::default()
+        };
+        let dev = devmgr::build_mmio_device(
+            desc,
+            guest_mem.clone(),
+            overlay_dir,
+            reattach_overlay,
+            policy,
+            dev_limits,
+            allow_local_egress,
+        )
+        .map_err(|e| format!("build mmio device {}: {e}", desc.name))?;
+        // An mmio device has one legacy IRQ, not a table of MSI-X vectors, so
+        // there is no ITS to consult and nothing to resolve: the intid the
+        // snapshot recorded is the SPI to raise.
+        if let Some(sink) = spi_sink {
+            dev.set_injector(Box::new(MsiSpiInjector::new(
+                desc.name.clone(),
+                vec![desc.intid],
+                sink.clone(),
+            )));
+        }
+        // Draining is not conditional on the injector: a device with in-flight
+        // work still has to notice it, and a drain that only happens when an
+        // interrupt can be delivered would skip exactly the devices whose
+        // completions nobody is watching for.
+        mmio_drainable.push(dev.clone());
+        bus.add(desc.base, desc.size, dev.clone());
+        if is_net {
+            net_devices.push(dev);
+        }
+        summary.push(format!("{kind} @ mmio {:#x}", desc.base));
+    }
+
     // Complete any requests left in-flight at snapshot time and deliver their
     // interrupts, so a resumed guest waiting on pre-snapshot I/O (e.g. a mount
     // reading the boot filesystem) makes progress instead of blocking forever.
     for dev in &drainable {
+        dev.drain_on_resume();
+    }
+    for dev in &mmio_drainable {
         dev.drain_on_resume();
     }
 
@@ -1242,7 +1328,7 @@ fn parse_egress_policy_labelled(raw: &str, fallback: &str) -> Option<EgressPolic
 #[derive(Default)]
 pub(crate) struct WiredVirtio {
     pub summary: Vec<String>,
-    pub net_devices: Vec<Arc<VirtioPciDevice>>,
+    pub net_devices: Vec<Arc<dyn NetIo>>,
     /// The credential proxy, when this run has one. Held only to keep it alive
     /// and stoppable for the life of the VM — nothing else reads it.
     pub proxy: Option<credproxy::server::RunningProxy>,
@@ -1264,7 +1350,7 @@ const NET_SERVICE_INTERVAL: Duration = Duration::from_millis(2);
 /// instead of running the NAT inside its MMIO exit. Returns `None` when there
 /// are no net devices to serve.
 fn spawn_net_service(
-    net_devices: Vec<Arc<VirtioPciDevice>>,
+    net_devices: Vec<Arc<dyn NetIo>>,
     running: Arc<AtomicBool>,
     exits: Arc<Mutex<Vec<ExitSignal>>>,
     audit: audit::AuditLog,
@@ -3343,6 +3429,15 @@ pub(crate) fn run_usgic_engine(
     // Created before the device model is wired because the net service registers
     // itself as it starts.
     let quiesce = Arc::new(livesnap::Quiesce::new());
+    // The SPI sink routes an INTID to the vCPU its GICD_IROUTER affinity names
+    // (via the shared distributor) and wakes that core. Built here rather than
+    // beside the console below because a virtio-mmio device needs the same sink
+    // and is wired first -- and one sink is one answer to "where does this
+    // interrupt go", which two constructions would eventually stop sharing.
+    let spi_router = Arc::new(prepared.spi_router(sgi_table.clone()));
+    let serial_sink: Arc<dyn MsiSink> = Arc::new(UsgicMsiSink {
+        router: spi_router,
+    });
     let net_service = match wire_virtio(
         &bus,
         &guest_mem,
@@ -3364,6 +3459,7 @@ pub(crate) fn run_usgic_engine(
         cfg.allow_local_egress,
         Some(usgic_lpi_sink),
         cfg.proxy_rules,
+        Some(&serial_sink),
     ) {
         Ok(wired) => {
             if !wired.summary.is_empty() && !cfg.quiet {
@@ -3394,10 +3490,6 @@ pub(crate) fn run_usgic_engine(
     // vCPU its GICD_IROUTER affinity names (via the shared distributor) and wakes
     // that core — so moving the serial IRQ's affinity (e.g. to CPU1) actually
     // delivers there. Single-vCPU routes to vCPU 0, unchanged.
-    let spi_router = Arc::new(prepared.spi_router(sgi_table.clone()));
-    let serial_sink: Arc<dyn MsiSink> = Arc::new(UsgicMsiSink {
-        router: spi_router,
-    });
     let serial_wake: Option<Arc<dyn Fn() + Send + Sync>> = Some(wake0);
     // Resolved once from the capture rather than three times from a constant:
     // three independent reads is three chances for the stdin pump, the reassert
@@ -5449,6 +5541,392 @@ mod tests {
             assert_eq!(body.trim(), process::id().to_string());
         }
         assert!(!path.exists(), "lock file must be removed when the guard drops");
+    }
+
+    /// A `state.json` describing one virtio-mmio device, built here rather than
+    /// borrowed from the writer.
+    ///
+    /// Deliberately hand-written: every other check on this document is a
+    /// writer/reader pair that would agree about a bug too, so a third
+    /// statement of the shape is the only thing here with independent
+    /// authority. If the layout moves, this is what says so.
+    fn an_mmio_doc(name: &str, device_id: u64, base: u64, intid: u64, config: &[u8]) -> String {
+        an_mmio_doc_with(
+            name,
+            device_id,
+            base,
+            intid,
+            config,
+            &serde_json::json!([{
+                "size": 64,
+                "desc_table": 0x4000,
+                "avail_ring": 0x5000,
+                "used_ring": 0x6000,
+                "ready": false,
+            }]),
+        )
+    }
+
+    fn an_mmio_doc_with(
+        name: &str,
+        device_id: u64,
+        base: u64,
+        intid: u64,
+        config: &[u8],
+        queues: &serde_json::Value,
+    ) -> String {
+        let key = format!("{}{name}", devmgr::VIRTIO_MMIO_NODE_PREFIX);
+        let state = serde_json::json!({
+            "name": name,
+            "device_id": device_id,
+            "device_features": 0,
+            "driver_features": 0,
+            "device_features_sel": 0,
+            "driver_features_sel": 0,
+            "queue_sel": 0,
+            "interrupt_status": 0,
+            "device_status": 15,
+            "config_generation": 0,
+            "queues": queues,
+            "device_config": config,
+        });
+        let tree = serde_json::json!({
+            "device_tree": {
+                key.clone(): {
+                    "resources": [
+                        {"MmioAddressRange": {"base": base, "size": 0x200u64}},
+                        {"LegacyIrq": intid},
+                    ],
+                },
+            },
+        });
+        serde_json::json!({
+            "snapshots": {
+                "device-manager": {
+                    "snapshot_data": {"state": tree.to_string()},
+                    "snapshots": {
+                        key: {"snapshot_data": {"state": state.to_string()}},
+                    },
+                },
+            },
+        })
+        .to_string()
+    }
+
+    fn wire_a_doc(doc: &str, dir: &Path) -> (Arc<MmioBus>, WiredVirtio) {
+        let (bus, wired, _) = wire_a_doc_with(doc, dir, None);
+        (bus, wired)
+    }
+
+    fn wire_a_doc_with(
+        doc: &str,
+        dir: &Path,
+        sink: Option<&Arc<dyn MsiSink>>,
+    ) -> (Arc<MmioBus>, WiredVirtio, Arc<GuestMemory>) {
+        let bus = Arc::new(MmioBus::new());
+        let mem = Arc::new(GuestMemory::new());
+        let wired = wire_virtio(
+            &bus,
+            &mem,
+            doc,
+            &dir.join(".chm-overlays"),
+            None,
+            false,
+            None,
+            &NatLimits::default(),
+            false,
+            None,
+            None,
+            sink,
+        )
+        .expect("wire the document");
+        (bus, wired, mem)
+    }
+
+    #[test]
+    fn an_mmio_device_answers_on_the_bus_at_the_window_the_snapshot_named() {
+        // The whole of the mmio restore path in one reading: the document is
+        // parsed, a device is built from it, and it is mapped at the address
+        // the snapshot recorded -- checked by asking the bus, which is the same
+        // question a guest instruction asks.
+        //
+        // The config bytes are the load-bearing half. A device built fresh
+        // rather than restored serves zeros there, so this distinguishes "an
+        // mmio device was wired" from "the guest's own device came back".
+        let dir = env::temp_dir().join(format!("chm-mmiowire-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch dir");
+        // A virtio-rng: no backing file to stage, so this measures the wiring
+        // and nothing about disks.
+        let doc = an_mmio_doc("rng0", 4, 0x1000_0000, 44, &[0xAB, 0xCD, 0xEF, 0x11]);
+        let (bus, wired) = wire_a_doc(&doc, &dir);
+
+        let mut magic = [0u8; 4];
+        bus.mmio_read(0x1000_0000, &mut magic).expect("read magic");
+        assert_eq!(
+            u32::from_le_bytes(magic),
+            0x7472_6976,
+            "no virtio-mmio device answered at the window the snapshot named"
+        );
+        let mut cfg = [0u8; 4];
+        bus.mmio_read(0x1000_0000 + 0x100, &mut cfg)
+            .expect("read config space");
+        assert_eq!(
+            cfg,
+            [0xAB, 0xCD, 0xEF, 0x11],
+            "the device did not serve the config space the guest was given"
+        );
+        assert!(
+            wired.summary.iter().any(|l| l.contains("virtio-rng rng0")),
+            "the mmio device is missing from the summary: {:?}",
+            wired.summary
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_mmio_nic_is_handed_to_the_net_service() {
+        // A NIC nobody services receives nothing: the userspace NAT only
+        // advances when the net thread polls it. Collecting mmio NICs is the
+        // whole point of `NetIo` existing, so this is what proves the trait is
+        // load-bearing rather than decorative.
+        let dir = env::temp_dir().join(format!("chm-mmionic-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch dir");
+
+        let (_, nic) = wire_a_doc(&an_mmio_doc("net0", 1, 0x1000_0000, 45, &[]), &dir);
+        assert_eq!(
+            nic.net_devices.len(),
+            1,
+            "an mmio NIC was not handed to the net service"
+        );
+        assert_eq!(nic.net_devices[0].name(), "net0");
+
+        // The control: the same path with a device that is not a NIC must not
+        // put anything in front of the net thread, or the assertion above would
+        // pass for a wiring that collects everything.
+        let (_, rng) = wire_a_doc(&an_mmio_doc("rng0", 4, 0x1000_0000, 45, &[]), &dir);
+        assert!(
+            rng.net_devices.is_empty(),
+            "a non-net mmio device was handed to the net service"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_document_with_neither_transport_wires_nothing() {
+        // The early return has to consult both transports. Consulting only the
+        // pci half would return here on every originated lineage, and the guest
+        // would come back with no devices and no complaint.
+        let dir = env::temp_dir().join(format!("chm-mmionone-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch dir");
+        let empty = serde_json::json!({
+            "snapshots": {"device-manager": {
+                "snapshot_data": {"state": "{\"device_tree\":{}}"},
+                "snapshots": {},
+            }},
+        })
+        .to_string();
+        let (_, wired) = wire_a_doc(&empty, &dir);
+        assert!(wired.summary.is_empty());
+        assert!(
+            !dir.join(".chm-overlays").exists(),
+            "a document with no devices must not leave an overlay dir behind"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A [`MsiSink`] that records every SPI delivered through it.
+    #[derive(Default)]
+    struct CountingSink(Mutex<Vec<u32>>);
+
+    impl MsiSink for CountingSink {
+        fn deliver_spi(&self, intid: u32) {
+            self.0.lock().unwrap().push(intid);
+        }
+    }
+
+    #[test]
+    fn the_posture_check_is_asked_about_both_transports() {
+        // `run_has_a_nic` is guarded above, but the posture line it gates is an
+        // eprintln, so no assertion about an outcome can see a call site that
+        // stopped handing it the mmio list. Read the source instead. The needle
+        // is assembled from parts so it cannot match this assertion's own text.
+        let src = include_str!("imp.rs");
+        let needle = format!("run_has_a_nic(&descs, &{})", "mmio_descs");
+        assert!(
+            src.contains(&needle),
+            "the egress posture check is no longer asked about the mmio devices, \
+             so an originated lineage would resume with its posture unreported"
+        );
+    }
+
+    #[test]
+    fn an_mmio_only_guest_with_a_nic_still_reports_its_egress_posture() {
+        // device_id 1 is virtio-net. The PCI list is deliberately empty: that is
+        // the shape of every lineage originated from a cold boot, and it is the
+        // shape a PCI-only check would report as having no network at all.
+        let doc = an_mmio_doc("net0", 1, 0x1000_0000, 44, &[0u8; 8]);
+        let mmio = devmgr::parse_mmio_devices(&doc).expect("parse the document");
+        assert!(
+            run_has_a_nic(&[], &mmio),
+            "a guest whose only NIC is on the mmio bus was reported as having none"
+        );
+
+        // The control: the same shape with a virtio-rng (device_id 4) must not
+        // claim a NIC, or the posture line becomes noise on every guest.
+        let rng = an_mmio_doc("rng0", 4, 0x1000_0000, 44, &[0u8; 8]);
+        let rng = devmgr::parse_mmio_devices(&rng).expect("parse the document");
+        assert!(
+            !run_has_a_nic(&[], &rng),
+            "a guest with no NIC at all was reported as having one"
+        );
+    }
+
+    #[test]
+    fn a_drained_mmio_device_raises_the_spi_the_snapshot_recorded() {
+        // The end of the wire, driven for real: a queue the guest left with an
+        // unconsumed entry is drained, the device completes it, and the
+        // completion arrives as the SPI the device tree named.
+        //
+        // This is the one check here that exercises injector wiring rather than
+        // asserting it from the source. The intid is deliberately not the one a
+        // fresh device would pick, so "an interrupt arrived" cannot pass for
+        // "the recorded interrupt arrived".
+        const INTID: u32 = 47;
+        const QSIZE: u16 = 8;
+        // Kept alive for the whole test: `GuestMemory::register` borrows the
+        // pointer, not the Vec.
+        let mut ram = vec![0u8; 0x1_0000];
+        let put16 = |ram: &mut Vec<u8>, off: usize, v: u16| {
+            ram[off..off + 2].copy_from_slice(&v.to_le_bytes());
+        };
+        let put32 = |ram: &mut Vec<u8>, off: usize, v: u32| {
+            ram[off..off + 4].copy_from_slice(&v.to_le_bytes());
+        };
+        let put64 = |ram: &mut Vec<u8>, off: usize, v: u64| {
+            ram[off..off + 8].copy_from_slice(&v.to_le_bytes());
+        };
+        // One device-writable descriptor: somewhere for virtio-rng to put bytes.
+        put64(&mut ram, 0x4000, 0x8000);
+        put32(&mut ram, 0x4008, 16);
+        put16(&mut ram, 0x400c, 2); // VIRTQ_DESC_F_WRITE
+        // The driver published entry 0 and then the guest was captured, so the
+        // device's own cursor is behind the ring -- the exact condition the
+        // drain exists for.
+        put16(&mut ram, 0x5002, 1); // avail.idx
+        put16(&mut ram, 0x5004, 0); // avail.ring[0] -> desc 0
+
+        let dir = env::temp_dir().join(format!("chm-mmiospi-{}", process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("scratch dir");
+        let doc = an_mmio_doc_with(
+            "rng0",
+            4,
+            0x1000_0000,
+            u64::from(INTID),
+            &[],
+            &serde_json::json!([{
+                "size": QSIZE,
+                "desc_table": 0x4000,
+                "avail_ring": 0x5000,
+                "used_ring": 0x6000,
+                "ready": true,
+            }]),
+        );
+
+        let sink = Arc::new(CountingSink::default());
+        let bus = Arc::new(MmioBus::new());
+        let mem = Arc::new(GuestMemory::new());
+        // SAFETY: `ram` outlives `mem` (both are dropped at the end of this
+        // test, `mem` first) and nothing else aliases it while the device runs.
+        unsafe { mem.register(0, ram.as_mut_ptr(), ram.len()) };
+        wire_virtio(
+            &bus,
+            &mem,
+            &doc,
+            &dir.join(".chm-overlays"),
+            None,
+            false,
+            None,
+            &NatLimits::default(),
+            false,
+            None,
+            None,
+            Some(&(sink.clone() as Arc<dyn MsiSink>)),
+        )
+        .expect("wire the document");
+
+        // Measured, not assumed: one queue notification delivers *two* edges --
+        // `DeviceCore::notify` signals per completion and the mmio transport
+        // then pulses unconditionally. That is pre-existing transport behaviour
+        // and harmless for an edge-triggered SPI (the driver re-reads the used
+        // ring either way), so the count is deliberately not asserted; what is
+        // asserted is that every edge carries the recorded intid and that
+        // exactly one request was completed.
+        let delivered = sink.0.lock().unwrap().clone();
+        assert!(
+            !delivered.is_empty(),
+            "the drained device delivered no interrupt at all"
+        );
+        assert!(
+            delivered.iter().all(|&i| i == INTID),
+            "an edge carried an intid the device tree never recorded: {delivered:?}"
+        );
+        let used_idx = u16::from_le_bytes([ram[0x6002], ram[0x6003]]);
+        assert_eq!(used_idx, 1, "the device never completed the queued request");
+
+        // The control, and the reason draining is not conditional on the
+        // injector: the same guest, wired with nowhere to deliver an interrupt,
+        // must still consume what the driver left behind. A drain that only ran
+        // when a completion could be signalled would skip exactly the devices
+        // whose work nobody is waiting on -- and leave that work undone.
+        let mut ram2 = ram.clone();
+        put16(&mut ram2, 0x6002, 0); // reset the used index
+        let bus2 = Arc::new(MmioBus::new());
+        let mem2 = Arc::new(GuestMemory::new());
+        // SAFETY: as above -- `ram2` outlives `mem2` and is not aliased.
+        unsafe { mem2.register(0, ram2.as_mut_ptr(), ram2.len()) };
+        wire_virtio(
+            &bus2,
+            &mem2,
+            &doc,
+            &dir.join(".chm-overlays"),
+            None,
+            false,
+            None,
+            &NatLimits::default(),
+            false,
+            None,
+            None,
+            None,
+        )
+        .expect("wire the document with no sink");
+        let used_idx2 = u16::from_le_bytes([ram2[0x6002], ram2[0x6003]]);
+        assert_eq!(
+            used_idx2, 1,
+            "a device wired without an SPI sink was never drained"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_mmio_device_is_drained_once_the_tree_is_wired() {
+        // A restored transport's queue cursors were never seeded, so a resumed
+        // guest can be waiting on a request the device has not noticed. The pci
+        // half has drained since it was written; this reads the source because
+        // the drain's effect is invisible without a guest that has already
+        // advanced a ring, and a guard asserting an outcome it cannot observe
+        // would report safety it does not provide.
+        let src = include_str!("imp.rs");
+        let needle = format!("{}.drain_on_resume()", "dev");
+        assert_eq!(
+            src.matches(&needle).count(),
+            2,
+            "both transports must drain on resume; found {} call(s)",
+            src.matches(&needle).count()
+        );
     }
 }
 
