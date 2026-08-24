@@ -345,7 +345,7 @@ const SHELL_NAMES: &[&str] = &["sh", "bash", "ash", "dash", "zsh", "ksh", "mksh"
 /// `busybox` is a shell only when told to be one -- `busybox sh` is, plain
 /// `busybox` prints its applet list and exits -- so it is the one name whose
 /// next token matters.
-fn entrypoint_is_shell(entrypoint: &str) -> bool {
+pub(super) fn entrypoint_is_shell(entrypoint: &str) -> bool {
     let mut tokens = entrypoint.split_whitespace();
     let Some(first) = tokens.next() else {
         return false;
@@ -357,6 +357,29 @@ fn entrypoint_is_shell(entrypoint: &str) -> bool {
             .is_some_and(|a| SHELL_NAMES.contains(&a) && a != "busybox");
     }
     SHELL_NAMES.contains(&program)
+}
+
+/// Whether a resolved entrypoint leaves an *interactive* shell on the console.
+///
+/// [`entrypoint_is_shell`] answers "is this program a shell", which is the
+/// right question for the build-time warning. It is the wrong question for
+/// chm's console reset, whose whole argument (`exec.rs:62`) is about a shell
+/// sitting at `PS1`/`PS2`: `sh -c 'node app.js'` is a shell by name and none
+/// of that by behaviour. It never prompts, never reads the console, and dies
+/// on `SIGINT` like any other non-interactive program -- taking PID 1 with it.
+/// It is also how a very large share of container images spell their
+/// entrypoint, so getting it wrong is not an edge case.
+///
+/// A token starting with `-` and containing `c` counts, so `-lc` and `-ec` are
+/// caught alongside `-c`. That test errs toward reporting "not interactive",
+/// and deliberately: mistakenly protecting an interactive shell costs Ctrl-C
+/// and the `PS2` recovery, while mistakenly leaving a non-interactive one
+/// unprotected destroys the guest.
+pub(super) fn entrypoint_is_interactive_shell(entrypoint: &str) -> bool {
+    entrypoint_is_shell(entrypoint)
+        && !entrypoint
+            .split_whitespace()
+            .any(|t| t.starts_with('-') && t.contains('c'))
 }
 
 /// Say so when the image's own entrypoint is not a shell.
@@ -1593,6 +1616,41 @@ mod tests {
         assert!(!entrypoint_is_shell("busybox"));
         assert!(!entrypoint_is_shell("busybox httpd"));
         assert!(!entrypoint_is_shell("busybox busybox"));
+    }
+
+    /// `sh -c` is a shell by name and a program by behaviour, and the console
+    /// reset only reasons correctly about the former.
+    ///
+    /// Pinned in both directions: `-c` in any spelling must not read as
+    /// interactive, and a plain or `-l` shell must. The `-l` row is the one that
+    /// stops the test being satisfied by "any flag at all means non-interactive",
+    /// which would quietly disarm the reset for `bash -l`.
+    #[test]
+    fn a_shell_given_c_is_not_an_interactive_shell() {
+        for e in [
+            "/bin/sh -c 'node app.js'",
+            "sh -c 'exec node app.js'",
+            "/bin/bash -lc 'exec node app.js'",
+            "sh -ec 'node app.js'",
+            "busybox sh -c 'node app.js'",
+        ] {
+            assert!(entrypoint_is_shell(e), "{e} is still a shell by name");
+            assert!(
+                !entrypoint_is_interactive_shell(e),
+                "{e} never prompts and never reads the console, so chm's reset \
+                 would kill it rather than return it to PS1"
+            );
+        }
+        for e in ["/bin/sh", "sh", "/bin/bash -l", "busybox sh"] {
+            assert!(
+                entrypoint_is_interactive_shell(e),
+                "{e} is the case the console reset is built for"
+            );
+        }
+        assert!(
+            !entrypoint_is_interactive_shell("/opt/gimbal-browser/start"),
+            "a non-shell was never interactive"
+        );
     }
 
     /// Someone who passed --entrypoint chose it. Telling them what they just

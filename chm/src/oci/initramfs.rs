@@ -461,6 +461,53 @@ pub fn default_init(
     }
     let cd = workdir.map_or_else(String::new, |d| format!("cd {} 2>/dev/null\n", sh_quote(d)));
 
+    // The banner *reports* the entrypoint; the handover below *runs* it. Those
+    // are different jobs, so they need different quoting, and only one of them
+    // is documented as taking shell source.
+    //
+    // Unquoted here, an entrypoint containing a double quote closes the echo's
+    // own string and the rest of it becomes live operators in this script: a
+    // `&` backgrounds part of the banner, a `;` runs the remainder as an init
+    // command, before the trap and before the exec. Measured on
+    // `/bin/sh -c "sleep 900 & wait; echo X"`, which printed X at boot from
+    // this line. The init still parses, so `sh -n` cannot see it.
+    let banner_entrypoint = sh_quote(entrypoint);
+
+    // Make the entrypoint survive the console reset, when the entrypoint is not
+    // an interactive shell.
+    //
+    // `ETX` is the only state-independent console reset chm has, and every
+    // framed write opens with it (`exec.rs:62`). The line discipline turns it
+    // into `SIGINT` for the foreground process group. Against a shell sitting
+    // at a prompt that costs a prompt and nothing else, which is the
+    // precondition `exec.rs` reasons from. Against anything else `SIGINT` is
+    // fatal by default, and when the foreground process is PID 1's only child,
+    // killing it takes the machine: #385 measured the readiness probe's own
+    // reset ending a browser guest in `Attempted to kill init!` before the
+    // post-boot command was ever delivered.
+    //
+    // A `SIG_IGN` disposition survives `exec` -- POSIX requires signals set to
+    // be ignored to stay ignored across it -- so trapping here, in the shell
+    // that is about to become the entrypoint, leaves the entrypoint itself
+    // ignoring `SIGINT`. That is also what a container started without a TTY
+    // gets, so it is the ordinary disposition for this kind of process rather
+    // than a special case invented for chm.
+    //
+    // "Interactive" is the load-bearing word: `sh -c 'node app.js'` is a shell
+    // by name and dies like any other program, so it needs this too. An
+    // interactive shell deliberately keeps the default disposition, because
+    // `SIGINT` is both how the reset returns it from `PS2` to `PS1` and how a
+    // human types Ctrl-C.
+    let sigint = if super::image::entrypoint_is_interactive_shell(entrypoint) {
+        String::new()
+    } else {
+        "# Not an interactive shell, so SIGINT would be fatal. chm's console\n\
+         # reset sends one before every framed write; SIG_IGN is inherited\n\
+         # across the handover below. See #385.\n\
+         trap '' INT\n"
+            .to_string()
+    };
+
     // The drivers the kernel needs before it can see anything chm attached.
     //
     // Order is the caller's, resolved from each module's own `depends=`, and
@@ -548,7 +595,7 @@ gimbal_start() {{
 if [ -z "${{NODE_EXTRA_CA_CERTS:-}}" ] && [ -r {ca_env} ]; then
     . {ca_env}
 fi
-{cd}exec {entrypoint}
+{cd}{sigint}exec {entrypoint}
 }}
 
 # Stop the machine, rather than letting init exit.
@@ -811,7 +858,7 @@ gimbal: --memory; until then HTTPS through the proxy fails a certificate check."
 fi
 unset __ca_sent
 
-echo "gimbal: container rootfs up; starting {entrypoint}"
+echo "gimbal: container rootfs up; starting" {banner_entrypoint}
 
 # Hand over with a controlling terminal, so job control works and Ctrl-C
 # interrupts something.
@@ -1331,6 +1378,77 @@ mod tests {
         );
     }
 
+    /// The body of `gimbal_start`, which is the only code both handover paths
+    /// run.
+    fn start_body(entrypoint: &str) -> String {
+        let s = default_init(entrypoint, &[], None, &[]);
+        let start = s.find("gimbal_start() {").expect("no gimbal_start");
+        let end = s[start..].find("\n}\n").expect("unterminated") + start;
+        s[start..end].to_string()
+    }
+
+    /// chm opens every framed console write with `ETX`, and the line discipline
+    /// turns that into `SIGINT` for the foreground process group.
+    ///
+    /// Pinned in **all three** directions, because a trap that is always set is
+    /// as wrong as one that is never set. Against an interactive shell the reset
+    /// is the mechanism, not a hazard: `SIGINT` is what returns it from `PS2` to
+    /// `PS1`, so ignoring it there would break the thing `CONSOLE_RESET` exists
+    /// to do. Against `sh -c` it is a hazard again -- that shell never prompts,
+    /// never reads the console, and dies like any other program.
+    #[test]
+    fn only_an_interactive_shell_keeps_the_default_sigint_disposition() {
+        let not_a_shell = start_body("/opt/gimbal-browser/start");
+        assert!(
+            not_a_shell.contains("trap '' INT"),
+            "a non-shell entrypoint must be exec'd with SIGINT ignored, or chm's \
+             own console reset kills the guest -- #385 measured exactly that, as \
+             `Attempted to kill init!`.\n{not_a_shell}"
+        );
+        assert!(
+            not_a_shell.find("trap '' INT").expect("no trap")
+                < not_a_shell.find("\nexec ").expect("no exec"),
+            "the trap must be set before the exec: SIG_IGN survives exec, but a \
+             disposition set afterwards is set in the wrong process.\n{not_a_shell}"
+        );
+
+        let a_shell = start_body("/bin/sh");
+        assert!(
+            !a_shell.contains("trap '' INT"),
+            "an interactive shell must keep the default SIGINT disposition: it is \
+             how the console reset returns it from PS2 to PS1, and how a human \
+             types Ctrl-C.\n{a_shell}"
+        );
+
+        for e in ["/bin/sh -c 'node app.js'", "sh -lc 'exec node app.js'"] {
+            let body = start_body(e);
+            assert!(
+                body.contains("trap '' INT"),
+                "`{e}` is a shell by name and a non-interactive program by \
+                 behaviour -- it never prompts and dies on SIGINT, taking PID 1 \
+                 with it. It is also how a large share of container images spell \
+                 their entrypoint.\n{body}"
+            );
+        }
+    }
+
+    /// The entrypoint that made #385 real, named rather than described.
+    ///
+    /// Read from the browser module's own constant and assembled the way
+    /// `image.rs` assembles it, so this cannot pass against a spelling the
+    /// shipped image does not use.
+    #[test]
+    fn the_browser_launcher_is_the_entrypoint_this_protects() {
+        let entrypoint = format!("/{}", super::super::browser::LAUNCH_PATH);
+        let body = start_body(&entrypoint);
+        assert!(
+            body.contains("trap '' INT"),
+            "the browser launcher is the entrypoint measured dying to chm's own \
+             reset in #385. If it ever classifies as a shell, the bug is back and \
+             the sandbox becomes unreachable by exec and --post-boot.\n{body}"
+        );
+    }
+
     /// The marker exists to be read back, so it is worthless if it can drift
     /// away from the installer it describes. Pinned in both directions: an init
     /// with the installer carries the marker, and an init without it does not.
@@ -1603,6 +1721,17 @@ mod tests {
                     &[],
                 ),
             ),
+            (
+                // The shipped browser image: a non-shell entrypoint, so this is
+                // the case that carries the `trap` from #385.
+                "browser launcher",
+                default_init(
+                    &format!("/{}", super::super::browser::LAUNCH_PATH),
+                    &[],
+                    None,
+                    &[],
+                ),
+            ),
         ] {
             if let Err(e) = sh_parses(&s) {
                 panic!("{name}: generated init does not parse: {e}");
@@ -1621,6 +1750,58 @@ mod tests {
             1,
             "the entrypoint must be spelled out exactly once:\n{s}"
         );
+    }
+
+    /// The one line of the generated init that reports the entrypoint.
+    fn banner_line(script: &str) -> String {
+        script
+            .lines()
+            .find(|l| l.starts_with("echo \"gimbal: container rootfs up;"))
+            .unwrap_or_else(|| panic!("no banner line in:\n{script}"))
+            .to_string()
+    }
+
+    /// The banner *reports* the entrypoint; the handover *runs* it. Only the
+    /// second is documented as taking shell source, so a double quote in an
+    /// entrypoint must not turn the first into live shell operators.
+    ///
+    /// Asked of a real shell by *running* the line, because the broken form is
+    /// still valid shell: `sh -n` parses it happily and it simply means
+    /// something else. A parse check or a substring assertion is structurally
+    /// blind to this, which is why it survived until a guest measured it.
+    #[test]
+    fn the_banner_reports_the_entrypoint_and_runs_nothing_else() {
+        use std::process::{self, Command};
+        use std::{env, fs};
+
+        let sentinel = env::temp_dir().join(format!("chm-banner-{}", process::id()));
+        let _ = fs::remove_file(&sentinel);
+
+        for entrypoint in [
+            // Measured: this printed INIT_FELL_THROUGH at boot, from the banner,
+            // because `&` and `;` escaped the echo's own quotes.
+            r#"/bin/sh -c "sleep 900 & wait; echo INIT_FELL_THROUGH""#.to_string(),
+            format!(r#"/app "; touch {} ; echo ""#, sentinel.display()),
+            // Controls: already safe, and must stay reported verbatim.
+            "/bin/sh -c 'echo hi'".to_string(),
+            "/usr/local/bin/gunicorn".to_string(),
+        ] {
+            let line = banner_line(&default_init(&entrypoint, &[], None, &[]));
+            let out = Command::new("/bin/sh")
+                .args(["-c", &line])
+                .output()
+                .expect("run the banner line");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                format!("gimbal: container rootfs up; starting {entrypoint}\n"),
+                "the banner must report the entrypoint verbatim, for {entrypoint:?}"
+            );
+            assert!(
+                !sentinel.exists(),
+                "the banner ran part of the entrypoint, for {entrypoint:?}"
+            );
+        }
+        let _ = fs::remove_file(&sentinel);
     }
 
     #[test]
