@@ -234,7 +234,7 @@ fn peer_uid(stream: &UnixStream) -> io::Result<u32> {
 
 /// Parse the shared `--socket PATH` flag out of an argument list, returning the
 /// remaining positional/other tokens.
-fn take_socket(raw: &[String]) -> Result<(PathBuf, Vec<String>), String> {
+pub(crate) fn take_socket(raw: &[String]) -> Result<(PathBuf, Vec<String>), String> {
     let mut socket = default_socket();
     let mut rest = Vec::new();
     let mut i = 0;
@@ -1720,27 +1720,10 @@ fn exec_client(raw: &[String]) -> Result<u8, String> {
     let (socket, rest) = take_socket(raw)?;
     let (timeout, json, argv) = parse_exec_args(&rest)?;
 
-    let mut stream = UnixStream::connect(&socket).map_err(|e| {
-        format!(
-            "cannot connect to daemon at {}: {e} (is `chm serve` running?)",
-            socket.display()
-        )
-    })?;
-    let request = format!("exec-json {timeout} {}\n", exec::encode_argv(&argv));
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|e| format!("send command: {e}"))?;
-    stream.flush().ok();
-
-    let mut body = String::new();
-    stream
-        .read_to_string(&mut body)
-        .map_err(|e| format!("read daemon: {e}"))?;
-    let reply: serde_json::Value =
-        serde_json::from_str(body.trim()).map_err(|e| format!("daemon reply: {e} ({body})"))?;
+    let reply = exec_once(&socket, timeout, &argv)?;
 
     if json {
-        println!("{}", body.trim());
+        println!("{reply}");
     }
 
     let status = reply.get("status").and_then(|v| v.as_str()).unwrap_or("error");
@@ -1770,6 +1753,38 @@ fn exec_client(raw: &[String]) -> Result<u8, String> {
         Some(c) if (0..=255).contains(&c) => Ok(c as u8),
         _ => Err("daemon reported completion without a usable exit status".to_string()),
     }
+}
+
+/// Send one framed command to a running daemon and return its reply.
+///
+/// Shared rather than reimplemented, because `chm cp` (#316) drives a guest over
+/// exactly this protocol and two implementations of one wire format eventually
+/// disagree — silently, since both sides would still be *ours*. The reply is
+/// returned raw so each caller decides what a non-zero status means to it: for
+/// `exec` it is the command's own result and must be passed through, for `cp` it
+/// is a transfer failure at a named step.
+pub(crate) fn exec_once(
+    socket: &Path,
+    timeout: u64,
+    argv: &[String],
+) -> Result<serde_json::Value, String> {
+    let mut stream = UnixStream::connect(socket).map_err(|e| {
+        format!(
+            "cannot connect to daemon at {}: {e} (is `chm serve` running?)",
+            socket.display()
+        )
+    })?;
+    let request = format!("exec-json {timeout} {}\n", exec::encode_argv(argv));
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("send command: {e}"))?;
+    stream.flush().ok();
+
+    let mut body = String::new();
+    stream
+        .read_to_string(&mut body)
+        .map_err(|e| format!("read daemon: {e}"))?;
+    serde_json::from_str(body.trim()).map_err(|e| format!("daemon reply: {e} ({body})"))
 }
 
 /// Split `chm exec`'s own flags from the guest argv.

@@ -52,6 +52,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use hypervisor::hvf::virtio::nat::EgressEvent;
 use serde_json::{Map, Value, json};
 
 /// The per-workspace audit file.
@@ -484,6 +485,28 @@ fn summarize(line: &str) -> String {
             s("detail"),
         ),
         other => format!("{ts}  {other}  {line}"),
+    }
+}
+
+/// Write one audit record per *distinct* egress decision.
+///
+/// The tally deduplicates, so a page opening eighty connections to one allowed
+/// host writes one record rather than eighty. An [`AuditLog`] with no workspace
+/// behind it drops everything, which is why there is no `Option` here: the
+/// no-workspace case is the disabled handle, not a branch.
+///
+/// Taking the events by value is what bounds the NAT's buffer -- see
+/// [`crate::imp::net_service_pass`], which is the only thing that calls this.
+pub(crate) fn record_egress(events: Vec<EgressEvent>, tally: &mut EgressTally, audit: &AuditLog) {
+    for ev in events {
+        if !tally.observe(ev.domain, &ev.target, &ev.rule, ev.allowed) {
+            continue;
+        }
+        if ev.allowed {
+            audit.egress_allow(ev.domain, &ev.target, &ev.rule, &ev.policy);
+        } else {
+            audit.egress_deny(ev.domain, &ev.target, &ev.rule, &ev.policy);
+        }
     }
 }
 

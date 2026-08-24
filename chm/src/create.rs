@@ -40,33 +40,34 @@ use std::time::{Duration, Instant, SystemTime};
 use std::{fs, io, thread};
 
 use arch::aarch64::layout::LEGACY_RTC_MAPPED_IO_START;
+use hypervisor::hvf::checkpoint::{self as hvf_checkpoint};
 use hypervisor::hvf::devices::{MmioBus, Pl011, Pl031};
+use hypervisor::hvf::rehydrate::MemMapping;
 use hypervisor::hvf::virtio::block::{BlockDevice, FileBackend};
 use hypervisor::hvf::virtio::devcore::{Backend, MsiSink, MsiSpiInjector};
+use hypervisor::hvf::virtio::devmgr::{self, SerialRegs};
 use hypervisor::hvf::virtio::mmio::{self, MmioParams, VirtioMmioDevice, device_id};
-use hypervisor::hvf::virtio::nat::{
-    EgressEvent, EgressPolicy, INGRESS_BIND_ADDR, NatLimits, NatResponder,
-};
+use hypervisor::hvf::virtio::nat::{EgressPolicy, INGRESS_BIND_ADDR, NatLimits, NatResponder};
 use hypervisor::hvf::virtio::net::{NetDevice, NetKick};
-use hypervisor::hvf::virtio::{GuestMemory, features};
+use hypervisor::hvf::virtio::{GuestMemory, NetIo, features};
 use hypervisor::hvf::{
     HvfHypervisor, UsgicCpuHandle, UsgicSpiRouter, VtimerClock, host_counter_hz, rehydrate,
 };
-use hypervisor::{VmExit, VmOps};
+use hypervisor::{Vcpu, VmExit, VmOps};
 
 use crate::audit::{AuditLog, EgressTally};
 use crate::coldboot::{ColdBootConfig, VirtioKind};
 use crate::console::RawConsole;
 use crate::imp::{
-    CpuPowerSlot, PL011_BASE, PL011_SIZE, PsciCoordinator, apply_psci_cpu_on_state,
-    egress_posture_line, wait_for_cpu_on_request,
+    CpuPowerSlot, NET_SERVICE_INTERVAL, PL011_BASE, PL011_SIZE, PsciCoordinator, UsgicCapture,
+    apply_psci_cpu_on_state, collect_usgic_checkpoint, egress_posture_line, net_service_pass,
+    wait_for_cpu_on_request,
 };
 use crate::oci::initramfs::installs_proxy_ca;
 use crate::oci::modules;
 use crate::runs;
 use crate::spec::{Overrides, SandboxSpec, resolve, spec_file_for};
-use crate::{coldboot, console, credproxy, postboot};
-
+use crate::{bundle, checkpoint, coldboot, console, credproxy, genesis, postboot};
 /// The NAT gateway the guest talks to, and the MAC we hand its NIC.
 ///
 /// Same subnet the restore path's NAT uses, so a guest image built for one
@@ -85,10 +86,6 @@ pub const GUEST_IP: [u8; 4] = [192, 168, 249, 2];
 pub const GUEST_PREFIX_LEN: u8 = 24;
 const GATEWAY_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
 const GUEST_MAC: [u8; 6] = [0x02, 0, 0, 0, 0, 2];
-
-/// How long the net service thread waits for a guest transmit before servicing
-/// anyway. Matches the restore path's interval; a transmit wakes it at once.
-const NET_SERVICE_INTERVAL: Duration = Duration::from_millis(2);
 
 /// An [`MsiSink`] that hands an `INTID` to the userspace GIC's SPI router, so a
 /// device thread's completion is delivered on the vCPU the interrupt is routed
@@ -196,6 +193,26 @@ struct CreateArgs {
     /// the existing behaviour is not merely preserved but untouched — the whole
     /// mechanism is skipped rather than run and found to have nothing to do.
     postboot: postboot::Plan,
+    /// Where to write a snapshot of this guest when it stops (#341).
+    ///
+    /// Cold boot is the only way a machine comes into existence here, and until
+    /// now it was also the only thing that could not produce a snapshot: every
+    /// capture in this tree descends from one taken on Graviton, because
+    /// `chm resume` can extend a lineage but nothing could *start* one. A
+    /// checkpoint cannot do it either — `imp::load_snapshot` requires a
+    /// `state.json` and a `memory-ranges` to apply a checkpoint *to*, so a
+    /// checkpoint is a delta against a snapshot that must already exist.
+    ///
+    /// So this writes the real thing: a vanilla snapshot directory, in the
+    /// layout `vanilla_export` produces and `chm run` reads.
+    originate: Option<PathBuf>,
+    /// `chm` flags a greedy `--post-boot` handed to the guest's command instead.
+    ///
+    /// Carried rather than printed from inside `parse` so the detection is
+    /// reachable from a test that goes through the real parser -- the flag is
+    /// swallowed by the parser, so a check that does not run the parser is
+    /// checking something else.
+    post_boot_swallowed: Vec<String>,
 }
 
 fn usage() -> String {
@@ -233,6 +250,13 @@ fn usage() -> String {
      \x20                     has to outlive the run.\n\
      \x20 --seconds <n>       Stop after n seconds (default 30). 0 runs until\n\
      \x20                     the guest powers off or you press Ctrl-A x.\n\
+     \x20 --originate <dir>   Snapshot this guest into <dir> when it stops, as\n\
+     \x20                     a cloud-hypervisor snapshot directory that\n\
+     \x20                     `chm run <dir>` resumes. This is how a lineage\n\
+     \x20                     starts on the Mac: every other capture here\n\
+     \x20                     descends from one taken on a Graviton host,\n\
+     \x20                     because resuming can extend a lineage but not\n\
+     \x20                     begin one. Not usable with --dry-run.\n\
      \x20 --env KEY=VALUE     Export a variable in the guest's console shell\n\
      \x20                     once it is up. Repeatable. Reaches the post-boot\n\
      \x20                     command, later `chm exec`s and your own session,\n\
@@ -305,6 +329,54 @@ fn parse_expose(raw: &str) -> Result<u16, String> {
     Ok(port)
 }
 
+/// Every long option `parse` understands.
+///
+/// It exists for one reader: the note that tells you a greedy `--post-boot`
+/// swallowed a flag you meant for `chm`. `create_flags_named_in_the_parser`
+/// reads the parser's own match arms out of this file and requires each to
+/// appear here, so a new flag cannot be added and quietly left out of the note.
+const CREATE_FLAGS: &[&str] = &[
+    "--kernel",
+    "--initramfs",
+    "--initrd",
+    "--cmdline",
+    "--cmdline-extra",
+    "--proxy-rules",
+    "--workspace",
+    "--originate",
+    "--cpus",
+    "--memory",
+    "--seconds",
+    "--disk",
+    "--net",
+    "--egress-allow",
+    "--expose",
+    "--env",
+    "--post-boot",
+    "--post-boot-arg",
+    "--dry-run",
+    "-h",
+    "--help",
+];
+
+/// The `chm` flags a greedy `--post-boot` took as arguments to the guest's
+/// command.
+///
+/// `--post-boot` has to be greedy -- the guest's command is entitled to its own
+/// `--dry-run` and we cannot know it was not meant for the guest. But being
+/// *right* is not the same as being *legible*: `--originate` typed after it
+/// produced no lineage, no error and an exit status of 0, and the only trace was
+/// the guest echoing our own flag back inside its argv. So say what happened.
+///
+/// Pure, and it returns the flags rather than a sentence, so the decision is
+/// testable without a console and the phrasing can change without the test.
+fn post_boot_swallowed_chm_flags(argv: &[String]) -> Vec<String> {
+    argv.iter()
+        .filter(|a| CREATE_FLAGS.contains(&a.as_str()))
+        .cloned()
+        .collect()
+}
+
 fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     let mut cfg = ColdBootConfig::default();
     let mut dry_run = false;
@@ -316,8 +388,10 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     let mut cmdline_extra: Vec<String> = Vec::new();
     let mut proxy_rules: Option<PathBuf> = None;
     let mut workspace: Option<PathBuf> = None;
+    let mut originate: Option<PathBuf> = None;
     let mut env: BTreeMap<String, String> = BTreeMap::new();
     let mut post_boot: Option<Vec<String>> = None;
+    let mut post_boot_swallowed: Vec<String> = Vec::new();
 
     let mut i = 0;
     while i < raw.len() {
@@ -349,6 +423,9 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
             }
             "--workspace" => {
                 workspace = Some(PathBuf::from(value("--workspace")?));
+            }
+            "--originate" => {
+                originate = Some(PathBuf::from(value("--originate")?));
             }
             "--cpus" => {
                 cfg.vcpus = value("--cpus")?
@@ -405,6 +482,7 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
                 }
                 // Replaces rather than appends: a command is a whole thing, so
                 // a flag overrides a spec's instead of concatenating onto it.
+                post_boot_swallowed = post_boot_swallowed_chm_flags(&rest);
                 post_boot = Some(rest);
                 i = raw.len();
                 continue;
@@ -467,6 +545,17 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     for extra in &cmdline_extra {
         cfg.cmdline = format!("{} {extra}", cfg.cmdline);
     }
+    // `--dry-run` returns before a VM exists, so there would be no machine to
+    // describe and no RAM to dump. Refusing beats writing nothing and exiting 0,
+    // which reads as "originated" to any script checking the status.
+    if dry_run && originate.is_some() {
+        return Err("--originate needs a running guest to snapshot, and \
+                    --dry-run stops before one is created. Drop one of them."
+            .to_string());
+    }
+    // A synthesized `state.json` now carries a node per virtio device, so a
+    // guest's disks are described rather than silently dropped. The refusal
+    // that used to stand here (#341, lifted by #378) exists no more.
     Ok(CreateArgs {
         cfg,
         dry_run,
@@ -476,6 +565,8 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
         proxy_rules,
         workspace,
         postboot: postboot::Plan { env, post_boot },
+        originate,
+        post_boot_swallowed,
     })
 }
 
@@ -545,6 +636,17 @@ pub fn create_main(raw: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    if !args.post_boot_swallowed.is_empty() {
+        let named = args.post_boot_swallowed.join(" ");
+        eprintln!(
+            "chm: note: --post-boot takes every remaining word as the guest's \
+             command, so {named} went to the guest and not to chm. If you meant \
+             it for chm, put it before --post-boot; if you meant it for the \
+             guest, this is already what you asked for. (--post-boot-arg takes \
+             one argv element at a time and is not greedy.)"
+        );
+    }
 
     match run(&args) {
         Ok(code) => code,
@@ -915,6 +1017,28 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     // `--seconds` a promise rather than a hope.
     type CpuReport = (usize, UsgicCpuHandle, Option<Arc<dyn Fn() + Send + Sync>>);
     let (setup_tx, setup_rx) = mpsc::channel::<Result<CpuReport, String>>();
+    // The origination capture channel (#341). `Some` only when `--originate`
+    // asked for a snapshot, so an ordinary cold boot does no capture work at
+    // all rather than doing it and throwing the result away.
+    //
+    // `collect_usgic_checkpoint` waits for exactly one capture per vCPU, so a
+    // thread that takes any path out without sending would hang the collector
+    // rather than fail it. That is why the capture below sits at a single exit
+    // point every path funnels through, instead of at the end of the run loop.
+    //
+    // The receiver is held apart from the sender so the orchestrator's own
+    // sender can be dropped once every thread has its clone. Keeping it alive
+    // would defeat the collector's only escape: `recv()` fails when the last
+    // sender goes, and a sender nobody sends on keeps the channel open forever.
+    // The single exit point is the belt; this is the braces, and it is what
+    // turns "origination hung after the guest ran perfectly" into an error that
+    // names the vCPU.
+    let (capture_tx, capture_rx) = if args.originate.is_some() {
+        let (tx, rx) = mpsc::channel::<(usize, UsgicCapture)>();
+        (Some(tx), Some(rx))
+    } else {
+        (None, None)
+    };
     let mut go_txs = Vec::with_capacity(vcpus);
     let outcome: Arc<Mutex<Option<Result<String, String>>>> = Arc::new(Mutex::new(None));
     let mut vcpu_threads = Vec::with_capacity(vcpus);
@@ -929,6 +1053,7 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         let running = running.clone();
         let outcome = outcome.clone();
         let setup_tx = setup_tx.clone();
+        let capture_tx = capture_tx.clone();
         let slot = psci.slot(id);
         // Only the boot CPU gets an entry point and a device tree. A secondary
         // keeps HVF's reset state until `CPU_ON` names an address for it.
@@ -959,53 +1084,85 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                     let Ok(table) = go_rx.recv() else { return };
                     rehydrate::usgic_set_cpu_table(&mut vcpu, table);
 
-                    if id != 0 {
-                        // Park until the kernel asks for this core. The entry
-                        // point and context arrive with the request, and both
-                        // must be in the register file before the first run().
-                        let Some((entry, context)) = wait_for_cpu_on_request(&slot, &running)
-                        else {
-                            return;
-                        };
-                        if let Err(e) = apply_psci_cpu_on_state(vcpu.as_mut(), entry, context) {
-                            *outcome.lock().unwrap() = Some(Err(format!("vCPU {id}: {e}")));
-                            running.store(false, Ordering::Release);
-                            return;
+                    // Everything that runs the guest lives in this closure, so
+                    // that every way out of it -- a secondary the kernel never
+                    // turned on, a failed CPU_ON, a run error, a clean
+                    // power-off -- arrives at the single capture below.
+                    //
+                    // `collect_usgic_checkpoint` waits for exactly one capture
+                    // per vCPU, so a path that returned straight out of the
+                    // thread instead would *hang* origination rather than fail
+                    // it, at the end of a boot that had otherwise worked. A
+                    // never-onlined secondary is not an edge case here: a guest
+                    // given four vCPUs that brings up one leaves three parked,
+                    // and all four still have to appear in the snapshot.
+                    let run_guest = |vcpu: &mut Box<dyn Vcpu>| {
+                        if id != 0 {
+                            // Park until the kernel asks for this core. The entry
+                            // point and context arrive with the request, and both
+                            // must be in the register file before the first run().
+                            let Some((entry, context)) = wait_for_cpu_on_request(&slot, &running)
+                            else {
+                                return;
+                            };
+                            if let Err(e) = apply_psci_cpu_on_state(vcpu.as_mut(), entry, context) {
+                                *outcome.lock().unwrap() = Some(Err(format!("vCPU {id}: {e}")));
+                                running.store(false, Ordering::Release);
+                                return;
+                            }
                         }
+
+                        while running.load(Ordering::Acquire) {
+                            match vcpu.run() {
+                                Ok(VmExit::Ignore) => {}
+                                Ok(VmExit::Shutdown | VmExit::Reset) => {
+                                    *outcome.lock().unwrap() = Some(Ok("guest powered off".into()));
+                                    running.store(false, Ordering::Release);
+                                    break;
+                                }
+                                Ok(other) => {
+                                    *outcome.lock().unwrap() =
+                                        Some(Err(format!("vCPU {id} unexpected exit: {other:?}")));
+                                    running.store(false, Ordering::Release);
+                                    break;
+                                }
+                                Err(e) => {
+                                    // The full source chain, not just the outermost
+                                    // display: `HypervisorCpuError::RunVcpu` renders
+                                    // as a bare "Failed to run vcpu", and the whole
+                                    // diagnosis (the HVF status code, the ESR, the
+                                    // faulting IPA) lives in the wrapped cause.
+                                    let mut msg = format!("vCPU {id} run: {e}");
+                                    let mut src = Error::source(&e);
+                                    while let Some(cause) = src {
+                                        msg.push_str(&format!(": {cause}"));
+                                        src = cause.source();
+                                    }
+                                    *outcome.lock().unwrap() = Some(Err(msg));
+                                    running.store(false, Ordering::Release);
+                                    break;
+                                }
+                            }
+                        }
+                    };
+                    run_guest(&mut vcpu);
+
+                    // The capture runs here because HVF register reads are only
+                    // valid from the vCPU's owning thread -- the same reason
+                    // `imp`'s suspend path captures on the vCPU thread and
+                    // assembles on the orchestrator. It is taken after the run
+                    // loop has left, so the vCPU is idle and nothing is going to
+                    // change underneath it.
+                    if let Some(tx) = capture_tx {
+                        let captured = hvf_checkpoint::capture_usgic_vcpu(&mut vcpu)
+                            .map_err(|e| format!("{e:#}"));
+                        // Sent whether it succeeded or failed. The collector
+                        // counts messages and names the failing vCPU, so
+                        // dropping a failed capture would turn a legible error
+                        // into a silent wait for a message that never comes.
+                        let _ = tx.send((id, captured));
                     }
 
-                    while running.load(Ordering::Acquire) {
-                        match vcpu.run() {
-                            Ok(VmExit::Ignore) => {}
-                            Ok(VmExit::Shutdown | VmExit::Reset) => {
-                                *outcome.lock().unwrap() = Some(Ok("guest powered off".into()));
-                                running.store(false, Ordering::Release);
-                                break;
-                            }
-                            Ok(other) => {
-                                *outcome.lock().unwrap() =
-                                    Some(Err(format!("vCPU {id} unexpected exit: {other:?}")));
-                                running.store(false, Ordering::Release);
-                                break;
-                            }
-                            Err(e) => {
-                                // The full source chain, not just the outermost
-                                // display: `HypervisorCpuError::RunVcpu` renders
-                                // as a bare "Failed to run vcpu", and the whole
-                                // diagnosis (the HVF status code, the ESR, the
-                                // faulting IPA) lives in the wrapped cause.
-                                let mut msg = format!("vCPU {id} run: {e}");
-                                let mut src = Error::source(&e);
-                                while let Some(cause) = src {
-                                    msg.push_str(&format!(": {cause}"));
-                                    src = cause.source();
-                                }
-                                *outcome.lock().unwrap() = Some(Err(msg));
-                                running.store(false, Ordering::Release);
-                                break;
-                            }
-                        }
-                    }
                     // A secondary that stops must be marked off, or the kernel
                     // sees ALREADY_ON if it retries.
                     psci_mark_offline(&slot);
@@ -1014,6 +1171,10 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         );
     }
     drop(setup_tx);
+    // Every thread now holds its own clone, so this one can go. See the channel's
+    // construction: the collector's only way to fail rather than wait forever is
+    // for the last sender to disappear.
+    drop(capture_tx);
 
     // Collect every vCPU's handle, in id order: the SGI table is indexed by
     // vCPU id, and the channel does not promise arrival order.
@@ -1108,6 +1269,10 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         for dev in &net_devices {
             dev.set_net_kick(kick.clone());
         }
+        // Collected before the loop rather than shared behind a lock: every
+        // vCPU has already reported in by here (the `setup_rx` drain above is
+        // synchronous), so the set is complete and never changes again.
+        let exits: Vec<Arc<dyn Fn() + Send + Sync>> = exits.iter().flatten().cloned().collect();
         // A workspace is where an audit trail can live; without one the handle
         // records nothing. Draining is *not* conditional on that, because the
         // NAT buffers every decision until somebody takes them — an undrained
@@ -1127,11 +1292,32 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                     // allowed host writes one record rather than eighty.
                     let mut tally = EgressTally::default();
                     while running.load(Ordering::Acquire) {
-                        for dev in &net_devices {
-                            service_and_record(dev, &mut tally, &audit);
+                        let delivered = net_service_pass(
+                            net_devices.iter().map(|d| d.as_ref() as &dyn NetIo),
+                            &mut tally,
+                            &audit,
+                        );
+                        if delivered {
+                            // The frame is in the ring and the SPI is raised,
+                            // but a vCPU parked in WFI does not see either until
+                            // something takes it out of `hv_vcpu_run`. Waiting
+                            // for its own poll to expire is a latency the guest
+                            // pays on every inbound packet.
+                            for exit in &exits {
+                                exit();
+                            }
+                            // And go straight round again: a bulk transfer is
+                            // many chains, and sleeping the interval between
+                            // them caps inbound throughput at one chain per
+                            // interval no matter how much is waiting.
+                            continue;
                         }
                         kick.wait(NET_SERVICE_INTERVAL);
                     }
+                    // The per-flow lines above are the detail; without this the
+                    // trail has no totals, so a reader cannot tell a complete
+                    // record from a truncated one.
+                    audit.egress_summary(&tally);
                 })
                 .map_err(|e| format!("spawning the net service thread: {e}"))?,
         )
@@ -1232,6 +1418,40 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     }
     if let Some(t) = postboot_thread {
         let _ = t.join();
+    }
+
+    // #341. This is the only window where both things are true at once: every
+    // vCPU has stopped and delivered its state, and guest RAM is still mapped.
+    // `drop(prepared)` two statements below unmaps it.
+    //
+    // Skipped when the guest itself failed. A snapshot of a machine that died
+    // mid-run is not a lineage anyone wants to descend from, and the guest's own
+    // error is the more useful thing to report — writing the snapshot anyway
+    // would bury it behind a capture failure it probably caused.
+    if let (Some(dir), Some(capture_rx)) = (args.originate.as_deref(), capture_rx.as_ref()) {
+        let guest_failed = matches!(*outcome.lock().unwrap(), Some(Err(_)));
+        if guest_failed {
+            eprintln!(
+                "chm: not originating {}: the guest failed, and a snapshot of a \
+                 machine that did not finish starting is not one to build on.",
+                dir.display()
+            );
+        } else {
+            originate_snapshot(
+                dir,
+                capture_rx,
+                vcpus,
+                &OriginatedRam {
+                    mem: &prepared.guest_mem,
+                    base: image.ram_base,
+                    size: image.ram_size as u64,
+                },
+                // Read off the live device the guest programmed, at the last
+                // moment it is still the machine being described.
+                uart.capture(),
+                &devices,
+            )?;
+        }
     }
 
     // `image` must outlive the VM: `prepared` holds the VM and unmaps guest RAM
@@ -1359,47 +1579,6 @@ fn await_ready(ready: &Arc<(Mutex<bool>, Condvar)>) {
     }
 }
 
-/// Service a NAT device and record every decision it made.
-///
-/// Servicing and recording are deliberately one operation. The NAT buffers
-/// every egress decision until somebody takes them, so a caller that services
-/// without draining grows an unbounded `Vec` for the life of the guest — and
-/// `--seconds 0` is the shape this path is normally run in. Keeping the two
-/// halves in one function means the call site cannot do half of it.
-fn service_and_record(
-    dev: &VirtioMmioDevice,
-    tally: &mut EgressTally,
-    audit: &AuditLog,
-) {
-    dev.service_net();
-    record_egress(dev.drain_egress_events(), tally, audit);
-}
-
-/// Write one audit record per *distinct* egress decision.
-///
-/// The tally deduplicates, so a page opening eighty connections to one allowed
-/// host writes one record rather than eighty. An [`AuditLog`] with no workspace
-/// behind it drops everything, which is why there is no `Option` here: the
-/// no-workspace case is the disabled handle, not a branch.
-///
-/// [`AuditLog`]: crate::audit::AuditLog
-fn record_egress(
-    events: Vec<EgressEvent>,
-    tally: &mut EgressTally,
-    audit: &AuditLog,
-) {
-    for ev in events {
-        if !tally.observe(ev.domain, &ev.target, &ev.rule, ev.allowed) {
-            continue;
-        }
-        if ev.allowed {
-            audit.egress_allow(ev.domain, &ev.target, &ev.rule, &ev.policy);
-        } else {
-            audit.egress_deny(ev.domain, &ev.target, &ev.rule, &ev.policy);
-        }
-    }
-}
-
 /// Arm one loopback listener per `--expose`d guest port and report each one.
 ///
 /// The ports are reported rather than returned because they are the *only*
@@ -1418,6 +1597,308 @@ fn expose_guest_ports(mut nat: NatResponder, ports: &[u16]) -> Result<NatRespond
         );
     }
     Ok(nat)
+}
+
+/// Write a cloud-hypervisor snapshot directory describing the guest that has
+/// just stopped, giving a lineage its first link (#341).
+///
+/// Until this existed, every snapshot in this tree descended from one taken on a
+/// Graviton host: `chm resume` can extend a lineage and `vanilla_export` can send
+/// one back to the cloud, but neither can *begin* one, and a checkpoint cannot
+/// either — `imp::load_snapshot` requires a `state.json` and a `memory-ranges`
+/// to apply a checkpoint to, so a checkpoint is a delta against a snapshot that
+/// already exists.
+///
+/// The output is therefore the real article rather than a chm-private format:
+/// the same layout [`crate::vanilla_export`] produces, which means the artefact
+/// is vanilla by construction instead of by later conversion.
+///
+/// MUST be called after every vCPU thread has joined (so all the captures have
+/// been sent, and nothing is still changing the machine) and before `prepared`
+/// is dropped (which unmaps guest RAM).
+///
+/// `devices` is the same vector the bus was built from, so the windows recorded
+/// in the document are the windows the guest's drivers are bound to rather than
+/// a second derivation of them.
+/// The guest's memory, and where the guest sees it.
+///
+/// One fact about one machine rather than three parameters, for the reason the
+/// `mappings` comment below gives: the dump and the document that describes it
+/// must be two uses of a single value, never two descriptions of it. Three
+/// separate arguments let a caller pass the memory of one machine with the base
+/// address of another, and the result is a snapshot that parses, validates,
+/// resumes, and has the guest's RAM in the wrong place.
+struct OriginatedRam<'a> {
+    mem: &'a GuestMemory,
+    base: u64,
+    size: u64,
+}
+
+fn originate_snapshot(
+    dir: &Path,
+    capture_rx: &mpsc::Receiver<(usize, UsgicCapture)>,
+    vcpus: usize,
+    ram: &OriginatedRam<'_>,
+    serial: SerialRegs,
+    devices: &[(coldboot::VirtioPlacement, Arc<VirtioMmioDevice>)],
+) -> Result<(), String> {
+    // Refuse rather than merge: writing into a directory that already holds a
+    // snapshot would leave a `state.json` from this run beside a
+    // `memory-ranges` from another, which is a machine that never existed and
+    // resumes without complaining.
+    if dir.exists()
+        && dir
+            .read_dir()
+            .map_err(|e| format!("reading {}: {e}", dir.display()))?
+            .next()
+            .is_some()
+    {
+        return Err(format!(
+            "{} already exists and is not empty. Originating into it would mix \
+             this guest's state with whatever is already there; name a new \
+             directory.",
+            dir.display()
+        ));
+    }
+
+    // The same assembler the suspend path uses, not a second one: two
+    // assemblers would be two chances to write a shape only one of them reads.
+    let state = collect_usgic_checkpoint(capture_rx, COLD_NR_IRQS, vcpus)?;
+
+    // `prepare_cold_usgic_vm` maps exactly one contiguous region, into slot 0,
+    // at the start of the dump. This single value then goes to both consumers:
+    // `dump_guest_ram` to decide where each byte goes, and `genesis::synthesize`
+    // to record where each byte came from. Handing them one value rather than
+    // two descriptions of it is the whole design — if those two ever disagreed,
+    // the snapshot would parse, validate, resume, and have the guest's memory in
+    // the wrong place, which no test of our writer against our own reader could
+    // see.
+    let mappings = vec![MemMapping {
+        slot: 0,
+        gpa: ram.base,
+        size: ram.size,
+        file_offset: 0,
+    }];
+
+    // A cold guest read the host's real `CNTFRQ_EL0` at boot, so that is the
+    // frequency the snapshot must declare: a restore that assumes a different
+    // one runs the guest's clock at the wrong rate.
+    //
+    // The console's interrupt line is passed for the same reason and is read
+    // from the one place that decides it: `spawn_stdin_pump` above asserts
+    // `coldboot::PL011_IRQ`, so a capture claiming anything else would describe
+    // a machine this one never was. Restating the number here would let the two
+    // drift into a snapshot whose console is deaf.
+    // Read off the live transports at the same instant the vCPUs stopped, and
+    // paired with the placement each was registered at. Both halves come from
+    // the objects the machine actually ran on: nothing here recomputes a window
+    // from `coldboot`'s constants, so a device node cannot describe a machine
+    // this one was not.
+    let virtio: Vec<genesis::VirtioNode> = devices
+        .iter()
+        .map(|(place, dev)| genesis::VirtioNode {
+            transport: dev.state(),
+            base: place.base,
+            size: place.size,
+            intid: place.intid,
+            backing: place.path.as_ref().map(|p| p.display().to_string()),
+        })
+        .collect();
+
+    let genesis = genesis::synthesize(
+        &state,
+        &mappings,
+        host_counter_hz(),
+        serial,
+        coldboot::PL011_IRQ,
+        &virtio,
+    )?;
+
+    // Read the document back and count what it describes, rather than trusting
+    // that it describes what was handed over. The two sides come from different
+    // places on purpose: `devices` is the machine that just stopped, and the
+    // count is parsed out of the bytes about to be written. A change that stops
+    // devices reaching the synthesizer moves the synthesizer's inputs and its
+    // outputs together, so no assertion about the rendering can see it -- but
+    // the machine still had disks, and this comparison still fails.
+    let described = genesis::virtio_nodes_in(&genesis.bytes)?;
+    if described != devices.len() {
+        return Err(format!(
+            "this guest ran {} virtio device(s) but the snapshot describes {}. \
+             Resuming it would hand the guest's kernel a machine missing the \
+             devices its drivers are bound to; refusing rather than writing a \
+             lineage that cannot come back.",
+            devices.len(),
+            described
+        ));
+    }
+
+    let snapshot = dir.join("snapshot");
+    fs::create_dir_all(&snapshot).map_err(|e| format!("creating {}: {e}", snapshot.display()))?;
+
+    // The disks travel with the RAM, at the instant the RAM was taken. A
+    // cold-booted guest's kernel has its filesystem's metadata cached in the
+    // pages about to be dumped, so resuming that RAM against anything other
+    // than the disk it was cached from is the ext4 metadata-mismatch failure
+    // mode (roadmap V6.7): the guest reads `Input/output error` on files it can
+    // see in its own page cache. RAM and disk are captured together or neither
+    // is worth having.
+    let shipped = ship_disks(dir, &virtio)?;
+
+    // cloud-hypervisor ships `state.json` at both the root and inside
+    // `snapshot/`, and different readers reach for different ones, so both are
+    // written from the same bytes rather than serialized twice.
+    for p in [dir.join("state.json"), snapshot.join("state.json")] {
+        fs::write(&p, &genesis.bytes).map_err(|e| format!("writing {}: {e}", p.display()))?;
+    }
+    let ranges = snapshot.join("memory-ranges");
+    // `None`: there is no parent dump to delta against. A lineage's first
+    // snapshot is by definition the one with nothing behind it.
+    checkpoint::dump_guest_ram(&ranges, ram.mem, &mappings, None)?;
+
+    verify_shipped_disks(dir, &String::from_utf8_lossy(&genesis.bytes), shipped)?;
+
+    println!(
+        "chm: originated {} ({} vCPU(s), {} MiB, {} IRQs, {} disk(s))",
+        dir.display(),
+        vcpus,
+        ram.size >> 20,
+        genesis.num_irq,
+        shipped
+    );
+    for line in &genesis.vcpu_summaries {
+        println!("chm:   {line}");
+    }
+    // Printed, not buried: the caller is about to be told a snapshot exists, and
+    // what it does not carry is part of what it is. Saying nothing here would
+    // let the artefact's shape imply a completeness it does not have.
+    for w in &genesis.warnings {
+        println!("chm: note: {w}");
+    }
+    Ok(())
+}
+
+/// Confirm the restore path can find every disk the document describes.
+///
+/// This asks the *reader*, not the writer. [`devmgr::parse_mmio_devices`] is
+/// the parser a resume will use to decide which devices exist, and
+/// [`devmgr::shipped_backing`] is what it will then call to find each disk --
+/// so both halves of the restore path are run against the bytes just written,
+/// rather than against the values that produced them.
+///
+/// A check against the caller's own device list could not do this. Shipping a
+/// disk under a name the reader does not compute moves the writer's input and
+/// its output together, so every assertion about the writer stays true while
+/// the resume silently falls back to a sparse zero overlay and the guest comes
+/// back to a disk full of holes. This comparison fails exactly then, and it
+/// fails just as well if the shipping step stops being called at all -- which
+/// no assertion about `ship_disks`'s own behaviour can see.
+pub(crate) fn verify_shipped_disks(
+    dir: &Path,
+    state_json: &str,
+    shipped: usize,
+) -> Result<(), String> {
+    let overlay_dir = dir.join(checkpoint::live_overlays_dir_name());
+    let mut found = 0;
+    for desc in devmgr::parse_mmio_devices(state_json)
+        .map_err(|e| format!("reading back the snapshot just written: {e}"))?
+    {
+        if !matches!(desc.backend, devmgr::BackendKind::Block { .. }) {
+            continue;
+        }
+        match devmgr::shipped_backing(&overlay_dir, &desc.name) {
+            Ok(Some(_)) => found += 1,
+            Ok(None) => {
+                return Err(format!(
+                    "the snapshot describes a disk for `{}` but a resume would \
+                     find no image for it, so the guest would come back on an \
+                     empty overlay against RAM that has its filesystem cached. \
+                     Refusing rather than writing a lineage that reads as corrupt.",
+                    desc.name
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "checking the shipped disk for `{}`: {e}",
+                    desc.name
+                ));
+            }
+        }
+    }
+    if found != shipped {
+        return Err(format!(
+            "shipped {shipped} disk image(s) but a resume would find {found}. \
+             Refusing rather than writing a lineage whose disks are not the ones \
+             this guest ran."
+        ));
+    }
+    Ok(())
+}
+
+/// Ship a copy of every disk the guest was running, where a resume will look.
+///
+/// The location is not computed here: [`devmgr::shipped_backing_candidates`] is
+/// the reader's own view of the layout, and its first entry is the canonical
+/// write target. Two descriptions of one path is how a writer comes to put a
+/// real disk somewhere the restore path never looks.
+///
+/// `clonefile` is what makes capturing the disk at the same instant as the RAM
+/// affordable: an APFS clone shares every extent, so a 25 GiB disk costs
+/// ~0 bytes and is frozen from the moment it is taken even though the caller's
+/// own file stays writable. A symlink would be free too and is not an option --
+/// the restore path refuses one by name as a possibly tampered bundle, and it
+/// is right to, because a link is a promise about a file that can be broken
+/// after the promise is made.
+///
+/// Returns how many images were written.
+pub(crate) fn ship_disks(dir: &Path, nodes: &[genesis::VirtioNode]) -> Result<usize, String> {
+    let overlay_dir = dir.join(checkpoint::live_overlays_dir_name());
+    let mut shipped = 0;
+    for node in nodes {
+        // A node with no backing file is not a disk -- the net device has none.
+        let Some(src) = node.backing.as_deref() else {
+            continue;
+        };
+        let src = Path::new(src);
+        let dest = devmgr::shipped_backing_candidates(&overlay_dir, &node.transport.name)
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                format!(
+                    "cannot place a shipped disk relative to {}",
+                    overlay_dir.display()
+                )
+            })?;
+        // Sanitization maps several device names onto one filename, so two
+        // devices can collide here. Refuse: letting the second clone overwrite
+        // the first would hand one guest disk to two drivers, and the resume
+        // would look entirely well-formed.
+        if dest.exists() {
+            return Err(format!(
+                "device `{}` would ship its disk to {}, which is already taken \
+                 by another device whose name sanitizes the same way. Refusing \
+                 rather than letting one guest disk replace another.",
+                node.transport.name,
+                dest.display()
+            ));
+        }
+        let parent = dest
+            .parent()
+            .ok_or_else(|| format!("{} has no parent directory", dest.display()))?;
+        fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
+        if let Err(e) = bundle::clone_file(src, &dest) {
+            // Not fatal on its own: `clonefile` only works within one APFS
+            // volume, and a disk sitting on another filesystem still has to
+            // travel. Copying is slow and correct; refusing would be neither.
+            // Said out loud because the cost is the user's to know about.
+            println!("chm: note: {e}; copying the disk instead, which is slower");
+            fs::copy(src, &dest).map_err(|e| {
+                format!("copying disk {} to {}: {e}", src.display(), dest.display())
+            })?;
+        }
+        shipped += 1;
+    }
+    Ok(shipped)
 }
 
 /// Build a `virtio-mmio` device for each placement the image reserved.
@@ -2062,7 +2543,11 @@ mod tests {
         let audit = crate::audit::AuditLog::open(&dir);
         let mut tally = crate::audit::EgressTally::default();
 
-        super::record_egress(vec![egress_event("dns", "neverssl.com", false)], &mut tally, &audit);
+        crate::audit::record_egress(
+            vec![egress_event("dns", "neverssl.com", false)],
+            &mut tally,
+            &audit,
+        );
 
         let trail = std::fs::read_to_string(dir.join("audit.jsonl")).unwrap_or_default();
         assert!(
@@ -2083,7 +2568,7 @@ mod tests {
         let mut tally = crate::audit::EgressTally::default();
 
         for _ in 0..80 {
-            super::record_egress(
+            crate::audit::record_egress(
                 vec![egress_event("tcp", "10.0.0.1:443", true)],
                 &mut tally,
                 &audit,
@@ -2113,7 +2598,7 @@ mod tests {
             egress_event("dns", "b.example", false),
         ];
 
-        super::record_egress(events, &mut tally, &audit);
+        crate::audit::record_egress(events, &mut tally, &audit);
 
         // `record_egress` takes the vector by value, so consuming it is what
         // bounds the buffer; the tally having seen both is the observable proof
@@ -2128,11 +2613,19 @@ mod tests {
         );
     }
 
-    /// Servicing a NAT device without draining it is the defect. This asserts
-    /// the two cannot be separated at the call site: `service_and_record` is
-    /// the only thing the cold-net loop calls, and it does both.
+    /// The cold-boot net loop lives inside a four-hundred-line function no test
+    /// can call, so the only way to hold it to its contract is to read it. Four
+    /// claims, each of which was false on this path until V11.3:
+    ///
+    /// 1. it services through the shared pass, which drains as it goes;
+    /// 2. it never services a device directly, the shape that leaves
+    ///    `drain_egress_events()` uncalled and the NAT's buffer growing;
+    /// 3. it wakes the vCPUs when a pass delivered, because a frame sitting in
+    ///    the ring behind a parked vCPU has not arrived;
+    /// 4. it writes the totals, without which a cold boot's trail has per-flow
+    ///    lines and no way to tell a complete record from a truncated one.
     #[test]
-    fn the_net_loop_cannot_service_without_recording() {
+    fn the_cold_net_loop_services_the_way_the_restore_path_does() {
         let src = include_str!("create.rs");
         // Assembled from parts so this literal is not itself a match (the file
         // reads its own source), and asserted unique so a second occurrence
@@ -2145,19 +2638,43 @@ mod tests {
             "the cold-net loop's tally must be the only match for {spawn:?}, \
              or this guard reads a region that is not the loop"
         );
-        let loop_body = src
+        let body = src
             .split(&spawn)
             .nth(1)
-            .and_then(|s| s.split("kick.wait(NET_SERVICE_INTERVAL)").next())
-            .expect("the cold-net loop must still spawn with a tally and a kick");
+            .and_then(|s| s.split("spawning the net service thread").next())
+            .expect("the cold-net loop must still spawn with a tally");
         assert!(
-            loop_body.contains(&format!("{}(dev,", "service_and_record")),
-            "the cold-net loop must service through service_and_record, which drains"
+            body.contains(&format!("{}(", "net_service_pass")),
+            "the cold-net loop must service through the shared pass, which drains"
         );
         assert!(
-            !loop_body.contains("dev.service_net()"),
+            !body.contains(&format!(".{}()", "service_net")),
             "the cold-net loop must not service a device directly -- that is the \
              shape that leaves drain_egress_events() uncalled and the buffer growing"
+        );
+        assert!(
+            body.contains(&format!("for exit in &{}", "exits")),
+            "a delivered frame must take the vCPUs out of WFI; otherwise the guest \
+             pays its own poll interval as latency on every inbound packet"
+        );
+        assert!(
+            body.contains(&format!("audit.{}(&tally)", "egress_summary")),
+            "the cold-boot trail must carry totals, or a reader cannot tell a \
+             complete record from a truncated one"
+        );
+    }
+
+    /// The interval is the restore path's, imported rather than restated. A
+    /// second declaration is two numbers that can drift, and the drift would be
+    /// invisible: both loops would keep working, at different rates, and only a
+    /// throughput measurement across the two paths would ever show it.
+    #[test]
+    fn the_service_interval_is_not_restated_here() {
+        let src = include_str!("create.rs");
+        assert!(
+            !src.contains(&format!("const {}", "NET_SERVICE_INTERVAL")),
+            "the cold-boot path must import the interval from imp, not declare \
+             its own copy of it"
         );
     }
 
@@ -2173,5 +2690,328 @@ mod tests {
             rule: if allowed { "allow".into() } else { "default-deny".into() },
             policy: "test-policy".into(),
         }
+    }
+
+    /// `--originate` has to name the directory it will write.
+    #[test]
+    fn originate_parses_to_the_directory_it_was_given() {
+        let a = parse(&args(&[
+            "--kernel",
+            "/tmp/Image",
+            "--originate",
+            "/tmp/lineage",
+        ]))
+        .expect("parses");
+        assert_eq!(a.originate.as_deref(), Some(Path::new("/tmp/lineage")));
+        let bare = parse(&args(&["--kernel", "/tmp/Image"])).expect("parses");
+        assert!(
+            bare.originate.is_none(),
+            "origination must be something the caller asked for"
+        );
+    }
+
+    /// A dry run has no guest, so it has nothing to originate from.
+    ///
+    /// Exiting 0 having written nothing is the shape that reads as success to
+    /// any script checking the status -- the caller would believe a lineage
+    /// exists and discover otherwise at the first resume.
+    #[test]
+    fn a_dry_run_cannot_originate_and_says_so() {
+        let e = parse(&args(&[
+            "--kernel",
+            "/tmp/Image",
+            "--originate",
+            "/tmp/lineage",
+            "--dry-run",
+        ]))
+        .unwrap_err();
+        assert!(e.contains("--originate"), "{e}");
+        assert!(
+            e.contains("running guest"),
+            "the refusal has to say why, not just that: {e}"
+        );
+    }
+
+    /// A guest with a disk is the only kind of guest worth originating from.
+    ///
+    /// This used to be refused: the synthesized capture had no device nodes, so
+    /// a snapshot would have restored to a machine whose RAM believed in a
+    /// filesystem that was not there -- the #139 failure shape, arrived at by
+    /// omission rather than by drift. #378 gave the document `_virtio-mmio-*`
+    /// nodes, so the refusal came down. The guard stays, inverted, because the
+    /// combination is the whole point of the feature (#361): a browser sandbox
+    /// has a rootfs, and a lineage that cannot start from one starts from
+    /// nothing anybody wants.
+    #[test]
+    fn a_guest_with_disks_can_originate_a_lineage() {
+        let a = parse(&args(&[
+            "--kernel",
+            "/tmp/Image",
+            "--disk",
+            "/tmp/root.img",
+            "--originate",
+            "/tmp/lineage",
+        ]))
+        .expect("a disk-backed guest must be able to begin a lineage");
+        assert_eq!(a.cfg.disks, vec![PathBuf::from("/tmp/root.img")]);
+        assert_eq!(a.originate, Some(PathBuf::from("/tmp/lineage")));
+    }
+
+    /// The console configuration must be read from the live device.
+    ///
+    /// `Pl011::capture()` reads the registers the guest itself programmed. A
+    /// caller that passed a constructed `SerialRegs` instead would write a
+    /// document describing a console nobody configured, and the guest would
+    /// resume unable to hear a keystroke while executing perfectly -- the least
+    /// legible failure this path has.
+    #[test]
+    fn the_originated_console_is_read_from_the_device_the_guest_programmed() {
+        let src = include_str!("create.rs");
+        let needle = format!("{}.{}()", "uart", "capture");
+        assert!(
+            src.contains(&needle),
+            "origination must capture the live PL011, not describe a fresh one"
+        );
+    }
+
+    /// A vCPU that never sends must fail origination, not stall it.
+    ///
+    /// `collect_usgic_checkpoint` calls `recv()` exactly once per vCPU, and
+    /// `recv()` returns an error only when the *last* sender is dropped. While
+    /// the orchestrator held its own sender through teardown, a thread that
+    /// exited without sending left the collector waiting on a channel nobody
+    /// would ever write to again -- origination hanging after a guest ran
+    /// perfectly, with no message.
+    ///
+    /// This is why `run` drops `capture_tx` once every thread holds a clone.
+    /// The test dropping the sender here is not tidiness; it *is* the property.
+    /// A guard whose failure mode is "the suite hangs" is not a guard, so this
+    /// runs the collector on its own thread and fails on the timeout instead.
+    #[test]
+    fn a_vcpu_that_exits_without_capturing_fails_origination_rather_than_hanging() {
+        let (tx, rx) = mpsc::channel::<(usize, UsgicCapture)>();
+        // Two vCPUs declared, nothing sent, and the last sender gone: the exact
+        // shape of a thread taking an early exit out of the run loop.
+        drop(tx);
+
+        let (done_tx, done_rx) = mpsc::channel::<Result<(), String>>();
+        thread::spawn(move || {
+            let r = collect_usgic_checkpoint(&rx, COLD_NR_IRQS, 2).map(|_| ());
+            let _ = done_tx.send(r);
+        });
+
+        let outcome = done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the collector must return; waiting forever is the bug");
+        let e = outcome.expect_err("no capture was sent, so there is nothing to assemble");
+        assert!(
+            e.contains("exited before sending"),
+            "the error has to name what went wrong, or a hang is merely traded \
+             for a mystery: {e}"
+        );
+    }
+
+    /// The orchestrator must let go of its own capture sender.
+    ///
+    /// The guard above proves the *collector* escapes once the last sender is
+    /// gone. It cannot see whether `run` actually lets go of its own, because
+    /// the test drops a sender it made itself -- the call-site blind spot this
+    /// repo has now been bitten by seven times. So read the source instead.
+    ///
+    /// The needle is assembled from parts: written whole it would match this
+    /// assertion's own text and pass while `run` held the sender forever.
+    #[test]
+    fn the_orchestrator_lets_go_of_its_capture_sender() {
+        let src = include_str!("create.rs");
+        let needle = format!("{}({}_{});", "drop", "capture", "tx");
+        assert!(
+            src.contains(&needle),
+            "run must drop its own capture sender once every vCPU thread holds \
+             a clone, or the collector's only escape is closed and origination \
+             waits forever on a guest that already finished"
+        );
+    }
+
+    /// The devices a guest ran must reach the synthesizer.
+    ///
+    /// Every assertion about the emitted document lives in `genesis` and asks
+    /// what the rendering looks like for the devices it was given. A change
+    /// here that stops handing devices over moves the synthesizer's inputs and
+    /// its outputs together: it is asked to describe a diskless machine, does
+    /// so correctly, and every one of those assertions still passes. That is
+    /// the eighth time this repository has been bitten by a mutation at a call
+    /// site rather than in the thing called, so this guard reads the call site
+    /// itself.
+    ///
+    /// `originate_snapshot` also compares the document's device count against
+    /// the machine's at run time, which is the half that protects a shipped
+    /// binary. This is the half that fails in the suite, before anyone builds
+    /// one.
+    ///
+    /// The needle is assembled rather than written out, because a literal would
+    /// appear in this function and match itself -- a guard that finds its own
+    /// assertion text cannot detect the code's disappearance.
+    #[test]
+    fn the_devices_the_guest_ran_are_handed_to_the_synthesizer() {
+        let src = include_str!("create.rs");
+        let passed = format!("&{},\n    )?;", "virtio");
+        assert!(
+            src.contains(&passed),
+            "`genesis::synthesize` must be called with the nodes mapped from \
+             the live devices. Passing an empty slice, or dropping the \
+             argument, would emit a snapshot describing a machine with no \
+             disks -- which resumes, and hands the guest's kernel nothing its \
+             drivers are bound to."
+        );
+
+        let built = format!(
+            "devices\n        .iter()\n        .map(|(place, dev)| genesis::{}",
+            "VirtioNode"
+        );
+        assert!(
+            src.contains(&built),
+            "the nodes must be mapped from `devices`, the vector the bus was \
+             built from. Deriving them from `coldboot`'s constants instead \
+             would let the recorded windows drift from the ones the guest's \
+             drivers are actually bound to."
+        );
+    }
+
+    /// The run-time half: a document that does not describe the machine it came
+    /// from is refused rather than written.
+    #[test]
+    fn a_snapshot_that_lost_the_guests_devices_is_refused_by_name() {
+        let src = include_str!("create.rs");
+        let check = format!("genesis::virtio_nodes_in(&genesis.{})?", "bytes");
+        assert!(
+            src.contains(&check),
+            "the count must be read back out of the bytes about to be written. \
+             Counting the caller's own vector instead would compare a value \
+             with itself and agree however wrong it was."
+        );
+        assert!(
+            src.contains("but the snapshot describes"),
+            "the refusal must name both counts, or the operator is told a \
+             lineage failed without being told what was missing from it"
+        );
+    }
+
+    /// The bug: `--originate` typed after `--post-boot` was taken as an argument
+    /// to the guest's command. No lineage, no error, exit 0 -- the only trace
+    /// was the guest echoing our own flag back inside its argv, and the run
+    /// otherwise looked perfect. Greed is correct (a guest command may carry a
+    /// word we also use) so the cure is legibility, not a parse change.
+    #[test]
+    fn a_chm_flag_after_post_boot_is_reported_as_swallowed() {
+        let a = parse(&args(&[
+            "--kernel",
+            "/tmp/Image",
+            "--post-boot",
+            "sh",
+            "-c",
+            "true",
+            "--originate",
+            "/tmp/lin",
+        ]))
+        .unwrap();
+        assert_eq!(a.originate, None, "greed is the behaviour under test");
+        assert_eq!(
+            a.post_boot_swallowed,
+            vec!["--originate".to_string()],
+            "the flag the parser ate has to be nameable, or the note cannot say \
+             which word went to the guest"
+        );
+    }
+
+    /// The other half, and the one that decides whether the note is worth
+    /// having: an ordinary command must not be accused of anything. A guest
+    /// command routinely carries words that are not our flags.
+    #[test]
+    fn an_ordinary_post_boot_command_is_not_reported() {
+        let a = parse(&args(&[
+            "--originate",
+            "/tmp/lin",
+            "--kernel",
+            "/tmp/Image",
+            "--post-boot",
+            "sh",
+            "-c",
+            "echo --net --disk hello",
+        ]))
+        .unwrap();
+        assert!(
+            a.post_boot_swallowed.is_empty(),
+            "--net and --disk inside a quoted shell word are one argv element, \
+             not flags, and a note that fires on them is noise"
+        );
+        assert!(
+            a.originate.is_some(),
+            "a flag before --post-boot still lands"
+        );
+    }
+
+    /// `CREATE_FLAGS` is a second copy of the parser's vocabulary, and a second
+    /// copy drifts: a flag added to the match and not here would be swallowed
+    /// silently, which is the bug this note exists to close. So read the
+    /// parser's own arms out of this file rather than trusting the list.
+    #[test]
+    fn create_flags_named_in_the_parser() {
+        let src = include_str!("create.rs");
+        let body = src
+            .split_once("fn parse(raw: &[String])")
+            .expect("the parser must still be named this")
+            .1;
+        let body = body.split_once("\n    Ok(CreateArgs {").unwrap().0;
+        let mut found = 0usize;
+        for line in body.lines() {
+            let t = line.trim();
+            // A match arm, not a string used in a message: `"--x" =>` or
+            // `"--x" | "--y" =>`.
+            if !t.starts_with('"') || !t.contains("=>") {
+                continue;
+            }
+            for flag in t.split("=>").next().unwrap().split('|') {
+                let flag = flag.trim().trim_matches('"');
+                if !flag.starts_with('-') {
+                    continue;
+                }
+                found += 1;
+                assert!(
+                    CREATE_FLAGS.contains(&flag),
+                    "{flag} is a create flag the parser understands but \
+                     CREATE_FLAGS does not, so typing it after --post-boot \
+                     would be swallowed with no note"
+                );
+            }
+        }
+        assert!(
+            found >= 15,
+            "only {found} arms found -- the extraction stopped matching the \
+             parser's shape, so this guard is passing without reading anything"
+        );
+    }
+
+    /// A test can see that `parse` *recorded* the swallowed flags and still not
+    /// see that nobody prints them: an assertion about a value cannot observe a
+    /// call site that no longer exists. This repo has been caught by that seven
+    /// times, so read the source.
+    #[test]
+    fn the_swallowed_flags_are_actually_printed() {
+        let src = include_str!("create.rs");
+        let needle = format!("args.{}.is_empty()", "post_boot_swallowed");
+        assert!(
+            src.contains(&needle),
+            "nothing consults the swallowed flags, so they are recorded and \
+             never said out loud -- which is the original bug with extra steps"
+        );
+        // Assembled, because a literal here would be found by `contains` in
+        // this very assertion -- a needle that matches its own test can never
+        // detect its removal from the code (§43).
+        let remedy = format!("put it {} --post-boot", "before");
+        assert!(
+            src.contains(&remedy),
+            "the note must carry the remedy: a true sentence that leaves the \
+             reader with no next step is what #305 and #306 were about"
+        );
     }
 }

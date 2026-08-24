@@ -106,6 +106,73 @@ struct MmioRegs {
     interrupt_status: u32,
 }
 
+/// One virtqueue exactly as the driver programmed it, for a snapshot.
+///
+/// This is [`QueueSetup`] made public, and it is deliberately the *driver's*
+/// writes rather than the [`Queue`] they produce. See
+/// [`MmioTransportState::queues`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MmioQueueState {
+    /// Ring size in descriptors.
+    pub size: u16,
+    /// Descriptor table GPA (`QueueDescLow`/`High`).
+    pub desc: u64,
+    /// Available ring GPA (`QueueDriverLow`/`High`).
+    pub driver: u64,
+    /// Used ring GPA (`QueueDeviceLow`/`High`).
+    pub device: u64,
+    /// Whether the driver has finished naming this ring (`QueueReady`).
+    pub ready: bool,
+}
+
+/// Everything about a live `virtio-mmio` device that a resume has to replay.
+///
+/// The counterpart of [`super::devmgr::VirtioDeviceDesc`], which describes a
+/// device read *out of* a cloud-hypervisor `state.json`. This describes one
+/// read out of a device this build is currently running, so a cold-booted guest
+/// can originate a snapshot (#378).
+///
+/// **What is deliberately not here.** The [`Queue`]s in [`DeviceCore`] are
+/// absent, because they are not independent state: [`VirtioMmioDevice::publish_queue`]
+/// derives each one from `queues[i]` plus `driver_features`, and a restore can
+/// re-derive them by running that same function. Recording both would be two
+/// descriptions of one machine with no way to tell which was right if they
+/// disagreed -- the failure mode `genesis`'s memory layout is written to avoid.
+///
+/// The ring *indices* (`next_avail`/`next_used`) are absent for a different and
+/// stronger reason: they live in guest RAM, which the snapshot dumps verbatim,
+/// and [`Queue::restore`] reads them back from there. Serializing them here
+/// would be copying a value out of the authoritative store into a second one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MmioTransportState {
+    /// Device name, e.g. `_disk0`.
+    pub name: String,
+    /// virtio device type (1 = net, 2 = block).
+    pub device_id: u32,
+    /// The full feature set this device offered.
+    pub device_features: u64,
+    /// The subset the driver acknowledged. Authoritative for ring features.
+    pub driver_features: u64,
+    /// `DeviceFeaturesSel` as last written.
+    pub device_features_sel: u32,
+    /// `DriverFeaturesSel` as last written.
+    pub driver_features_sel: u32,
+    /// `QueueSel` as last written.
+    pub queue_sel: u16,
+    /// `InterruptStatus`, so a resume does not lose an interrupt the driver had
+    /// not yet acknowledged.
+    pub interrupt_status: u32,
+    /// `Status`, which is what tells a resume whether the driver ever finished
+    /// bringing this device up.
+    pub device_status: u8,
+    /// Device-specific config generation counter.
+    pub config_generation: u8,
+    /// Per-queue driver programming, index == queue select.
+    pub queues: Vec<MmioQueueState>,
+    /// Device-specific configuration space (e.g. `virtio_blk_config`).
+    pub device_config: Vec<u8>,
+}
+
 /// A `virtio-mmio` device: the register map, plus the shared device model.
 pub struct VirtioMmioDevice {
     name: String,
@@ -165,6 +232,7 @@ impl VirtioMmioDevice {
             device_config: params.device_config,
             isr_status: 0,
             mem,
+            transport_signals: true,
             injector: Box::new(LoggingInjector::new(name.clone())),
         };
         Self {
@@ -184,9 +252,155 @@ impl VirtioMmioDevice {
         }
     }
 
+    /// Rebuild a device from the state a snapshot recorded (#378), driving
+    /// `backend`.
+    ///
+    /// Only the backend is supplied by the caller: it is a *host* resource (an
+    /// open file, a NAT responder) that no snapshot can carry. Everything the
+    /// guest can observe — name, device id, features, config space, queue
+    /// programming, status — comes from `state`, so a restored device is
+    /// described by exactly one authority.
+    ///
+    /// `core.queues` is **derived** from the stored `setups` plus
+    /// `driver_features`, the same way [`Self::publish_queue`] derives it when a
+    /// driver programs the device live. Deserializing the queues directly would
+    /// be a second, independent description of a value that already has one, and
+    /// the two would drift silently: the ring features come from what the driver
+    /// *acknowledged*, not from what the device offered.
+    ///
+    /// The progress cursors are the one thing that cannot come from the
+    /// document. They live in the guest's own rings, so a ready queue reads them
+    /// back out of guest RAM ([`Queue::restore`]) rather than resuming at zero
+    /// and re-consuming requests the device already completed.
+    pub fn restored(backend: Backend, mem: Arc<GuestMemory>, state: &MmioTransportState) -> Self {
+        let acked = state.driver_features;
+        let n = state.queues.len();
+        let queues = state
+            .queues
+            .iter()
+            .map(|qs| {
+                let mut q = Queue {
+                    size: qs.size,
+                    desc: qs.desc,
+                    avail: qs.driver,
+                    used: qs.device,
+                    event_idx: acked & super::features::RING_EVENT_IDX != 0,
+                    indirect: acked & super::features::RING_INDIRECT_DESC != 0,
+                    next_avail: 0,
+                    next_used: 0,
+                };
+                // Only a queue the driver marked ready has rings in guest RAM to
+                // read: an unready queue's addresses are whatever half-written
+                // state the driver had reached, and reading them would seed the
+                // cursors from an address that means nothing.
+                if qs.ready {
+                    let _ = q.restore(&mem);
+                }
+                q
+            })
+            .collect();
+        let setups = state
+            .queues
+            .iter()
+            .map(|qs| QueueSetup {
+                size: qs.size,
+                desc: qs.desc,
+                driver: qs.driver,
+                device: qs.device,
+                ready: qs.ready,
+            })
+            .collect();
+        let core = DeviceCore {
+            common: VirtioConfig {
+                device_feature_select: state.device_features_sel,
+                driver_feature_select: state.driver_features_sel,
+                device_features: state.device_features,
+                driver_features: acked,
+                msix_config: 0,
+                num_queues: n as u16,
+                device_status: state.device_status,
+                config_generation: state.config_generation,
+                queue_select: state.queue_sel,
+            },
+            queues,
+            queue_vectors: vec![0; n],
+            backend,
+            device_config: state.device_config.clone(),
+            isr_status: 0,
+            mem,
+            transport_signals: true,
+            injector: Box::new(LoggingInjector::new(state.name.clone())),
+        };
+        Self {
+            name: state.name.clone(),
+            device_id: state.device_id,
+            device_features: state.device_features,
+            core: Mutex::new(core),
+            regs: Mutex::new(MmioRegs {
+                device_features_sel: state.device_features_sel,
+                driver_features_sel: state.driver_features_sel,
+                driver_features: acked,
+                queue_sel: state.queue_sel,
+                setups,
+                interrupt_status: state.interrupt_status,
+            }),
+            kick: Mutex::new(None),
+        }
+    }
+
     /// The device's name (for diagnostics).
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    /// Read this device's replayable state, for originating a snapshot (#378).
+    ///
+    /// Takes both locks, `regs` first and then `core`, which is the order every
+    /// other path in this file uses (`publish_queue`, `write_status`). Taking
+    /// them in the opposite order here would be a lock-ordering inversion and a
+    /// deadlock waiting for the one interleaving that hits it.
+    pub fn state(&self) -> MmioTransportState {
+        let regs = self.regs.lock().unwrap();
+        let queues = regs
+            .setups
+            .iter()
+            .map(|s| MmioQueueState {
+                size: s.size,
+                desc: s.desc,
+                driver: s.driver,
+                device: s.device,
+                ready: s.ready,
+            })
+            .collect();
+        let (
+            device_features_sel,
+            driver_features_sel,
+            driver_features,
+            queue_sel,
+            interrupt_status,
+        ) = (
+            regs.device_features_sel,
+            regs.driver_features_sel,
+            regs.driver_features,
+            regs.queue_sel,
+            regs.interrupt_status,
+        );
+        drop(regs);
+        let core = self.core.lock().unwrap();
+        MmioTransportState {
+            name: self.name.clone(),
+            device_id: self.device_id,
+            device_features: self.device_features,
+            driver_features,
+            device_features_sel,
+            driver_features_sel,
+            queue_sel,
+            interrupt_status,
+            device_status: core.common.device_status,
+            config_generation: core.common.config_generation,
+            queues,
+            device_config: core.device_config.clone(),
+        }
     }
 
     /// Replace the interrupt injector with one that reaches a real GIC.
@@ -217,6 +431,31 @@ impl VirtioMmioDevice {
             self.raise(&mut core);
         }
         delivered
+    }
+
+    /// Complete anything the guest made available before the capture that the
+    /// capture-side device never consumed.
+    ///
+    /// A resumed guest will not re-notify a queue it has already kicked: from
+    /// its side the request is outstanding and the completion is owed. Without
+    /// this, a checkpoint taken with a disk read in flight resumes into a guest
+    /// blocked forever on a read nothing will finish. `notify` only signals an
+    /// interrupt when it actually completes a request, so a device whose queues
+    /// were quiesced at capture pops nothing and stays silent.
+    ///
+    /// This goes through the transport's own `notify` rather than straight to
+    /// the core, because that is where `QueueReady` is consulted. [`restored`]
+    /// gives an unready queue its recorded ring addresses but deliberately
+    /// skips seeding its cursors from those rings -- so `next_avail` reads 0
+    /// against a ring the driver may already have advanced, and walking one
+    /// would complete a request that does not exist.
+    ///
+    /// [`restored`]: Self::restored
+    pub fn drain_on_resume(&self) {
+        let n = self.core.lock().unwrap().queues.len();
+        for qi in 0..n as u16 {
+            self.notify(qi);
+        }
     }
 
     /// Drain the net backend's egress-decision events for the audit trail.
@@ -652,5 +891,524 @@ mod tests {
         // be rejected as a descriptor loop.
         assert!(QUEUE_NUM_MAX <= u32::from(u16::MAX));
         assert!(QUEUE_NUM_MAX.is_power_of_two());
+    }
+
+    /// The guard #378 rests on: what a driver programmed is what a snapshot
+    /// reports.
+    ///
+    /// Drives the device through the sequence a real `virtio_mmio` driver uses
+    /// -- negotiate features, program a ring, set `QueueReady`, then `DRIVER_OK`
+    /// -- and asserts every field of [`MmioTransportState`] came back. If any
+    /// one of them is dropped on the floor, a cold-booted guest originates a
+    /// snapshot that resumes into a device the driver no longer recognises.
+    #[test]
+    fn the_state_a_snapshot_records_is_what_the_driver_programmed() {
+        let (d, _m) = dev();
+        write32(&d, 0x024, 0); // DriverFeaturesSel = 0
+        write32(&d, 0x020, 0x1000_0000); // RING_INDIRECT_DESC
+        write32(&d, 0x024, 1); // DriverFeaturesSel = 1
+        write32(&d, 0x020, 0x0000_0001); // VERSION_1
+        write32(&d, 0x070, 0x8); // FEATURES_OK
+        write32(&d, 0x030, 0); // QueueSel = 0
+        write32(&d, 0x038, 64); // QueueNum
+        write32(&d, 0x080, 0x2000); // QueueDescLow
+        write32(&d, 0x090, 0x3000); // QueueDriverLow
+        write32(&d, 0x0a0, 0x4000); // QueueDeviceLow
+        write32(&d, 0x044, 1); // QueueReady
+        write32(&d, 0x070, 0xf); // ACKNOWLEDGE|DRIVER|FEATURES_OK|DRIVER_OK
+
+        let s = d.state();
+        assert_eq!(s.name, "blk0");
+        assert_eq!(s.device_id, device_id::BLOCK);
+        assert_eq!(
+            s.driver_features,
+            super::super::features::RING_INDIRECT_DESC | super::super::features::VERSION_1,
+            "the acked set is what ring features are derived from on resume"
+        );
+        assert_eq!(s.driver_features_sel, 1, "last DriverFeaturesSel written");
+        assert_eq!(s.queue_sel, 0);
+        assert_eq!(
+            s.device_status, 0xf,
+            "DRIVER_OK must survive into the snapshot"
+        );
+        assert_eq!(s.queues.len(), 1);
+        assert_eq!(
+            s.queues[0],
+            MmioQueueState {
+                size: 64,
+                desc: 0x2000,
+                driver: 0x3000,
+                device: 0x4000,
+                ready: true
+            }
+        );
+        assert_eq!(
+            s.device_config,
+            blk_config(8),
+            "config space is what tells a resumed driver the disk's capacity"
+        );
+    }
+
+    /// A queue the driver never finished naming must be recorded as not ready.
+    ///
+    /// The inverse of the guard above, and the one that matters for
+    /// correctness: `notify` refuses to walk a ring whose `ready` is false, so a
+    /// snapshot that recorded `ready: true` for a half-programmed queue would
+    /// resume into a device that walks a ring at an address the driver never
+    /// finished writing.
+    #[test]
+    fn a_half_programmed_queue_is_recorded_as_not_ready() {
+        let (d, _m) = dev();
+        write32(&d, 0x030, 0);
+        write32(&d, 0x038, 64);
+        write32(&d, 0x080, 0xdead_0000); // addresses started, QueueReady never set
+        let s = d.state();
+        assert!(
+            !s.queues[0].ready,
+            "an unfinished ring must not be marked ready"
+        );
+        assert_eq!(
+            s.device_status, 0,
+            "a driver that never came up must say so"
+        );
+    }
+
+    /// A restored device is described by the document, not by a second
+    /// hand-written description of it. Comparing the whole state — rather than
+    /// the handful of fields a reviewer thinks to check — is what makes this
+    /// guard see a field that is added later and never carried across.
+    #[test]
+    fn a_restored_device_describes_itself_exactly_as_the_one_it_came_from() {
+        // Every field carries a value it could not have taken by default, so
+        // dropping any one of them changes the answer. A fixture built by
+        // driving a fresh device would leave the rarely-written registers
+        // (`interrupt_status`, `config_generation`) at zero, and a guard cannot
+        // see a field zeroed to the value it already held.
+        let captured = MmioTransportState {
+            name: "blk7".into(),
+            device_id: device_id::NET,
+            device_features: 0x0000_0003_8000_0021,
+            driver_features: 0x0000_0001_8000_0001,
+            device_features_sel: 1,
+            driver_features_sel: 1,
+            queue_sel: 1,
+            interrupt_status: 0x3,
+            device_status: 0xf,
+            config_generation: 5,
+            queues: vec![
+                MmioQueueState {
+                    size: 64,
+                    desc: RING_DESC,
+                    driver: RING_AVAIL,
+                    device: RING_USED,
+                    ready: true,
+                },
+                MmioQueueState {
+                    size: 32,
+                    desc: RING_DESC + 0x4000,
+                    driver: RING_AVAIL + 0x4000,
+                    device: RING_USED + 0x4000,
+                    ready: false,
+                },
+            ],
+            device_config: vec![0xde, 0xad, 0xbe, 0xef, 0x01],
+        };
+        let (back, _m) = restored_from(&captured);
+        assert_eq!(
+            back.state(),
+            captured,
+            "every field a snapshot recorded has to come back, or the guest \
+             resumes against a device it never programmed"
+        );
+    }
+
+    /// The one thing the document cannot carry: the rings are the guest's, and
+    /// their indices live in guest RAM. A device that resumed at zero would
+    /// re-consume every request it had already completed.
+    #[test]
+    fn a_restored_queue_resumes_where_the_guest_left_off() {
+        let mut s = a_ready_queue_state();
+        let (d, mem) = restored_from_with_used_idx(&s, 7);
+        {
+            let core = d.core.lock().unwrap();
+            assert_eq!(
+                (core.queues[0].next_used, core.queues[0].next_avail),
+                (7, 7),
+                "both cursors seed from the live used.idx the guest published"
+            );
+        }
+        // And the reading is of RAM, not of a constant: a different guest is at
+        // a different point in its own ring.
+        s.queues[0].ready = true;
+        mem.write_u16(RING_USED + 2, 19).expect("write used.idx");
+        let d2 = VirtioMmioDevice::restored(a_backend(), mem.clone(), &s);
+        assert_eq!(d2.core.lock().unwrap().queues[0].next_used, 19);
+    }
+
+    /// A queue the driver never finished bringing up has no rings to read: its
+    /// addresses are whatever half-written state the driver had reached, and
+    /// seeding a cursor from one would be reading an address that means nothing.
+    #[test]
+    fn an_unready_queue_is_not_seeded_from_addresses_the_driver_never_wrote() {
+        let mut s = a_ready_queue_state();
+        s.queues[0].ready = false;
+        let (d, _m) = restored_from_with_used_idx(&s, 7);
+        let core = d.core.lock().unwrap();
+        assert_eq!(
+            (core.queues[0].next_used, core.queues[0].next_avail),
+            (0, 0),
+            "an unready queue stays at zero rather than reading a stale address"
+        );
+    }
+
+    /// The point of restoring the status byte: the guest comes back believing it
+    /// finished bringing this device up, and it will never do so again.
+    #[test]
+    fn a_restored_device_is_already_brought_up() {
+        let s = a_ready_queue_state();
+        let (d, _m) = restored_from(&s);
+        assert!(
+            d.driver_ok(),
+            "DRIVER_OK has to survive, or the resumed guest waits forever for a \
+             device it already configured"
+        );
+    }
+
+    /// Ring features come from what the driver acknowledged, never from what the
+    /// device offered: a driver is free to decline EVENT_IDX, and a restored
+    /// queue that believed otherwise would read an index the driver never
+    /// writes.
+    #[test]
+    fn a_restored_queue_takes_its_ring_features_from_the_acked_set() {
+        let mut s = a_ready_queue_state();
+        s.device_features = super::super::features::RING_EVENT_IDX
+            | super::super::features::RING_INDIRECT_DESC
+            | super::super::features::VERSION_1;
+        s.driver_features = super::super::features::VERSION_1;
+        let (d, _m) = restored_from(&s);
+        let core = d.core.lock().unwrap();
+        assert!(
+            !core.queues[0].event_idx && !core.queues[0].indirect,
+            "the device offered both and the driver took neither"
+        );
+    }
+
+    // ---- restore fixtures -------------------------------------------------
+
+    const RING_DESC: u64 = 0x4000_1000;
+    const RING_AVAIL: u64 = 0x4000_2000;
+    const RING_USED: u64 = 0x4000_3000;
+
+    fn a_backend() -> Backend {
+        Backend::Block(BlockDevice::new(
+            Box::new(MemDisk(vec![0xabu8; 512 * 8])),
+            "disk0",
+        ))
+    }
+
+    /// A device state as a driver that finished bring-up would leave it.
+    fn a_ready_queue_state() -> MmioTransportState {
+        MmioTransportState {
+            name: "blk0".into(),
+            device_id: device_id::BLOCK,
+            device_features: super::super::features::VERSION_1,
+            driver_features: super::super::features::VERSION_1,
+            device_features_sel: 1,
+            driver_features_sel: 1,
+            queue_sel: 0,
+            interrupt_status: 0,
+            device_status: 0xf,
+            config_generation: 0,
+            queues: vec![MmioQueueState {
+                size: 64,
+                desc: RING_DESC,
+                driver: RING_AVAIL,
+                device: RING_USED,
+                ready: true,
+            }],
+            device_config: blk_config(8),
+        }
+    }
+
+    fn restored_from(s: &MmioTransportState) -> (VirtioMmioDevice, Arc<GuestMemory>) {
+        restored_from_with_used_idx(s, 0)
+    }
+
+    fn restored_from_with_used_idx(
+        s: &MmioTransportState,
+        used_idx: u16,
+    ) -> (VirtioMmioDevice, Arc<GuestMemory>) {
+        let mem = Arc::new(GuestMemory::new());
+        mem.register_owned(0x4000_0000, 0x2_0000);
+        mem.write_u16(RING_USED + 2, used_idx)
+            .expect("seed used.idx");
+        let d = VirtioMmioDevice::restored(a_backend(), mem.clone(), s);
+        (d, mem)
+    }
+
+    /// Lay down a one-descriptor virtio-blk read the guest published but the
+    /// capture-side device never consumed: `avail.idx = 1` against a device
+    /// cursor of 0.
+    fn an_unconsumed_read(mem: &GuestMemory, desc: u64, avail: u64) {
+        let wr = |gpa: u64, addr: u64, len: u32, flags: u16, next: u16| {
+            mem.write(gpa, &addr.to_le_bytes()).unwrap();
+            mem.write_u32(gpa + 8, len).unwrap();
+            mem.write_u16(gpa + 12, flags).unwrap();
+            mem.write_u16(gpa + 14, next).unwrap();
+        };
+        wr(desc, 0x4000_4000, 16, 0x1, 1); // header, NEXT
+        wr(desc + 16, 0x4000_5000, 512, 0x3, 2); // data, NEXT|WRITE
+        wr(desc + 32, 0x4000_6000, 1, 0x2, 0); // status, WRITE
+        mem.write_u32(0x4000_4000, 0).unwrap(); // VIRTIO_BLK_T_IN
+        mem.write_u64(0x4000_4008, 0).unwrap(); // sector 0
+        mem.write_u16(avail + 4, 0).unwrap(); // ring[0] = head 0
+        mem.write_u16(avail + 2, 1).unwrap(); // avail.idx = 1
+    }
+
+    #[test]
+    fn a_resume_completes_the_request_the_capture_never_consumed() {
+        // The guest kicked this queue before the checkpoint, so from its side
+        // the completion is owed and it will never kick again. Nothing else
+        // will finish the read.
+        let (d, mem) = restored_from(&a_ready_queue_state());
+        an_unconsumed_read(&mem, RING_DESC, RING_AVAIL);
+        d.drain_on_resume();
+        assert_eq!(
+            mem.read_u16(RING_USED + 2).unwrap(),
+            1,
+            "the used ring must have advanced"
+        );
+        assert_eq!(
+            mem.read_u32(0x4000_5000).unwrap(),
+            0xabab_abab,
+            "the disk contents must have reached the guest's buffer"
+        );
+    }
+
+    #[test]
+    fn a_resume_does_not_walk_a_queue_the_driver_never_published() {
+        // `restored` keeps an unready queue's *recorded* addresses and only
+        // skips seeding its cursors -- so a drain that bypassed the transport's
+        // QueueReady gate would walk a ring the driver was partway through
+        // publishing, and complete a request that does not exist.
+        let mut s = a_ready_queue_state();
+        s.queues[0].ready = false;
+        let (d, mem) = restored_from(&s);
+        an_unconsumed_read(&mem, RING_DESC, RING_AVAIL);
+        d.drain_on_resume();
+        assert_eq!(
+            mem.read_u16(RING_USED + 2).unwrap(),
+            0,
+            "a half-published ring must be left alone"
+        );
+    }
+
+    /// Counts the edges a device actually asks the interrupt controller for.
+    struct CountingInjector(Arc<Mutex<usize>>);
+    impl InterruptInjector for CountingInjector {
+        fn signal(&self, _vector: u16) {
+            *self.0.lock().unwrap() += 1;
+        }
+    }
+
+    #[test]
+    fn one_notification_raises_one_edge() {
+        // virtio-mmio has a single wired interrupt and the driver's handler
+        // reads `InterruptStatus` to learn why it fired, reporting `IRQ_NONE`
+        // when it reads zero. `raise` is the only thing that sets that
+        // register, so a second edge from anywhere else necessarily arrives
+        // ahead of it and tells the driver nothing -- and Linux counts
+        // unhandled edges on a line towards disabling it outright. Holding the
+        // count at one is therefore also what keeps the ordering right: it
+        // leaves `raise` as the sole signaller on this transport.
+        let (d, mem) = restored_from(&a_ready_queue_state());
+        an_unconsumed_read(&mem, RING_DESC, RING_AVAIL);
+        let edges = Arc::new(Mutex::new(0usize));
+        d.set_injector(Box::new(CountingInjector(edges.clone())));
+        d.notify(0);
+        assert_eq!(
+            mem.read_u16(RING_USED + 2).unwrap(),
+            1,
+            "the notification must have completed work, or there is no edge to count"
+        );
+        assert_eq!(
+            read32(&d, 0x060) & INT_USED_RING,
+            INT_USED_RING,
+            "the driver must be able to read why it was interrupted"
+        );
+        assert_eq!(
+            *edges.lock().unwrap(),
+            1,
+            "one completed notification must raise exactly one edge"
+        );
+    }
+
+    #[test]
+    fn a_net_service_tick_raises_one_edge_for_both_completions() {
+        // The net paths are the ones that can actually be observed torn: they
+        // run on the service thread while the guest is executing, so a bare
+        // edge really can reach the driver before `raise` has said why. One
+        // tick completes a TX descriptor and delivers an RX frame -- two
+        // separate signal sites -- and the transport still owes the driver
+        // exactly one edge, raised after `InterruptStatus` is set.
+        use super::super::net::{EchoResponder, NetDevice, VIRTIO_NET_HDR_LEN};
+
+        let guest_mac: [u8; 6] = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc];
+        let guest_ip: [u8; 4] = [192, 168, 249, 2];
+        let gw_ip: [u8; 4] = [192, 168, 249, 1];
+        let gw_mac: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
+
+        let mem = Arc::new(GuestMemory::new());
+        mem.register_owned(0x4000_0000, 0x2_0000);
+        let wr_desc = |gpa: u64, addr: u64, len: u32, flags: u16| {
+            mem.write(gpa, &addr.to_le_bytes()).unwrap();
+            mem.write_u32(gpa + 8, len).unwrap();
+            mem.write_u16(gpa + 12, flags).unwrap();
+            mem.write_u16(gpa + 14, 0).unwrap();
+        };
+
+        // RX queue (index 0): one empty device-writable buffer.
+        let (rx_desc, rx_avail, rx_used, rx_buf) = (
+            0x4000_1000u64,
+            0x4000_1100u64,
+            0x4000_1200u64,
+            0x4000_1400u64,
+        );
+        wr_desc(rx_desc, rx_buf, 256, 0x2);
+        mem.write_u16(rx_avail + 4, 0).unwrap();
+        mem.write_u16(rx_avail + 2, 1).unwrap();
+
+        // TX queue (index 1): a virtio-net header followed by an ARP request.
+        let (tx_desc, tx_avail, tx_used, tx_buf) = (
+            0x4000_2000u64,
+            0x4000_2100u64,
+            0x4000_2200u64,
+            0x4000_2400u64,
+        );
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0xff; 6]);
+        frame.extend_from_slice(&guest_mac);
+        frame.extend_from_slice(&0x0806u16.to_be_bytes());
+        frame.extend_from_slice(&1u16.to_be_bytes());
+        frame.extend_from_slice(&0x0800u16.to_be_bytes());
+        frame.push(6);
+        frame.push(4);
+        frame.extend_from_slice(&1u16.to_be_bytes()); // request
+        frame.extend_from_slice(&guest_mac);
+        frame.extend_from_slice(&guest_ip);
+        frame.extend_from_slice(&[0u8; 6]);
+        frame.extend_from_slice(&gw_ip);
+        let mut tx_payload = vec![0u8; VIRTIO_NET_HDR_LEN];
+        tx_payload.extend_from_slice(&frame);
+        mem.write(tx_buf, &tx_payload).unwrap();
+        wr_desc(tx_desc, tx_buf, tx_payload.len() as u32, 0x0);
+        mem.write_u16(tx_avail + 4, 0).unwrap();
+        mem.write_u16(tx_avail + 2, 1).unwrap();
+
+        let q = |desc, driver, device| MmioQueueState {
+            size: 8,
+            desc,
+            driver,
+            device,
+            ready: true,
+        };
+        let state = MmioTransportState {
+            name: "net0".into(),
+            device_id: device_id::NET,
+            device_features: super::super::features::VERSION_1,
+            driver_features: super::super::features::VERSION_1,
+            device_features_sel: 1,
+            driver_features_sel: 1,
+            queue_sel: 0,
+            interrupt_status: 0,
+            device_status: 0xf,
+            config_generation: 0,
+            queues: vec![q(rx_desc, rx_avail, rx_used), q(tx_desc, tx_avail, tx_used)],
+            device_config: vec![],
+        };
+        let responder = EchoResponder::new(gw_ip, gw_mac);
+        let d = VirtioMmioDevice::restored(
+            Backend::Net(NetDevice::new(Box::new(responder))),
+            mem.clone(),
+            &state,
+        );
+        let edges = Arc::new(Mutex::new(0usize));
+        d.set_injector(Box::new(CountingInjector(edges.clone())));
+
+        // The guest transmits; the reply is produced off the vCPU thread, so
+        // the service tick is what injects it back into RX.
+        d.notify(1);
+        let tx_edges = *edges.lock().unwrap();
+        assert!(d.service_net(), "the service tick injected the reply");
+
+        assert_eq!(
+            mem.read_u16(tx_used + 2).unwrap(),
+            1,
+            "TX descriptor completed"
+        );
+        assert_eq!(mem.read_u16(rx_used + 2).unwrap(), 1, "RX reply injected");
+        assert_eq!(
+            read32(&d, 0x060) & INT_USED_RING,
+            INT_USED_RING,
+            "the driver must be able to read why it was interrupted"
+        );
+        assert_eq!(
+            tx_edges, 1,
+            "the transmit notification owes exactly one edge"
+        );
+        assert_eq!(
+            *edges.lock().unwrap(),
+            2,
+            "the service tick owes exactly one further edge, not one per queue"
+        );
+    }
+
+    #[test]
+    fn a_cold_booted_device_raises_one_edge_too() {
+        // A cold-booted guest never sees the restore constructor: it negotiates
+        // and brings the device up itself over the register interface. That is
+        // the *only* transport such a guest has, so the same one-edge property
+        // has to hold on the path it actually takes.
+        let (d, mem) = dev();
+        write32(&d, 0x070, 0x1 | 0x2); // ACKNOWLEDGE | DRIVER
+        write32(&d, 0x024, 1); // DriverFeaturesSel = high half
+        write32(&d, 0x020, 1); // VIRTIO_F_VERSION_1
+        write32(&d, 0x070, 0x1 | 0x2 | u32::from(DEVICE_STATUS_FEATURES_OK));
+        write32(&d, 0x030, 0); // QueueSel = 0
+        write32(&d, 0x038, 64); // QueueNum
+        write32(&d, 0x080, RING_DESC as u32);
+        write32(&d, 0x084, (RING_DESC >> 32) as u32);
+        write32(&d, 0x090, RING_AVAIL as u32);
+        write32(&d, 0x094, (RING_AVAIL >> 32) as u32);
+        write32(&d, 0x0a0, RING_USED as u32);
+        write32(&d, 0x0a4, (RING_USED >> 32) as u32);
+        write32(&d, 0x044, 1); // QueueReady
+        write32(
+            &d,
+            0x070,
+            0x1 | 0x2 | u32::from(DEVICE_STATUS_FEATURES_OK) | u32::from(DEVICE_STATUS_DRIVER_OK),
+        );
+        assert!(d.driver_ok(), "the bring-up sequence must have taken");
+
+        an_unconsumed_read(&mem, RING_DESC, RING_AVAIL);
+        let edges = Arc::new(Mutex::new(0usize));
+        d.set_injector(Box::new(CountingInjector(edges.clone())));
+        write32(&d, 0x050, 0); // QueueNotify, as the guest writes it
+
+        assert_eq!(
+            mem.read_u16(RING_USED + 2).unwrap(),
+            1,
+            "the notification must have completed work, or there is no edge to count"
+        );
+        assert_eq!(
+            read32(&d, 0x060) & INT_USED_RING,
+            INT_USED_RING,
+            "the driver must be able to read why it was interrupted"
+        );
+        assert_eq!(
+            *edges.lock().unwrap(),
+            1,
+            "a negotiated device owes exactly one edge per notification too"
+        );
     }
 }

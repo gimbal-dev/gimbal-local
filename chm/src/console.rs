@@ -24,28 +24,41 @@ use std::time::Duration;
 use std::{env, mem, thread};
 
 use hypervisor::hvf::devices::Pl011;
+use hypervisor::hvf::virtio::devmgr;
 use hypervisor::hvf::virtio::pci::MsiSink;
 
-/// Serial PL011 interrupt, as a GIC SPI INTID.
+/// Serial PL011 interrupt, as a GIC SPI INTID, for a capture that does not say.
 ///
-/// The serial console's IRQ is NOT carried in the snapshot's serialized device
-/// state (the `__serial` node holds only PL011 register values, and the guest
-/// FDT that names it is reclaimed RAM after boot), so it cannot be read back
-/// directly. It is instead determined by cloud-hypervisor's device/IRQ
-/// allocation at capture time. For our GICv2M capture recipe the only
-/// enabled non-MSI distributor SPIs are 42 and 43 (the legacy RTC/GPIO/GED/
-/// serial block; the virtio MSI-X vectors occupy 128+), and 43 is the
-/// interrupt-driven `agetty` line — empirically confirmed by a full
-/// host-keystroke login round-trip. `CHM_SERIAL_SPI` overrides it for a
-/// snapshot captured under a different device/IRQ order.
+/// A restoring VMM has to aim a host keystroke at some INTID, and the number is
+/// whatever the *capturing* VMM's device/IRQ allocation produced. For our
+/// GICv2M capture recipe the only enabled non-MSI distributor SPIs are 42 and
+/// 43 (the legacy RTC/GPIO/GED/serial block; the virtio MSI-X vectors occupy
+/// 128+), and 43 is the interrupt-driven `agetty` line — empirically confirmed
+/// by a full host-keystroke login round-trip.
+///
+/// It is a fallback, not the answer: a capture that records its own line in
+/// `__serial.resources` is believed instead (see
+/// [`devmgr::parse_serial_intid`]), because a captured machine knows which
+/// interrupt its console asserts and this constant only knows which one a
+/// cloud-hypervisor capture usually asserts. `CHM_SERIAL_SPI` overrides both.
 const DEFAULT_SERIAL_SPI: u32 = 43;
 
-/// Resolve the serial console's SPI INTID, honoring a `CHM_SERIAL_SPI` override.
-pub(crate) fn serial_spi() -> u32 {
-    env::var("CHM_SERIAL_SPI")
+/// Resolve the serial console's SPI INTID for the capture in `state_json`.
+///
+/// Order is deliberate: an operator's `CHM_SERIAL_SPI` beats everything, then
+/// what the capture itself records, then the cloud-hypervisor-shaped default.
+/// The middle step is why a chm-originated snapshot needs no environment
+/// variable to take input — a cold-booted guest's PL011 sits on a different
+/// line from a captured cloud-hypervisor guest's, and guessing wrong is silent:
+/// the guest runs perfectly and never sees a keystroke.
+pub(crate) fn serial_spi_for(state_json: &str) -> u32 {
+    if let Some(v) = env::var("CHM_SERIAL_SPI")
         .ok()
         .and_then(|v| v.trim().parse::<u32>().ok())
-        .unwrap_or(DEFAULT_SERIAL_SPI)
+    {
+        return v;
+    }
+    devmgr::parse_serial_intid(state_json).unwrap_or(DEFAULT_SERIAL_SPI)
 }
 
 const CTRL_A: u8 = 0x01;
@@ -389,3 +402,41 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod serial_line_tests {
+    use super::*;
+
+    /// A `state.json` whose `__serial` node records `line`.
+    fn a_capture_recording(line: u32) -> String {
+        let tree = format!(
+            r#"{{"device_tree":{{"__serial":{{"id":"__serial","resources":[{{"LegacyIrq":{line}}}],"children":[]}}}}}}"#
+        );
+        let embedded = serde_json::to_string(&tree).expect("string");
+        format!(
+            r#"{{"snapshots":{{"device-manager":{{"snapshots":{{}},"snapshot_data":{{"state":{embedded}}}}}}}}}"#
+        )
+    }
+
+    /// What the capture says beats what the constant guesses.
+    ///
+    /// The constant describes a cloud-hypervisor capture's device order. A
+    /// capture that states its own line knows something the constant cannot,
+    /// and preferring the constant is how a chm-originated snapshot ends up
+    /// with a console that runs perfectly and hears nothing.
+    #[test]
+    fn a_capture_that_names_its_line_is_believed_over_the_default() {
+        let line = DEFAULT_SERIAL_SPI + 7;
+        assert_eq!(serial_spi_for(&a_capture_recording(line)), line);
+    }
+
+    /// A capture that says nothing leaves the default in place.
+    ///
+    /// Every cloud-hypervisor capture is this case, so the fallback is not a
+    /// nicety: removing it would take input away from the vanilla snapshots
+    /// this whole project exists to rehydrate.
+    #[test]
+    fn a_silent_capture_leaves_the_cloud_hypervisor_default_in_place() {
+        assert_eq!(serial_spi_for("{}"), DEFAULT_SERIAL_SPI);
+    }
+}

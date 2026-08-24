@@ -257,6 +257,61 @@ pub(crate) struct ImpliedEgress {
     pub(crate) skipped: Vec<String>,
 }
 
+/// A client that refuses to make a request unless it already sees a credential,
+/// and the guest-side variables it reads.
+///
+/// Such a client never gives the proxy a chance: injection happens on the wire,
+/// and there is no wire until the client decides to speak. Seeding a worthless
+/// placeholder is what gets it to speak (#318).
+struct LocalAuthGate {
+    /// A canonical host this client authenticates to. Matched through
+    /// [`RuleSet::decide`], so a `*.github.com` rule covers it without this
+    /// table having to know anything about wildcards.
+    host: &'static str,
+    /// Every variable the client will accept the credential in. All of them are
+    /// seeded: which one a given version reads is not ours to predict, and an
+    /// unset one costs nothing.
+    vars: &'static [&'static str],
+    /// A value shaped like the real thing and worth nothing.
+    placeholder: &'static str,
+}
+
+/// A fine-grained-PAT-shaped value that is obviously not a credential.
+///
+/// The shape matters: the Copilot CLI validates it locally and rejects a
+/// classic `ghp_` token outright, so a placeholder in the wrong shape fails in
+/// a second way that looks like the first. Measured during the #286 acceptance
+/// run, and written down in `docs/credential-proxy.md` §6.
+///
+/// It says what it is in the value itself, because the place this shows up is a
+/// guest environment someone is debugging, and "is this a real token I should
+/// rotate?" is the question it should answer on sight.
+const PLACEHOLDER_GITHUB_PAT: &str = "github_pat_11GIMBALPLACEHOLDER000_\
+     NOTAREALTOKENtheproxysubstitutestherealoneonthewire00000000";
+
+/// The clients measured to gate on local auth.
+///
+/// Deliberately a table of measured entries, not a guess at what every client
+/// might read. A bearer rule matching no entry here is *reported* rather than
+/// given an invented variable name: telling a user "you may need to set
+/// something" is honest, and inventing `FOO_API_TOKEN` is not.
+const LOCAL_AUTH_GATES: &[LocalAuthGate] = &[LocalAuthGate {
+    host: "api.github.com",
+    vars: &["GITHUB_TOKEN", "GH_TOKEN", "COPILOT_GITHUB_TOKEN"],
+    placeholder: PLACEHOLDER_GITHUB_PAT,
+}];
+
+/// What [`RuleSet::placeholder_env`] derived: variables to seed in the guest,
+/// and bearer rules it has no measured client for.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PlaceholderEnv {
+    /// `(NAME, VALUE)` pairs to export in the guest, in table order.
+    pub(crate) vars: Vec<(String, String)>,
+    /// Bearer-rule hosts no entry in the table covers, annotated with the rule
+    /// name, so a caller can say which ones the user may have to handle.
+    pub(crate) skipped: Vec<String>,
+}
+
 /// The full set of injection rules for a workspace.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RuleSet {    pub(crate) rules: Vec<Rule>,
@@ -327,6 +382,53 @@ impl RuleSet {
             }
         }
         ImpliedEgress { allow, skipped }
+    }
+
+    /// The guest-side variables to seed so a client that gates on local auth
+    /// actually makes the request this rule set exists to intercept (#318).
+    ///
+    /// [`Self::decide`] is the oracle rather than [`Rule::matches`], so this
+    /// answers the question that matters — *would the proxy inject here?* — and
+    /// inherits passthrough exclusions and the cleartext refusal for free. A
+    /// host on the passthrough list gets no placeholder, which is correct: the
+    /// guest's own header would travel untouched, and a worthless one is worse
+    /// than none.
+    ///
+    /// Only `bearer` rules qualify. `basic` and `template` describe schemes
+    /// whose local-gate behaviour has not been measured, and a placeholder in
+    /// the wrong shape is a second failure dressed as the first.
+    pub(crate) fn placeholder_env(&self) -> PlaceholderEnv {
+        let mut vars: Vec<(String, String)> = Vec::new();
+        let mut covered: Vec<String> = Vec::new();
+        for gate in LOCAL_AUTH_GATES {
+            let dest = Destination::new(Some(gate.host.to_string()), None, 443);
+            let Disposition::Inject(rule) = self.decide(&dest) else {
+                continue;
+            };
+            if !matches!(rule.scheme, Scheme::Bearer) {
+                continue;
+            }
+            covered.push(rule.name.clone());
+            for name in gate.vars {
+                let entry = ((*name).to_string(), gate.placeholder.to_string());
+                if !vars.iter().any(|(n, _)| n == name) {
+                    vars.push(entry);
+                }
+            }
+        }
+        let mut skipped: Vec<String> = Vec::new();
+        for rule in &self.rules {
+            if !matches!(rule.scheme, Scheme::Bearer) || covered.contains(&rule.name) {
+                continue;
+            }
+            for host in &rule.hosts {
+                let note = format!("{} (rule '{}')", host, rule.name);
+                if !skipped.contains(&note) {
+                    skipped.push(note);
+                }
+            }
+        }
+        PlaceholderEnv { vars, skipped }
     }
 
     pub(crate) fn decide(&self, dest: &Destination) -> Disposition {
@@ -822,5 +924,101 @@ mod tests {
                          {"name":"b","hosts":["api.github.com"],"env":"T"}]}"#,
         );
         assert_eq!(rs.implied_egress_allow().allow, vec!["api.github.com:443"]);
+    }
+
+    // ---- #318: the placeholder a locally-gated client needs ----------------
+
+    /// The value has to survive the client's *local* shape check, which is a
+    /// different check from the origin's. Getting it wrong fails in a second
+    /// way that looks exactly like the first.
+    #[test]
+    fn the_placeholder_is_shaped_like_a_fine_grained_pat() {
+        let v = PLACEHOLDER_GITHUB_PAT;
+        let rest = v
+            .strip_prefix("github_pat_")
+            .unwrap_or_else(|| panic!("no github_pat_ prefix: {v}"));
+        let (a, b) = rest
+            .split_once('_')
+            .unwrap_or_else(|| panic!("no segment separator: {v}"));
+        assert_eq!(a.len(), 22, "first segment of {v}");
+        assert_eq!(b.len(), 59, "second segment of {v}");
+        assert!(
+            rest.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
+            "a real PAT is alphanumeric, so a placeholder must be too: {v}"
+        );
+        // A classic token is rejected outright by the client, so a placeholder
+        // that drifted into that shape would be worse than none.
+        assert!(!v.starts_with("ghp_"), "{v}");
+    }
+
+    /// Whoever finds this in a guest environment is debugging, and the first
+    /// question is "is this real, do I rotate it?". The value answers it.
+    #[test]
+    fn the_placeholder_says_in_itself_that_it_is_not_a_credential() {
+        let shout = format!("NOT{}REAL{}TOKEN", "A", "");
+        assert!(
+            PLACEHOLDER_GITHUB_PAT.contains(&shout),
+            "placeholder does not announce itself: {PLACEHOLDER_GITHUB_PAT}"
+        );
+    }
+
+    #[test]
+    fn a_bearer_rule_for_github_seeds_every_variable_the_client_might_read() {
+        let rs = ruleset(r#"{"rules":[{"name":"gh","hosts":["api.github.com"],"env":"T"}]}"#);
+        let p = rs.placeholder_env();
+        let names: Vec<&str> = p.vars.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(names, ["GITHUB_TOKEN", "GH_TOKEN", "COPILOT_GITHUB_TOKEN"]);
+        assert!(
+            p.vars.iter().all(|(_, v)| v == PLACEHOLDER_GITHUB_PAT),
+            "every seeded variable carries the placeholder: {:?}",
+            p.vars
+        );
+        assert!(p.skipped.is_empty(), "{:?}", p.skipped);
+    }
+
+    /// The table names one canonical host and knows nothing about wildcards.
+    /// It does not need to: `decide` is the matcher, so every host syntax the
+    /// rule language grows works here for free.
+    #[test]
+    fn a_wildcard_rule_covers_the_client_without_the_table_knowing_about_wildcards() {
+        let rs = ruleset(r#"{"rules":[{"name":"gh","hosts":["*.github.com"],"env":"T"}]}"#);
+        assert_eq!(rs.placeholder_env().vars.len(), 3);
+    }
+
+    /// The question is "would the proxy inject here", not "does a rule name
+    /// this host". A passthrough entry means the guest's own header travels
+    /// untouched, and a worthless one is worse than none.
+    #[test]
+    fn a_host_on_the_passthrough_list_seeds_nothing() {
+        let rs = ruleset(
+            r#"{"rules":[{"name":"gh","hosts":["*.github.com"],"env":"T"}],
+                "passthrough":["api.github.com"]}"#,
+        );
+        let p = rs.placeholder_env();
+        assert!(p.vars.is_empty(), "{:?}", p.vars);
+    }
+
+    #[test]
+    fn a_non_bearer_rule_seeds_nothing() {
+        let rs = ruleset(
+            r#"{"rules":[{"name":"gh","hosts":["api.github.com"],"scheme":"basic","env":"T"}]}"#,
+        );
+        assert!(rs.placeholder_env().vars.is_empty());
+    }
+
+    /// We measured one client. A bearer rule for anything else gets reported,
+    /// never an invented variable name.
+    #[test]
+    fn a_bearer_rule_with_no_measured_client_is_reported_not_invented() {
+        let rs = ruleset(r#"{"rules":[{"name":"acme","hosts":["api.acme.io"],"env":"T"}]}"#);
+        let p = rs.placeholder_env();
+        assert!(p.vars.is_empty(), "{:?}", p.vars);
+        assert_eq!(p.skipped, vec!["api.acme.io (rule 'acme')"]);
+    }
+
+    #[test]
+    fn no_rules_seed_nothing() {
+        let p = RuleSet::default().placeholder_env();
+        assert_eq!(p, PlaceholderEnv::default());
     }
 }

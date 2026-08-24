@@ -458,10 +458,33 @@ the second is silent:
   does the verdict.
 - **rustfmt formats submodules too.** Point it at a file with `mod foo;`
   declarations — `hypervisor/src/hvf/mod.rs` is the obvious one — and the output
-  covers the whole subtree, so the count is not about your file at all. It is
-  also not fixable with `--skip-children`, which stable rustfmt rejects
-  outright (`Unrecognized option`) *after* you have already believed a number.
-  Measured once as 22893 "drift lines" on a five-line change.
+  covers the whole subtree, so the count is not about your file at all. Stable
+  rustfmt rejects `--skip-children` outright (`Unrecognized option`) *after* you
+  have already believed a number. Nightly accepts it, but only together with
+  `--unstable-features`; **without that flag rustfmt errors out and `| wc -l`
+  then counts the error message**, returning 1 on both sides of a comparison and
+  reporting a clean result for anything.
+
+  ```bash
+  rustfmt +nightly --unstable-features --skip-children --edition 2024 --check <file>
+  ```
+
+- **The baseline must live inside the tree.** `.rustfmt.toml` sits at the repo
+  root and rustfmt discovers it by walking up from *the file's own location*, so
+  a HEAD baseline written to `/tmp` is formatted under rustfmt's defaults while
+  the live file is formatted under this repo's `group_imports` and
+  `imports_granularity`. Measured: the byte-identical `chm/src/firewall.rs`
+  scored **39 in place and 25 as a `/tmp` copy**. Both settings are
+  import-related, which is why the manufactured hunks are always `use std::…`
+  regrouping at the top of a file — a long way from wherever you edited.
+
+  Write the baseline somewhere like `chm/src/.fmtbase/` so it discovers the same
+  config, and delete it before committing. Note that scratch `.rs` files left
+  inside `chm/src` are picked up by `hygiene.rs`, which scans that tree.
+
+  This one is worth being loud about: a baseline under the wrong ruleset is
+  *self-consistent*, so it reports a confident number and can show zero drift on
+  code that genuinely drifts under the config the repo actually uses.
 
 When a drift number moves by much more than your diff could explain, the
 measurement is wrong before the code is. Formatting needs nightly:

@@ -94,6 +94,7 @@ impl VirtioPciDevice {
             device_config,
             isr_status: 0,
             mem,
+            transport_signals: false,
             injector: Box::new(LoggingInjector::new(name.clone())),
         };
         Self {

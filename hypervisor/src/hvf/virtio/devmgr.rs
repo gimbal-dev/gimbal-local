@@ -18,6 +18,7 @@ use std::sync::Arc;
 use serde_json::Value;
 
 use super::block::{BlockBackend, BlockDevice, FileBackend, OverlayBackend};
+use super::mmio::{MmioQueueState, MmioTransportState, VirtioMmioDevice};
 use super::nat::{EgressPolicy, NatLimits, NatResponder};
 use super::net::NetDevice;
 use super::pathsafe;
@@ -63,13 +64,15 @@ pub struct QueueState {
     pub used: u64,
 }
 
-/// The backend a restored virtio-pci device drives.
+/// The backend a restored virtio device drives.
 ///
-/// The variant is chosen authoritatively from the device's PCI Device ID
-/// (`0x1040 + virtio_device_type`), not from heuristics on the backing state,
-/// so a device is modeled as exactly what the guest negotiated it to be. An
-/// unrecognised type becomes [`BackendKind::Unsupported`] and is rejected at
-/// build time rather than silently mismodeled.
+/// The variant is chosen authoritatively from the device type the guest
+/// negotiated -- carried as the PCI Device ID (`0x1040 + virtio_device_type`)
+/// on virtio-pci and as the `DeviceID` register on virtio-mmio -- not from
+/// heuristics on the backing state, so a device is modeled as exactly what the
+/// guest negotiated it to be. An unrecognised type becomes
+/// [`BackendKind::Unsupported`] and is rejected at build time rather than
+/// silently mismodeled.
 #[derive(Debug, Clone)]
 pub enum BackendKind {
     /// virtio-blk (type 2): a disk image (by file name) with `nsectors`.
@@ -89,6 +92,36 @@ pub enum BackendKind {
         /// The virtio device type (PCI Device ID minus `0x1040`).
         virtio_type: u32,
     },
+}
+
+/// How a guest reaches a virtio device.
+///
+/// Carried only so a refusal can name the register the reader can actually go
+/// and look at. The *decision* to refuse is a property of the device and is
+/// shared; the identifier a reader recognises is not. A virtio-mmio guest never
+/// saw a PCI Device ID -- there is no PCI bus in the machine -- so quoting one
+/// sends them looking for a device that does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// virtio-pci: the type is carried as PCI Device ID `0x1040 + type`.
+    Pci,
+    /// virtio-mmio: the type is carried verbatim in the `DeviceID` register at
+    /// offset `0x008`.
+    Mmio,
+}
+
+impl Transport {
+    /// How this transport names `virtio_type` to the guest, phrased so a reader
+    /// can find the same number on the machine in front of them.
+    fn identifies(self, virtio_type: u32) -> String {
+        match self {
+            Self::Pci => format!(
+                "PCI Device ID {:#06x}",
+                VIRTIO_PCI_DEVICE_ID_BASE + virtio_type
+            ),
+            Self::Mmio => format!("virtio-mmio DeviceID register {virtio_type:#x} at 0x008"),
+        }
+    }
 }
 
 /// virtio device type for virtio-net (PCI Device ID `0x1041`).
@@ -201,6 +234,26 @@ pub struct SerialRegs {
     pub ifls: u32,
 }
 
+impl SerialRegs {
+    /// Whether the guest reads its console through the receive interrupt.
+    ///
+    /// A capture of a machine whose console is interrupt-driven must carry
+    /// `imsc`, or the restored guest never learns that a keystroke arrived.
+    /// `false` is not automatically wrong -- a guest that polls `UARTFR` reads
+    /// input either way -- but on a Linux guest with a getty it means the
+    /// console will be deaf, which is worth saying out loud at the moment of
+    /// capture rather than discovering at restore.
+    ///
+    /// The masks come from the device model itself rather than being restated
+    /// here, so this predicate and the model's own
+    /// [`crate::hvf::devices::Pl011::rx_irq_pending`] cannot disagree about
+    /// which bits mean "interrupt-driven".
+    pub fn receives_by_interrupt(&self) -> bool {
+        use crate::hvf::devices::{INT_RT, INT_RX};
+        (self.imsc & (INT_RX | INT_RT)) != 0
+    }
+}
+
 /// Parse the `__serial` device node's captured PL011 register state, if present.
 ///
 /// cloud-hypervisor serializes the UART under
@@ -220,6 +273,37 @@ pub fn parse_serial_state(state_json: &str) -> Option<SerialRegs> {
         fbrd: u32_at("fbrd").unwrap_or(0),
         ifls: u32_at("ifl").unwrap_or(0),
     })
+}
+
+/// The interrupt line the captured serial console asserts, if the capture
+/// records one.
+///
+/// A restoring VMM has to aim a host keystroke at *some* INTID, and the number
+/// depends entirely on the device/IRQ allocation order of the VMM that captured
+/// the machine. cloud-hypervisor re-derives it on restore by rebuilding its
+/// device manager from the same configuration, so it has never needed to write
+/// the number down and a capture from it carries an empty `resources` list on
+/// `__serial`. We do not rebuild from a configuration -- there is none for a
+/// guest whose device tree we wrote ourselves -- so a capture chm originates
+/// records the line here instead. `Resource::LegacyIrq` is cloud-hypervisor's
+/// own vocabulary for exactly this (`vm-device/src/lib.rs`), so the node stays
+/// a shape upstream can deserialize rather than one only we understand.
+///
+/// `None` means "this capture does not say", which is the honest answer for
+/// every capture written before this existed; the caller keeps its own default.
+pub fn parse_serial_intid(state_json: &str) -> Option<u32> {
+    let root: Value = serde_json::from_str(state_json).ok()?;
+    let tree = root
+        .pointer("/snapshots/device-manager/snapshot_data/state")
+        .and_then(Value::as_str)
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())?;
+    let resources = tree
+        .pointer("/device_tree/__serial/resources")?
+        .as_array()?;
+    resources
+        .iter()
+        .find_map(|r| r.get("LegacyIrq").and_then(Value::as_u64))
+        .map(|v| v as u32)
 }
 
 /// Parse the device-manager `device_tree` into a map of transport id -> ITS
@@ -428,22 +512,108 @@ pub fn build_device(
         .map(|qs| restore_queue(qs, desc.features, &mem))
         .collect::<Vec<_>>();
 
-    let (backend, device_config) = match &desc.backend {
+    let backend = build_backend(
+        &desc.name,
+        &desc.backend,
+        Transport::Pci,
+        desc.features,
+        overlay_dir,
+        resume,
+        net_policy,
+        net_limits,
+        allow_local_egress,
+    )?;
+    let device_config = match &desc.backend {
+        BackendKind::Block { nsectors, .. } => blk_device_config(*nsectors),
+        _ => Vec::new(),
+    };
+    let dev = Arc::new(VirtioPciDevice::new(
+        desc.name.clone(),
+        backend,
+        mem,
+        RestoreParams {
+            features: desc.features,
+            queues,
+            queue_vectors: desc.queue_vectors.clone(),
+            device_status: desc.device_status,
+            device_config,
+        },
+    ));
+    Ok((desc.bar_base, CAPABILITY_BAR_SIZE, dev))
+}
+
+/// Build one virtio-mmio device from its captured transport state.
+///
+/// The counterpart of [`build_device`], and deliberately much shorter: an MMIO
+/// device has no BAR, no MSI-X table and no ITS `DeviceID`, so there is nothing
+/// to place. The transport state carries the guest-observable device
+/// configuration verbatim, so unlike the PCI path nothing is recomputed here --
+/// the guest already negotiated it, and recomputing would let this build's
+/// opinion overwrite what the guest was actually told.
+pub fn build_mmio_device(
+    desc: &VirtioMmioDeviceDesc,
+    mem: Arc<GuestMemory>,
+    overlay_dir: &std::path::Path,
+    resume: bool,
+    net_policy: Option<EgressPolicy>,
+    net_limits: NatLimits,
+    allow_local_egress: bool,
+) -> Result<Arc<VirtioMmioDevice>, DevMgrError> {
+    let backend = build_backend(
+        &desc.name,
+        &desc.backend,
+        Transport::Mmio,
+        desc.transport.driver_features,
+        overlay_dir,
+        resume,
+        net_policy,
+        net_limits,
+        allow_local_egress,
+    )?;
+    Ok(Arc::new(VirtioMmioDevice::restored(
+        backend,
+        mem,
+        &desc.transport,
+    )))
+}
+
+/// Build the backend a device of `kind` should be attached to.
+///
+/// Shared by both transports on purpose. Everything decided here -- which file
+/// a disk is really opened against, the NAT's gateway address, the egress
+/// policy and the lines that report it, and the refusal for a virtio type this
+/// build does not model -- is a property of the *device*, not of how the guest
+/// reaches it. Rendering it twice is how a virtio-mmio guest ends up quietly
+/// governed by a different posture than a virtio-pci one.
+///
+/// `transport` is the one thing that is not: it decides only how the refusal
+/// *names* the offending type, so a reader is pointed at a register that
+/// exists on the machine they are holding.
+#[allow(clippy::too_many_arguments)]
+pub fn build_backend(
+    name: &str,
+    kind: &BackendKind,
+    transport: Transport,
+    features: u64,
+    overlay_dir: &std::path::Path,
+    resume: bool,
+    net_policy: Option<EgressPolicy>,
+    net_limits: NatLimits,
+    allow_local_egress: bool,
+) -> Result<Backend, DevMgrError> {
+    let backend = match kind {
         BackendKind::Block {
             disk_path,
             nsectors,
         } => {
             let (backend, _backing) =
-                resolve_block_backend(overlay_dir, &desc.name, disk_path, *nsectors, resume)?;
-            (
-                Backend::Block(BlockDevice::new(backend, &desc.name)),
-                blk_device_config(*nsectors),
-            )
+                resolve_block_backend(overlay_dir, name, disk_path, *nsectors, resume)?;
+            Backend::Block(BlockDevice::new(backend, name))
         }
         BackendKind::Rng => {
             let src = UrandomSource::open()
                 .map_err(|e| DevMgrError::Io(format!("open /dev/urandom: {e}")))?;
-            (Backend::Rng(RngDevice::new(Box::new(src))), Vec::new())
+            Backend::Rng(RngDevice::new(Box::new(src)))
         }
         BackendKind::Net => {
             // The gateway the resumed guest talks to. Capture-side cloud-init
@@ -465,48 +635,35 @@ pub fn build_device(
                     // constant reporting a sandbox that was not running.
                     "chm: virtio-net {} governed by egress policy {} — {} \
                      (enforced at the NAT)",
-                    desc.name,
+                    name,
                     policy.label(),
                     policy.posture_summary()
                 );
             }
             if allow_local_egress {
                 eprintln!(
-                    "chm: virtio-net {} — local egress ALLOWED (reserved-address \
-                     guard disabled); the guest can reach host loopback/LAN",
-                    desc.name
+                    "chm: virtio-net {name} — local egress ALLOWED (reserved-address \
+                     guard disabled); the guest can reach host loopback/LAN"
                 );
             }
-            let responder = NatResponder::new([192, 168, 249, 1], [0x02, 0, 0, 0, 0, 1], policy, net_limits);
-            (
-                Backend::Net(NetDevice::new(Box::new(responder)).with_features(desc.features)),
-                Vec::new(),
-            )
+            let responder = NatResponder::new(
+                [192, 168, 249, 1],
+                [0x02, 0, 0, 0, 0, 1],
+                policy,
+                net_limits,
+            );
+            Backend::Net(NetDevice::new(Box::new(responder)).with_features(features))
         }
         BackendKind::Unsupported { virtio_type } => {
             return Err(DevMgrError::Unsupported(format!(
-                "device `{}` is virtio type {virtio_type} (PCI Device ID \
-                 {:#06x}), which this build does not model; refusing to \
-                 mismodel it",
-                desc.name,
-                0x1040 + virtio_type
+                "device `{name}` is virtio type {virtio_type} ({}), which this \
+                 build does not model; refusing to mismodel it",
+                transport.identifies(*virtio_type)
             )));
         }
     };
 
-    let dev = Arc::new(VirtioPciDevice::new(
-        desc.name.clone(),
-        backend,
-        mem,
-        RestoreParams {
-            features: desc.features,
-            queues,
-            queue_vectors: desc.queue_vectors.clone(),
-            device_status: desc.device_status,
-            device_config,
-        },
-    ));
-    Ok((desc.bar_base, CAPABILITY_BAR_SIZE, dev))
+    Ok(backend)
 }
 
 /// Which host backing a virtio-blk device resolved to. Surfaced so the wiring
@@ -584,15 +741,11 @@ pub(crate) fn resolve_block_backend(
 /// The enclosing `disks/` directory may itself be a symlink (the trusted
 /// read-only base in the workspace model); only the disk *file* is constrained.
 /// `dev_name` is sanitized, so the candidate cannot traverse out of `disks/`.
-fn shipped_backing(
+pub fn shipped_backing(
     overlay_dir: &std::path::Path,
     dev_name: &str,
 ) -> Result<Option<std::path::PathBuf>, DevMgrError> {
-    let Some(disks) = overlay_dir.parent().map(|p| p.join("disks")) else {
-        return Ok(None);
-    };
-    for ext in ["raw", "img"] {
-        let cand = disks.join(format!("{}.{ext}", sanitize(dev_name)));
+    for cand in shipped_backing_candidates(overlay_dir, dev_name) {
         match std::fs::symlink_metadata(&cand) {
             Ok(md) if md.file_type().is_symlink() => {
                 return Err(DevMgrError::Io(format!(
@@ -605,6 +758,30 @@ fn shipped_backing(
         }
     }
     Ok(None)
+}
+
+/// The paths [`shipped_backing`] will consider for `dev_name`, in the order it
+/// considers them.
+///
+/// A writer producing a snapshot must ship its disk to the **first** of these.
+/// Taking the location from the same function the reader walks is the whole
+/// point: a writer that restated the layout could put a real disk somewhere
+/// the restore path never looks, and the guest would then come back on a
+/// sparse zero overlay against RAM that has its filesystem's metadata cached.
+/// That resumes, and reads `Input/output error` on files the guest can see in
+/// its own page cache -- a failure that looks like disk corruption and is
+/// really a naming disagreement between two halves of one format.
+pub fn shipped_backing_candidates(
+    overlay_dir: &std::path::Path,
+    dev_name: &str,
+) -> Vec<std::path::PathBuf> {
+    let Some(disks) = overlay_dir.parent().map(|p| p.join("disks")) else {
+        return Vec::new();
+    };
+    ["raw", "img"]
+        .iter()
+        .map(|ext| disks.join(format!("{}.{ext}", sanitize(dev_name))))
+        .collect()
 }
 
 /// Create `path` as a sparse file of `nsectors * 512` bytes if it does not yet
@@ -644,6 +821,210 @@ fn sanitize(s: &str) -> String {
     s.chars()
         .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '.' { c } else { '_' })
         .collect()
+}
+
+/// The MMIO prefix a locally-originated lineage records its devices under.
+///
+/// A capture taken on a KVM host carries `_virtio-pci-*` transports, because
+/// that is what cloud-hypervisor gives a guest. A lineage originated here
+/// carries `_virtio-mmio-*`, because a cold-booted guest's kernel bound its
+/// drivers to MMIO windows and that binding lives in the RAM dump.
+///
+/// Emitting the PCI prefix instead would hand [`parse_devices`] a node whose
+/// transport it would then get wrong -- and it would get it wrong *quietly*,
+/// because the two transports share `DeviceCore` and the resulting device would
+/// look entirely well-formed. A distinct prefix makes that misreading
+/// impossible rather than unlikely.
+///
+/// The writer (chm's `genesis`) re-exports this rather than restating it: the
+/// two halves must agree on the string exactly, and two copies of a constant is
+/// how that agreement becomes optional.
+pub const VIRTIO_MMIO_NODE_PREFIX: &str = "_virtio-mmio-";
+
+/// A fully-parsed virtio-mmio device ready to be turned into a live device.
+///
+/// Deliberately flatter than [`VirtioDeviceDesc`]: there is no BAR, no MSI-X
+/// table and no ITS `DeviceID`, because an MMIO transport has none of them. It
+/// occupies one window and raises one wired SPI.
+#[derive(Debug, Clone)]
+pub struct VirtioMmioDeviceDesc {
+    /// Device name (e.g. `blk0`), as the guest's driver knows it.
+    pub name: String,
+    /// Base address of the device's MMIO window.
+    pub base: u64,
+    /// Length of that window.
+    pub size: u64,
+    /// The wired SPI this device raises.
+    pub intid: u32,
+    /// Everything guest-observable about the transport.
+    pub transport: MmioTransportState,
+    /// The backend to attach.
+    pub backend: BackendKind,
+}
+
+/// Read one `MmioAddressRange` + `LegacyIrq` pair out of a device-tree node.
+///
+/// Both are required. A window with no interrupt is a device the guest can
+/// program and never hear from, and an interrupt with no window is one it
+/// cannot reach at all; either is a device that would look present and be
+/// useless, so both are refused by name rather than defaulted.
+fn mmio_placement(node: &Value) -> Result<(u64, u64, u32), DevMgrError> {
+    let resources = node
+        .get("resources")
+        .and_then(Value::as_array)
+        .ok_or_else(|| malformed("virtio-mmio node has no resources array"))?;
+    let mut window = None;
+    let mut irq = None;
+    for r in resources {
+        if let Some(m) = r.get("MmioAddressRange") {
+            window = Some((u64_at(m, "base")?, u64_at(m, "size")?));
+        } else if let Some(i) = r.get("LegacyIrq").and_then(Value::as_u64) {
+            irq = Some(
+                u32::try_from(i).map_err(|_| malformed(format!("LegacyIrq {i} is not an SPI")))?,
+            );
+        }
+    }
+    let (base, size) =
+        window.ok_or_else(|| malformed("virtio-mmio node has no MmioAddressRange"))?;
+    let intid = irq.ok_or_else(|| malformed("virtio-mmio node has no LegacyIrq"))?;
+    if size == 0 {
+        return Err(malformed(format!(
+            "virtio-mmio device at {base:#x} has a zero-length window, so nothing could reach it"
+        )));
+    }
+    Ok((base, size, intid))
+}
+
+fn u16_at(v: &Value, key: &str) -> Result<u16, DevMgrError> {
+    u16::try_from(u64_at(v, key)?).map_err(|_| malformed(format!("`{key}` does not fit a u16")))
+}
+
+/// Choose the backend for a virtio-mmio device from its virtio device type.
+///
+/// Same authority as the PCI path: the type the guest negotiated decides, and
+/// an unmodelled type becomes [`BackendKind::Unsupported`] so it is refused by
+/// name at build time rather than mismodelled into something that half works.
+fn mmio_backend(device_id: u32, state: &Value, config: &[u8]) -> BackendKind {
+    match device_id {
+        VIRTIO_TYPE_NET => BackendKind::Net,
+        VIRTIO_TYPE_RNG => BackendKind::Rng,
+        VIRTIO_TYPE_BLOCK => {
+            // Capacity comes from the device config space the guest read, not
+            // from the host file's current length: the guest sized its
+            // filesystem against that number and a disk that grew underneath
+            // the snapshot must not silently change it.
+            let nsectors = config
+                .get(..8)
+                .map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap_or([0; 8])));
+            BackendKind::Block {
+                disk_path: state
+                    .get("backing")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                nsectors,
+            }
+        }
+        other => BackendKind::Unsupported { virtio_type: other },
+    }
+}
+
+/// Parse every `_virtio-mmio-*` device in a `state.json` into descriptors.
+///
+/// The twin of [`parse_devices`], and deliberately a separate function rather
+/// than a branch inside it: the two transports share no resource shape, so a
+/// merged parser would be two parsers behind one name.
+pub fn parse_mmio_devices(state_json: &str) -> Result<Vec<VirtioMmioDeviceDesc>, DevMgrError> {
+    let root: Value = serde_json::from_str(state_json)
+        .map_err(|e| malformed(format!("invalid state.json: {e}")))?;
+    let dm = root
+        .get("snapshots")
+        .and_then(|s| s.get("device-manager"))
+        .and_then(|d| d.get("snapshots"))
+        .and_then(Value::as_object)
+        .ok_or_else(|| malformed("missing device-manager snapshots"))?;
+    let tree = root
+        .pointer("/snapshots/device-manager/snapshot_data/state")
+        .and_then(Value::as_str)
+        .and_then(|s| serde_json::from_str::<Value>(s).ok());
+    let tree = tree
+        .as_ref()
+        .and_then(|v| v.get("device_tree"))
+        .and_then(Value::as_object);
+
+    let mut out = Vec::new();
+    for (key, node) in dm {
+        let Some(name) = key.strip_prefix(VIRTIO_MMIO_NODE_PREFIX) else {
+            continue;
+        };
+        let tree_node = tree.and_then(|t| t.get(key)).ok_or_else(|| {
+            malformed(format!(
+                "virtio-mmio device `{name}` has no device-tree node, so its window is unknown"
+            ))
+        })?;
+        let (base, size, intid) = mmio_placement(tree_node)?;
+        let state = embedded(node)?;
+
+        let device_id = u32::try_from(u64_at(&state, "device_id")?)
+            .map_err(|_| malformed("device_id does not fit a u32"))?;
+        let device_config: Vec<u8> = state
+            .get("device_config")
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_u64)
+                    .map(|b| b as u8)
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        let queues = state
+            .get("queues")
+            .and_then(Value::as_array)
+            .ok_or_else(|| malformed(format!("virtio-mmio device `{name}` records no queues")))?
+            .iter()
+            .map(|q| {
+                Ok(MmioQueueState {
+                    size: u16_at(q, "size")?,
+                    desc: u64_at(q, "desc_table")?,
+                    driver: u64_at(q, "avail_ring")?,
+                    device: u64_at(q, "used_ring")?,
+                    ready: q.get("ready").and_then(Value::as_bool).unwrap_or(false),
+                })
+            })
+            .collect::<Result<Vec<_>, DevMgrError>>()?;
+
+        let backend = mmio_backend(device_id, &state, &device_config);
+        out.push(VirtioMmioDeviceDesc {
+            name: name.to_string(),
+            base,
+            size,
+            intid,
+            transport: MmioTransportState {
+                name: name.to_string(),
+                device_id,
+                device_features: u64_at(&state, "device_features")?,
+                driver_features: u64_at(&state, "driver_features")?,
+                device_features_sel: u32::try_from(u64_at(&state, "device_features_sel")?)
+                    .map_err(|_| malformed("device_features_sel does not fit a u32"))?,
+                driver_features_sel: u32::try_from(u64_at(&state, "driver_features_sel")?)
+                    .map_err(|_| malformed("driver_features_sel does not fit a u32"))?,
+                queue_sel: u16_at(&state, "queue_sel")?,
+                interrupt_status: u32::try_from(u64_at(&state, "interrupt_status")?)
+                    .map_err(|_| malformed("interrupt_status does not fit a u32"))?,
+                device_status: u8::try_from(u64_at(&state, "device_status")?)
+                    .map_err(|_| malformed("device_status does not fit a u8"))?,
+                config_generation: u8::try_from(u64_at(&state, "config_generation")?)
+                    .map_err(|_| malformed("config_generation does not fit a u8"))?,
+                queues,
+                device_config,
+            },
+            backend,
+        });
+    }
+    // Stable order (window address) so wiring is deterministic.
+    out.sort_by_key(|d| d.base);
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -713,7 +1094,10 @@ mod tests {
         ))
         .expect("parse block");
         match &blk[0].backend {
-            BackendKind::Block { nsectors, disk_path } => {
+            BackendKind::Block {
+                nsectors,
+                disk_path,
+            } => {
                 assert_eq!(*nsectors, 2048);
                 assert_eq!(disk_path, "/x.raw");
             }
@@ -947,5 +1331,479 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A document whose one virtio-mmio device is described by `state` (the
+    /// embedded per-device state) and `resources` (the device-tree entry).
+    fn mmio_doc(state: &str, resources: &str) -> String {
+        let tree =
+            format!(r#"{{"device_tree":{{"_virtio-mmio-blk0":{{"resources":{resources}}}}}}}"#);
+        serde_json::json!({
+            "snapshots": {
+                "device-manager": {
+                    "snapshots": {
+                        "_virtio-mmio-blk0": {
+                            "snapshot_data": { "state": state }
+                        }
+                    },
+                    "snapshot_data": { "state": tree }
+                }
+            }
+        })
+        .to_string()
+    }
+
+    /// A driver-programmed block transport, as the writer records one.
+    fn mmio_state() -> String {
+        r#"{"device_id":2,"device_features":68,"driver_features":4,
+            "device_features_sel":1,"driver_features_sel":0,"queue_sel":0,
+            "interrupt_status":1,"device_status":15,"config_generation":3,
+            "queues":[{"size":128,"desc_table":1090519040,"avail_ring":1124073472,
+                       "used_ring":1107296256,"ready":true}],
+            "device_config":[1,0,0,0,0,0,0,0],"backing":"/disks/blk0.raw"}"#
+            .to_string()
+    }
+
+    const GOOD_RESOURCES: &str =
+        r#"[{"MmioAddressRange":{"base":1073741824,"size":512}},{"LegacyIrq":35}]"#;
+
+    fn mmio_refused(doc: &str, what: &str) -> String {
+        match parse_mmio_devices(doc) {
+            Ok(v) => panic!("{what} was accepted, and produced {} device(s)", v.len()),
+            Err(e) => e.to_string(),
+        }
+    }
+
+    /// The ring addresses are three differently-named keys holding three
+    /// same-typed values, which is exactly the shape where a transposed pair
+    /// reads back perfectly and points the device at the wrong ring.
+    #[test]
+    fn each_ring_address_lands_in_the_field_that_names_it() {
+        let doc = mmio_doc(&mmio_state(), GOOD_RESOURCES);
+        let d = &parse_mmio_devices(&doc).expect("well-formed")[0];
+        let q = &d.transport.queues[0];
+        assert_eq!(q.desc, 0x4100_0000, "desc_table");
+        assert_eq!(q.driver, 0x4300_0000, "avail_ring");
+        assert_eq!(q.device, 0x4200_0000, "used_ring");
+        assert_eq!(q.size, 128);
+        assert!(q.ready, "the driver had brought this queue up");
+    }
+
+    /// The window and the interrupt come from the device tree, not the state.
+    #[test]
+    fn the_window_and_the_interrupt_come_from_the_device_tree() {
+        let doc = mmio_doc(&mmio_state(), GOOD_RESOURCES);
+        let d = &parse_mmio_devices(&doc).expect("well-formed")[0];
+        assert_eq!(d.base, 0x4000_0000);
+        assert_eq!(d.size, 0x200);
+        assert_eq!(d.intid, 35, "the SPI the guest's driver expects");
+    }
+
+    /// A device with a window and no interrupt is one the guest can program and
+    /// never hear from -- a silent hang, so it is refused by name.
+    #[test]
+    fn a_device_with_no_interrupt_is_refused_rather_than_wired_deaf() {
+        let doc = mmio_doc(
+            &mmio_state(),
+            r#"[{"MmioAddressRange":{"base":1073741824,"size":512}}]"#,
+        );
+        let msg = mmio_refused(&doc, "a device with no LegacyIrq");
+        assert!(msg.contains("LegacyIrq"), "{msg}");
+    }
+
+    /// Likewise an interrupt with no window: unreachable, not merely degraded.
+    #[test]
+    fn a_device_with_no_window_is_refused_rather_than_wired_unreachable() {
+        let doc = mmio_doc(&mmio_state(), r#"[{"LegacyIrq":35}]"#);
+        let msg = mmio_refused(&doc, "a device with no MmioAddressRange");
+        assert!(msg.contains("MmioAddressRange"), "{msg}");
+    }
+
+    /// A zero-length window accepts no access at all, so a device behind one is
+    /// present in the document and absent from the machine.
+    #[test]
+    fn a_zero_length_window_is_refused() {
+        let doc = mmio_doc(
+            &mmio_state(),
+            r#"[{"MmioAddressRange":{"base":1073741824,"size":0}},{"LegacyIrq":35}]"#,
+        );
+        let msg = mmio_refused(&doc, "a zero-length window");
+        assert!(msg.contains("zero-length"), "{msg}");
+    }
+
+    /// A device recorded with no device-tree node has no window to be placed
+    /// in. Defaulting one would put it wherever we guessed, which is not where
+    /// the guest's driver is bound.
+    #[test]
+    fn a_device_with_no_device_tree_node_is_refused_rather_than_placed_by_guess() {
+        let doc = serde_json::json!({
+            "snapshots": { "device-manager": {
+                "snapshots": { "_virtio-mmio-blk0": {
+                    "snapshot_data": { "state": mmio_state() } } },
+                "snapshot_data": { "state": r#"{"device_tree":{}}"# }
+            } }
+        })
+        .to_string();
+        let msg = mmio_refused(&doc, "a device with no device-tree node");
+        assert!(msg.contains("blk0") && msg.contains("device-tree"), "{msg}");
+    }
+
+    /// A virtio type this build does not model must be refused by name at build
+    /// time, not quietly turned into a device of some other kind.
+    #[test]
+    fn an_unmodelled_virtio_type_is_carried_through_as_unsupported() {
+        let state = mmio_state().replace("\"device_id\":2", "\"device_id\":9");
+        let doc = mmio_doc(&state, GOOD_RESOURCES);
+        let d = &parse_mmio_devices(&doc).expect("well-formed")[0];
+        match d.backend {
+            BackendKind::Unsupported { virtio_type } => assert_eq!(virtio_type, 9),
+            ref other => panic!("virtio type 9 is not modelled here, got {other:?}"),
+        }
+    }
+
+    /// The per-device state is a JSON *string* inside the document, so a reader
+    /// that forgets the second parse sees an opaque scalar and finds nothing.
+    #[test]
+    fn the_per_device_state_is_parsed_out_of_its_string() {
+        let doc = mmio_doc(&mmio_state(), GOOD_RESOURCES);
+        let d = &parse_mmio_devices(&doc).expect("well-formed")[0];
+        assert_eq!(d.transport.device_features, 68);
+        assert_eq!(d.transport.driver_features, 4);
+        assert_eq!(d.transport.device_features_sel, 1);
+        assert_eq!(d.transport.device_status, 0xf);
+        assert_eq!(d.transport.config_generation, 3);
+        assert_eq!(d.transport.interrupt_status, 1);
+    }
+
+    /// The guest sized its filesystem against the capacity it read out of
+    /// config space. Recomputing it from the host file's current length is a
+    /// second derivation of a number the guest already committed to, and a
+    /// disk that grew under the snapshot would silently move the end of the
+    /// filesystem the guest believes in.
+    #[test]
+    fn a_disk_keeps_the_capacity_the_guest_was_told() {
+        // 4096 sectors, little-endian, exactly as config space carries it.
+        let state = mmio_state().replace(
+            r#""device_config":[1,0,0,0,0,0,0,0]"#,
+            r#""device_config":[0,16,0,0,0,0,0,0]"#,
+        );
+        let doc = mmio_doc(&state, GOOD_RESOURCES);
+        let d = &parse_mmio_devices(&doc).expect("well-formed")[0];
+        match &d.backend {
+            BackendKind::Block {
+                nsectors,
+                disk_path,
+            } => {
+                assert_eq!(*nsectors, 4096, "read from device_config, LE");
+                assert_eq!(disk_path, "/disks/blk0.raw");
+            }
+            other => panic!("device_id 2 is a block device, got {other:?}"),
+        }
+    }
+
+    /// A JSON object has no order, so a parser that reports devices in map
+    /// order reports them in whatever order the serializer happened to choose.
+    /// Two runs over the same document then wire the same machine differently.
+    #[test]
+    fn devices_come_back_in_window_order_whatever_the_document_says() {
+        // The names are deliberately in the OPPOSITE order to the windows.
+        // serde_json keys a map with a BTreeMap, so a parser with no sort
+        // reports alphabetically -- and a fixture whose names ascend with its
+        // bases would read back correctly with the sort deleted.
+        let tree = r#"{"device_tree":{
+            "_virtio-mmio-aa":{"resources":[{"MmioAddressRange":{"base":1073741824,"size":512}},{"LegacyIrq":35}]},
+            "_virtio-mmio-zz":{"resources":[{"MmioAddressRange":{"base":536870912,"size":512}},{"LegacyIrq":36}]}}}"#;
+        let doc = serde_json::json!({
+            "snapshots": { "device-manager": {
+                "snapshots": {
+                    "_virtio-mmio-aa": { "snapshot_data": { "state": mmio_state() } },
+                    "_virtio-mmio-zz": { "snapshot_data": { "state": mmio_state() } },
+                },
+                "snapshot_data": { "state": tree }
+            } }
+        })
+        .to_string();
+        let found = parse_mmio_devices(&doc).expect("well-formed");
+        let bases: Vec<u64> = found.iter().map(|d| d.base).collect();
+        assert_eq!(bases, vec![0x2000_0000, 0x4000_0000], "ascending by window");
+        assert_eq!(found[0].name, "zz", "the low window, despite the late name");
+        assert_eq!(found[0].intid, 36, "each device keeps its own interrupt");
+        assert_eq!(found[1].name, "aa");
+        assert_eq!(found[1].intid, 35);
+    }
+
+    /// The other direction, and the one that does real damage: if the MMIO
+    /// reader claimed a `_virtio-pci-*` node, `parse_devices` would claim it
+    /// too and the same backend would be wired twice onto one guest -- two
+    /// devices driving one disk, which is corruption rather than a refusal.
+    #[test]
+    fn the_mmio_parser_does_not_claim_a_pci_node() {
+        let doc = mmio_doc(&mmio_state(), GOOD_RESOURCES)
+            .replace(VIRTIO_MMIO_NODE_PREFIX, "_virtio-pci-");
+        let found = parse_mmio_devices(&doc).expect("well-formed, just not MMIO");
+        assert!(
+            found.is_empty(),
+            "the MMIO reader claimed {} PCI node(s); the PCI reader will claim \
+             them as well, and one backend would be wired to two devices",
+            found.len()
+        );
+    }
+
+    /// The PCI parser and the MMIO parser must not claim each other's nodes.
+    #[test]
+    fn the_pci_parser_does_not_claim_an_mmio_document() {
+        let doc = mmio_doc(&mmio_state(), GOOD_RESOURCES);
+        let pci = parse_devices(&doc).expect("well-formed, just not PCI");
+        assert!(
+            pci.is_empty(),
+            "a virtio-mmio device read as PCI would be given a BAR and an ITS \
+             DeviceID it does not have"
+        );
+    }
+
+    /// One virtio-mmio device, parsed out of a document, ready to build.
+    fn an_mmio_desc(state: &str) -> VirtioMmioDeviceDesc {
+        parse_mmio_devices(&mmio_doc(state, GOOD_RESOURCES))
+            .expect("well-formed")
+            .remove(0)
+    }
+
+    /// The refusal for a virtio type this build does not model has to reach the
+    /// mmio path too. A transport that quietly built *something* for an
+    /// unmodelled type would hand the guest a device that answers wrongly --
+    /// worse than the device being absent, because the driver binds to it.
+    #[test]
+    fn an_unmodelled_device_is_refused_on_the_mmio_transport_as_well() {
+        // device_id 9 is virtio-9p, which this build does not model.
+        let desc = an_mmio_desc(&mmio_state().replace(r#""device_id":2"#, r#""device_id":9"#));
+        let dir = std::env::temp_dir().join(format!("chm-mmioref-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // `VirtioMmioDevice` has no `Debug`, so `expect_err` does not compile.
+        let msg = match build_mmio_device(
+            &desc,
+            Arc::new(GuestMemory::new()),
+            &dir,
+            false,
+            None,
+            NatLimits::default(),
+            false,
+        ) {
+            Err(e) => format!("{e:?}"),
+            Ok(_) => panic!("an unmodelled virtio type must be refused, not mismodelled"),
+        };
+        assert!(msg.contains("blk0"), "names the device: {msg}");
+        assert!(msg.contains('9'), "names the virtio type: {msg}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A shipped disk is an immutable base with a per-run CoW overlay over it.
+    /// If the mmio path opened the backing file directly it would write through
+    /// to the user's disk and diverge from the RAM the same snapshot restores,
+    /// so the overlay's existence is the observable proof the shared resolver
+    /// was reached rather than re-derived.
+    #[test]
+    fn an_mmio_disk_is_opened_as_a_copy_on_write_overlay() {
+        use std::io::Write;
+
+        let root = std::env::temp_dir().join(format!("chm-mmiocow-{}", std::process::id()));
+        let overlay_dir = root.join(".chm-overlays");
+        let disks = root.join("disks");
+        std::fs::create_dir_all(&overlay_dir).unwrap();
+        std::fs::create_dir_all(&disks).unwrap();
+        let base = disks.join("blk0.raw");
+        std::fs::File::create(&base)
+            .unwrap()
+            .write_all(&[0xC0u8; 512])
+            .unwrap();
+
+        let dev = build_mmio_device(
+            &an_mmio_desc(&mmio_state()),
+            Arc::new(GuestMemory::new()),
+            &overlay_dir,
+            false,
+            None,
+            NatLimits::default(),
+            false,
+        )
+        .expect("a block device with a shipped disk builds");
+        assert_eq!(dev.name(), "blk0");
+        assert!(
+            overlay_dir.join("blk0-cow.raw").exists(),
+            "a shipped disk must be opened through a per-run overlay, not in place"
+        );
+        assert_eq!(
+            std::fs::read(&base).unwrap(),
+            vec![0xC0u8; 512],
+            "the shipped disk is the immutable base and must not be written"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The guest negotiated its config space before the capture and sized its
+    /// filesystem against what it read there. Recomputing it from `nsectors`
+    /// would let this build's opinion overwrite what the guest was told, so the
+    /// fixture deliberately carries a capacity the backend kind disagrees with.
+    #[test]
+    fn an_mmio_device_serves_the_config_space_the_guest_was_given() {
+        use crate::hvf::devices::MmioDevice;
+
+        // Capacity is *derived* from config space, so a capacity assertion
+        // agrees with any recomputation by construction and cannot fail. The
+        // distinguishing byte is `blk_size` at offset 20: this build renders
+        // 512 there, so the fixture says 4096 -- a value a recomputation
+        // cannot produce.
+        let mut cfg = vec![0u8; 24];
+        cfg[..8].copy_from_slice(&4096u64.to_le_bytes());
+        cfg[20..24].copy_from_slice(&4096u32.to_le_bytes());
+        let state = mmio_state().replace(
+            r#""device_config":[1,0,0,0,0,0,0,0]"#,
+            &format!(r#""device_config":{cfg:?}"#),
+        );
+        let dir = std::env::temp_dir().join(format!("chm-mmiocfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dev = build_mmio_device(
+            &an_mmio_desc(&state),
+            Arc::new(GuestMemory::new()),
+            &dir,
+            false,
+            None,
+            NatLimits::default(),
+            false,
+        )
+        .expect("a block device with no shipped disk still builds");
+        let mut got = [0u8; 8];
+        dev.read(0x100, &mut got);
+        assert_eq!(
+            u64::from_le_bytes(got),
+            4096,
+            "capacity is served from the transport state"
+        );
+        let mut blk = [0u8; 4];
+        dev.read(0x100 + 20, &mut blk);
+        assert_eq!(
+            u32::from_le_bytes(blk),
+            4096,
+            "the guest's own block size survives; this build must not render \
+             its own 512 over it"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Both transports must reach one backend builder. Two renderings of "which
+    /// file is this disk really" or "what may this NIC reach" drift, and the
+    /// drift is invisible until an mmio guest is governed by a posture nobody
+    /// chose. An outcome assertion cannot see a path that stops being taken, so
+    /// this reads the source.
+    #[test]
+    fn both_transports_build_a_backend_the_same_way() {
+        let src = include_str!("devmgr.rs");
+        // Only production code counts. The tests below call `build_backend`
+        // too, and a guard that counts its own call sites drifts every time a
+        // test is added -- which is exactly when nobody re-derives the number.
+        let prod = src
+            .split_once("\nmod tests {")
+            .expect("the test module marks the end of production code")
+            .0;
+        let needle = format!("{}(", "build_backend");
+        assert_eq!(
+            prod.matches(&needle).count(),
+            3,
+            "expected the definition plus one call from each transport builder"
+        );
+    }
+
+    /// A refusal must name the register the reader can actually go and look at.
+    ///
+    /// The decision to refuse is shared by both transports (see
+    /// [`build_backend`]), and that sharing is what nearly made this wrong: a
+    /// virtio-mmio guest has no PCI bus, so quoting a PCI Device ID at it sends
+    /// the reader hunting for a device that does not exist on the machine.
+    /// Asserted in both directions, because "never says PCI" would also be
+    /// satisfied by a message that says nothing useful to either transport.
+    #[test]
+    fn a_refusal_names_the_identifier_this_transport_actually_carries() {
+        let dir = std::env::temp_dir();
+        let refuse = |t: Transport| {
+            let built = build_backend(
+                "_dev0",
+                &BackendKind::Unsupported { virtio_type: 26 },
+                t,
+                0,
+                &dir,
+                true,
+                None,
+                NatLimits::default(),
+                false,
+            );
+            // `Backend` is not `Debug`, so `expect_err` will not do here.
+            match built {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("an unmodelled virtio type must be refused"),
+            }
+        };
+
+        let pci = refuse(Transport::Pci);
+        assert!(
+            pci.contains("PCI Device ID") && pci.contains("0x105a"),
+            "a virtio-pci refusal must quote the PCI Device ID the guest saw \
+             (0x1040 + 26), got {pci}"
+        );
+
+        let mmio = refuse(Transport::Mmio);
+        assert!(
+            !mmio.contains("PCI"),
+            "a virtio-mmio guest has no PCI bus, so a refusal must not send the \
+             reader looking for a PCI Device ID, got {mmio}"
+        );
+        assert!(
+            mmio.contains("DeviceID") && mmio.contains("0x008"),
+            "a virtio-mmio refusal must name the DeviceID register and where it \
+             lives, got {mmio}"
+        );
+
+        for m in [&pci, &mmio] {
+            assert!(
+                m.contains("virtio type 26"),
+                "both transports must still name the raw virtio type, got {m}"
+            );
+        }
+    }
+
+    /// Each transport builder must hand `build_backend` *its own* transport.
+    ///
+    /// The guard above calls `build_backend` directly, so it is structurally
+    /// blind to which constant a caller passes -- swapping them at a call site
+    /// leaves it green. That is the same call-site class this repository has
+    /// been caught by repeatedly, and it cannot be made a compile error here
+    /// because both constants type-check. So read the source instead, with
+    /// needles assembled from parts so this assertion cannot match itself.
+    #[test]
+    fn each_transport_builder_names_itself() {
+        let src = include_str!("devmgr.rs");
+        let prod = src
+            .split_once("\nmod tests {")
+            .expect("the test module marks the end of production code")
+            .0;
+        let cut = |from: &str, to: &str| {
+            let start = prod.find(from).unwrap_or_else(|| panic!("no `{from}`"));
+            let end = prod.find(to).unwrap_or_else(|| panic!("no `{to}`"));
+            assert!(start < end, "`{from}` must precede `{to}` in this file");
+            &prod[start..end]
+        };
+
+        let pci = format!("{}::{}", "Transport", "Pci");
+        let mmio = format!("{}::{}", "Transport", "Mmio");
+
+        let pci_builder = cut("fn build_device(", "fn build_mmio_device(");
+        assert!(
+            pci_builder.contains(&pci) && !pci_builder.contains(&mmio),
+            "the virtio-pci builder must pass {pci} and nothing else"
+        );
+
+        let mmio_builder = cut("fn build_mmio_device(", "fn build_backend(");
+        assert!(
+            mmio_builder.contains(&mmio) && !mmio_builder.contains(&pci),
+            "the virtio-mmio builder must pass {mmio} and nothing else"
+        );
     }
 }

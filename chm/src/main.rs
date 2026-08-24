@@ -18,9 +18,17 @@
 // stopped testing -- `dead_code` and the `unused_*` family.
 //
 //   absolute_paths (259)              `std::...` spelled out inline in a test body.
-//   assertions_on_result_states (46)  `assert!(x.is_ok())`. Reads fine, but throws
-//                                     the error away on failure; worth converting
-//                                     on its own rather than inside this change.
+//   assertions_on_result_states (29)  Deliberately narrowed to the `is_err()` form
+//                                     only (#365). `assert!(x.is_ok())` discards the
+//                                     error it caught, so those 17 were converted to
+//                                     `.unwrap()` and are now refused by
+//                                     `hygiene::no_assertion_discards_the_error_it_
+//                                     caught` -- a comment saying "is_err() only"
+//                                     stops being true the moment someone adds an
+//                                     `is_ok()`, so the claim is coupled to a test
+//                                     rather than written down. The `is_err()` half
+//                                     stays: `unwrap_err()` prints the unexpected
+//                                     `Ok` value, which is rarely what you needed.
 //   assertions_on_constants (2)       `assert!(CONST >= N, "why")`. Measured, not
 //                                     assumed: both still panic when the constant
 //                                     moves, so the guards do their job.
@@ -55,6 +63,12 @@ mod console_filter;
 // exit status over the console channel (#149).
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod exec;
+
+// Putting a host file into a running guest, chunked so each step frames inside
+// the tty's line limit and verified by digest (#316). The way in for anything
+// `chm exec` is structurally too small to carry.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod guestcp;
 
 // Delivering a spec's `env` and `postBootCommand` into a guest that is up
 // (#190). Reuses the `exec` framing, and establishes readiness by getting an
@@ -167,6 +181,14 @@ mod vanilla;
 /// no Linux host anywhere in the path.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
 mod vanilla_export;
+
+/// Originating a lineage here (#341): synthesizing a capture for a machine
+/// `chm` itself cold-booted, which has no ancestor to patch. Separate from
+/// `vanilla_export` because the two answer opposite questions -- that one
+/// rewrites a capture we did not author, this one describes a machine nobody
+/// else has ever seen.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+mod genesis;
 
 /// Properties of the test suite itself (#243).
 mod hygiene;

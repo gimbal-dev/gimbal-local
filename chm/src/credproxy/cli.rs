@@ -13,6 +13,7 @@ use crate::oci::entry::EntryKind;
 use crate::oci::initramfs::{Rootfs, write_cpio};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -25,9 +26,9 @@ use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned, version
 
 use crate::audit::AuditLog;
 
-use super::ca::ProxyCa;
+use super::ca::{CA_CERT_FILE, CA_KEY_FILE, ProxyCa};
 use super::nat::RuleDecider;
-use super::rules::{Destination, Disposition, RuleSet};
+use super::rules::{Destination, Disposition, PlaceholderEnv, RuleSet};
 use super::server::{self, ProxyConfig};
 
 /// Which authority supplied a piece of a run's configuration.
@@ -107,6 +108,100 @@ pub(crate) fn ca_dir(workspace: &Path) -> PathBuf {
     workspace.join("proxy-ca")
 }
 
+/// Copy an image's proxy CA into a workspace being created from it (#315).
+///
+/// A workspace shares its image's base read-only and diverges from there, so
+/// the guest inside it is *the same guest*: if the image's rootfs was already
+/// provisioned to trust a CA, a workspace that mints a fresh one presents a
+/// certificate that guest will never accept. The failure surfaces as a generic
+/// curl message naming nothing, while `chm` has just printed a banner saying
+/// injection is ACTIVE — the two most visible facts contradict each other and
+/// only one of them is reachable without reading this codebase.
+///
+/// Copied rather than symlinked. [`ProxyCa::load_or_create`] writes into this
+/// directory (it tightens permissions, and mints the pair when either file is
+/// missing), so a symlink would let a workspace mutate the image every other
+/// workspace is sharing — the opposite of the read-only base contract the rest
+/// of `workspace_from_image` keeps.
+///
+/// Returns whether there was anything to inherit. An image with no CA is the
+/// ordinary case and not a problem: nothing in that guest trusts anything yet,
+/// so a freshly minted workspace CA is the right answer.
+pub(crate) fn inherit_ca(image_dir: &Path, ws_dir: &Path) -> Result<bool, String> {
+    let from = ca_dir(image_dir);
+    let (key, cert) = (from.join(CA_KEY_FILE), from.join(CA_CERT_FILE));
+    // Both halves or neither. A cert without its key cannot sign a leaf, so
+    // copying half a CA would replace a working mint-fresh path with a proxy
+    // that fails at the first interception instead of at creation.
+    if !key.exists() || !cert.exists() {
+        return Ok(false);
+    }
+    let to = ca_dir(ws_dir);
+    fs::create_dir_all(&to).map_err(|e| format!("create {}: {e}", to.display()))?;
+    // Tightened here rather than left to the next `load_or_create`, which is
+    // what the running proxy calls: between creating the workspace and starting
+    // a VM in it, a 0755 directory holding a CA private key is readable by
+    // anyone on the host, and a readable CA key impersonates every intercepted
+    // host to the guest.
+    let _ = fs::set_permissions(&to, fs::Permissions::from_mode(0o700));
+    for (src, name) in [(&key, CA_KEY_FILE), (&cert, CA_CERT_FILE)] {
+        let dst = to.join(name);
+        fs::copy(src, &dst)
+            .map_err(|e| format!("copy {} -> {}: {e}", src.display(), dst.display()))?;
+    }
+    let _ = fs::set_permissions(to.join(CA_KEY_FILE), fs::Permissions::from_mode(0o600));
+    Ok(true)
+}
+
+/// The image directory a workspace shares its base with, or `None` when this
+/// does not look like a workspace created by `chm workspace`.
+///
+/// Recovered from the `state.json` symlink rather than recorded in a file of
+/// our own: the symlink is what actually makes the workspace share that base,
+/// so it cannot go stale relative to the thing it describes. A recorded origin
+/// could disagree with where the base really is, and would then name the wrong
+/// directory in exactly the diagnosis below.
+pub(crate) fn base_image_dir(workspace: &Path) -> Option<PathBuf> {
+    let target = fs::read_link(workspace.join("state.json")).ok()?;
+    target.parent().map(Path::to_path_buf)
+}
+
+/// Why the CA this workspace presents is not the one its base image carries, or
+/// `None` when they agree, when there is nothing to compare, or when this is
+/// not a workspace at all.
+///
+/// [`inherit_ca`] means a workspace created by this build always agrees. This
+/// exists for the ones that already exist: a workspace made by an earlier build
+/// stays broken across the upgrade, and without this it stays broken *silently*,
+/// which is the whole of what #315 cost.
+///
+/// Compares the certificate bytes, not fingerprint strings, so the comparison
+/// cannot be defeated by a formatting change on either side.
+pub(crate) fn inherited_ca_mismatch(workspace: &Path) -> Option<String> {
+    let image = base_image_dir(workspace)?;
+    let theirs = fs::read(ca_dir(&image).join(CA_CERT_FILE)).ok()?;
+    let ours = fs::read(ca_dir(workspace).join(CA_CERT_FILE)).ok()?;
+    if theirs == ours {
+        return None;
+    }
+    // Stated as a conditional, because the host cannot read the guest's trust
+    // store from here. A user who deliberately re-minted this workspace's CA
+    // *and* reinstalled it in the guest is fine, and telling them their setup is
+    // broken would be a false alarm. What is certain is which two things differ.
+    Some(format!(
+        "chm: [proxy] this workspace's CA is not the one its base image carries.\n\
+         \x20 workspace {}\n\
+         \x20 image     {}\n\
+         \x20 If the guest's trust store came from that image, every intercepted\n\
+         \x20 request will fail with a generic certificate error naming nothing.\n\
+         \x20 Install this workspace's CA in the guest:\n\
+         \x20     chm proxy ca --workspace {}",
+        ca_dir(workspace).display(),
+        ca_dir(&image).display(),
+        workspace.display(),
+    ))
+}
+
 /// A started proxy and the hook that routes flows to it. The proxy is returned
 /// so the caller can keep it alive for the life of the VM.
 pub(crate) type StartedProxy = (server::RunningProxy, Arc<dyn InterceptDecider>);
@@ -153,6 +248,12 @@ pub(crate) fn start_resolved(
         resolved.origin,
         ca.fingerprint()
     );
+    // Immediately after the banner, because the banner is the claim this
+    // contradicts: it says injection is active and names a CA, and #315 was
+    // exactly the case where that sentence was true and useless.
+    if let Some(why) = inherited_ca_mismatch(workspace) {
+        eprintln!("{why}");
+    }
     Ok(Some((proxy, decider)))
 }
 
@@ -178,13 +279,16 @@ chm proxy — the credential-injecting egress proxy
 USAGE:
     chm proxy show [WORKSPACE_DIR|--workspace DIR] [--rules FILE] [--json]
     chm proxy ca   <WORKSPACE_DIR|--workspace DIR> [--out FILE] [--for-guest]
-    chm proxy check --host HOST [--port N] [--path P] [--rules FILE]
-                    [--control] [--json]
+    chm proxy check --host HOST [--port N] [--path P]
+                    [--workspace DIR] [--rules FILE] [--control] [--json]
 
 COMMANDS:
     show    What the rules would do, and whether each credential is available.
             Reads no credential values: an `exec` source is never run.
     ca      Print the workspace CA certificate, and how to install it in a guest.
+            --for-guest also seeds a worthless placeholder credential for any
+            client known to refuse to make a request without one (a proxy
+            cannot inject into a request that is never sent).
     check   Prove this machine can reach a host through the proxy. Sends a real
             HEAD request; injects only if a rule matches. Use --path to choose
             an endpoint whose answer differs with and without a credential
@@ -222,6 +326,20 @@ fn workspace_arg(args: &[String]) -> Option<&str> {
     flag(args, "--workspace").or_else(|| positional(args))
 }
 
+/// The workspace `chm proxy check` will read its rules from.
+///
+/// `--workspace` only, unlike `show`, which also takes the directory as a
+/// positional. Every argument to `check` is a flag with a value, so a bare
+/// path there is far more likely to be a misplaced value than an intended
+/// workspace, and silently adopting it would be the same class of mistake as
+/// #317 itself: acting confidently on an argument the user did not mean.
+///
+/// Split out so the resolution can be tested without opening a socket --
+/// `check` itself sends a real request, which is exactly why the bug survived.
+fn check_workspace(args: &[String]) -> Option<PathBuf> {
+    flag(args, "--workspace").map(PathBuf::from)
+}
+
 /// Reject flags this command does not know, naming the offender.
 /// What each subcommand accepts, named once.
 ///
@@ -232,6 +350,31 @@ fn workspace_arg(args: &[String]) -> Option<&str> {
 /// now holds them to the help text.
 const SHOW_FLAGS: &[&str] = &["--rules", "--json", "--workspace"];
 const CA_FLAGS: &[&str] = &["--out", "--workspace", "--for-guest"];
+const CHECK_FLAGS: &[&str] = &[
+    "--host",
+    "--port",
+    "--path",
+    "--rules",
+    "--workspace",
+    "--control",
+    "--json",
+];
+
+/// What one subcommand accepts, looked up rather than listed at the call site.
+///
+/// #317 was a subcommand with *no* allow-list at all: `check` never called
+/// `reject_unknown`, so `--workspace` was consumed and dropped and the command
+/// still printed a confident verdict. A table keyed by name lets the guard
+/// below ask "does every subcommand USAGE documents have one of these?", which
+/// is the question that catches a missing list rather than a wrong one.
+fn flags_for(cmd: &str) -> Option<&'static [&'static str]> {
+    match cmd {
+        "show" => Some(SHOW_FLAGS),
+        "ca" => Some(CA_FLAGS),
+        "check" => Some(CHECK_FLAGS),
+        _ => None,
+    }
+}
 
 /// The remedy `chm proxy ca` prints beside the certificate.
 ///
@@ -242,17 +385,32 @@ const CA_FLAGS: &[&str] = &["--out", "--workspace", "--for-guest"];
 /// while the sentence the user actually reads sends them at a flag that does
 /// not work.
 const CA_GUEST_HINT: &str = "\
-`chm proxy ca <WORKSPACE_DIR> --for-guest` prints an installer to
-paste into the guest console.";
+`chm proxy ca <WORKSPACE_DIR> --for-guest` prints an installer for the guest.
+It is far longer than one console line will carry, so send it as a file:
+    chm proxy ca <WORKSPACE_DIR> --for-guest > ca.sh
+    chm cp ca.sh /tmp/ca.sh
+    chm exec -- sh /tmp/ca.sh";
 
-fn reject_unknown(cmd: &str, args: &[String], known: &[&str]) -> Result<(), ExitCode> {
-    for a in args {
-        if a.starts_with("--") && !known.contains(&a.as_str()) {
-            eprintln!("chm proxy {cmd}: unknown flag `{a}`\n\n{USAGE}");
-            return Err(ExitCode::FAILURE);
-        }
+fn reject_unknown(cmd: &str, args: &[String]) -> Result<(), ExitCode> {
+    if let Some(a) = first_unknown_flag(cmd, args) {
+        eprintln!("chm proxy {cmd}: unknown flag `{a}`\n\n{USAGE}");
+        return Err(ExitCode::FAILURE);
     }
     Ok(())
+}
+
+/// The first flag `cmd` does not accept, if any.
+///
+/// An unregistered subcommand gets an empty allow-list, so it refuses
+/// *everything* rather than accepting everything. #317 was the permissive
+/// version of that mistake: a command with no list took every flag it was
+/// handed and still printed a verdict. Failing closed turns the same omission
+/// into a command that visibly does not work.
+fn first_unknown_flag<'a>(cmd: &str, args: &'a [String]) -> Option<&'a str> {
+    let known = flags_for(cmd).unwrap_or(&[]);
+    args.iter()
+        .map(String::as_str)
+        .find(|a| a.starts_with("--") && !known.contains(a))
 }
 
 fn positional(args: &[String]) -> Option<&str> {
@@ -275,7 +433,7 @@ fn positional(args: &[String]) -> Option<&str> {
 }
 
 fn show(args: &[String]) -> ExitCode {
-    if let Err(e) = reject_unknown("show", args, SHOW_FLAGS) {
+    if let Err(e) = reject_unknown("show", args) {
         return e;
     }
     let workspace = workspace_arg(args).map(PathBuf::from);
@@ -328,6 +486,22 @@ fn show(args: &[String]) -> ExitCode {
             .map(ToString::to_string)
             .collect();
         println!("  never intercepted: {}", p.join(", "));
+    }
+    // A client that gates on local auth is the most likely way a correct proxy
+    // looks broken (#318), so `show` names the variables the CA installer will
+    // seed rather than leaving the user to discover the pattern from the docs.
+    let seed = resolved.rules.placeholder_env();
+    if !seed.vars.is_empty() {
+        let names: Vec<&str> = seed.vars.iter().map(|(n, _)| n.as_str()).collect();
+        println!("\n  placeholder in the guest: {}", names.join(", "));
+        println!("      installed by `chm proxy ca --for-guest`; worth nothing, and");
+        println!("      replaced in flight by the real credential.");
+    }
+    for s in &seed.skipped {
+        println!("\n  note: {s} injects a bearer token.");
+        println!("        No client is known here to gate on a local credential for it.");
+        println!("        If one does, give the guest a worthless placeholder in the");
+        println!("        shape that client validates - docs/credential-proxy.md §6.");
     }
     println!("\nEverything not listed above is relayed end-to-end; the proxy cannot read it.");
     ExitCode::SUCCESS
@@ -419,7 +593,7 @@ fn quote(s: &str) -> String {
 }
 
 fn ca(args: &[String]) -> ExitCode {
-    if let Err(e) = reject_unknown("ca", args, CA_FLAGS) {
+    if let Err(e) = reject_unknown("ca", args) {
         return e;
     }
     let Some(ws) = workspace_arg(args) else {
@@ -443,10 +617,22 @@ fn ca(args: &[String]) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if args.iter().any(|a| a == "--for-guest") {
-        // A single self-contained block, because the way this actually gets into
-        // a guest is a paste into the serial console — there is no shared
-        // filesystem to copy it through, by design.
-        print!("{}", guest_install_script(&pem, &ca.fingerprint()));
+        // A single self-contained block, so that it is one file rather than a
+        // sequence a reader has to assemble. It is emitted on stdout precisely
+        // so it can be redirected and carried in by `chm cp` (#316): there is no
+        // shared filesystem, by design, and at ~4 KB it is too big to reach the
+        // guest as a console line — which is the wall the reporter hit.
+        // The rule set is what says whether any client here gates on local auth,
+        // so the CA and the placeholder are decided together. They are also
+        // installed together on purpose: both are "make this guest able to use
+        // the proxy", and a guest with one and not the other fails in a way
+        // that names neither (#318).
+        let seed = resolve_rules(Some(Path::new(ws)), flag(args, "--rules").map(Path::new))
+            .ok()
+            .flatten()
+            .map(|r| r.rules.placeholder_env())
+            .unwrap_or_default();
+        print!("{}", guest_install_script(&pem, &ca.fingerprint(), &seed));
         return ExitCode::SUCCESS;
     }
     eprintln!("# sha256 {}", ca.fingerprint());
@@ -473,7 +659,12 @@ pub(crate) fn ca_json_for_daemon(workspace: &Path) -> String {
     match ProxyCa::load_existing(&dir) {
         Ok(Some(ca)) => {
             let pem = ca.cert_pem();
-            let script = guest_install_script(&pem, &ca.fingerprint());
+            let seed = resolve_rules(Some(workspace), None)
+                .ok()
+                .flatten()
+                .map(|r| r.rules.placeholder_env())
+                .unwrap_or_default();
+            let script = guest_install_script(&pem, &ca.fingerprint(), &seed);
             let lines: Vec<String> = guest_install_transfer(&script)
                 .iter()
                 .map(|l| quote(l))
@@ -509,7 +700,32 @@ pub(crate) fn ca_json_for_daemon(workspace: &Path) -> String {
 /// `openssl verify -CApath` is the check because it asks the question the guest
 /// will actually ask: does this certificate chain to something the store
 /// trusts? For a self-signed CA that is exactly "is it installed".
-fn guest_install_script(pem: &str, fingerprint: &str) -> String {
+fn guest_install_script(pem: &str, fingerprint: &str, seed: &PlaceholderEnv) -> String {
+    // Built here rather than inline in the script literal, because `${VAR:-…}`
+    // is full of braces and `format!` would need every one of them doubled.
+    let (seed_block, seed_report) = if seed.vars.is_empty() {
+        (
+            String::new(),
+            "placeholder:  none (no bearer rule names a client known to gate on local auth)"
+                .to_string(),
+        )
+    } else {
+        let mut lines = String::new();
+        for (name, value) in &seed.vars {
+            // `:-` so a value the operator put there deliberately wins. Seeding
+            // over a real credential would break the guest to fix a guest that
+            // was not broken.
+            lines.push_str(&format!("export {name}=\"${{{name}:-{value}}}\"\n"));
+        }
+        let names: Vec<&str> = seed.vars.iter().map(|(n, _)| n.as_str()).collect();
+        (
+            format!("$S tee -a {ENV_PATH} >/dev/null <<'GIMBAL_ENV_EOF'\n{lines}GIMBAL_ENV_EOF\n"),
+            format!(
+                "placeholder:  {} (worthless; the proxy substitutes the real one on the wire)",
+                names.join(" ")
+            ),
+        )
+    };
     format!(
         "set -e\n\
          # Root already, or borrow authority only if it is actually available.\n\
@@ -549,6 +765,11 @@ fn guest_install_script(pem: &str, fingerprint: &str) -> String {
          # A coding agent is a Node program, so leaving this out ships a guest\n\
          # where curl works and the agent does not.\n\
          printf 'export NODE_EXTRA_CA_CERTS=%s\\n' \"$CRT\" | $S tee {ENV_PATH} >/dev/null\n\
+         # A client that checks for a credential before it will make a request\n\
+         # never gives the proxy anything to inject into, so it needs to see\n\
+         # something. This is worth nothing: the proxy drops every guest copy of\n\
+         # a header it manages before attaching the real credential (#318).\n\
+         {seed_block}\
          $S mkdir -p /etc/profile.d \\\n\
          \x20 && $S cp {ENV_PATH} /etc/profile.d/gimbal-proxy-ca.sh 2>/dev/null || true\n\
          . {ENV_PATH}\n\
@@ -563,6 +784,7 @@ fn guest_install_script(pem: &str, fingerprint: &str) -> String {
          fi\n\
          echo \"system store: $SYS\"\n\
          echo \"node:         $NODE ($CRT)\"\n\
+         echo \"{seed_report}\"\n\
          GOT=$(openssl x509 -noout -fingerprint -sha256 -in \"$CRT\" 2>/dev/null \\\n\
          \x20 | tr -d ':' | tr 'A-Z' 'a-z' | sed 's/.*=//')\n\
          echo \"installed:    ${{GOT:-<no openssl here to read it back>}}\"\n\
@@ -690,7 +912,7 @@ pub(crate) fn guest_install_transfer(script: &str) -> Vec<String> {
     // Short enough that a whole line is well inside any plausible terminal
     // input limit, long enough that a ~1.6 KB payload is ~10 lines.
     const CHUNK: usize = 160;
-    let b64 = base64_encode(script.as_bytes());
+    let b64 = super::base64::encode(script.as_bytes());
     let digest: String = digest(&SHA256, b64.as_bytes())
         .as_ref()
         .iter()
@@ -714,45 +936,70 @@ pub(crate) fn guest_install_transfer(script: &str) -> Vec<String> {
     lines
 }
 
-/// Standard base64, because the guest decodes it with `base64 -d`.
-fn base64_encode(bytes: &[u8]) -> String {
-    const A: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for group in bytes.chunks(3) {
-        let b0 = u32::from(group[0]);
-        let b1 = group.get(1).map_or(0, |b| u32::from(*b));
-        let b2 = group.get(2).map_or(0, |b| u32::from(*b));
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        out.push(char::from(A[((n >> 18) & 63) as usize]));
-        out.push(char::from(A[((n >> 12) & 63) as usize]));
-        out.push(if group.len() > 1 {
-            char::from(A[((n >> 6) & 63) as usize])
-        } else {
-            '='
-        });
-        out.push(if group.len() > 2 {
-            char::from(A[(n & 63) as usize])
-        } else {
-            '='
-        });
+/// Everything `chm proxy check` decides before it opens a socket.
+#[derive(Debug)]
+struct CheckPlan<'a> {
+    host: &'a str,
+    port: u16,
+    path: &'a str,
+    json: bool,
+    want_control: bool,
+    over: Option<PathBuf>,
+    workspace: Option<PathBuf>,
+}
+
+/// Read `check`'s arguments, or say why they cannot be read.
+///
+/// Split out from `check` so the decisions are reachable from a test.
+/// #317 lived here: `workspace` was hardcoded to `None`, so `--workspace DIR`
+/// was accepted, dropped, and answered as "no rule matched" -- a legitimate
+/// outcome, indistinguishable from a dropped flag. It survived because the
+/// only way to observe it was to run the command, and running the command
+/// sends a real request to a real host.
+fn plan_check(args: &[String]) -> Result<CheckPlan<'_>, String> {
+    if let Some(f) = first_unknown_flag("check", args) {
+        return Err(format!("unknown flag `{f}`"));
     }
-    out
+    let host = flag(args, "--host").ok_or("--host is required")?;
+    Ok(CheckPlan {
+        host,
+        port: flag(args, "--port")
+            .and_then(|p| p.parse().ok())
+            .unwrap_or(443),
+        path: flag(args, "--path").unwrap_or("/"),
+        json: args.iter().any(|a| a == "--json"),
+        want_control: args.iter().any(|a| a == "--control"),
+        over: flag(args, "--rules").map(PathBuf::from),
+        workspace: check_workspace(args),
+    })
 }
 
 fn check(args: &[String]) -> ExitCode {
-    let Some(host) = flag(args, "--host") else {
-        eprintln!("chm proxy check: --host is required\n\n{USAGE}");
-        return ExitCode::FAILURE;
+    let plan = match plan_check(args) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("chm proxy check: {e}\n\n{USAGE}");
+            return ExitCode::FAILURE;
+        }
     };
-    let port: u16 = flag(args, "--port")
-        .and_then(|p| p.parse().ok())
-        .unwrap_or(443);
-    let path = flag(args, "--path").unwrap_or("/");
-    let json = args.iter().any(|a| a == "--json");
-    let want_control = args.iter().any(|a| a == "--control");
-    let over = flag(args, "--rules").map(PathBuf::from);
+    let CheckPlan {
+        host,
+        port,
+        path,
+        json,
+        want_control,
+        over,
+        workspace,
+    } = plan;
 
-    let outcome = match run_check(None, over.as_deref(), host, port, path, want_control) {
+    let outcome = match run_check(
+        workspace.as_deref(),
+        over.as_deref(),
+        host,
+        port,
+        path,
+        want_control,
+    ) {
         Ok(o) => o,
         Err(e) => {
             eprintln!("chm proxy check: {e}");
@@ -1365,13 +1612,13 @@ mod tests {
             .iter()
             .map(ToString::to_string)
             .collect();
-        assert!(reject_unknown("show", &args, SHOW_FLAGS).is_err());
+        assert!(reject_unknown("show", &args).is_err());
 
         let ok: Vec<String> = ["--workspace", "/ws", "--json"]
             .iter()
             .map(ToString::to_string)
             .collect();
-        assert!(reject_unknown("show", &ok, SHOW_FLAGS).is_ok());
+        reject_unknown("show", &ok).unwrap();
     }
 
     #[test]
@@ -1403,7 +1650,11 @@ mod tests {
     /// and `openssl verify` exited 0, via the direct-link fallback.
     #[test]
     fn the_ca_installer_verifies_against_the_trust_store_not_its_own_file() {
-        let script = guest_install_script("-----BEGIN CERTIFICATE-----\nAA\n", "beefcafe");
+        let script = guest_install_script(
+            "-----BEGIN CERTIFICATE-----\nAA\n",
+            "beefcafe",
+            &PlaceholderEnv::default(),
+        );
 
         // The check that matters: does this cert chain to the guest's store?
         assert!(
@@ -1497,7 +1748,11 @@ mod tests {
 
     #[test]
     fn the_ca_installer_does_not_assume_sudo_or_a_trust_store() {
-        let script = guest_install_script("-----BEGIN CERTIFICATE-----\nAA\n", "beefcafe");
+        let script = guest_install_script(
+            "-----BEGIN CERTIFICATE-----\nAA\n",
+            "beefcafe",
+            &PlaceholderEnv::default(),
+        );
 
         assert!(
             !script.contains("sudo tee") && !script.contains("sudo cp \"$CRT\" /usr"),
@@ -1531,7 +1786,11 @@ mod tests {
     /// is the workload.
     #[test]
     fn the_ca_installer_configures_node_as_well_as_the_system_store() {
-        let script = guest_install_script("-----BEGIN CERTIFICATE-----\nAA\n", "beefcafe");
+        let script = guest_install_script(
+            "-----BEGIN CERTIFICATE-----\nAA\n",
+            "beefcafe",
+            &PlaceholderEnv::default(),
+        );
 
         assert!(
             script.contains("NODE_EXTRA_CA_CERTS"),
@@ -1577,7 +1836,11 @@ mod tests {
     /// implementation again (`base64 -d`).
     #[test]
     fn the_install_transfer_reassembles_and_is_checked_before_it_runs() {
-        let script = guest_install_script("-----BEGIN CERTIFICATE-----\nQUJD\n", "beefcafe");
+        let script = guest_install_script(
+            "-----BEGIN CERTIFICATE-----\nQUJD\n",
+            "beefcafe",
+            &PlaceholderEnv::default(),
+        );
         let lines = guest_install_transfer(&script);
 
         // Reassemble exactly what the guest's file would hold.
@@ -1726,7 +1989,15 @@ mod tests {
     /// a restated expectation drifts with the thing it is meant to pin.
     #[test]
     fn usage_promises_only_flags_the_parser_accepts() {
-        for (cmd, known) in [("show", SHOW_FLAGS), ("ca", CA_FLAGS)] {
+        for cmd in subcommands_in_usage() {
+            let cmd = cmd.as_str();
+            let known = flags_for(cmd).unwrap_or_else(|| {
+                panic!(
+                    "USAGE documents `chm proxy {cmd}` but no allow-list is \
+                     registered for it in `flags_for`, so the parser cannot \
+                     refuse anything it is handed -- that was #317"
+                )
+            });
             let promised = flags_promised_for(cmd);
             assert!(
                 !promised.is_empty(),
@@ -1752,6 +2023,31 @@ mod tests {
                  `{f}`, which the parser refuses as unknown"
             );
         }
+    }
+
+    /// Every subcommand USAGE documents, read out of the synopsis block.
+    ///
+    /// Derived rather than listed so a new subcommand is covered the day it is
+    /// documented. #317 shipped because `check` was simply absent from a
+    /// hardcoded pair, and nothing noticed the omission.
+    fn subcommands_in_usage() -> Vec<String> {
+        let section = USAGE
+            .split_once("USAGE:\n")
+            .expect("USAGE: header")
+            .1
+            .split("\n\n")
+            .next()
+            .expect("a synopsis block");
+        let mut out: Vec<String> = section
+            .lines()
+            .filter_map(|l| l.trim().strip_prefix("chm proxy "))
+            .filter_map(|r| r.split_whitespace().next())
+            .filter(|v| v.chars().all(|c| c.is_ascii_lowercase()))
+            .map(str::to_string)
+            .collect();
+        out.sort();
+        out.dedup();
+        out
     }
 
     /// The flags USAGE offers for one subcommand, including continuation lines.
@@ -1789,6 +2085,79 @@ mod tests {
             .collect()
     }
 
+    /// `check` reads its rules from `--workspace`, the same directory `show` reads.
+    ///
+    /// This is #317 as a test. `chm proxy check --workspace DIR` accepted the
+    /// flag, dropped it, and reported `PASS-THROUGH (no-rule)` while
+    /// `chm proxy show --workspace DIR` listed a matching rule from the file in
+    /// that very directory. Two sibling commands disagreed about what
+    /// `--workspace` meant, and the one that disagreed is the *evidence*
+    /// command -- the one whose whole purpose is answering "is my credential
+    /// actually being injected?".
+    ///
+    /// What made it survive review is that `no-rule` is not an error. It is a
+    /// legitimate outcome meaning "nothing is configured for this host", so
+    /// there was no way to tell it apart from a flag that was silently
+    /// discarded. During the #286 acceptance run it was read as evidence the
+    /// proxy was misconfigured.
+    ///
+    /// Asserts on the plan rather than on the command, because running the
+    /// command opens a real connection to a real host -- which is exactly why
+    /// nothing exercised this path.
+    #[test]
+    fn check_reads_the_workspace_it_is_given() {
+        let args = vec![
+            "--workspace".to_string(),
+            "/tmp/ws-317".to_string(),
+            "--host".to_string(),
+            "api.github.com".to_string(),
+        ];
+        let plan = plan_check(&args).expect("a well-formed check");
+        assert_eq!(
+            plan.workspace.as_deref(),
+            Some(Path::new("/tmp/ws-317")),
+            "`check --workspace DIR` must resolve DIR; passing None here is \
+             #317, and it reports `no-rule` rather than failing"
+        );
+        assert_eq!(plan.host, "api.github.com");
+    }
+
+    /// An argument `check` does not understand is an error, not a shrug.
+    ///
+    /// `check` had no allow-list at all, so any flag at all was consumed and
+    /// the command still rendered a confident verdict below it. A wrong answer
+    /// from the evidence command is worse than no answer.
+    #[test]
+    fn check_refuses_a_flag_it_does_not_know() {
+        let args = vec![
+            "--host".to_string(),
+            "api.github.com".to_string(),
+            "--workspce".to_string(), // a plausible typo, not a wild string
+            "/tmp/ws-317".to_string(),
+        ];
+        let err = plan_check(&args).expect_err("a misspelled flag must not pass");
+        assert!(
+            err.contains("--workspce"),
+            "the refusal must name the offending flag, got: {err}"
+        );
+    }
+
+    /// A subcommand with no registered flags refuses everything.
+    ///
+    /// The failure mode this rules out is the one #317 shipped: a command that
+    /// accepts every flag it is handed. Failing closed makes the same omission
+    /// loudly broken instead of quietly permissive.
+    #[test]
+    fn an_unregistered_subcommand_accepts_nothing() {
+        assert!(flags_for("no-such-subcommand").is_none());
+        let args = vec!["--json".to_string()];
+        assert_eq!(
+            first_unknown_flag("no-such-subcommand", &args),
+            Some("--json"),
+            "an unregistered subcommand must reject flags, not wave them through"
+        );
+    }
+
     /// A workspace directory is positional *or* `--workspace`, and `--for-guest`
     /// must survive alongside either — the refusal fired before the handler,
     /// so neither form reached it.
@@ -1800,10 +2169,367 @@ mod tests {
             "/tmp/ws".to_string(),
             "--for-guest".to_string(),
         ];
-        assert!(reject_unknown("ca", &positional, CA_FLAGS).is_ok());
-        assert!(reject_unknown("ca", &flagged, CA_FLAGS).is_ok());
+        reject_unknown("ca", &positional).unwrap();
+        reject_unknown("ca", &flagged).unwrap();
         assert_eq!(workspace_arg(&positional), Some("/tmp/ws"));
         assert_eq!(workspace_arg(&flagged), Some("/tmp/ws"));
     }
 
+    /// A CA directory holding both halves, so a test can assert on inheritance
+    /// without minting a real key pair (`load_or_create` is slow and its output
+    /// is not what any of these assertions are about).
+    fn seed_ca(dir: &Path, key: &[u8], cert: &[u8]) {
+        let ca = ca_dir(dir);
+        fs::create_dir_all(&ca).unwrap();
+        fs::write(ca.join(CA_KEY_FILE), key).unwrap();
+        fs::write(ca.join(CA_CERT_FILE), cert).unwrap();
+    }
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "chm-ca-{tag}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        dir
+    }
+
+    #[test]
+    fn an_image_ca_is_inherited_by_a_workspace_made_from_it() {
+        // #315: the guest inside a workspace is the image's guest, so it already
+        // trusts the image's CA. Minting a fresh one hands that guest a
+        // certificate chain it will refuse, and the refusal names nothing.
+        let root = scratch("inherit");
+        let (image, ws) = (root.join("image"), root.join("ws"));
+        seed_ca(&image, b"image-key", b"image-cert");
+        fs::create_dir_all(&ws).unwrap();
+
+        assert!(
+            inherit_ca(&image, &ws).unwrap(),
+            "there was a CA to inherit"
+        );
+        assert_eq!(
+            fs::read(ca_dir(&ws).join(CA_CERT_FILE)).unwrap(),
+            b"image-cert"
+        );
+        assert_eq!(
+            fs::read(ca_dir(&ws).join(CA_KEY_FILE)).unwrap(),
+            b"image-key",
+            "the key travels too, or the proxy holds a cert it cannot sign with"
+        );
+
+        // Copied, not shared: a workspace must not be able to write through to
+        // the image every other workspace is sharing read-only.
+        assert!(
+            !fs::symlink_metadata(ca_dir(&ws).join(CA_CERT_FILE))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        fs::write(ca_dir(&ws).join(CA_CERT_FILE), b"diverged").unwrap();
+        assert_eq!(
+            fs::read(ca_dir(&image).join(CA_CERT_FILE)).unwrap(),
+            b"image-cert"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_image_with_no_ca_leaves_the_workspace_to_mint_its_own() {
+        // The ordinary case, and deliberately not an error: a guest that trusts
+        // nothing yet is not harmed by a new authority. The bug only bites when
+        // the image carries one the guest was provisioned against.
+        let root = scratch("nothing");
+        let (image, ws) = (root.join("image"), root.join("ws"));
+        fs::create_dir_all(&image).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+
+        assert!(!inherit_ca(&image, &ws).unwrap());
+        assert!(
+            !ca_dir(&ws).exists(),
+            "an empty CA directory would make `load_or_create` mint into a path \
+             that implies it inherited something"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn half_a_ca_is_not_inherited() {
+        // A cert without its key cannot sign a leaf. Copying it would replace a
+        // working mint-fresh path with a proxy that fails at the first
+        // interception -- later, and further from the cause.
+        let root = scratch("half");
+        let (image, ws) = (root.join("image"), root.join("ws"));
+        fs::create_dir_all(ca_dir(&image)).unwrap();
+        fs::write(ca_dir(&image).join(CA_CERT_FILE), b"orphan-cert").unwrap();
+        fs::create_dir_all(&ws).unwrap();
+
+        assert!(!inherit_ca(&image, &ws).unwrap());
+        assert!(!ca_dir(&ws).exists());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn an_inherited_ca_keeps_its_private_key_unreadable() {
+        // Tightened at copy time rather than at the next `load_or_create`: a
+        // workspace can sit between creation and its first run for any length of
+        // time, and a host-readable CA key impersonates every intercepted host.
+        let root = scratch("perms");
+        let (image, ws) = (root.join("image"), root.join("ws"));
+        seed_ca(&image, b"k", b"c");
+        fs::create_dir_all(&ws).unwrap();
+        inherit_ca(&image, &ws).unwrap();
+
+        let mode = |p: PathBuf| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(ca_dir(&ws)), 0o700);
+        assert_eq!(mode(ca_dir(&ws).join(CA_KEY_FILE)), 0o600);
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_workspace_presenting_a_different_ca_from_its_image_is_named() {
+        // For the workspaces that already exist. `inherit_ca` means a workspace
+        // created by this build always agrees; one created by an earlier build
+        // stays broken across the upgrade, and without this it stays broken
+        // *silently*, which is the whole of what #315 cost.
+        let root = scratch("mismatch");
+        let (image, ws) = (root.join("image"), root.join("ws"));
+        fs::create_dir_all(&image).unwrap();
+        fs::create_dir_all(&ws).unwrap();
+        fs::write(image.join("state.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink(image.join("state.json"), ws.join("state.json")).unwrap();
+        seed_ca(&image, b"image-key", b"image-cert");
+        seed_ca(&ws, b"ws-key", b"ws-cert");
+
+        let why = inherited_ca_mismatch(&ws).expect("the two CAs differ");
+        assert!(why.contains(&ca_dir(&ws).display().to_string()));
+        assert!(
+            why.contains(&ca_dir(&image).display().to_string()),
+            "naming only one side leaves the reader with nothing to compare"
+        );
+
+        // Agreement is silent -- which is what every workspace made by this
+        // build looks like.
+        fs::write(ca_dir(&ws).join(CA_CERT_FILE), b"image-cert").unwrap();
+        assert!(inherited_ca_mismatch(&ws).is_none());
+
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_directory_that_is_not_a_workspace_is_not_diagnosed() {
+        // No `state.json` symlink means no base image, so there is no second CA
+        // to disagree with. Reporting one here would be inventing a comparison.
+        let root = scratch("standalone");
+        seed_ca(&root, b"k", b"c");
+        assert!(base_image_dir(&root).is_none());
+        assert!(inherited_ca_mismatch(&root).is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn the_proxy_banner_is_followed_by_the_mismatch_diagnosis() {
+        // `start_resolved` binds a listener and needs a resolved rule set, so no
+        // unit test can call it — and deleting its call to `inherited_ca_mismatch`
+        // left all 877 tests green. An assertion about an outcome structurally
+        // cannot see a path that is no longer taken, so this reads the source.
+        //
+        // The needle is assembled from parts: a literal written out here would
+        // match this assertion's own text and could never detect its removal
+        // from the place that matters.
+        let src = include_str!("cli.rs");
+        let needle = format!("if let Some(why) = {}(workspace)", "inherited_ca_mismatch");
+        assert!(
+            src.contains(&needle),
+            "start_resolved must print the #315 mismatch right after the injection \
+             banner; the banner claims injection is active and names a CA, which is \
+             exactly the sentence #315 made true and useless"
+        );
+    }
+
+    /// #316: the hint has to describe a route that exists end to end.
+    ///
+    /// It used to say the installer was something to "paste into the guest
+    /// console". It is ~4 KB, and a console line is capped at
+    /// [`exec::MAX_SCRIPT`], so the one instruction we gave was the one thing
+    /// that could not work. Every command the hint names is checked against
+    /// imp.rs's dispatch table, because the failure mode here is not a missing
+    /// sentence — it is a confident sentence naming a command that is not
+    /// there, which is the shape #210 already cost us once.
+    #[test]
+    fn every_command_the_ca_hint_names_is_one_this_binary_dispatches() {
+        let dispatch = include_str!("../imp.rs");
+
+        // Needles assembled at runtime: a literal would be found in this test's
+        // own text by any later source-reading guard, and would satisfy it
+        // without the hint containing anything at all.
+        let named: Vec<String> = ["cp", "exec"].iter().map(|c| c.to_string()).collect();
+
+        for cmd in &named {
+            let invocation = format!("{} {cmd} ", "chm");
+            assert!(
+                CA_GUEST_HINT.contains(&invocation),
+                "the hint no longer shows `{invocation}`, so the route it \
+                 describes is incomplete: {CA_GUEST_HINT}"
+            );
+            let arm = format!("Some({cmd:?}) =>");
+            assert!(
+                dispatch.contains(&arm),
+                "the hint tells the reader to run `chm {cmd}`, which imp.rs \
+                 does not dispatch"
+            );
+        }
+    }
+
+    // ---- #318: seeding a client that gates on local auth -------------------
+
+    fn gh_seed() -> PlaceholderEnv {
+        RuleSet::parse(r#"{"rules":[{"name":"gh","hosts":["api.github.com"],"env":"T"}]}"#)
+            .expect("parses")
+            .placeholder_env()
+    }
+
+    fn seeded_script() -> String {
+        guest_install_script("-----BEGIN CERTIFICATE-----\nAA\n", "beefcafe", &gh_seed())
+    }
+
+    /// The heredoc must be *quoted*, so `${VAR:-…}` reaches the file as text and
+    /// expands when the file is sourced. An unquoted one would expand at install
+    /// time, in the installer's own shell, and bake whatever was set there --
+    /// which for the variable we are seeding is very often nothing, writing an
+    /// empty default that silently defeats the whole mechanism.
+    #[test]
+    fn the_installer_writes_the_placeholder_as_a_default_not_an_assignment() {
+        let script = seeded_script();
+        for var in ["GITHUB_TOKEN", "GH_TOKEN", "COPILOT_GITHUB_TOKEN"] {
+            let want = format!("export {var}=\"${{{var}:-");
+            assert!(
+                script.contains(&want),
+                "{var} is not seeded as a fill-if-unset default:\n{script}"
+            );
+        }
+    }
+
+    /// `/etc/profile.d` is read by login shells and is how an interactive agent
+    /// session picks this up. It is populated by copying the env file, so a seed
+    /// written after the copy reaches one reader and not the other -- and the
+    /// reader it misses is the one a human is looking at.
+    #[test]
+    fn the_seed_is_written_before_the_file_is_copied_to_profile_d() {
+        let script = seeded_script();
+        let seed = script.find("tee -a").expect("a seed append");
+        let copy = script
+            .find("/etc/profile.d/gimbal-proxy-ca.sh")
+            .expect("a copy to profile.d");
+        assert!(
+            seed < copy,
+            "seed at {seed} must precede the profile.d copy at {copy}:\n{script}"
+        );
+    }
+
+    /// Asked of a real shell, because the whole value of `:-` is a semantic this
+    /// repo would otherwise be asserting from memory. Three cases, because the
+    /// middle one is the one that would break a working guest.
+    #[test]
+    fn the_seeded_env_file_fills_only_what_is_unset() {
+        let script = seeded_script();
+        let body = script
+            .split_once("<<'GIMBAL_ENV_EOF'\n")
+            .and_then(|(_, r)| r.split_once("GIMBAL_ENV_EOF"))
+            .map(|(b, _)| b.to_string())
+            .expect("a quoted heredoc body");
+        // Keyed by thread as well as process (#243), and sanitised: the debug
+        // form of a ThreadId is `ThreadId(1)`, and those parentheses turned the
+        // path below into a shell syntax error rather than a missing file.
+        let tid: String = format!("{:?}", std::thread::current().id())
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .collect();
+        let dir = std::env::temp_dir().join(format!("chm-g318-{}-{tid}", std::process::id()));
+        fs::create_dir_all(&dir).expect("temp dir");
+        let env_file = dir.join("proxy-ca.env");
+        fs::write(&env_file, &body).expect("write env file");
+        // Taken from the derivation rather than the constant: what this test is
+        // for is the wiring between them, and the constant's own shape is
+        // guarded where it is defined.
+        let expected = gh_seed()
+            .vars
+            .into_iter()
+            .find(|(n, _)| n == "GH_TOKEN")
+            .map(|(_, v)| v)
+            .expect("GH_TOKEN is seeded");
+        let run = |preset: Option<&str>| -> String {
+            let mut c = std::process::Command::new("/bin/sh");
+            c.env_clear().arg("-c").arg(format!(
+                ". '{}'; printf %s \"$GH_TOKEN\"",
+                env_file.display()
+            ));
+            if let Some(v) = preset {
+                c.env("GH_TOKEN", v);
+            }
+            let out = c.output().expect("run sh");
+            String::from_utf8_lossy(&out.stdout).into_owned()
+        };
+        assert_eq!(
+            run(Some("A_REAL_TOKEN")),
+            "A_REAL_TOKEN",
+            "a value the operator set deliberately must survive"
+        );
+        assert_eq!(run(None), expected, "an unset variable must be filled");
+        assert_eq!(
+            run(Some("")),
+            expected,
+            "an empty value fails the client's gate exactly like an unset one"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The script is assembled by string formatting, so a broken heredoc is one
+    /// edit away and its symptom appears only inside a guest.
+    #[test]
+    fn the_generated_installer_is_valid_shell() {
+        for (label, script) in [
+            ("seeded", seeded_script()),
+            (
+                "unseeded",
+                guest_install_script(
+                    "-----BEGIN CERTIFICATE-----\nAA\n",
+                    "beefcafe",
+                    &PlaceholderEnv::default(),
+                ),
+            ),
+        ] {
+            let out = std::process::Command::new("/bin/sh")
+                .arg("-n")
+                .arg("-c")
+                .arg(&script)
+                .output()
+                .expect("run sh -n");
+            assert!(
+                out.status.success(),
+                "{label} installer is not valid shell: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
+    /// Silence would be indistinguishable from "the feature did not run".
+    #[test]
+    fn an_installer_with_no_gated_client_says_so_rather_than_saying_nothing() {
+        let script = guest_install_script(
+            "-----BEGIN CERTIFICATE-----\nAA\n",
+            "beefcafe",
+            &PlaceholderEnv::default(),
+        );
+        assert!(!script.contains("GITHUB_TOKEN"), "{script}");
+        assert!(
+            script.contains("placeholder:  none"),
+            "an unseeded installer must still report the placeholder line:\n{script}"
+        );
+    }
 }

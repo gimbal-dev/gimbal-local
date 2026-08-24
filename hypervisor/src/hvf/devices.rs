@@ -17,6 +17,7 @@
 
 use std::sync::{Arc, Mutex, RwLock};
 
+use crate::hvf::virtio::devmgr::SerialRegs;
 use crate::vm::{Result as VmOpsResult, VmOps};
 
 /// A single memory-mapped device occupying a contiguous IPA range.
@@ -178,8 +179,8 @@ const FR_DCD: u32 = 1 << 2; // data carrier detect
 const FR_MODEM_PRESENT: u32 = FR_CTS | FR_DSR | FR_DCD;
 
 // Interrupt bits, shared by UARTRIS / UARTMIS / UARTIMSC / UARTICR.
-const INT_RX: u32 = 1 << 4; // receive interrupt (RXRIS/RXMIS/RXIM)
-const INT_RT: u32 = 1 << 6; // receive-timeout interrupt (RTRIS/RTMIS/RTIM)
+pub(crate) const INT_RX: u32 = 1 << 4; // receive interrupt (RXRIS/RXMIS/RXIM)
+pub(crate) const INT_RT: u32 = 1 << 6; // receive-timeout interrupt (RTRIS/RTMIS/RTIM)
 
 /// Depth of the receive FIFO. The PL011 FIFO is 16 entries deep; host input
 /// beyond that backs up in [`Pl011State::read_fifo`] and is fed in as the guest
@@ -256,6 +257,31 @@ impl Pl011 {
         st.ibrd = ibrd;
         st.fbrd = fbrd;
         st.ifls = ifls;
+    }
+
+    /// Read back the line/interrupt configuration the guest has programmed, in
+    /// the shape a capture records it.
+    ///
+    /// This is the inverse of [`Self::restore`] and exists for the same reason
+    /// it does: a guest programs UARTIMSC once when it opens the tty and never
+    /// re-issues it, so a capture that omits these registers describes a
+    /// machine whose console is deaf. Originating a snapshot from a live cold
+    /// boot is the only path that has to *write* them, and it reads them from
+    /// the model the guest actually programmed rather than restating defaults.
+    ///
+    /// Returning [`SerialRegs`] -- the type the restore path parses into --
+    /// rather than a tuple is deliberate: the writer and the reader then name
+    /// the same fields, so they cannot drift apart field by field.
+    pub fn capture(&self) -> SerialRegs {
+        let st = self.state.lock().unwrap();
+        SerialRegs {
+            imsc: st.imsc,
+            cr: st.cr,
+            lcr_h: st.lcr_h,
+            ibrd: st.ibrd,
+            fbrd: st.fbrd,
+            ifls: st.ifls,
+        }
     }
 
     /// Enqueue host input for the guest to receive. Returns `true` when the
