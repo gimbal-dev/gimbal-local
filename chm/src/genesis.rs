@@ -82,12 +82,6 @@
 //! [`crate::vanilla_export`] set: the reader of an artefact should not have to
 //! discover its boundary by resuming it.
 
-// Nothing outside this module's own tests calls it yet, by design: it is the
-// foundation layer of #341 and the cold-boot path that will call it is separate
-// work in the same issue. Scoped to this module so it cannot hide dead code
-// anywhere else, and it goes away with the first caller.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 
 use hypervisor::hvf::VcpuHvfState;
@@ -95,9 +89,46 @@ use hypervisor::hvf::checkpoint::CheckpointState;
 use hypervisor::hvf::rehydrate::{MemMapping, Snapshot};
 use hypervisor::hvf::translate::{self, gic_ingest, kvm_ingest, lower_to_kvm};
 use hypervisor::hvf::virtio::devmgr::SerialRegs;
+use hypervisor::hvf::virtio::mmio::MmioTransportState;
 use serde_json::{Map, Value, json};
 
 use crate::vanilla::{CORE_REGS_LEN, VanillaState};
+
+/// The prefix every emitted virtio device node carries.
+///
+/// Deliberately *not* `_virtio-pci-`, which is what a real cloud-hypervisor
+/// capture uses and what [`hypervisor::hvf::virtio::devmgr::parse_devices`]
+/// matches on. A cold-booted guest discovered its devices over `virtio-mmio`
+/// and its drivers are bound to MMIO windows, so a snapshot of it describes an
+/// MMIO machine. Emitting the PCI prefix would hand the PCI parser a node whose
+/// transport it would then get wrong -- and it would get it wrong *quietly*,
+/// because the two transports share `DeviceCore` and the resulting device would
+/// look entirely well-formed. A distinct prefix makes that misreading
+/// impossible rather than unlikely.
+pub(crate) const VIRTIO_MMIO_NODE_PREFIX: &str = "_virtio-mmio-";
+
+/// One cold-booted virtio device, as the emitted document will describe it.
+///
+/// The transport state comes off the live device; `base`, `size` and `intid`
+/// come off the placement the image reserved. Both are passed in rather than
+/// recomputed from `coldboot`'s constants for the reason the module header
+/// gives about guest RAM: a second derivation of a value the machine already
+/// decided is a second chance to disagree with it, and a device node that
+/// names a window the guest's driver is not bound to resumes without complaint.
+pub(crate) struct VirtioNode {
+    /// What the driver negotiated and programmed, read off the live transport.
+    pub transport: MmioTransportState,
+    /// The MMIO window the device answers on.
+    pub base: u64,
+    pub size: u64,
+    /// The SPI the device raises.
+    pub intid: u32,
+    /// The backing file, for a block device. `None` for anything else.
+    ///
+    /// A restore has to reopen the disk, and nothing in the transport state
+    /// says which file it was: `blk_config` carries the capacity, not the path.
+    pub backing: Option<String>,
+}
 
 /// A synthesized capture description, plus everything a caller needs to say
 /// honestly what it holds.
@@ -143,6 +174,11 @@ pub(crate) struct Genesis {
 /// receives a keystroke, because its driver unmasked the receive interrupt
 /// before the capture and does not do so again.
 ///
+/// `virtio` is one entry per device the cold guest was built with, each pairing
+/// the window the image reserved with the state its driver programmed. An empty
+/// slice describes a guest with no virtio devices, which is a real machine and
+/// not an omission -- so it is not a warning.
+///
 /// Every refusal below is a case where writing the document anyway would produce
 /// an artefact that reads back as a machine nobody asked for.
 pub(crate) fn synthesize(
@@ -151,6 +187,7 @@ pub(crate) fn synthesize(
     cntfrq: u64,
     serial: SerialRegs,
     serial_intid: u32,
+    virtio: &[VirtioNode],
 ) -> Result<Genesis, String> {
     if ram.is_empty() {
         return Err(
@@ -259,57 +296,88 @@ pub(crate) fn synthesize(
         cpu_nodes.insert(id.to_string(), node);
     }
 
+    // --- virtio devices -----------------------------------------------------
+    // Assembled before the document because their ids are data, and `json!`
+    // takes literal keys.
+    let mut device_snapshots = Map::new();
+    let mut device_tree = Map::new();
+
+    device_snapshots.insert(
+        "gic-v3-its".to_string(),
+        leaf(&json!({
+            "Kvm": {
+                "dist": gic.dist,
+                "rdist": gic.rdist,
+                "icc": gic.icc,
+            }
+        }))?,
+    );
+    // The field names are cloud-hypervisor's, not ours, and three of the six
+    // differ from the register they hold (`int_enabled`, `lcr`, `ifl`). They are
+    // written here and read by `devmgr::parse_serial_state`; the round-trip test
+    // is what holds the two together, since a rename on one side alone produces
+    // a node that parses into silent defaults rather than an error.
+    device_snapshots.insert(
+        "__serial".to_string(),
+        leaf(&json!({
+            "int_enabled": serial.imsc,
+            "cr": serial.cr,
+            "lcr": serial.lcr_h,
+            "ibrd": serial.ibrd,
+            "fbrd": serial.fbrd,
+            "ifl": serial.ifls,
+        }))?,
+    );
+
+    // cloud-hypervisor rebuilds its device manager from a configuration on
+    // restore and so re-derives the console's interrupt line rather than reading
+    // it back; a capture from it leaves `__serial.resources` empty. There is no
+    // configuration to rebuild from for a guest whose device tree we wrote, so
+    // the line is recorded here, in upstream's own `Resource::LegacyIrq` shape.
+    // Without it a restoring VMM has to guess, and a guess that is wrong
+    // delivers every keystroke to an interrupt no device owns: the guest runs
+    // perfectly and the console is deaf.
+    device_tree.insert(
+        "__serial".to_string(),
+        json!({
+            "id": "__serial",
+            "resources": [{ "LegacyIrq": serial_intid }],
+            "children": [],
+        }),
+    );
+    device_tree.insert(
+        "gic-v3-its".to_string(),
+        json!({
+            "id": "gic-v3-its",
+            "resources": [],
+            "children": [],
+        }),
+    );
+
+    for n in virtio {
+        let (id, snap, node) = synthesize_virtio(n)?;
+        // Two devices under one id would collapse into one node, and the
+        // survivor would be whichever was written last -- a guest that resumes
+        // having quietly lost a disk.
+        if device_tree.contains_key(&id) {
+            return Err(format!(
+                "two virtio devices are both named {:?}, so the capture could \
+                 only describe one of them.",
+                n.transport.name
+            ));
+        }
+        device_snapshots.insert(id.clone(), snap);
+        device_tree.insert(id, node);
+    }
+
     let doc = json!({
         "snapshots": {
             "memory-manager": leaf(&json!({ "guest_ram_mappings": mappings }))?,
             "device-manager": {
-                "snapshots": {
-                    "gic-v3-its": leaf(&json!({
-                        "Kvm": {
-                            "dist": gic.dist,
-                            "rdist": gic.rdist,
-                            "icc": gic.icc,
-                        }
-                    }))?,
-                    // The field names are cloud-hypervisor's, not ours, and
-                    // three of the six differ from the register they hold
-                    // (`int_enabled`, `lcr`, `ifl`). They are written here
-                    // and read by `devmgr::parse_serial_state`; the
-                    // round-trip test is what holds the two together, since
-                    // a rename on one side alone produces a node that
-                    // parses into silent defaults rather than an error.
-                    "__serial": leaf(&json!({
-                        "int_enabled": serial.imsc,
-                        "cr": serial.cr,
-                        "lcr": serial.lcr_h,
-                        "ibrd": serial.ibrd,
-                        "fbrd": serial.fbrd,
-                        "ifl": serial.ifls,
-                    }))?,
-                },
-                // cloud-hypervisor rebuilds its device manager from a
-                // configuration on restore and so re-derives the console's
-                // interrupt line rather than reading it back; a capture from it
-                // leaves `__serial.resources` empty. There is no configuration
-                // to rebuild from for a guest whose device tree we wrote, so the
-                // line is recorded here, in upstream's own `Resource::LegacyIrq`
-                // shape. Without it a restoring VMM has to guess, and a guess
-                // that is wrong delivers every keystroke to an interrupt no
-                // device owns: the guest runs perfectly and the console is deaf.
+                "snapshots": Value::Object(device_snapshots),
                 "snapshot_data": {
                     "state": embed(&json!({
-                        "device_tree": {
-                            "__serial": {
-                                "id": "__serial",
-                                "resources": [{ "LegacyIrq": serial_intid }],
-                                "children": [],
-                            },
-                            "gic-v3-its": {
-                                "id": "gic-v3-its",
-                                "resources": [],
-                                "children": [],
-                            },
-                        },
+                        "device_tree": Value::Object(device_tree),
                         "device_id_cnt": 0,
                     }))?,
                 },
@@ -398,14 +466,27 @@ pub(crate) fn synthesize(
             serial.imsc
         ));
     }
-    warnings.push(
-        "this describes only the machine chm builds: guest RAM, the GIC, the \
-         vCPUs and the serial port. Stock cloud-hypervisor also reads a node \
-         per virtio device, the ITS tables and the rest of the memory-manager's \
-         state, none of which this build models -- so the capture is restorable \
-         by chm and not yet by the cloud."
-            .to_string(),
-    );
+    if virtio.is_empty() {
+        warnings.push(
+            "this describes only the machine chm builds: guest RAM, the GIC, \
+             the vCPUs and the serial port. Stock cloud-hypervisor also reads \
+             the ITS tables and the rest of the memory-manager's state, neither \
+             of which this build models -- so the capture is restorable by chm \
+             and not yet by the cloud."
+                .to_string(),
+        );
+    } else {
+        warnings.push(format!(
+            "{} virtio device(s) are recorded as `{VIRTIO_MMIO_NODE_PREFIX}*` \
+             nodes, because this guest discovered them over virtio-mmio and its \
+             drivers are bound to those windows. Stock cloud-hypervisor reads \
+             `_virtio-pci-*` and would find no devices here rather than the \
+             wrong ones -- so the capture is restorable by chm and not yet by \
+             the cloud. It also reads the ITS tables and the rest of the \
+             memory-manager's state, neither of which this build models.",
+            virtio.len()
+        ));
+    }
 
     Ok(Genesis {
         bytes,
@@ -413,6 +494,127 @@ pub(crate) fn synthesize(
         vcpu_summaries,
         num_irq: gic.num_irq,
     })
+}
+
+/// Count the virtio devices an emitted document actually describes, by reading
+/// it back the way a restoring VMM would.
+///
+/// This exists because every other check in this module compares the writer
+/// against the writer's own inputs, and a call site that stops handing devices
+/// over changes both sides at once: `synthesize` is asked for a machine with no
+/// devices, produces a correct document for that machine, and every assertion
+/// about it passes. The mistake is not in the rendering, so nothing that reads
+/// the rendering can see it -- the seven call-site misses already recorded in
+/// this repository are all this shape.
+///
+/// So the count comes from the artifact and the caller compares it against the
+/// machine it just stopped. Two independent sources, one of which is the file
+/// that will be shipped.
+pub(crate) fn virtio_nodes_in(bytes: &[u8]) -> Result<usize, String> {
+    let doc: Value = serde_json::from_slice(bytes)
+        .map_err(|e| format!("the document just written does not parse: {e}"))?;
+    // Through the embedded string, because that is where a reader finds the
+    // tree; counting the `snapshots` keys instead would count state blobs, and
+    // a device is only restorable when it has both.
+    let embedded = doc
+        .get("snapshots")
+        .and_then(|s| s.get("device-manager"))
+        .and_then(|d| d.get("snapshot_data"))
+        .and_then(|d| d.get("state"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            "the document just written has no device-manager state to read the \
+             device tree out of."
+                .to_string()
+        })?;
+    let tree: Value = serde_json::from_str(embedded)
+        .map_err(|e| format!("the embedded device tree does not parse: {e}"))?;
+    let nodes = tree
+        .get("device_tree")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "the document just written has no device tree.".to_string())?;
+    Ok(nodes
+        .keys()
+        .filter(|k| k.starts_with(VIRTIO_MMIO_NODE_PREFIX))
+        .count())
+}
+
+/// Render one virtio device into the pair of entries a device-manager snapshot
+/// holds for it: the state blob, and the tree node naming its resources.
+///
+/// Returns `(id, snapshot_entry, tree_node)`.
+///
+/// The two halves are produced together, by one function, because they are two
+/// statements about one device: a tree node whose id no state blob answers to
+/// describes a device with no state, and a state blob with no node is state
+/// belonging to a device the tree says does not exist. Neither is detectable by
+/// reading only one of them.
+fn synthesize_virtio(n: &VirtioNode) -> Result<(String, Value, Value), String> {
+    if n.transport.name.is_empty() {
+        return Err("a virtio device with no name cannot be recorded: its node \
+                    would have no id for its state to be found under."
+            .to_string());
+    }
+    if n.size == 0 {
+        return Err(format!(
+            "virtio device {:?} is placed at {:#x} with a zero-length window, \
+             so nothing restored from this capture could reach it.",
+            n.transport.name, n.base
+        ));
+    }
+    let id = format!("{VIRTIO_MMIO_NODE_PREFIX}{}", n.transport.name);
+
+    // The queue is written out as the driver programmed it, not as
+    // `DeviceCore` derived it. `publish_queue` builds each live `Queue` from
+    // exactly these fields plus `driver_features`, so recording both would be
+    // two descriptions of one thing with no tiebreak; a restore replays the
+    // derivation instead. The ring *indices* are absent for a different reason:
+    // they live in guest RAM, which this capture dumps, and `Queue::restore`
+    // reads them back from there.
+    let queues: Vec<Value> = n
+        .transport
+        .queues
+        .iter()
+        .map(|q| {
+            json!({
+                "size": q.size,
+                "ready": q.ready,
+                "desc_table": q.desc,
+                "avail_ring": q.driver,
+                "used_ring": q.device,
+            })
+        })
+        .collect();
+
+    let state = json!({
+        "device_id": n.transport.device_id,
+        "device_features": n.transport.device_features,
+        "driver_features": n.transport.driver_features,
+        "device_features_sel": n.transport.device_features_sel,
+        "driver_features_sel": n.transport.driver_features_sel,
+        "queue_sel": n.transport.queue_sel,
+        "interrupt_status": n.transport.interrupt_status,
+        "device_status": n.transport.device_status,
+        "config_generation": n.transport.config_generation,
+        "queues": queues,
+        "device_config": n.transport.device_config,
+        "backing": n.backing,
+    });
+
+    // Both resources, in upstream's own `Resource` shapes. The window is what a
+    // restoring VMM must place the device at -- the guest's driver is bound to
+    // this address and will not rediscover it -- and the SPI is what it must
+    // raise, for the reason the console's line is recorded above.
+    let node = json!({
+        "id": id,
+        "resources": [
+            { "MmioAddressRange": { "base": n.base, "size": n.size } },
+            { "LegacyIrq": n.intid },
+        ],
+        "children": [],
+    });
+
+    Ok((id.clone(), leaf(&state)?, node))
 }
 
 /// The three KVM GIC register dumps, assembled for every vCPU.
@@ -665,6 +867,7 @@ mod tests {
     use hypervisor::hvf::{VcpuFpState, VcpuHvfState, rehydrate};
 
     use super::*;
+    use hypervisor::hvf::virtio::mmio::MmioQueueState;
 
     // Encodings named once here. They are not asserted against `hvf::ffi` from
     // this crate because that module is private to the hypervisor crate; they
@@ -787,6 +990,56 @@ mod tests {
     /// guessed, which is the exact failure this field exists to end.
     const SERIAL_LINE: u32 = 37;
 
+    /// A guest with no virtio devices at all, for the tests that are about
+    /// something else.
+    const NO_VIRTIO: &[VirtioNode] = &[];
+
+    /// The window a cold `chm` guest's first virtio device sits in, as a
+    /// fixture. Deliberately not `coldboot::VIRTIO_MMIO_BASE`, for the reason
+    /// [`SERIAL_LINE`] is not `PL011_IRQ`: a test that passed production's own
+    /// constant would go green against a writer that dropped the value and a
+    /// reader that assumed it.
+    const DEV_BASE: u64 = 0x1234_0000;
+    const DEV_SIZE: u64 = 0x400;
+    const DEV_INTID: u32 = 41;
+
+    /// A block device as a driver leaves it once the kernel has mounted the
+    /// root filesystem: features negotiated and acked, one queue programmed and
+    /// ready, `DRIVER_OK` set.
+    ///
+    /// Every scalar is distinct on purpose, and the three ring addresses are
+    /// deliberately not in ascending order of the fields that hold them --
+    /// `desc` < `driver` < `device` is the natural layout, so a fixture that
+    /// used it would let a transposed pair round-trip perfectly.
+    fn a_block_device() -> VirtioNode {
+        VirtioNode {
+            transport: MmioTransportState {
+                name: "blk0".to_string(),
+                device_id: 2,
+                device_features: 0x1_3000_0044,
+                driver_features: 0x1_1000_0004,
+                device_features_sel: 1,
+                driver_features_sel: 0,
+                queue_sel: 0,
+                interrupt_status: 1,
+                device_status: 0xf,
+                config_generation: 3,
+                queues: vec![MmioQueueState {
+                    size: 128,
+                    desc: 0x4100_0000,
+                    driver: 0x4300_0000,
+                    device: 0x4200_0000,
+                    ready: true,
+                }],
+                device_config: vec![0xde, 0xad, 0xbe, 0xef],
+            },
+            base: DEV_BASE,
+            size: DEV_SIZE,
+            intid: DEV_INTID,
+            backing: Some("/tmp/rootfs.img".to_string()),
+        }
+    }
+
     /// A PL011 as a Linux guest leaves it once a getty has opened `ttyAMA0`:
     /// RXIM|RTIM unmasked, port enabled, 8n1 with FIFOs.
     ///
@@ -806,8 +1059,15 @@ mod tests {
     }
 
     fn synthesized(n: usize) -> Genesis {
-        synthesize(&a_checkpoint(n), RAM, 24_000_000, a_serial(), SERIAL_LINE)
-            .expect("a cold machine synthesizes")
+        synthesize(
+            &a_checkpoint(n),
+            RAM,
+            24_000_000,
+            a_serial(),
+            SERIAL_LINE,
+            NO_VIRTIO,
+        )
+        .expect("a cold machine synthesizes")
     }
 
     fn parsed(g: &Genesis) -> Snapshot {
@@ -822,7 +1082,8 @@ mod tests {
     #[test]
     fn a_synthesized_capture_reads_back_as_the_machine_it_describes() {
         let ckpt = a_checkpoint(2);
-        let g = synthesize(&ckpt, RAM, 24_000_000, a_serial(), SERIAL_LINE).expect("synthesizes");
+        let g = synthesize(&ckpt, RAM, 24_000_000, a_serial(), SERIAL_LINE, NO_VIRTIO)
+            .expect("synthesizes");
         let snap = parsed(&g);
 
         // --- memory ---------------------------------------------------------
@@ -922,8 +1183,15 @@ mod tests {
             size: 0x8000_0000,
             file_offset: 0,
         }];
-        let g = synthesize(&a_checkpoint(1), &cold, 24_000_000, a_serial(), SERIAL_LINE)
-            .expect("synthesizes");
+        let g = synthesize(
+            &a_checkpoint(1),
+            &cold,
+            24_000_000,
+            a_serial(),
+            SERIAL_LINE,
+            NO_VIRTIO,
+        )
+        .expect("synthesizes");
         let snap = parsed(&g);
         assert_eq!(snap.num_vcpus(), 1);
         assert_eq!(snap.mem_mappings, cold);
@@ -964,13 +1232,13 @@ mod tests {
         let ckpt = a_checkpoint(1);
 
         let e = refused(
-            synthesize(&ckpt, &[], 24_000_000, a_serial(), SERIAL_LINE),
+            synthesize(&ckpt, &[], 24_000_000, a_serial(), SERIAL_LINE, NO_VIRTIO),
             "no RAM",
         );
         assert!(e.contains("no guest RAM"), "{e}");
 
         let e = refused(
-            synthesize(&ckpt, RAM, 0, a_serial(), SERIAL_LINE),
+            synthesize(&ckpt, RAM, 0, a_serial(), SERIAL_LINE, NO_VIRTIO),
             "no counter frequency",
         );
         assert!(e.contains("counter frequency"), "{e}");
@@ -978,7 +1246,14 @@ mod tests {
         let mut no_vcpus = ckpt.clone();
         no_vcpus.vcpus.clear();
         let e = refused(
-            synthesize(&no_vcpus, RAM, 24_000_000, a_serial(), SERIAL_LINE),
+            synthesize(
+                &no_vcpus,
+                RAM,
+                24_000_000,
+                a_serial(),
+                SERIAL_LINE,
+                NO_VIRTIO,
+            ),
             "no vCPUs",
         );
         assert!(e.contains("no vCPUs"), "{e}");
@@ -986,7 +1261,14 @@ mod tests {
         let mut no_time = ckpt.clone();
         no_time.host_realtime_ns = None;
         let e = refused(
-            synthesize(&no_time, RAM, 24_000_000, a_serial(), SERIAL_LINE),
+            synthesize(
+                &no_time,
+                RAM,
+                24_000_000,
+                a_serial(),
+                SERIAL_LINE,
+                NO_VIRTIO,
+            ),
             "no capture time",
         );
         assert!(e.contains("when it was taken"), "{e}");
@@ -997,7 +1279,14 @@ mod tests {
             .sysregs
             .retain(|(enc, _)| *enc != SYSREG_CNTVCT_EL0);
         let e = refused(
-            synthesize(&no_counter, RAM, 24_000_000, a_serial(), SERIAL_LINE),
+            synthesize(
+                &no_counter,
+                RAM,
+                24_000_000,
+                a_serial(),
+                SERIAL_LINE,
+                NO_VIRTIO,
+            ),
             "no CNTVCT",
         );
         assert!(e.contains("CNTVCT_EL0"), "{e}");
@@ -1005,7 +1294,14 @@ mod tests {
         let mut managed = ckpt.clone();
         managed.usgic_cpus.clear();
         let e = refused(
-            synthesize(&managed, RAM, 24_000_000, a_serial(), SERIAL_LINE),
+            synthesize(
+                &managed,
+                RAM,
+                24_000_000,
+                a_serial(),
+                SERIAL_LINE,
+                NO_VIRTIO,
+            ),
             "not a cold machine",
         );
         assert!(e.contains("software-GIC state for vCPU 0"), "{e}");
@@ -1013,7 +1309,7 @@ mod tests {
         let mut no_icc = ckpt.clone();
         no_icc.vcpus[0].state.gic_icc.clear();
         let e = refused(
-            synthesize(&no_icc, RAM, 24_000_000, a_serial(), SERIAL_LINE),
+            synthesize(&no_icc, RAM, 24_000_000, a_serial(), SERIAL_LINE, NO_VIRTIO),
             "no ICC_CTLR_EL1",
         );
         assert!(e.contains("ICC_CTLR_EL1"), "{e}");
@@ -1021,7 +1317,7 @@ mod tests {
         let mut widths = a_checkpoint(2);
         widths.usgic_cpus[1].dist = Distributor::new(64);
         let e = refused(
-            synthesize(&widths, RAM, 24_000_000, a_serial(), SERIAL_LINE),
+            synthesize(&widths, RAM, 24_000_000, a_serial(), SERIAL_LINE, NO_VIRTIO),
             "two distributors",
         );
         assert!(e.contains("does not describe one machine"), "{e}");
@@ -1029,7 +1325,14 @@ mod tests {
         let mut declared = a_checkpoint(1);
         declared.num_irq = 128;
         let e = refused(
-            synthesize(&declared, RAM, 24_000_000, a_serial(), SERIAL_LINE),
+            synthesize(
+                &declared,
+                RAM,
+                24_000_000,
+                a_serial(),
+                SERIAL_LINE,
+                NO_VIRTIO,
+            ),
             "width disagreement",
         );
         assert!(e.contains("128 interrupt lines"), "{e}");
@@ -1043,7 +1346,8 @@ mod tests {
         let mut ckpt = a_checkpoint(1);
         ckpt.usgic_cpus[0].pending = vec![33];
         ckpt.usgic_cpus[0].active_stack = vec![27];
-        let g = synthesize(&ckpt, RAM, 24_000_000, a_serial(), SERIAL_LINE).expect("synthesizes");
+        let g = synthesize(&ckpt, RAM, 24_000_000, a_serial(), SERIAL_LINE, NO_VIRTIO)
+            .expect("synthesizes");
         let all = g.warnings.join("\n");
         for needle in [
             "GICR_IPRIORITYR0..7",
@@ -1058,8 +1362,15 @@ mod tests {
         }
         // A quiescent machine has nothing in flight, so that warning must not
         // fire -- otherwise it is decoration rather than a report.
-        let quiet = synthesize(&a_checkpoint(1), RAM, 24_000_000, a_serial(), SERIAL_LINE)
-            .expect("synthesizes");
+        let quiet = synthesize(
+            &a_checkpoint(1),
+            RAM,
+            24_000_000,
+            a_serial(),
+            SERIAL_LINE,
+            NO_VIRTIO,
+        )
+        .expect("synthesizes");
         assert!(
             !quiet.warnings.join("\n").contains("active-priority stack"),
             "an idle machine reported in-flight interrupts it does not have"
@@ -1098,8 +1409,15 @@ mod tests {
                 file_offset: 0x8000_0000,
             },
         ];
-        let g = synthesize(&a_checkpoint(1), &want, 24_000_000, a_serial(), SERIAL_LINE)
-            .expect("synthesizes");
+        let g = synthesize(
+            &a_checkpoint(1),
+            &want,
+            24_000_000,
+            a_serial(),
+            SERIAL_LINE,
+            NO_VIRTIO,
+        )
+        .expect("synthesizes");
         assert_eq!(parsed(&g).mem_mappings, want);
     }
 
@@ -1118,7 +1436,14 @@ mod tests {
 
         let empty = vec![one(0, 0x4000_0000, 0, 0)];
         let e = refused(
-            synthesize(&ckpt, &empty, 24_000_000, a_serial(), SERIAL_LINE),
+            synthesize(
+                &ckpt,
+                &empty,
+                24_000_000,
+                a_serial(),
+                SERIAL_LINE,
+                NO_VIRTIO,
+            ),
             "a zero-byte region",
         );
         assert!(e.contains("zero bytes"), "{e}");
@@ -1128,7 +1453,14 @@ mod tests {
             one(1, 0x5000_0000, 0x1000_0000, 0x2000_0000),
         ];
         let e = refused(
-            synthesize(&ckpt, &overlap_gpa, 24_000_000, a_serial(), SERIAL_LINE),
+            synthesize(
+                &ckpt,
+                &overlap_gpa,
+                24_000_000,
+                a_serial(),
+                SERIAL_LINE,
+                NO_VIRTIO,
+            ),
             "regions overlapping in guest-physical space",
         );
         assert!(e.contains("overlap in guest-physical space"), "{e}");
@@ -1138,21 +1470,42 @@ mod tests {
             one(1, 0x1_0000_0000, 0x1000_0000, 0x1fff_f000),
         ];
         let e = refused(
-            synthesize(&ckpt, &overlap_file, 24_000_000, a_serial(), SERIAL_LINE),
+            synthesize(
+                &ckpt,
+                &overlap_file,
+                24_000_000,
+                a_serial(),
+                SERIAL_LINE,
+                NO_VIRTIO,
+            ),
             "regions overlapping in the dump file",
         );
         assert!(e.contains("overlap in memory-ranges"), "{e}");
 
         let past_gpa_end = vec![one(0, u64::MAX - 0xfff, 0x2000, 0)];
         let e = refused(
-            synthesize(&ckpt, &past_gpa_end, 24_000_000, a_serial(), SERIAL_LINE),
+            synthesize(
+                &ckpt,
+                &past_gpa_end,
+                24_000_000,
+                a_serial(),
+                SERIAL_LINE,
+                NO_VIRTIO,
+            ),
             "a region past the end of guest-physical space",
         );
         assert!(e.contains("guest-physical address space"), "{e}");
 
         let past_file_end = vec![one(0, 0x4000_0000, 0x2000, u64::MAX - 0xfff)];
         let e = refused(
-            synthesize(&ckpt, &past_file_end, 24_000_000, a_serial(), SERIAL_LINE),
+            synthesize(
+                &ckpt,
+                &past_file_end,
+                24_000_000,
+                a_serial(),
+                SERIAL_LINE,
+                NO_VIRTIO,
+            ),
             "a region past the end of the dump file",
         );
         assert!(e.contains("memory-ranges file"), "{e}");
@@ -1196,9 +1549,16 @@ mod tests {
             v.state.sysregs.reverse();
         }
         assert_eq!(
-            synthesize(&reordered, RAM, 24_000_000, a_serial(), SERIAL_LINE)
-                .expect("synthesizes")
-                .bytes,
+            synthesize(
+                &reordered,
+                RAM,
+                24_000_000,
+                a_serial(),
+                SERIAL_LINE,
+                NO_VIRTIO
+            )
+            .expect("synthesizes")
+            .bytes,
             synthesized(2).bytes,
             "the capture order of the system registers must not reach the bytes"
         );
@@ -1274,8 +1634,15 @@ mod tests {
             imsc: 0,
             ..a_serial()
         };
-        let g =
-            synthesize(&a_checkpoint(1), RAM, 24_000_000, deaf, SERIAL_LINE).expect("synthesizes");
+        let g = synthesize(
+            &a_checkpoint(1),
+            RAM,
+            24_000_000,
+            deaf,
+            SERIAL_LINE,
+            NO_VIRTIO,
+        )
+        .expect("synthesizes");
         assert!(
             g.warnings.iter().any(|w| w.contains("receive interrupt")),
             "a capture with the receive interrupt masked must say so: {:?}",
@@ -1310,6 +1677,362 @@ mod tests {
         assert!(
             !note.contains("node per device (serial"),
             "the note must not still list the serial port as absent: {note}"
+        );
+    }
+
+    /// The device the guest is bound to must come back at the address it is
+    /// bound to, on the interrupt it is bound to, with the queue it programmed.
+    ///
+    /// This is the property the whole node exists for. A cold-booted guest
+    /// discovered its virtio devices over MMIO at boot and its drivers hold
+    /// those windows in RAM that this capture dumps faithfully -- so a restore
+    /// that placed a device anywhere else would resume a kernel talking to an
+    /// address with nothing behind it, having been told nothing was wrong.
+    #[test]
+    fn a_disk_the_guest_is_using_is_recorded_where_the_guest_is_using_it() {
+        let g = synthesize(
+            &a_checkpoint(1),
+            RAM,
+            24_000_000,
+            a_serial(),
+            SERIAL_LINE,
+            &[a_block_device()],
+        )
+        .expect("a guest with a disk synthesizes");
+        let doc: Value = serde_json::from_slice(&g.bytes).expect("json");
+
+        let dm = &doc["snapshots"]["device-manager"];
+        let tree: Value = serde_json::from_str(
+            dm["snapshot_data"]["state"]
+                .as_str()
+                .expect("device-manager state is an embedded string"),
+        )
+        .expect("the embedded device tree parses");
+        let node = &tree["device_tree"]["_virtio-mmio-blk0"];
+
+        assert_eq!(
+            node["resources"][0]["MmioAddressRange"]["base"],
+            json!(DEV_BASE),
+            "the window must be the one the device was placed at: {node}"
+        );
+        assert_eq!(
+            node["resources"][0]["MmioAddressRange"]["size"],
+            json!(DEV_SIZE),
+            "a window of the wrong length puts part of the device out of \
+             reach: {node}"
+        );
+        assert_eq!(
+            node["resources"][1]["LegacyIrq"],
+            json!(DEV_INTID),
+            "the SPI must be the one the device raises, or completions land on \
+             an interrupt no driver is waiting on: {node}"
+        );
+
+        let st = &dm["snapshots"]["_virtio-mmio-blk0"];
+        let state: Value =
+            serde_json::from_str(st["snapshot_data"]["state"].as_str().expect("state string"))
+                .expect("the device state parses");
+        let q = &state["queues"][0];
+        assert_eq!(q["size"], json!(128));
+        assert_eq!(q["ready"], json!(true));
+        assert_eq!(
+            (
+                q["desc_table"].clone(),
+                q["avail_ring"].clone(),
+                q["used_ring"].clone(),
+            ),
+            (
+                json!(0x4100_0000u64),
+                json!(0x4300_0000u64),
+                json!(0x4200_0000u64)
+            ),
+            "each ring must be recorded under its own name: a transposed pair \
+             restores a device reading the driver's writes out of the ring it \
+             writes its own completions into: {q}"
+        );
+        assert_eq!(
+            state["driver_features"],
+            json!(0x1_1000_0004u64),
+            "the acked features are what `publish_queue` re-derives every live \
+             queue from, so recording the offered set in their place would \
+             rebuild every queue wrong"
+        );
+        assert_eq!(
+            state["device_status"],
+            json!(0xf),
+            "a device restored below DRIVER_OK is a device the guest believes \
+             it has finished bringing up"
+        );
+        assert_eq!(
+            state["backing"],
+            json!("/tmp/rootfs.img"),
+            "the node has to say which file the disk is, or a restore has \
+             nothing to open"
+        );
+    }
+
+    /// The prefix is load-bearing, not cosmetic.
+    ///
+    /// `devmgr::parse_devices` matches `_virtio-pci-*`, and this document
+    /// describes devices the guest found over MMIO. Emitting the PCI prefix
+    /// would hand the PCI parser a transport it does not describe, and it
+    /// would accept it: same `DeviceCore`, different bus, every device moved
+    /// out from under its own driver. Being unreadable by that parser is the
+    /// safe half of the trade and is chosen deliberately.
+    #[test]
+    fn an_mmio_device_is_never_recorded_under_the_pci_prefix() {
+        let g = synthesize(
+            &a_checkpoint(1),
+            RAM,
+            24_000_000,
+            a_serial(),
+            SERIAL_LINE,
+            &[a_block_device()],
+        )
+        .expect("synthesizes");
+        let text = std::str::from_utf8(&g.bytes).expect("utf-8");
+        assert!(
+            text.contains("_virtio-mmio-blk0"),
+            "the device must be recorded under the MMIO prefix"
+        );
+        assert!(
+            !text.contains("_virtio-pci-"),
+            "nothing in an MMIO capture may claim to be a PCI transport"
+        );
+        assert!(
+            hypervisor::hvf::virtio::devmgr::parse_devices(text)
+                .expect("the document is well-formed; the PCI reader parses it")
+                .is_empty(),
+            "the PCI reader must find nothing here rather than something \
+             wrong; if it starts finding these, it has to have learned the \
+             MMIO transport first"
+        );
+    }
+
+    /// A tree node and a state blob are two statements about one device, and
+    /// only agreeing ids join them.
+    ///
+    /// A node whose id no blob answers to restores a device with no state; a
+    /// blob no node names is state for a device the tree says is not there.
+    /// Neither is visible from one side.
+    #[test]
+    fn every_device_node_has_the_state_that_belongs_to_it() {
+        let mut second = a_block_device();
+        second.transport.name = "net0".to_string();
+        second.transport.device_id = 1;
+        second.base = DEV_BASE + DEV_SIZE;
+        second.intid = DEV_INTID + 1;
+        second.backing = None;
+
+        let g = synthesize(
+            &a_checkpoint(1),
+            RAM,
+            24_000_000,
+            a_serial(),
+            SERIAL_LINE,
+            &[a_block_device(), second],
+        )
+        .expect("synthesizes");
+        let doc: Value = serde_json::from_slice(&g.bytes).expect("json");
+        let dm = &doc["snapshots"]["device-manager"];
+        let tree: Value = serde_json::from_str(dm["snapshot_data"]["state"].as_str().unwrap())
+            .expect("tree parses");
+
+        for id in ["_virtio-mmio-blk0", "_virtio-mmio-net0"] {
+            assert!(
+                tree["device_tree"].get(id).is_some(),
+                "{id} must have a tree node"
+            );
+            assert!(
+                dm["snapshots"].get(id).is_some(),
+                "{id} must have a state blob"
+            );
+        }
+        // And nothing invented: every virtio node in the tree is answered.
+        let names: Vec<&String> = tree["device_tree"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .filter(|k| k.starts_with(VIRTIO_MMIO_NODE_PREFIX))
+            .collect();
+        assert_eq!(names.len(), 2, "one node per device, no more: {names:?}");
+    }
+
+    /// Two devices under one name would collapse into one node and the guest
+    /// would resume having quietly lost a disk.
+    #[test]
+    fn two_devices_with_the_same_name_are_refused_rather_than_merged() {
+        let e = refused(
+            synthesize(
+                &a_checkpoint(1),
+                RAM,
+                24_000_000,
+                a_serial(),
+                SERIAL_LINE,
+                &[a_block_device(), a_block_device()],
+            ),
+            "two devices named blk0",
+        );
+        assert!(
+            e.contains("blk0"),
+            "the refusal has to name the collision: {e}"
+        );
+    }
+
+    /// A window of zero length is a device nothing can reach, and a nameless
+    /// device is state nothing can find.
+    #[test]
+    fn a_device_that_could_not_be_reached_is_refused_rather_than_written() {
+        let mut zero = a_block_device();
+        zero.size = 0;
+        let e = refused(
+            synthesize(
+                &a_checkpoint(1),
+                RAM,
+                24_000_000,
+                a_serial(),
+                SERIAL_LINE,
+                &[zero],
+            ),
+            "a zero-length window",
+        );
+        assert!(e.contains("zero-length"), "{e}");
+
+        let mut nameless = a_block_device();
+        nameless.transport.name = String::new();
+        let e = refused(
+            synthesize(
+                &a_checkpoint(1),
+                RAM,
+                24_000_000,
+                a_serial(),
+                SERIAL_LINE,
+                &[nameless],
+            ),
+            "a nameless device",
+        );
+        assert!(e.contains("no name"), "{e}");
+    }
+
+    /// The warning has to say what a reader in the cloud will actually find.
+    ///
+    /// A capture with devices is not restorable by stock cloud-hypervisor for a
+    /// different reason than one without, and a note that said "no device
+    /// nodes" over a document full of them would send its reader looking for
+    /// the wrong thing.
+    #[test]
+    fn the_note_says_which_prefix_the_devices_were_written_under() {
+        let with = synthesize(
+            &a_checkpoint(1),
+            RAM,
+            24_000_000,
+            a_serial(),
+            SERIAL_LINE,
+            &[a_block_device()],
+        )
+        .expect("synthesizes");
+        let note = with.warnings.join(" ");
+        assert!(
+            note.contains(VIRTIO_MMIO_NODE_PREFIX),
+            "the note must name the prefix the devices were written under: \
+             {note}"
+        );
+        assert!(
+            note.contains("_virtio-pci-"),
+            "and the prefix the cloud reads, or it does not say why the cloud \
+             finds nothing: {note}"
+        );
+
+        // A guest with no devices is a real machine, not an omission, so it
+        // must not be described as one.
+        let without = synthesized(1);
+        assert!(
+            !without.warnings.join(" ").contains(VIRTIO_MMIO_NODE_PREFIX),
+            "a guest with no devices must not be told about a prefix nothing \
+             was written under"
+        );
+    }
+
+    /// The count has to come from the document, because the whole point of it
+    /// is to disagree with the caller's own idea of what it asked for.
+    #[test]
+    fn the_count_comes_from_the_document_not_from_the_caller() {
+        let one = synthesize(
+            &a_checkpoint(1),
+            RAM,
+            24_000_000,
+            a_serial(),
+            SERIAL_LINE,
+            &[a_block_device()],
+        )
+        .expect("one device is a machine we can describe");
+        assert_eq!(
+            virtio_nodes_in(&one.bytes),
+            Ok(1),
+            "a document holding one device node must be read back as one device"
+        );
+
+        let none = synthesized(1);
+        assert_eq!(
+            virtio_nodes_in(&none.bytes),
+            Ok(0),
+            "a machine with no devices is a real machine, not a parse failure"
+        );
+    }
+
+    /// Two devices, so a reader that finds the tree but stops at the first
+    /// match cannot pass.
+    #[test]
+    fn every_device_in_the_document_is_counted() {
+        let mut net = a_block_device();
+        net.transport.name = "net0".to_string();
+        net.transport.device_id = 1;
+        net.base = DEV_BASE + DEV_SIZE;
+        net.intid = DEV_INTID + 1;
+
+        let g = synthesize(
+            &a_checkpoint(1),
+            RAM,
+            24_000_000,
+            a_serial(),
+            SERIAL_LINE,
+            &[a_block_device(), net],
+        )
+        .expect("two devices at distinct windows describe a real machine");
+        assert_eq!(virtio_nodes_in(&g.bytes), Ok(2));
+    }
+
+    /// The reader counts devices, not every node in the tree. A machine with no
+    /// virtio devices still has a GIC and a console, and reporting those as
+    /// devices would make the caller's comparison fail on a correct document.
+    #[test]
+    fn the_other_nodes_in_the_tree_are_not_counted_as_devices() {
+        let g = synthesized(2);
+        let text = std::str::from_utf8(&g.bytes).expect("the document is utf-8");
+        assert!(
+            text.contains("gic-v3-its") && text.contains("__serial"),
+            "this machine really does have other nodes, or the test proves nothing"
+        );
+        assert_eq!(virtio_nodes_in(&g.bytes), Ok(0));
+    }
+
+    /// A document it cannot read is refused by name rather than counted as
+    /// zero. Zero is the answer for a machine with no devices, so returning it
+    /// for a document that could not be parsed would report agreement with a
+    /// diskless guest and let a torn snapshot through.
+    #[test]
+    fn a_document_that_cannot_be_read_is_refused_rather_than_counted_as_zero() {
+        let bad = virtio_nodes_in(b"{ not json");
+        assert!(
+            bad.is_err_and(|e| e.contains("does not parse")),
+            "unreadable bytes must be refused by name"
+        );
+
+        let empty = virtio_nodes_in(b"{}");
+        assert!(
+            empty.is_err_and(|e| e.contains("device-manager state")),
+            "a document with no device-manager state must be refused, not \
+             silently agreed with"
         );
     }
 }

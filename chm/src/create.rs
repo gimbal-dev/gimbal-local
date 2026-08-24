@@ -501,18 +501,9 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
                     --dry-run stops before one is created. Drop one of them."
             .to_string());
     }
-    // A synthesized `state.json` carries the CPUs, the GIC, the clock and the
-    // memory map. It does not yet carry per-device nodes, so nothing in the
-    // written snapshot would name these disks or say where they went. Refusing
-    // is the honest half of that limitation: a snapshot that quietly lost the
-    // guest's storage would resume, and only fail later, somewhere else.
-    if originate.is_some() && !cfg.disks.is_empty() {
-        return Err("--originate cannot yet describe a guest's disks: the \
-                    snapshot it writes carries the CPUs, the GIC, the clock and \
-                    guest RAM, but has no device nodes to record a disk in. \
-                    Originate from a boot without --disk (see #341)."
-            .to_string());
-    }
+    // A synthesized `state.json` now carries a node per virtio device, so a
+    // guest's disks are described rather than silently dropped. The refusal
+    // that used to stand here (#341, lifted by #378) exists no more.
     Ok(CreateArgs {
         cfg,
         dry_run,
@@ -1361,12 +1352,15 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                 dir,
                 capture_rx,
                 vcpus,
-                &prepared.guest_mem,
-                image.ram_base,
-                image.ram_size as u64,
+                &OriginatedRam {
+                    mem: &prepared.guest_mem,
+                    base: image.ram_base,
+                    size: image.ram_size as u64,
+                },
                 // Read off the live device the guest programmed, at the last
                 // moment it is still the machine being described.
                 uart.capture(),
+                &devices,
             )?;
         }
     }
@@ -1574,14 +1568,31 @@ fn expose_guest_ports(mut nat: NatResponder, ports: &[u16]) -> Result<NatRespond
 /// MUST be called after every vCPU thread has joined (so all the captures have
 /// been sent, and nothing is still changing the machine) and before `prepared`
 /// is dropped (which unmaps guest RAM).
+///
+/// `devices` is the same vector the bus was built from, so the windows recorded
+/// in the document are the windows the guest's drivers are bound to rather than
+/// a second derivation of them.
+/// The guest's memory, and where the guest sees it.
+///
+/// One fact about one machine rather than three parameters, for the reason the
+/// `mappings` comment below gives: the dump and the document that describes it
+/// must be two uses of a single value, never two descriptions of it. Three
+/// separate arguments let a caller pass the memory of one machine with the base
+/// address of another, and the result is a snapshot that parses, validates,
+/// resumes, and has the guest's RAM in the wrong place.
+struct OriginatedRam<'a> {
+    mem: &'a GuestMemory,
+    base: u64,
+    size: u64,
+}
+
 fn originate_snapshot(
     dir: &Path,
     capture_rx: &mpsc::Receiver<(usize, UsgicCapture)>,
     vcpus: usize,
-    guest_mem: &GuestMemory,
-    ram_base: u64,
-    ram_size: u64,
+    ram: &OriginatedRam<'_>,
     serial: SerialRegs,
+    devices: &[(coldboot::VirtioPlacement, Arc<VirtioMmioDevice>)],
 ) -> Result<(), String> {
     // Refuse rather than merge: writing into a directory that already holds a
     // snapshot would leave a `state.json` from this run beside a
@@ -1616,8 +1627,8 @@ fn originate_snapshot(
     // see.
     let mappings = vec![MemMapping {
         slot: 0,
-        gpa: ram_base,
-        size: ram_size,
+        gpa: ram.base,
+        size: ram.size,
         file_offset: 0,
     }];
 
@@ -1630,13 +1641,49 @@ fn originate_snapshot(
     // `coldboot::PL011_IRQ`, so a capture claiming anything else would describe
     // a machine this one never was. Restating the number here would let the two
     // drift into a snapshot whose console is deaf.
+    // Read off the live transports at the same instant the vCPUs stopped, and
+    // paired with the placement each was registered at. Both halves come from
+    // the objects the machine actually ran on: nothing here recomputes a window
+    // from `coldboot`'s constants, so a device node cannot describe a machine
+    // this one was not.
+    let virtio: Vec<genesis::VirtioNode> = devices
+        .iter()
+        .map(|(place, dev)| genesis::VirtioNode {
+            transport: dev.state(),
+            base: place.base,
+            size: place.size,
+            intid: place.intid,
+            backing: place.path.as_ref().map(|p| p.display().to_string()),
+        })
+        .collect();
+
     let genesis = genesis::synthesize(
         &state,
         &mappings,
         host_counter_hz(),
         serial,
         coldboot::PL011_IRQ,
+        &virtio,
     )?;
+
+    // Read the document back and count what it describes, rather than trusting
+    // that it describes what was handed over. The two sides come from different
+    // places on purpose: `devices` is the machine that just stopped, and the
+    // count is parsed out of the bytes about to be written. A change that stops
+    // devices reaching the synthesizer moves the synthesizer's inputs and its
+    // outputs together, so no assertion about the rendering can see it -- but
+    // the machine still had disks, and this comparison still fails.
+    let described = genesis::virtio_nodes_in(&genesis.bytes)?;
+    if described != devices.len() {
+        return Err(format!(
+            "this guest ran {} virtio device(s) but the snapshot describes {}. \
+             Resuming it would hand the guest's kernel a machine missing the \
+             devices its drivers are bound to; refusing rather than writing a \
+             lineage that cannot come back.",
+            devices.len(),
+            described
+        ));
+    }
 
     let snapshot = dir.join("snapshot");
     fs::create_dir_all(&snapshot).map_err(|e| format!("creating {}: {e}", snapshot.display()))?;
@@ -1650,13 +1697,13 @@ fn originate_snapshot(
     let ranges = snapshot.join("memory-ranges");
     // `None`: there is no parent dump to delta against. A lineage's first
     // snapshot is by definition the one with nothing behind it.
-    checkpoint::dump_guest_ram(&ranges, guest_mem, &mappings, None)?;
+    checkpoint::dump_guest_ram(&ranges, ram.mem, &mappings, None)?;
 
     println!(
         "chm: originated {} ({} vCPU(s), {} MiB, {} IRQs)",
         dir.display(),
         vcpus,
-        ram_size >> 20,
+        ram.size >> 20,
         genesis.num_irq
     );
     for line in &genesis.vcpu_summaries {
@@ -2466,14 +2513,19 @@ mod tests {
         );
     }
 
-    /// A disk is state the synthesized capture does not yet describe.
+    /// A guest with a disk is the only kind of guest worth originating from.
     ///
-    /// Writing a snapshot that silently forgets a guest's disks would restore
-    /// to a machine whose RAM believes in a filesystem that is not there --
-    /// the #139 failure shape, arrived at by omission rather than by drift.
+    /// This used to be refused: the synthesized capture had no device nodes, so
+    /// a snapshot would have restored to a machine whose RAM believed in a
+    /// filesystem that was not there -- the #139 failure shape, arrived at by
+    /// omission rather than by drift. #378 gave the document `_virtio-mmio-*`
+    /// nodes, so the refusal came down. The guard stays, inverted, because the
+    /// combination is the whole point of the feature (#361): a browser sandbox
+    /// has a rootfs, and a lineage that cannot start from one starts from
+    /// nothing anybody wants.
     #[test]
-    fn originating_a_guest_with_disks_is_refused_by_name() {
-        let e = parse(&args(&[
+    fn a_guest_with_disks_can_originate_a_lineage() {
+        let a = parse(&args(&[
             "--kernel",
             "/tmp/Image",
             "--disk",
@@ -2481,12 +2533,9 @@ mod tests {
             "--originate",
             "/tmp/lineage",
         ]))
-        .unwrap_err();
-        assert!(e.contains("--originate"), "{e}");
-        assert!(
-            e.contains("disk"),
-            "the refusal has to name what cannot be carried: {e}"
-        );
+        .expect("a disk-backed guest must be able to begin a lineage");
+        assert_eq!(a.cfg.disks, vec![PathBuf::from("/tmp/root.img")]);
+        assert_eq!(a.originate, Some(PathBuf::from("/tmp/lineage")));
     }
 
     /// The console configuration must be read from the live device.
@@ -2561,6 +2610,70 @@ mod tests {
             "run must drop its own capture sender once every vCPU thread holds \
              a clone, or the collector's only escape is closed and origination \
              waits forever on a guest that already finished"
+        );
+    }
+
+    /// The devices a guest ran must reach the synthesizer.
+    ///
+    /// Every assertion about the emitted document lives in `genesis` and asks
+    /// what the rendering looks like for the devices it was given. A change
+    /// here that stops handing devices over moves the synthesizer's inputs and
+    /// its outputs together: it is asked to describe a diskless machine, does
+    /// so correctly, and every one of those assertions still passes. That is
+    /// the eighth time this repository has been bitten by a mutation at a call
+    /// site rather than in the thing called, so this guard reads the call site
+    /// itself.
+    ///
+    /// `originate_snapshot` also compares the document's device count against
+    /// the machine's at run time, which is the half that protects a shipped
+    /// binary. This is the half that fails in the suite, before anyone builds
+    /// one.
+    ///
+    /// The needle is assembled rather than written out, because a literal would
+    /// appear in this function and match itself -- a guard that finds its own
+    /// assertion text cannot detect the code's disappearance.
+    #[test]
+    fn the_devices_the_guest_ran_are_handed_to_the_synthesizer() {
+        let src = include_str!("create.rs");
+        let passed = format!("&{},\n    )?;", "virtio");
+        assert!(
+            src.contains(&passed),
+            "`genesis::synthesize` must be called with the nodes mapped from \
+             the live devices. Passing an empty slice, or dropping the \
+             argument, would emit a snapshot describing a machine with no \
+             disks -- which resumes, and hands the guest's kernel nothing its \
+             drivers are bound to."
+        );
+
+        let built = format!(
+            "devices\n        .iter()\n        .map(|(place, dev)| genesis::{}",
+            "VirtioNode"
+        );
+        assert!(
+            src.contains(&built),
+            "the nodes must be mapped from `devices`, the vector the bus was \
+             built from. Deriving them from `coldboot`'s constants instead \
+             would let the recorded windows drift from the ones the guest's \
+             drivers are actually bound to."
+        );
+    }
+
+    /// The run-time half: a document that does not describe the machine it came
+    /// from is refused rather than written.
+    #[test]
+    fn a_snapshot_that_lost_the_guests_devices_is_refused_by_name() {
+        let src = include_str!("create.rs");
+        let check = format!("genesis::virtio_nodes_in(&genesis.{})?", "bytes");
+        assert!(
+            src.contains(&check),
+            "the count must be read back out of the bytes about to be written. \
+             Counting the caller's own vector instead would compare a value \
+             with itself and agree however wrong it was."
+        );
+        assert!(
+            src.contains("but the snapshot describes"),
+            "the refusal must name both counts, or the operator is told a \
+             lineage failed without being told what was missing from it"
         );
     }
 }
