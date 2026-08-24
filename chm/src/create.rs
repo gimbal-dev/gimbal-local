@@ -45,7 +45,7 @@ use hypervisor::hvf::devices::{MmioBus, Pl011, Pl031};
 use hypervisor::hvf::rehydrate::MemMapping;
 use hypervisor::hvf::virtio::block::{BlockDevice, FileBackend};
 use hypervisor::hvf::virtio::devcore::{Backend, MsiSink, MsiSpiInjector};
-use hypervisor::hvf::virtio::devmgr::SerialRegs;
+use hypervisor::hvf::virtio::devmgr::{self, SerialRegs};
 use hypervisor::hvf::virtio::mmio::{self, MmioParams, VirtioMmioDevice, device_id};
 use hypervisor::hvf::virtio::nat::{
     EgressEvent, EgressPolicy, INGRESS_BIND_ADDR, NatLimits, NatResponder,
@@ -68,7 +68,7 @@ use crate::oci::initramfs::installs_proxy_ca;
 use crate::oci::modules;
 use crate::runs;
 use crate::spec::{Overrides, SandboxSpec, resolve, spec_file_for};
-use crate::{checkpoint, coldboot, console, credproxy, genesis, postboot};
+use crate::{bundle, checkpoint, coldboot, console, credproxy, genesis, postboot};
 /// The NAT gateway the guest talks to, and the MAC we hand its NIC.
 ///
 /// Same subnet the restore path's NAT uses, so a guest image built for one
@@ -1688,6 +1688,15 @@ fn originate_snapshot(
     let snapshot = dir.join("snapshot");
     fs::create_dir_all(&snapshot).map_err(|e| format!("creating {}: {e}", snapshot.display()))?;
 
+    // The disks travel with the RAM, at the instant the RAM was taken. A
+    // cold-booted guest's kernel has its filesystem's metadata cached in the
+    // pages about to be dumped, so resuming that RAM against anything other
+    // than the disk it was cached from is the ext4 metadata-mismatch failure
+    // mode (roadmap V6.7): the guest reads `Input/output error` on files it can
+    // see in its own page cache. RAM and disk are captured together or neither
+    // is worth having.
+    let shipped = ship_disks(dir, &virtio)?;
+
     // cloud-hypervisor ships `state.json` at both the root and inside
     // `snapshot/`, and different readers reach for different ones, so both are
     // written from the same bytes rather than serialized twice.
@@ -1699,12 +1708,15 @@ fn originate_snapshot(
     // snapshot is by definition the one with nothing behind it.
     checkpoint::dump_guest_ram(&ranges, ram.mem, &mappings, None)?;
 
+    verify_shipped_disks(dir, &String::from_utf8_lossy(&genesis.bytes), shipped)?;
+
     println!(
-        "chm: originated {} ({} vCPU(s), {} MiB, {} IRQs)",
+        "chm: originated {} ({} vCPU(s), {} MiB, {} IRQs, {} disk(s))",
         dir.display(),
         vcpus,
         ram.size >> 20,
-        genesis.num_irq
+        genesis.num_irq,
+        shipped
     );
     for line in &genesis.vcpu_summaries {
         println!("chm:   {line}");
@@ -1716,6 +1728,129 @@ fn originate_snapshot(
         println!("chm: note: {w}");
     }
     Ok(())
+}
+
+/// Confirm the restore path can find every disk the document describes.
+///
+/// This asks the *reader*, not the writer. [`devmgr::parse_mmio_devices`] is
+/// the parser a resume will use to decide which devices exist, and
+/// [`devmgr::shipped_backing`] is what it will then call to find each disk --
+/// so both halves of the restore path are run against the bytes just written,
+/// rather than against the values that produced them.
+///
+/// A check against the caller's own device list could not do this. Shipping a
+/// disk under a name the reader does not compute moves the writer's input and
+/// its output together, so every assertion about the writer stays true while
+/// the resume silently falls back to a sparse zero overlay and the guest comes
+/// back to a disk full of holes. This comparison fails exactly then, and it
+/// fails just as well if the shipping step stops being called at all -- which
+/// no assertion about `ship_disks`'s own behaviour can see.
+pub(crate) fn verify_shipped_disks(
+    dir: &Path,
+    state_json: &str,
+    shipped: usize,
+) -> Result<(), String> {
+    let overlay_dir = dir.join(checkpoint::live_overlays_dir_name());
+    let mut found = 0;
+    for desc in devmgr::parse_mmio_devices(state_json)
+        .map_err(|e| format!("reading back the snapshot just written: {e}"))?
+    {
+        if !matches!(desc.backend, devmgr::BackendKind::Block { .. }) {
+            continue;
+        }
+        match devmgr::shipped_backing(&overlay_dir, &desc.name) {
+            Ok(Some(_)) => found += 1,
+            Ok(None) => {
+                return Err(format!(
+                    "the snapshot describes a disk for `{}` but a resume would \
+                     find no image for it, so the guest would come back on an \
+                     empty overlay against RAM that has its filesystem cached. \
+                     Refusing rather than writing a lineage that reads as corrupt.",
+                    desc.name
+                ));
+            }
+            Err(e) => {
+                return Err(format!(
+                    "checking the shipped disk for `{}`: {e}",
+                    desc.name
+                ));
+            }
+        }
+    }
+    if found != shipped {
+        return Err(format!(
+            "shipped {shipped} disk image(s) but a resume would find {found}. \
+             Refusing rather than writing a lineage whose disks are not the ones \
+             this guest ran."
+        ));
+    }
+    Ok(())
+}
+
+/// Ship a copy of every disk the guest was running, where a resume will look.
+///
+/// The location is not computed here: [`devmgr::shipped_backing_candidates`] is
+/// the reader's own view of the layout, and its first entry is the canonical
+/// write target. Two descriptions of one path is how a writer comes to put a
+/// real disk somewhere the restore path never looks.
+///
+/// `clonefile` is what makes capturing the disk at the same instant as the RAM
+/// affordable: an APFS clone shares every extent, so a 25 GiB disk costs
+/// ~0 bytes and is frozen from the moment it is taken even though the caller's
+/// own file stays writable. A symlink would be free too and is not an option --
+/// the restore path refuses one by name as a possibly tampered bundle, and it
+/// is right to, because a link is a promise about a file that can be broken
+/// after the promise is made.
+///
+/// Returns how many images were written.
+pub(crate) fn ship_disks(dir: &Path, nodes: &[genesis::VirtioNode]) -> Result<usize, String> {
+    let overlay_dir = dir.join(checkpoint::live_overlays_dir_name());
+    let mut shipped = 0;
+    for node in nodes {
+        // A node with no backing file is not a disk -- the net device has none.
+        let Some(src) = node.backing.as_deref() else {
+            continue;
+        };
+        let src = Path::new(src);
+        let dest = devmgr::shipped_backing_candidates(&overlay_dir, &node.transport.name)
+            .into_iter()
+            .next()
+            .ok_or_else(|| {
+                format!(
+                    "cannot place a shipped disk relative to {}",
+                    overlay_dir.display()
+                )
+            })?;
+        // Sanitization maps several device names onto one filename, so two
+        // devices can collide here. Refuse: letting the second clone overwrite
+        // the first would hand one guest disk to two drivers, and the resume
+        // would look entirely well-formed.
+        if dest.exists() {
+            return Err(format!(
+                "device `{}` would ship its disk to {}, which is already taken \
+                 by another device whose name sanitizes the same way. Refusing \
+                 rather than letting one guest disk replace another.",
+                node.transport.name,
+                dest.display()
+            ));
+        }
+        let parent = dest
+            .parent()
+            .ok_or_else(|| format!("{} has no parent directory", dest.display()))?;
+        fs::create_dir_all(parent).map_err(|e| format!("creating {}: {e}", parent.display()))?;
+        if let Err(e) = bundle::clone_file(src, &dest) {
+            // Not fatal on its own: `clonefile` only works within one APFS
+            // volume, and a disk sitting on another filesystem still has to
+            // travel. Copying is slow and correct; refusing would be neither.
+            // Said out loud because the cost is the user's to know about.
+            println!("chm: note: {e}; copying the disk instead, which is slower");
+            fs::copy(src, &dest).map_err(|e| {
+                format!("copying disk {} to {}: {e}", src.display(), dest.display())
+            })?;
+        }
+        shipped += 1;
+    }
+    Ok(shipped)
 }
 
 /// Build a `virtio-mmio` device for each placement the image reserved.

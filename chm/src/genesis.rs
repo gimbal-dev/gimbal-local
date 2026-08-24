@@ -858,8 +858,11 @@ fn leaf(state: &Value) -> Result<Value, String> {
 
 #[cfg(test)]
 mod tests {
+    use crate::checkpoint::live_overlays_dir_name;
+    use crate::create;
     use hypervisor::hvf::checkpoint::{UsgicCheckpoint, VcpuCheckpoint};
     use hypervisor::hvf::softgic::{Distributor, GICR_SGI_OFFSET, Redistributor};
+    use hypervisor::hvf::virtio::devmgr::shipped_backing;
     use hypervisor::hvf::{VcpuFpState, VcpuHvfState, rehydrate};
 
     use super::*;
@@ -2126,5 +2129,274 @@ mod tests {
             "a PCI capture has no virtio-mmio devices; claiming one would wire \
              a guest to a transport it never used"
         );
+    }
+
+    // ---- Step C: the disks an originated lineage has to carry ------------
+    //
+    // These sit here rather than beside `ship_disks` in `create.rs` because
+    // what they check is an *agreement* between the writer and the reader, and
+    // the fixtures for both halves already exist in this module. A test that
+    // built its own document would be asserting against a third description of
+    // the format, which is the one thing this pair must never grow.
+
+    /// A scratch directory named for the test that owns it.
+    ///
+    /// The name must be unique per test: every `#[test]` in this binary shares
+    /// one `process::id()`, so two tests using one prefix name one directory
+    /// that both create and delete, concurrently. `hygiene.rs` refuses that,
+    /// and #243 is what it cost before the guard existed.
+    fn scratch(who: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("chm-{who}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    /// A disk with `bytes` in it, named `name`, inside `dir`.
+    fn a_disk_file(dir: &std::path::Path, name: &str, bytes: &[u8]) -> String {
+        let p = dir.join(name);
+        std::fs::write(&p, bytes).expect("writing a disk image");
+        p.to_string_lossy().into_owned()
+    }
+
+    /// The writer puts a disk exactly where the reader goes looking for it.
+    ///
+    /// This is the guard that makes a naming divergence impossible. The two
+    /// sides do not share an assertion, they share a *function*: the writer
+    /// takes the first candidate `shipped_backing_candidates` offers
+    /// and the reader is asked, afterwards, whether it can find anything. A
+    /// change to the layout that moved only one of them fails here.
+    ///
+    /// The device is named so that sanitization actually does something. With
+    /// a name like `blk0` the sanitized and raw forms are identical, so a
+    /// writer that skipped sanitizing entirely would pass -- and then produce
+    /// an unresumable lineage for every device whose name contains a space or
+    /// a slash.
+    #[test]
+    fn a_shipped_disk_lands_where_a_resume_goes_looking_for_it() {
+        let dir = scratch("shipdisk");
+        let src = a_disk_file(&dir, "rootfs.img", b"the guest's own bytes");
+
+        let mut node = a_block_device();
+        node.transport.name = "blk 0/odd".to_string();
+        node.backing = Some(src.clone());
+
+        let shipped = create::ship_disks(&dir, std::slice::from_ref(&node)).expect("shipping");
+        assert_eq!(shipped, 1, "one disk in, one disk shipped");
+
+        let overlay_dir = dir.join(live_overlays_dir_name());
+        let found = shipped_backing(&overlay_dir, &node.transport.name)
+            .expect("the reader must not error")
+            .expect(
+                "the reader must find the disk the writer just shipped: if it \
+                 cannot, a resume falls back to an empty overlay against RAM \
+                 that has this filesystem cached",
+            );
+        assert_eq!(
+            std::fs::read(&found).expect("reading the shipped disk"),
+            b"the guest's own bytes",
+            "the shipped image must be the guest's own disk, byte for byte"
+        );
+        assert!(
+            !std::fs::symlink_metadata(&found)
+                .expect("stat")
+                .file_type()
+                .is_symlink(),
+            "the disk must be a copy, not a link: `shipped_backing` refuses a \
+             symlink by name, so a link would ship a lineage that refuses \
+             itself on the first resume"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A device with no image behind it ships nothing and is not counted.
+    ///
+    /// The net device is exactly this case, and it is in every guest that has
+    /// networking, so a writer that assumed every node had a disk would refuse
+    /// the most ordinary machine there is.
+    #[test]
+    fn a_device_with_no_image_behind_it_ships_nothing() {
+        let dir = scratch("shipnone");
+        let mut node = a_block_device();
+        node.transport.name = "net0".to_string();
+        node.backing = None;
+
+        let shipped = create::ship_disks(&dir, std::slice::from_ref(&node)).expect("shipping");
+        assert_eq!(shipped, 0, "a device with no backing file ships nothing");
+        assert!(
+            !dir.join(live_overlays_dir_name()).exists()
+                || shipped_backing(&dir.join(live_overlays_dir_name()), "net0")
+                    .expect("the reader must not error")
+                    .is_none(),
+            "nothing may be left behind for a device that never had a disk"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Two devices whose names sanitize alike are refused, not silently merged.
+    ///
+    /// Sanitization is many-to-one, so `disk a` and `disk-a` land on one file.
+    /// Overwriting would hand one host image to two guest drivers, each
+    /// believing it owns the disk -- and the resulting lineage looks perfectly
+    /// well-formed, so nothing downstream would ever report it.
+    #[test]
+    fn two_devices_whose_names_sanitize_alike_are_refused() {
+        let dir = scratch("shipcollide");
+        let src = a_disk_file(&dir, "rootfs.img", b"one image");
+
+        let mut first = a_block_device();
+        first.transport.name = "disk a".to_string();
+        first.backing = Some(src.clone());
+        let mut second = a_block_device();
+        second.transport.name = "disk+a".to_string();
+        second.backing = Some(src);
+
+        let err = create::ship_disks(&dir, &[first, second])
+            .expect_err("a collision must be refused, not resolved by last-writer-wins");
+        assert!(
+            err.contains("disk+a") && err.contains("sanitizes"),
+            "the refusal must name the device that could not be placed and why, \
+             got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A lineage whose document promises a disk no resume could find is refused.
+    ///
+    /// This is the failure the whole step exists to prevent: the guest comes
+    /// back with RAM that has its filesystem cached and an overlay full of
+    /// zeroes, which is not an error anywhere -- it is a guest reading a disk
+    /// that has silently become corrupt.
+    #[test]
+    fn a_document_promising_a_disk_nothing_shipped_is_refused_by_name() {
+        let dir = scratch("verifymissing");
+        let doc = synthesized_with(&[a_block_device()]);
+
+        let err = create::verify_shipped_disks(&dir, &doc, 0)
+            .expect_err("a document describing an unfindable disk must be refused");
+        assert!(
+            err.contains("blk0"),
+            "the refusal must name the device whose disk is missing, or the \
+             operator is told a lineage failed without being told what for, \
+             got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A disk shipped under a name the reader does not compute is refused.
+    ///
+    /// This is the case an assertion about `ship_disks` alone cannot see. The
+    /// file is present, the count is right, and the writer is internally
+    /// consistent -- it is only wrong relative to the name the *reader* will
+    /// derive, which is why the check has to run the reader.
+    #[test]
+    fn a_disk_shipped_under_a_name_the_reader_never_computes_is_refused() {
+        let dir = scratch("verifymisnamed");
+        let doc = synthesized_with(&[a_block_device()]);
+
+        // Present, plausible, and in the right directory -- under the raw
+        // device name rather than the sanitized one the reader asks for.
+        let disks = dir.join("disks");
+        std::fs::create_dir_all(&disks).expect("disks dir");
+        std::fs::write(disks.join("blk0-image.raw"), b"x").expect("a misnamed disk");
+
+        let err = create::verify_shipped_disks(&dir, &doc, 1)
+            .expect_err("a disk the reader cannot name is as good as absent");
+        assert!(
+            err.contains("blk0"),
+            "the refusal must name the device, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A document and a shipment that disagree on how many disks exist is refused.
+    ///
+    /// Every disk being findable is not the same claim as the shipment being
+    /// the one this guest ran. A stale image left in the destination satisfies
+    /// the first and fails this, which is the difference between a lineage that
+    /// resumes and one that resumes onto somebody else's filesystem.
+    #[test]
+    fn a_shipment_and_a_document_that_disagree_on_a_count_are_refused() {
+        let dir = scratch("verifycount");
+        let doc = synthesized_with(&[a_block_device()]);
+
+        let mut node = a_block_device();
+        node.backing = Some(a_disk_file(&dir, "rootfs.img", b"bytes"));
+        create::ship_disks(&dir, std::slice::from_ref(&node)).expect("shipping");
+
+        create::verify_shipped_disks(&dir, &doc, 1)
+            .expect("one described, one shipped, one findable");
+        let err = create::verify_shipped_disks(&dir, &doc, 2)
+            .expect_err("a count the document does not support must be refused");
+        assert!(
+            err.contains('2') && err.contains('1'),
+            "the refusal must state both counts, got: {err}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Origination ships the disks and then checks its own work.
+    ///
+    /// Both of the guards above assert an *outcome*, and an outcome assertion
+    /// is structurally blind to a call site that stops taking the path: pass
+    /// `&[]` where the devices go and every one of them still passes. This
+    /// repo has been bitten by that class nine times. Deleting the shipping
+    /// call is already a compile error -- `verify_shipped_disks` consumes the
+    /// count it returns -- so what is left to guard is the pairing itself.
+    #[test]
+    fn origination_ships_the_guests_disks_and_then_verifies_them() {
+        let src = include_str!("create.rs");
+        // Assembled from parts: a literal needle matches this assertion's own
+        // text, so the guard would find itself and pass with the call gone.
+        let ship = format!("let shipped = {}(dir, &virtio)?;", "ship_disks");
+        let verify = format!("{}(dir, &String::from_utf8_lossy(", "verify_shipped_disks");
+        assert!(
+            src.contains(&ship),
+            "origination must ship the disks the guest was running, or the \
+             lineage describes devices whose images do not travel with it"
+        );
+        assert!(
+            src.contains(&verify),
+            "the verification must be handed the bytes that were written, not \
+             the values they were written from: a check against the caller's \
+             own list moves with the writer and agrees however wrong it is"
+        );
+    }
+
+    /// A stale image beside the one just shipped does not win.
+    ///
+    /// The writer takes the first candidate and the reader tries them in the
+    /// same order, so the extensions agree by construction -- which is why
+    /// reordering them is *not* a defect and no guard here pretends it is.
+    /// What the order does decide is which file wins when both exist: a
+    /// `.img` left behind by some earlier tool sits in the same directory,
+    /// and a reader that preferred it would resume the guest onto a disk this
+    /// lineage never ran, with no error anywhere.
+    #[test]
+    fn a_stale_image_beside_the_shipped_one_does_not_win() {
+        let dir = scratch("shipstale");
+        let mut node = a_block_device();
+        node.transport.name = "blk0".to_string();
+        node.backing = Some(a_disk_file(&dir, "rootfs.img", b"the disk this guest ran"));
+
+        // Something else got here first, under the other extension.
+        let disks = dir.join("disks");
+        std::fs::create_dir_all(&disks).expect("disks dir");
+        std::fs::write(disks.join("blk0.img"), b"somebody else's filesystem")
+            .expect("a stale image");
+
+        create::ship_disks(&dir, std::slice::from_ref(&node)).expect("shipping");
+
+        let overlay_dir = dir.join(live_overlays_dir_name());
+        let found = shipped_backing(&overlay_dir, "blk0")
+            .expect("the reader must not error")
+            .expect("the reader must find something");
+        assert_eq!(
+            std::fs::read(&found).expect("reading it back"),
+            b"the disk this guest ran",
+            "the reader must prefer the image this lineage shipped over one \
+             that was already lying beside it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

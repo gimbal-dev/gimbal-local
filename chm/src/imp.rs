@@ -3304,7 +3304,11 @@ pub(crate) fn run_usgic_engine(
         Arc::new(setups.into_iter().map(|s| s.handle).collect());
 
     let (limits, _src) = limits::resolve_limits(dir, cfg.limits_file);
-    let overlay_dir = dir.join(".chm-overlays");
+    // Read the constant, never restate it: `create.rs` computes this same
+    // directory when it ships a lineage's disks, and `checkpoint` fingerprints
+    // it. Three spellings of one path is how a disk comes to be written where
+    // nothing looks for it.
+    let overlay_dir = dir.join(checkpoint::live_overlays_dir_name());
     // Durable audit trail (M29): record the session lifecycle and every denied
     // egress flow to a per-workspace append-only log, so an operator can review
     // what the sandbox did independent of the (guest-floodable) console.
