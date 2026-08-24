@@ -825,6 +825,10 @@ struct UserGic {
     /// without a cap it would print on every run entry for the rest of the run.
     wedge_reports: u32,
     wedge_request_seen: u64,
+    /// How many *recovered* reports this vCPU has emitted, counted separately
+    /// from `wedge_reports` so a benign stall can never spend a fault's
+    /// allowance. See [`RECOVERED_REPORT_LIMIT`].
+    recovered_reports: u32,
     /// Fault-injection bookkeeping for `CHM_USGIC_LEAK_ACTIVE`; inert otherwise.
     vtimer_deactivations: u64,
     leaked: bool,
@@ -968,6 +972,30 @@ const WEDGE_OVERDUE_ENTRIES: u64 = 200;
 /// construction, so this is what stops one wedge printing forever.
 const WEDGE_REPORT_LIMIT: u32 = 3;
 
+/// How many *recovered* reports a single vCPU will emit, budgeted separately
+/// from [`WEDGE_REPORT_LIMIT`] rather than sharing one counter.
+///
+/// One counter served both classes until #310. A guest that reports a benign
+/// stall at resume -- the ordinary case, and the one the `recovered` arm exists
+/// to name -- spent the allowance a real wedge would need later in the same run,
+/// so the fault this detector was built for printed nothing at all. **The benign
+/// case must never be able to silence the fatal one**, and separate counters are
+/// what makes that structural rather than a matter of how many benign stalls a
+/// particular guest happens to emit.
+const RECOVERED_REPORT_LIMIT: u32 = 3;
+
+/// The tag a fault report is printed under.
+///
+/// It stays attached to the alarming case only. A benign post-resume stall
+/// printed under `[wedge]` says "wedge" in the headline and "nothing is stuck"
+/// in the middle of the fourth line, and the headline is what gets read -- so
+/// the presentation contradicted the classification the line itself carried.
+const WEDGE_REPORT_TAG: &str = "[wedge]";
+
+/// The tag a recovered report is printed under: a stall the guest has already
+/// come out of is a note, not an alarm, and must not read like one.
+const RECOVERED_REPORT_TAG: &str = "[stall]";
+
 /// Bumped by [`request_wedge_report`]; each vCPU compares it against its own
 /// last-seen value at its next run entry.
 static WEDGE_REPORT_REQUESTS: AtomicU64 = AtomicU64::new(0);
@@ -1102,6 +1130,60 @@ struct WedgeFacts {
 /// recovered from.
 const WEDGE_CLOCK_SKEW_SECONDS: u128 = 1;
 
+/// Whether a report describes something stuck, or something already recovered.
+///
+/// Derived from the *same* arm ordering that produces the text, because the
+/// ordering is the argument (see [`wedge_verdict`]): a companion
+/// `wedge_is_benign()` would restate it, and two statements of one rule drift
+/// silently -- this repo has recorded that failure at least twice.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum WedgeClass {
+    /// Something is stuck, or we cannot say it is not.
+    Fault,
+    /// Nothing is stuck. The guest reported a stall it has already come out of.
+    ///
+    /// Deliberately narrow: only the `recovered` arm earns it. `guest-idle` and
+    /// `guest-masked` say the fault is not *ours*, which is not the same as
+    /// saying the guest is fine -- a guest that masked its tick forever is
+    /// genuinely wedged. The error directions are not symmetric: an
+    /// over-reported fault is noise, an under-reported one is a silent hang.
+    Recovered,
+}
+
+/// A classification and the sentence that explains it, produced together.
+struct Verdict {
+    class: WedgeClass,
+    text: &'static str,
+}
+
+/// Render a counter-tick interval in human units, given the guest's rate.
+///
+/// `overdue_by=-33266` cannot be read without knowing the guest counts at
+/// 121.875 MHz; `272us` is the same fact and needs nothing. The recovered report
+/// exists to be understood at a glance by someone who has just been alarmed by a
+/// kernel stall trace, so raw ticks are the wrong unit for it.
+fn ticks_as_human(ticks: i128, guest_hz: u128) -> String {
+    if guest_hz == 0 {
+        return format!("{ticks} ticks");
+    }
+    let ns = ticks.saturating_mul(1_000_000_000) / (guest_hz as i128);
+    let mag = ns.unsigned_abs();
+    if mag < 1_000 {
+        format!("{ns}ns")
+    } else if mag < 1_000_000 {
+        format!("{}us", ns / 1_000)
+    } else if mag < 1_000_000_000 {
+        format!("{}ms", ns / 1_000_000)
+    } else {
+        let sign = if ns < 0 { "-" } else { "" };
+        format!(
+            "{sign}{}.{:03}s",
+            mag / 1_000_000_000,
+            (mag % 1_000_000_000) / 1_000_000
+        )
+    }
+}
+
 /// Decide who owns a stalled tick, from the state captured at the stall.
 ///
 /// The order of these arms is the argument, not a formatting choice, because
@@ -1124,29 +1206,51 @@ const WEDGE_CLOCK_SKEW_SECONDS: u128 = 1;
 ///    the next tick is imminent, so the stall the guest reported is behind it.
 ///    This is the benign post-resume case, and it must not be filed as a clock
 ///    bug — a diagnostic that names the wrong subsystem costs more than one that
-///    says nothing.
+///    says nothing. It is the one arm classified [`WedgeClass::Recovered`].
 /// 5. `PSTATE.I` set is separated from the general guest-side case for the same
 ///    reason: a guest that has disabled interrupts is not failing to *take* an
 ///    interrupt, it is refusing one, and only one of those is DIC territory.
-fn wedge_verdict(f: WedgeFacts) -> &'static str {
+fn wedge_verdict(f: WedgeFacts) -> Verdict {
     let skew_floor = -((f.guest_hz * WEDGE_CLOCK_SKEW_SECONDS) as i128);
-    if !f.active_empty {
-        "gic-model: an INTID is stuck active, so re-queue is refused — ours (#262/#302 shape)"
+    let (class, text) = if !f.active_empty {
+        (
+            WedgeClass::Fault,
+            "gic-model: an INTID is stuck active, so re-queue is refused — ours (#262/#302 shape)",
+        )
     } else if !f.timer_live {
-        "guest-idle: the guest's own timer is disabled or masked; not a delivery failure"
+        (
+            WedgeClass::Fault,
+            "guest-idle: the guest's own timer is disabled or masked; not a delivery failure",
+        )
     } else if f.overdue_by < skew_floor {
-        "clock: the guest reports a stopped tick but our counter says its deadline is still far \
-         off — counter offset/scale, not the GIC"
+        (
+            WedgeClass::Fault,
+            "clock: the guest reports a stopped tick but our counter says its deadline is still \
+             far off — counter offset/scale, not the GIC",
+        )
     } else if f.overdue_by < 0 {
-        "recovered: nothing is stuck and the next tick is imminent — the stall the guest reported \
-         is behind it (the benign post-resume case)"
+        (
+            WedgeClass::Recovered,
+            "recovered: nothing is stuck and the next tick is imminent — the stall the guest \
+             reported is behind it (the benign post-resume case)",
+        )
     } else if f.irqs_masked {
-        "guest-masked: delivered, but the guest is running with PSTATE.I set"
+        (
+            WedgeClass::Fault,
+            "guest-masked: delivered, but the guest is running with PSTATE.I set",
+        )
     } else if f.vtimer_pending {
-        "guest-side: delivered with interrupts enabled and not taken — i-cache/DIC territory"
+        (
+            WedgeClass::Fault,
+            "guest-side: delivered with interrupts enabled and not taken — i-cache/DIC territory",
+        )
     } else {
-        "unclassified: the timer is live and overdue but 27 is neither pending nor active"
-    }
+        (
+            WedgeClass::Fault,
+            "unclassified: the timer is live and overdue but 27 is neither pending nor active",
+        )
+    };
+    Verdict { class, text }
 }
 
 /// Whether an `ICC_SGI1R_EL1` write targets the core `cand_id`, given the raw
@@ -1167,6 +1271,38 @@ fn sgi_targets_core(sgi: u64, self_id: usize, cand_id: usize) -> bool {
 }
 
 impl UserGic {
+    /// Charge one report of `class` against **its own** budget, returning
+    /// whether it may be printed.
+    ///
+    /// The budgets are per class on purpose. Sharing one counter let a benign
+    /// post-resume stall consume the allowance a real wedge needed later in the
+    /// same run, so the detector reported nothing exactly when it mattered
+    /// (#310). Kept here, on a type a unit test can construct, rather than
+    /// inline in `HvfVcpu::usgic_report_wedge` -- a predicate that lives on
+    /// `HvfVcpu` cannot be tested at all, which is how #309's first crossing
+    /// condition shipped with roughly a one-in-5.8-million chance of firing.
+    fn charge_report(&mut self, class: WedgeClass) -> bool {
+        let (count, limit) = match class {
+            WedgeClass::Fault => (&mut self.wedge_reports, WEDGE_REPORT_LIMIT),
+            WedgeClass::Recovered => (&mut self.recovered_reports, RECOVERED_REPORT_LIMIT),
+        };
+        if *count >= limit {
+            return false;
+        }
+        *count += 1;
+        true
+    }
+
+    /// Whether every class has spent its budget, so no report of any kind can
+    /// be printed.
+    ///
+    /// Checked before the register reads a verdict needs, which is the only
+    /// reason those reads stay bounded now that the classification -- and
+    /// therefore the budget that applies -- can only be known after them.
+    fn all_report_budgets_spent(&self) -> bool {
+        self.wedge_reports >= WEDGE_REPORT_LIMIT && self.recovered_reports >= RECOVERED_REPORT_LIMIT
+    }
+
     /// This vCPU's own redistributor frame.
     fn my_redist(&self) -> std::sync::MutexGuard<'_, crate::hvf::softgic::Redistributor> {
         self.redists[self.redist_index].lock().unwrap()
@@ -2117,8 +2253,9 @@ mod usgic_tests {
     use std::time::Instant;
 
     use super::{
-        ROLL_CALL_SILENCE, UserGic, WEDGE_OVERDUE_DWELL, WEDGE_OVERDUE_ENTRIES, WedgeFacts,
-        pack_gic, wedge_verdict,
+        RECOVERED_REPORT_LIMIT, ROLL_CALL_SILENCE, UserGic, WEDGE_OVERDUE_DWELL,
+        WEDGE_OVERDUE_ENTRIES, WEDGE_REPORT_LIMIT, WedgeClass, WedgeFacts, pack_gic,
+        ticks_as_human, wedge_verdict,
     };
 
     /// The `CNTFRQ_EL0` a Graviton2 capture carries, so a tick count in a test
@@ -2579,7 +2716,8 @@ mod usgic_tests {
             // The buried case: refused re-queue means it is NOT pending.
             vtimer_pending: false,
         });
-        assert!(v.starts_with("gic-model:"), "got {v}");
+        assert!(v.text.starts_with("gic-model:"), "got {}", v.text);
+        assert_eq!(v.class, WedgeClass::Fault);
     }
 
     /// A tick the guest reports as stopped while our own counter says its
@@ -2601,7 +2739,8 @@ mod usgic_tests {
             irqs_masked: false,
             vtimer_pending: true,
         });
-        assert!(v.starts_with("clock:"), "got {v}");
+        assert!(v.text.starts_with("clock:"), "got {}", v.text);
+        assert_eq!(v.class, WedgeClass::Fault);
     }
 
     /// A deadline only just ahead is the *opposite* finding to a clock fault,
@@ -2625,9 +2764,13 @@ mod usgic_tests {
             vtimer_pending: false,
         });
         assert!(
-            v.starts_with("recovered:"),
-            "273us from the next tick is not a clock bug; got {v}"
+            v.text.starts_with("recovered:"),
+            "273us from the next tick is not a clock bug; got {}",
+            v.text
         );
+        // The classification is not decoration: it selects the tag the line is
+        // printed under and the budget it is charged against.
+        assert_eq!(v.class, WedgeClass::Recovered);
     }
 
     /// A guest running with interrupts disabled is refusing the tick, not
@@ -2642,7 +2785,14 @@ mod usgic_tests {
             irqs_masked: true,
             vtimer_pending: true,
         });
-        assert!(masked.starts_with("guest-masked:"), "got {masked}");
+        assert!(
+            masked.text.starts_with("guest-masked:"),
+            "got {}",
+            masked.text
+        );
+        // Not `Recovered`: a guest that has masked its tick forever really is
+        // wedged. "Not our delivery failure" is not "benign, carry on".
+        assert_eq!(masked.class, WedgeClass::Fault);
 
         let enabled = wedge_verdict(WedgeFacts {
             active_empty: true,
@@ -2652,7 +2802,12 @@ mod usgic_tests {
             irqs_masked: false,
             vtimer_pending: true,
         });
-        assert!(enabled.starts_with("guest-side:"), "got {enabled}");
+        assert!(
+            enabled.text.starts_with("guest-side:"),
+            "got {}",
+            enabled.text
+        );
+        assert_eq!(enabled.class, WedgeClass::Fault);
     }
 
     /// A guest that has disabled its own timer is idle, not wedged. Reporting
@@ -2667,7 +2822,93 @@ mod usgic_tests {
             irqs_masked: false,
             vtimer_pending: false,
         });
-        assert!(v.starts_with("guest-idle:"), "got {v}");
+        assert!(v.text.starts_with("guest-idle:"), "got {}", v.text);
+        // `guest-idle` is not benign either. It says the fault is not *ours*,
+        // which is a different statement from "nothing is wrong", and only the
+        // second one earns a quiet report.
+        assert_eq!(v.class, WedgeClass::Fault);
+    }
+
+    /// A benign post-resume stall must never consume the budget a real wedge
+    /// needs later in the same run.
+    ///
+    /// This is #310's actual defect. One shared counter served both classes, and
+    /// the control run in §54 produced roughly eight benign lines at a single
+    /// resume -- more than `WEDGE_REPORT_LIMIT` -- so by the time anything went
+    /// genuinely wrong the detector had nothing left to say. The failure is
+    /// silent, which is the worst shape available: the run looks clean.
+    #[test]
+    fn a_benign_stall_cannot_spend_the_budget_a_real_wedge_needs() {
+        let mut g = UserGic::default();
+        for _ in 0..(RECOVERED_REPORT_LIMIT * 4) {
+            g.charge_report(WedgeClass::Recovered);
+        }
+        assert!(
+            g.charge_report(WedgeClass::Fault),
+            "a run full of benign post-resume stalls silenced the wedge detector"
+        );
+    }
+
+    /// Each class still bounds its own output. The condition that produces a
+    /// report is permanent by construction, so an unbounded counter would print
+    /// on every run entry for the rest of the run -- which is what the limits
+    /// are for, and splitting them must not lose that.
+    #[test]
+    fn each_report_class_is_bounded_by_its_own_limit() {
+        for (class, limit) in [
+            (WedgeClass::Fault, WEDGE_REPORT_LIMIT),
+            (WedgeClass::Recovered, RECOVERED_REPORT_LIMIT),
+        ] {
+            let mut g = UserGic::default();
+            let printed = (0..limit * 3).filter(|_| g.charge_report(class)).count();
+            assert_eq!(printed as u32, limit, "{class:?} printed {printed} reports");
+        }
+    }
+
+    /// The cheap early return must stay closed until *every* class is spent,
+    /// or a spent fault budget would suppress benign reports and vice versa.
+    ///
+    /// It runs before the register reads, because which budget applies is not
+    /// known until the verdict is computed -- so this is the only thing keeping
+    /// those reads bounded.
+    #[test]
+    fn the_early_return_waits_for_every_budget_to_be_spent() {
+        let mut g = UserGic::default();
+        assert!(!g.all_report_budgets_spent(), "fresh vCPU");
+        for _ in 0..WEDGE_REPORT_LIMIT {
+            g.charge_report(WedgeClass::Fault);
+        }
+        assert!(
+            !g.all_report_budgets_spent(),
+            "a spent fault budget must not suppress the benign report that explains a resume"
+        );
+        for _ in 0..RECOVERED_REPORT_LIMIT {
+            g.charge_report(WedgeClass::Recovered);
+        }
+        assert!(g.all_report_budgets_spent());
+    }
+
+    /// `overdue_by` in raw ticks is unreadable without the guest's counter
+    /// rate, and the recovered report exists to be read at a glance.
+    ///
+    /// The values are the measured ones: 33,266 ticks at Graviton2's
+    /// 121.875 MHz is the benign post-resume gap this whole classification was
+    /// built to name.
+    #[test]
+    fn a_tick_count_is_rendered_in_units_a_reader_has() {
+        assert_eq!(ticks_as_human(33_266, GRAVITON_HZ), "272us");
+        assert_eq!(
+            ticks_as_human(GRAVITON_HZ as i128 / 1_000, GRAVITON_HZ),
+            "1ms"
+        );
+        assert_eq!(
+            ticks_as_human(GRAVITON_HZ as i128 * 3, GRAVITON_HZ),
+            "3.000s"
+        );
+        assert_eq!(ticks_as_human(-33_266, GRAVITON_HZ), "-272us");
+        // A rate we never learned must not divide by zero. Falling back to raw
+        // ticks is honest: it is the only number we actually have.
+        assert_eq!(ticks_as_human(33_266, 0), "33266 ticks");
     }
 
     /// The #257 wedge, in the model: a deactivate must honour the INTID the
@@ -3794,15 +4035,21 @@ impl HvfVcpu {
     ///   console trigger, because a deadline we do not believe has passed can
     ///   never raise the overdue trigger. Recording it as its own arm is what
     ///   stops a counter-scaling bug being misfiled as a guest-side one.
+    /// * **`recovered`** — nothing is stuck: the timer is live, no INTID is
+    ///   active, and the next tick is microseconds out. The guest reported a
+    ///   stall it has already come out of, which is the ordinary consequence of
+    ///   being frozen between two ticks. This is the only arm that is *not* a
+    ///   fault, so it prints under [`RECOVERED_REPORT_TAG`] and spends a budget
+    ///   of its own — sharing one with the fault arms let a benign post-resume
+    ///   stall silence a real wedge later in the same run (#310).
     fn usgic_report_wedge(&self, trigger: &str) {
         const CNTV_CTL_EL0: u16 = 0xDF19;
         const CNTV_CVAL_EL0: u16 = 0xDF1A;
-        {
-            let mut g = self.usgic.lock().unwrap();
-            if g.wedge_reports >= WEDGE_REPORT_LIMIT {
-                return;
-            }
-            g.wedge_reports += 1;
+        // Cheap gate first: if no class can print, nothing below is worth
+        // reading. The per-class charge cannot happen here, because which
+        // budget applies is not known until the verdict is computed.
+        if self.usgic.lock().unwrap().all_report_budgets_spent() {
+            return;
         }
         let ctl = self.get_sysreg(CNTV_CTL_EL0).unwrap_or(0);
         let cval = self.get_sysreg(CNTV_CVAL_EL0).unwrap_or(0);
@@ -3826,22 +4073,46 @@ impl HvfVcpu {
             )
         };
 
+        let guest_hz = self.guest_ticks_per_second();
         let verdict = wedge_verdict(WedgeFacts {
             active_empty: active.is_empty(),
             timer_live,
             overdue_by,
-            guest_hz: self.guest_ticks_per_second(),
+            guest_hz,
             irqs_masked,
             vtimer_pending: pending.contains(&VTIMER_PPI),
         });
 
+        if !self.usgic.lock().unwrap().charge_report(verdict.class) {
+            return;
+        }
+
+        if verdict.class == WedgeClass::Recovered {
+            // Two calm lines, in the units a reader has. The alarming detail
+            // belongs to the alarming case: a register dump under a report that
+            // says nothing is stuck reads as a crash report, which is the whole
+            // of what #310 was about.
+            eprintln!(
+                "{RECOVERED_REPORT_TAG} vcpu {} the guest reported a stall it has already \
+                 recovered from -- nothing is stuck\n\
+                 {RECOVERED_REPORT_TAG} vcpu {}   the next tick is {} away, no INTID is stuck \
+                 active and the timer is live (trigger={trigger}); expected after a resume, see \
+                 docs/first-resume.md",
+                self.index,
+                self.index,
+                ticks_as_human(-overdue_by, guest_hz),
+            );
+            return;
+        }
+
+        let verdict = verdict.text;
         eprintln!(
-            "[wedge] vcpu {} trigger={trigger} verdict={verdict}\n\
-             [wedge] vcpu {}   pending={pending:?} active={active:?} depth={} \
+            "{WEDGE_REPORT_TAG} vcpu {} trigger={trigger} verdict={verdict}\n\
+             {WEDGE_REPORT_TAG} vcpu {}   pending={pending:?} active={active:?} depth={} \
              asserting={asserting} nested_requeues_refused={refused}\n\
-             [wedge] vcpu {}   CNTV_CTL={ctl:#x} (live={timer_live}) CVAL={cval:#x} \
+             {WEDGE_REPORT_TAG} vcpu {}   CNTV_CTL={ctl:#x} (live={timer_live}) CVAL={cval:#x} \
              CNTVCT={now:#x} overdue_by={overdue_by} overdue_entries={entries}\n\
-             [wedge] vcpu {}   PC={pc:#x} CPSR={cpsr:#x} (PSTATE.I={})",
+             {WEDGE_REPORT_TAG} vcpu {}   PC={pc:#x} CPSR={cpsr:#x} (PSTATE.I={})",
             self.index,
             self.index,
             active.len(),

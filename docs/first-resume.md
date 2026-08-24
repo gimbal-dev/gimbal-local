@@ -20,6 +20,7 @@ to you.
 | 3 | Package database arrives half-applied | **`2cpu-net` only** |
 | 4 | Chromium's sandbox cannot start | both |
 | 5 | JIT code executes stale instructions | workload-dependent |
+| 6 | The guest reports an RCU stall right after resume | **`2cpu-net` only** |
 
 > If you cold-booted from a container image or a BYO kernel, none of this
 > applies: nothing was captured, so nothing arrived stale.
@@ -270,6 +271,55 @@ Mac's own `CTR_EL0` and keeps the maintenance its kernel would otherwise have
 elided. That is a real property to reach for if you are choosing between the two,
 but it is no longer the recommendation for running an agent, because a rehydrated
 capture has now done it.
+
+## 6. The guest reports an RCU stall right after resume — **chm classifies this**
+
+The first thing a rehydrated guest may print is its own kernel accusing itself:
+
+```
+rcu: INFO: rcu_preempt detected expedited stalls on CPUs/tasks: { 1-.... }
+```
+
+That line is alarming and, immediately after a resume, usually means nothing is
+wrong. The guest was frozen between two ticks; from inside, the interval that
+elapsed while it was suspended looks exactly like a tick that never arrived, and
+its stall detector fires on a gap it has *already come out of*.
+
+**chm tells the two apart, and the tag is the answer.** Immediately below the
+kernel's line you will see one of two things:
+
+```
+[stall] vcpu 0 the guest reported a stall it has already recovered from -- nothing is stuck
+[stall] vcpu 0   the next tick is 272us away, no INTID is stuck active and the timer is
+                 live (trigger=guest-reported-stall); expected after a resume, see
+                 docs/first-resume.md
+```
+
+`[stall]` means chm looked and found nothing stuck: the virtual timer is enabled,
+no interrupt is jammed in the active stack, and the next tick is microseconds
+out. The guest's complaint is behind it. **Nothing to do.**
+
+```
+[wedge] vcpu 0 trigger=guest-reported-stall verdict=gic-model: an INTID is stuck active ...
+```
+
+`[wedge]` is the opposite: chm looked and something *is* stuck. The verdict names
+the owner. Report that one --
+[open an issue](https://github.com/gimbal-dev/gimbal-local/issues) with the four
+`[wedge]` lines, which carry everything needed to classify it.
+
+The kernel's own stall line is left alone deliberately. Suppressing a real
+message from the guest to make our own output tidier would be lying about
+something we did not observe; chm can say what it found, and it should not say
+what the guest found on its behalf.
+
+**Only the `2cpu-net` capture has produced this**, and only in the first seconds
+after a resume. Why the guest reports a stall on a resume where nothing is stuck
+is not explained -- forcing a large counter advance
+(`CHM_FORCE_RESUME_ADVANCE_S=3600`) produced **zero** stalls, which argues
+against the obvious "the clock jumped" answer. The classification is honest
+about that: it reports what it can see, and what it can see is that nothing is
+stuck.
 
 ## In short
 
