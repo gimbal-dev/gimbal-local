@@ -64,13 +64,15 @@ pub struct QueueState {
     pub used: u64,
 }
 
-/// The backend a restored virtio-pci device drives.
+/// The backend a restored virtio device drives.
 ///
-/// The variant is chosen authoritatively from the device's PCI Device ID
-/// (`0x1040 + virtio_device_type`), not from heuristics on the backing state,
-/// so a device is modeled as exactly what the guest negotiated it to be. An
-/// unrecognised type becomes [`BackendKind::Unsupported`] and is rejected at
-/// build time rather than silently mismodeled.
+/// The variant is chosen authoritatively from the device type the guest
+/// negotiated -- carried as the PCI Device ID (`0x1040 + virtio_device_type`)
+/// on virtio-pci and as the `DeviceID` register on virtio-mmio -- not from
+/// heuristics on the backing state, so a device is modeled as exactly what the
+/// guest negotiated it to be. An unrecognised type becomes
+/// [`BackendKind::Unsupported`] and is rejected at build time rather than
+/// silently mismodeled.
 #[derive(Debug, Clone)]
 pub enum BackendKind {
     /// virtio-blk (type 2): a disk image (by file name) with `nsectors`.
@@ -90,6 +92,36 @@ pub enum BackendKind {
         /// The virtio device type (PCI Device ID minus `0x1040`).
         virtio_type: u32,
     },
+}
+
+/// How a guest reaches a virtio device.
+///
+/// Carried only so a refusal can name the register the reader can actually go
+/// and look at. The *decision* to refuse is a property of the device and is
+/// shared; the identifier a reader recognises is not. A virtio-mmio guest never
+/// saw a PCI Device ID -- there is no PCI bus in the machine -- so quoting one
+/// sends them looking for a device that does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Transport {
+    /// virtio-pci: the type is carried as PCI Device ID `0x1040 + type`.
+    Pci,
+    /// virtio-mmio: the type is carried verbatim in the `DeviceID` register at
+    /// offset `0x008`.
+    Mmio,
+}
+
+impl Transport {
+    /// How this transport names `virtio_type` to the guest, phrased so a reader
+    /// can find the same number on the machine in front of them.
+    fn identifies(self, virtio_type: u32) -> String {
+        match self {
+            Self::Pci => format!(
+                "PCI Device ID {:#06x}",
+                VIRTIO_PCI_DEVICE_ID_BASE + virtio_type
+            ),
+            Self::Mmio => format!("virtio-mmio DeviceID register {virtio_type:#x} at 0x008"),
+        }
+    }
 }
 
 /// virtio device type for virtio-net (PCI Device ID `0x1041`).
@@ -483,6 +515,7 @@ pub fn build_device(
     let backend = build_backend(
         &desc.name,
         &desc.backend,
+        Transport::Pci,
         desc.features,
         overlay_dir,
         resume,
@@ -529,6 +562,7 @@ pub fn build_mmio_device(
     let backend = build_backend(
         &desc.name,
         &desc.backend,
+        Transport::Mmio,
         desc.transport.driver_features,
         overlay_dir,
         resume,
@@ -551,10 +585,15 @@ pub fn build_mmio_device(
 /// build does not model -- is a property of the *device*, not of how the guest
 /// reaches it. Rendering it twice is how a virtio-mmio guest ends up quietly
 /// governed by a different posture than a virtio-pci one.
+///
+/// `transport` is the one thing that is not: it decides only how the refusal
+/// *names* the offending type, so a reader is pointed at a register that
+/// exists on the machine they are holding.
 #[allow(clippy::too_many_arguments)]
 pub fn build_backend(
     name: &str,
     kind: &BackendKind,
+    transport: Transport,
     features: u64,
     overlay_dir: &std::path::Path,
     resume: bool,
@@ -617,11 +656,9 @@ pub fn build_backend(
         }
         BackendKind::Unsupported { virtio_type } => {
             return Err(DevMgrError::Unsupported(format!(
-                "device `{}` is virtio type {virtio_type} (PCI Device ID \
-                 {:#06x}), which this build does not model; refusing to \
-                 mismodel it",
-                name,
-                0x1040 + virtio_type
+                "device `{name}` is virtio type {virtio_type} ({}), which this \
+                 build does not model; refusing to mismodel it",
+                transport.identifies(*virtio_type)
             )));
         }
     };
@@ -1660,11 +1697,113 @@ mod tests {
     #[test]
     fn both_transports_build_a_backend_the_same_way() {
         let src = include_str!("devmgr.rs");
+        // Only production code counts. The tests below call `build_backend`
+        // too, and a guard that counts its own call sites drifts every time a
+        // test is added -- which is exactly when nobody re-derives the number.
+        let prod = src
+            .split_once("\nmod tests {")
+            .expect("the test module marks the end of production code")
+            .0;
         let needle = format!("{}(", "build_backend");
         assert_eq!(
-            src.matches(&needle).count(),
+            prod.matches(&needle).count(),
             3,
             "expected the definition plus one call from each transport builder"
+        );
+    }
+
+    /// A refusal must name the register the reader can actually go and look at.
+    ///
+    /// The decision to refuse is shared by both transports (see
+    /// [`build_backend`]), and that sharing is what nearly made this wrong: a
+    /// virtio-mmio guest has no PCI bus, so quoting a PCI Device ID at it sends
+    /// the reader hunting for a device that does not exist on the machine.
+    /// Asserted in both directions, because "never says PCI" would also be
+    /// satisfied by a message that says nothing useful to either transport.
+    #[test]
+    fn a_refusal_names_the_identifier_this_transport_actually_carries() {
+        let dir = std::env::temp_dir();
+        let refuse = |t: Transport| {
+            let built = build_backend(
+                "_dev0",
+                &BackendKind::Unsupported { virtio_type: 26 },
+                t,
+                0,
+                &dir,
+                true,
+                None,
+                NatLimits::default(),
+                false,
+            );
+            // `Backend` is not `Debug`, so `expect_err` will not do here.
+            match built {
+                Err(e) => e.to_string(),
+                Ok(_) => panic!("an unmodelled virtio type must be refused"),
+            }
+        };
+
+        let pci = refuse(Transport::Pci);
+        assert!(
+            pci.contains("PCI Device ID") && pci.contains("0x105a"),
+            "a virtio-pci refusal must quote the PCI Device ID the guest saw \
+             (0x1040 + 26), got {pci}"
+        );
+
+        let mmio = refuse(Transport::Mmio);
+        assert!(
+            !mmio.contains("PCI"),
+            "a virtio-mmio guest has no PCI bus, so a refusal must not send the \
+             reader looking for a PCI Device ID, got {mmio}"
+        );
+        assert!(
+            mmio.contains("DeviceID") && mmio.contains("0x008"),
+            "a virtio-mmio refusal must name the DeviceID register and where it \
+             lives, got {mmio}"
+        );
+
+        for m in [&pci, &mmio] {
+            assert!(
+                m.contains("virtio type 26"),
+                "both transports must still name the raw virtio type, got {m}"
+            );
+        }
+    }
+
+    /// Each transport builder must hand `build_backend` *its own* transport.
+    ///
+    /// The guard above calls `build_backend` directly, so it is structurally
+    /// blind to which constant a caller passes -- swapping them at a call site
+    /// leaves it green. That is the same call-site class this repository has
+    /// been caught by repeatedly, and it cannot be made a compile error here
+    /// because both constants type-check. So read the source instead, with
+    /// needles assembled from parts so this assertion cannot match itself.
+    #[test]
+    fn each_transport_builder_names_itself() {
+        let src = include_str!("devmgr.rs");
+        let prod = src
+            .split_once("\nmod tests {")
+            .expect("the test module marks the end of production code")
+            .0;
+        let cut = |from: &str, to: &str| {
+            let start = prod.find(from).unwrap_or_else(|| panic!("no `{from}`"));
+            let end = prod.find(to).unwrap_or_else(|| panic!("no `{to}`"));
+            assert!(start < end, "`{from}` must precede `{to}` in this file");
+            &prod[start..end]
+        };
+
+        let pci = format!("{}::{}", "Transport", "Pci");
+        let mmio = format!("{}::{}", "Transport", "Mmio");
+
+        let pci_builder = cut("fn build_device(", "fn build_mmio_device(");
+        assert!(
+            pci_builder.contains(&pci) && !pci_builder.contains(&mmio),
+            "the virtio-pci builder must pass {pci} and nothing else"
+        );
+
+        let mmio_builder = cut("fn build_mmio_device(", "fn build_backend(");
+        assert!(
+            mmio_builder.contains(&mmio) && !mmio_builder.contains(&pci),
+            "the virtio-mmio builder must pass {mmio} and nothing else"
         );
     }
 }
