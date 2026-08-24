@@ -955,4 +955,86 @@ mod tests {
             );
         }
     }
+
+    /// `docs/release-facts.md` records the things a release needs that do not
+    /// live in this repository -- the signing identity, when its certificate
+    /// stops working, and how notarization is authenticated. None of that can
+    /// be checked by building the tree, so the page is the only record, and a
+    /// page that has drifted from the script is worse than no page: it is
+    /// instructions that fail after the four-minute Apple round trip rather
+    /// than before it.
+    ///
+    /// Two different drifts are guarded, because neither implies the other.
+    ///
+    /// The first is the script renaming a knob the page tells a reader to set.
+    /// That is why the environment variables and the default profile name are
+    /// read out of `release-macos.sh` rather than restated here -- the same
+    /// coupling `grow_sequence()` gives `docs/first-resume.md` (#284).
+    ///
+    /// The second is the page losing a fact that cost a measurement to learn.
+    /// The expiry date is the whole reason #391 was filed: a certificate that
+    /// nothing watches is a dateable outage, and this paragraph is currently
+    /// the only thing that watches it. The `security find-generic-password`
+    /// trap is the other -- that tool cannot see the data protection keychain,
+    /// so it reports a working credential as missing, and a reader who has
+    /// lost that sentence will conclude the release is unrepeatable when it is
+    /// not.
+    #[test]
+    fn the_release_facts_page_matches_the_script_it_documents() {
+        let doc = flattened(include_str!("../../docs/release-facts.md"));
+        let script = flattened(include_str!("../../scripts/release-macos.sh"));
+
+        for var in ["GIMBAL_SIGN_IDENTITY", "GIMBAL_NOTARY_PROFILE"] {
+            assert!(
+                script.contains(var),
+                "scripts/release-macos.sh no longer reads `{var}`, so \
+                 docs/release-facts.md is telling a releaser to set a variable \
+                 that does nothing"
+            );
+            assert!(
+                doc.contains(var),
+                "docs/release-facts.md no longer names `{var}`, which the \
+                 release script still requires -- the page has stopped \
+                 describing how to drive it"
+            );
+        }
+
+        let default_profile = "gimbal-notary";
+        assert!(
+            script.contains(&format!("GIMBAL_NOTARY_PROFILE:-{default_profile}")),
+            "the release script's default notary profile is no longer \
+             `{default_profile}`, so every `notarytool` command in \
+             docs/release-facts.md now names the wrong profile"
+        );
+        assert!(
+            doc.contains(default_profile),
+            "docs/release-facts.md no longer names the `{default_profile}` \
+             profile, so it cannot tell anyone how to check or recreate the \
+             notarization credential"
+        );
+
+        for (needle, why) in [
+            (
+                "2027-02-01",
+                "the certificate expiry is the dateable risk #391 was filed \
+                 for, and this page is the only place it is recorded",
+            ),
+            (
+                "89N7ZG42ZM",
+                "the team ID is what identifies the account a re-run needs \
+                 access to",
+            ),
+            (
+                "security find-generic-password",
+                "the page has lost the measured trap that this tool cannot \
+                 see the data protection keychain, so the next reader will \
+                 read a working credential as a missing one",
+            ),
+        ] {
+            assert!(
+                doc.contains(needle),
+                "docs/release-facts.md no longer carries `{needle}`: {why}"
+            );
+        }
+    }
 }

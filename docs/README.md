@@ -87,6 +87,7 @@ fake demos and stale claims. They are not the first thing a release user needs.
 | Doc | Why it remains visible |
 | --- | --- |
 | [`project-state.md`](project-state.md) | The measured state of the world, gate numbers, open limitations, and issue grouping. |
+| [`release-facts.md`](release-facts.md) | The facts a release depends on that live outside this repository: the signing identity, when its certificate stops working, and how notarization is authenticated. |
 | [`engineering-discipline.md`](engineering-discipline.md) | The project's working rules: measure, mutation-test, fail honestly, and keep build traps written down. |
 | [`agents.md`](agents.md) | The specialist agent map. Useful to humans too, but primarily an engineering handoff tool. |
 | [`network-policy-plan.md`](network-policy-plan.md) | Planning record for the network/filesystem policy track. The shipped user surface is in `networking.md` and `security-model.md`. |
