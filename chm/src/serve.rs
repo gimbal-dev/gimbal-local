@@ -29,9 +29,9 @@ use crate::credproxy::cli;
 use crate::console_filter::ConsoleFilter;
 use crate::exec;
 use crate::imp::{
-    Loaded, Outcome, UsgicConfig, UsgicSession, aarch32_guard, cntfrq_guard, icache_dic_guard,
-    load_snapshot,
-    run_usgic_engine, superseded_note,
+    IDLE_RESIDENCY_PERCENT, IdleResidency, Loaded, Outcome, UsgicConfig, UsgicSession,
+    aarch32_guard, cntfrq_guard, icache_dic_guard, load_snapshot, run_usgic_engine,
+    superseded_note,
 };
 use crate::posture;
 
@@ -1453,6 +1453,11 @@ fn supervise_daemon(
     let max = (opts.max_seconds > 0).then(|| Duration::from_secs(opts.max_seconds));
     let idle = (opts.idle_exit_secs > 0).then(|| Duration::from_secs(opts.idle_exit_secs));
     let mut console_filter = ConsoleFilter::new();
+    let mut residency = IdleResidency::new(s.parked);
+    // Say why an idle exit was withheld, once per silent window. A user who
+    // asked for `--idle-exit` and watched it not fire is otherwise left with the
+    // same silence the flag was about.
+    let mut withheld = false;
 
     while s.running.load(Ordering::Acquire) {
         if inner.lock().unwrap().stop_requested {
@@ -1468,6 +1473,10 @@ fn supervise_daemon(
             if !bytes.is_empty() {
                 append_console(inner, &bytes);
                 last_output = Instant::now();
+                // The guest spoke, so the silent window -- and the residency
+                // measured across it -- starts again from here.
+                residency.restart();
+                withheld = false;
             }
         }
 
@@ -1476,10 +1485,30 @@ fn supervise_daemon(
         {
             return Ok(Outcome::MaxSeconds);
         }
-        if let Some(idle) = idle
-            && last_output.elapsed() >= idle
-        {
-            return Ok(Outcome::Idle(opts.idle_exit_secs));
+        if let Some(idle) = idle {
+            let silent_for = last_output.elapsed();
+            residency.trace(silent_for);
+            if silent_for >= idle {
+                match residency.idle_over(silent_for) {
+                    // Silent and genuinely parked: the guest is waiting, not working.
+                    Some(true) | None => return Ok(Outcome::Idle(opts.idle_exit_secs)),
+                    // Silent but running guest code -- a compile, an agent
+                    // thinking, a package resolve. Console silence was the only
+                    // thing that ever made this look idle.
+                    Some(false) => {
+                        if !withheld {
+                            withheld = true;
+                            eprintln!(
+                                "[idle] guest silent for {}s but its vCPUs were parked only {}% of \
+                                 it (idle needs {}%), so it is working, not idle -- not stopping",
+                                silent_for.as_secs(),
+                                residency.percent_over(silent_for),
+                                IDLE_RESIDENCY_PERCENT,
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
     // `running` cleared without the supervisor asking: a vCPU thread powered off

@@ -2940,7 +2940,7 @@ fn run_usgic(args: &Args, loaded: Loaded, kind: runs::Kind) -> Result<ExitCode, 
         snapshot_every: args.snapshot_every,
     };
     let outcome = run_usgic_engine(&cfg, loaded, &mut |s| {
-        run_console(s.uart, s.running, args, s.limits, s.overlay_dir)
+        run_console(s.uart, s.running, args, s.limits, s.overlay_dir, s.parked)
     })?;
     if !args.quiet {
         match &outcome {
@@ -3000,6 +3000,13 @@ pub(crate) struct UsgicSession<'a> {
     pub overlay_dir: &'a Path,
     /// One per vCPU: forces that core out of `hv_vcpu_run` from another thread.
     pub exits: &'a [ExitSignal],
+    /// One per vCPU, in vCPU order: monotonic nanoseconds that core has spent
+    /// parked in the host-side WFI idle path. A supervisor samples the sum at
+    /// both ends of a window to measure how idle the guest actually was, rather
+    /// than inferring it from console silence — silence is also what a guest
+    /// doing a long compile emits. `None` for a vCPU whose backend has no
+    /// host-side park, which means "no signal", not "idle".
+    pub parked: &'a [Option<Arc<AtomicU64>>],
     /// Delivers host bytes to the guest's serial console. The CLI drives this
     /// from stdin; the daemon exposes it as the `input` command.
     pub input: &'a console::ConsoleInput,
@@ -3174,6 +3181,10 @@ pub(crate) fn run_usgic_engine(
         /// Run-progress counter, bumped once per `hv_vcpu_run` iteration. Read by
         /// the run watchdog to detect a vCPU wedged inside a single entry.
         progress: Option<Arc<AtomicU64>>,
+        /// Nanoseconds this vCPU has spent parked in the host-side WFI idle
+        /// path. Read by the supervisor to measure idleness directly instead of
+        /// inferring it from console silence.
+        parked: Option<Arc<AtomicU64>>,
         handle: UsgicCpuHandle,
     }
     let (setup_tx, setup_rx) = mpsc::channel::<Result<CpuSetup, String>>();
@@ -3252,6 +3263,7 @@ pub(crate) fn run_usgic_engine(
                     .exit_signal()
                     .unwrap_or_else(|| Arc::new(|| {}) as Arc<dyn Fn() + Send + Sync>);
                 let progress = vcpu.run_progress();
+                let parked = vcpu.wfi_parked_ns();
                 let handle = match rehydrate::usgic_cpu_handle(&mut vcpu) {
                     Some(h) => h,
                     None => {
@@ -3259,7 +3271,9 @@ pub(crate) fn run_usgic_engine(
                         return;
                     }
                 };
-                if setup_tx.send(Ok(CpuSetup { id, inject, wake, exit, progress, handle })).is_err()
+                if setup_tx
+                    .send(Ok(CpuSetup { id, inject, wake, exit, progress, parked, handle }))
+                    .is_err()
                 {
                     return;
                 }
@@ -3389,6 +3403,10 @@ pub(crate) fn run_usgic_engine(
     let inject0 = setups[0].inject.clone();
     let wake0 = setups[0].wake.clone();
     let all_exits: Vec<Arc<dyn Fn() + Send + Sync>> = setups.iter().map(|s| s.exit.clone()).collect();
+    // Every vCPU's WFI residency counter, in vCPU order. `None` for any backend
+    // without a host-side idle park; the supervisor treats a missing counter as
+    // "no residency signal", never as "idle".
+    let all_parked: Vec<Option<Arc<AtomicU64>>> = setups.iter().map(|s| s.parked.clone()).collect();
     // Every vCPU's WFI wake fd. `all_exits` alone is not enough to stop the
     // world for a live checkpoint: `hv_vcpus_exit` forces a vCPU out of
     // `hv_vcpu_run`, but a core idling in the host-side WFI park has already
@@ -3603,6 +3621,7 @@ pub(crate) fn run_usgic_engine(
         limits: &limits,
         overlay_dir: &overlay_dir,
         exits: &all_exits,
+        parked: &all_parked,
         input: &console_input,
     });
 
@@ -4291,6 +4310,182 @@ fn assemble_usgic_checkpoint(
     })
 }
 
+/// Percentage of a silent window's total vCPU-time that must have been spent
+/// parked in the host-side WFI idle path before that silence is read as
+/// idleness.
+///
+/// The two cases this separates are not close together. Measured on a
+/// rehydrated 2-vCPU Graviton capture, sampling this same counter through
+/// `CHM_TRACE_IDLE`, the *rate* at which parked time accrues converges to
+/// 100% for a guest sitting at a prompt, ~50% for a guest with one of its
+/// two cores spinning, and 0% for a guest with both spinning. The bar sits
+/// 20 points above the half-busy ceiling and ~23 below the idle reading at
+/// the default window, which is as near centred as the data allows while
+/// still biased towards refusing to suspend.
+///
+/// The figure this is compared against is cumulative over the *whole* silent
+/// window, so it carries a post-resume settling transient of roughly 40--60
+/// seconds during which a genuinely idle guest reads low and climbs. That is
+/// deliberate: the cumulative statistic is the one that makes "computed for
+/// half the window" read as ~50%, and it errs towards withholding a suspend
+/// rather than towards taking one. The cost is that an `--idle-exit` window
+/// shorter than roughly 150 seconds will decline to suspend a guest that is
+/// genuinely idle. The default is 600 seconds, where an idle guest reads
+/// 93--96% even with the host under heavy load.
+///
+/// Residency is aggregated across all vCPUs, so a multi-core guest doing
+/// silent background work on a fraction of one core can still clear the bar.
+/// That is strictly better than the console-silence-only rule it replaces,
+/// which suspended such a guest unconditionally.
+///
+/// The measured figures and the trace variable are in
+/// `docs/environment-variables.md`.
+pub(crate) const IDLE_RESIDENCY_PERCENT: u64 = 70;
+
+/// Whether `parked_ns` of parked vCPU-time over `window` across `vcpus` cores
+/// clears [`IDLE_RESIDENCY_PERCENT`].
+///
+/// Pure, so the threshold can be exercised without a guest -- the arithmetic is
+/// the whole of the decision and inlining it would leave it untested.
+fn clears_idle_residency(parked_ns: u64, window: Duration, vcpus: usize) -> bool {
+    let available = window.as_nanos().saturating_mul(vcpus as u128);
+    if available == 0 {
+        // No evidence in the window either way, so decline rather than guess.
+        // This covers a zero-length window and a guest with no reporting vCPUs
+        // alike -- `saturating_mul(0)` is zero -- and both must read as
+        // "unknown" rather than as the 0% a division would produce, which would
+        // read as "busy". A separate `vcpus == 0` arm was removed after a
+        // mutation proved it could never be reached.
+        return false;
+    }
+    u128::from(parked_ns) * 100 >= available * u128::from(IDLE_RESIDENCY_PERCENT)
+}
+
+/// Seconds between `CHM_TRACE_IDLE` residency reports, or `None` when the
+/// variable is unset or unusable. Split from the reporting itself so the parse
+/// is testable without a process-global.
+fn idle_trace_interval(raw: Option<&str>) -> Option<Duration> {
+    let secs: u64 = raw?.trim().parse().ok()?;
+    (secs > 0).then(|| Duration::from_secs(secs))
+}
+
+/// The WFI-residency half of the idle decision.
+///
+/// Console silence alone cannot tell a guest waiting at a login prompt from one
+/// part-way through a long compile, an agent thinking, or a package resolve:
+/// every one of them emits nothing. Each vCPU publishes a monotonic count of
+/// nanoseconds it has spent parked in the host-side wait-for-interrupt path, so
+/// the increase across a silent window measures directly how much of that window
+/// the guest spent doing nothing at all.
+///
+/// The one guest this cannot see is a wedged one. A vCPU whose vtimer deadline
+/// is permanently in the past re-enters the park path immediately every time,
+/// so it accrues dwell as "parked" while making no progress -- it reads idle,
+/// and it is silent, so it is suspended. That is exactly what `--idle-exit` did
+/// before this counter existed, and the revision it displaces stays resumable
+/// (#288), so the blind spot costs nothing that was previously protected. It is
+/// recorded here rather than guarded against because the residency counter is
+/// not the instrument that can tell the two apart: the wedge detector in the
+/// userspace GIC is.
+pub(crate) struct IdleResidency {
+    /// One counter per vCPU that publishes one, so the sum covers exactly
+    /// `counters.len()` cores. Empty when no backend on this VM has a host-side
+    /// park, which is the "no signal" case -- see [`Self::idle_over`].
+    counters: Vec<Arc<AtomicU64>>,
+    /// Summed parked-nanos at the instant the current silent window opened.
+    at_window_start: u64,
+    /// `CHM_TRACE_IDLE` cadence, and when a report was last emitted. This is
+    /// the instrument the threshold was chosen from, so it stays in the shipped
+    /// build rather than being deleted as scaffolding.
+    trace_every: Option<Duration>,
+    last_trace: Instant,
+}
+
+impl IdleResidency {
+    pub(crate) fn new(parked: &[Option<Arc<AtomicU64>>]) -> Self {
+        let counters: Vec<Arc<AtomicU64>> = parked.iter().flatten().cloned().collect();
+        let raw = env::var("CHM_TRACE_IDLE").ok();
+        let mut r = Self {
+            counters,
+            at_window_start: 0,
+            trace_every: idle_trace_interval(raw.as_deref()),
+            last_trace: Instant::now(),
+        };
+        r.restart();
+        r
+    }
+
+    /// Emit a residency report when `CHM_TRACE_IDLE` asks for one. `silent_for`
+    /// is how long the current window has been open, so the printed percentage
+    /// is exactly the figure [`Self::idle_over`] would decide on.
+    pub(crate) fn trace(&mut self, silent_for: Duration) {
+        let Some(every) = self.trace_every else {
+            return;
+        };
+        if self.last_trace.elapsed() < every {
+            return;
+        }
+        self.last_trace = Instant::now();
+        eprintln!(
+            "[idle] silent {}s  vcpus {}  parked {} ms  residency {}%  (bar {IDLE_RESIDENCY_PERCENT}%)",
+            silent_for.as_secs(),
+            self.counters.len(),
+            self.parked_since_start() / 1_000_000,
+            self.percent_over(silent_for),
+        );
+    }
+
+    /// Summed parked nanoseconds across every reporting vCPU. The individual
+    /// reads are not simultaneous, but each counter only ever increases and the
+    /// skew is nanoseconds against a window measured in minutes.
+    fn total(&self) -> u64 {
+        self.counters
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .sum::<u64>()
+    }
+
+    /// Reopen the window at the current instant. Called whenever the guest
+    /// speaks, so residency is only ever measured across the silence itself.
+    pub(crate) fn restart(&mut self) {
+        self.at_window_start = self.total();
+    }
+
+    /// Parked nanoseconds accumulated since the window opened.
+    fn parked_since_start(&self) -> u64 {
+        self.total().saturating_sub(self.at_window_start)
+    }
+
+    /// Whether the guest was parked for enough of `window` to call it idle.
+    ///
+    /// `None` means no vCPU reports a counter, so there is no residency signal
+    /// at all. That is deliberately distinct from `Some(false)`: a caller must
+    /// not read a missing instrument as evidence the guest was busy, any more
+    /// than as evidence it was idle.
+    pub(crate) fn idle_over(&self, window: Duration) -> Option<bool> {
+        if self.counters.is_empty() {
+            return None;
+        }
+        Some(clears_idle_residency(
+            self.parked_since_start(),
+            window,
+            self.counters.len(),
+        ))
+    }
+
+    /// Residency across `window` as a percentage, for reporting. Saturates at
+    /// 100 so a sampling boundary cannot print an impossible figure.
+    pub(crate) fn percent_over(&self, window: Duration) -> u64 {
+        let available = window
+            .as_nanos()
+            .saturating_mul(self.counters.len() as u128);
+        if available == 0 {
+            return 0;
+        }
+        ((u128::from(self.parked_since_start()) * 100) / available).min(100) as u64
+    }
+}
+
 /// The effective wall-clock cap in seconds: the tighter (smaller nonzero) of the
 /// `--max-seconds` flag and the limits doc's `max_wall_seconds`. `0`/`None` mean
 /// "no cap from that source"; `None` result means unlimited.
@@ -4333,11 +4528,17 @@ fn run_console(
     args: &Args,
     limits: &limits::LimitsDoc,
     overlay_dir: &Path,
+    parked: &[Option<Arc<AtomicU64>>],
 ) -> Result<Outcome, String> {
     let start = Instant::now();
     let mut last_output = Instant::now();
     let mut stdout = io::stdout();
     let mut filter = ConsoleFilter::new();
+    let mut residency = IdleResidency::new(parked);
+    // Say why an idle exit was withheld, once per silent window, rather than
+    // leaving a user who asked for `--idle-exit` with the same silence the flag
+    // was supposed to act on.
+    let mut withheld = false;
 
     // The wall-clock cap is the tighter of --max-seconds and the limits doc.
     let wall_secs = effective_wall_secs(args.max_seconds, limits.max_wall_seconds);
@@ -4374,7 +4575,13 @@ fn run_console(
                 continue;
             }
             match stdout.write_all(&bytes).and_then(|()| stdout.flush()) {
-                Ok(()) => last_output = Instant::now(),
+                Ok(()) => {
+                    last_output = Instant::now();
+                    // The guest spoke, so the silent window -- and the residency
+                    // measured across it -- starts again from here.
+                    residency.restart();
+                    withheld = false;
+                }
                 // The console consumer went away (e.g. piped into `head`): stop
                 // cleanly rather than treating a closed pipe as a failure.
                 Err(e) if e.kind() == io::ErrorKind::BrokenPipe => {
@@ -4414,10 +4621,30 @@ fn run_console(
         {
             return Ok(Outcome::MaxSeconds);
         }
-        if let Some(idle) = idle
-            && last_output.elapsed() >= idle
-        {
-            return Ok(Outcome::Idle(args.idle_exit_secs));
+        if let Some(idle) = idle {
+            let silent_for = last_output.elapsed();
+            residency.trace(silent_for);
+            if silent_for >= idle {
+                match residency.idle_over(silent_for) {
+                    // Silent and genuinely parked: the guest is waiting, not working.
+                    Some(true) | None => return Ok(Outcome::Idle(args.idle_exit_secs)),
+                    // Silent but running guest code -- a compile, an agent
+                    // thinking, a package resolve. Console silence was the only
+                    // thing that ever made this look idle.
+                    Some(false) => {
+                        if !withheld {
+                            withheld = true;
+                            eprintln!(
+                                "chm: guest silent for {}s but its vCPUs were parked only {}% of \
+                                 it (idle needs {IDLE_RESIDENCY_PERCENT}%), so it is working, not \
+                                 idle -- not stopping",
+                                silent_for.as_secs(),
+                                residency.percent_over(silent_for),
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
     // A vCPU thread stopped the run; flush any withheld partial line and surface
@@ -5944,6 +6171,202 @@ mod tests {
             src.matches(&needle).count()
         );
     }
+
+    // ---- #171: the WFI-residency half of the idle decision ----------------
+
+    /// One nanosecond short of the bar must not clear it, and exactly the bar
+    /// must. A `>` where the code has `>=` is a one-character mutation, so the
+    /// boundary is asserted from both sides rather than sampled in the middle.
+    #[test]
+    fn the_residency_bar_is_inclusive_and_exact() {
+        let window = Duration::from_secs(100);
+        let vcpus = 2;
+        // 70% of 100s x 2 vCPU.
+        let at_bar = 140 * 1_000_000_000u64;
+        assert!(
+            !clears_idle_residency(at_bar - 1, window, vcpus),
+            "one nanosecond below the bar is not idle"
+        );
+        assert!(
+            clears_idle_residency(at_bar, window, vcpus),
+            "exactly the bar is idle"
+        );
+        assert!(clears_idle_residency(at_bar + 1, window, vcpus));
+    }
+
+    /// The three populations this threshold was chosen to separate, at the
+    /// figures actually measured on hardware (see the constant's doc comment
+    /// and `docs/environment-variables.md`). A bar moved far enough to
+    /// misclassify either extreme fails here rather than in a guest.
+    #[test]
+    fn the_measured_populations_land_on_the_right_side_of_the_bar() {
+        let window = Duration::from_secs(600);
+        let vcpus = 2;
+        let available_ms = 600 * 1000 * vcpus as u64;
+        let at = |percent: u64| percent * available_ms * 1_000_000 / 100;
+
+        // Idle at a prompt: 93-96% at the 600s default, worst sample under a
+        // host load of 11.96.
+        assert!(
+            clears_idle_residency(at(93), window, vcpus),
+            "a measured idle guest must suspend"
+        );
+        // Half busy asymptotes at 50% and approaches it from below, so its
+        // ceiling is the number that has to fail.
+        assert!(
+            !clears_idle_residency(at(50), window, vcpus),
+            "the half-busy ceiling must never read as idle"
+        );
+        // Both cores spinning: 0.3% over a whole run.
+        assert!(
+            !clears_idle_residency(at(1), window, vcpus),
+            "a busy guest must never suspend"
+        );
+    }
+
+    /// Neither degenerate input may read as idle. Zero vCPUs and a zero-length
+    /// window both carry no evidence, and the arithmetic would otherwise
+    /// divide by zero or report 0% -- which reads as "busy", not "unknown".
+    #[test]
+    fn a_window_with_no_evidence_in_it_is_not_idle() {
+        assert!(!clears_idle_residency(
+            u64::MAX,
+            Duration::from_secs(100),
+            0
+        ));
+        assert!(!clears_idle_residency(u64::MAX, Duration::ZERO, 2));
+        assert!(!clears_idle_residency(0, Duration::ZERO, 0));
+    }
+
+    /// A backend with no host-side park reports no counters, and that is
+    /// deliberately `None` rather than `false`: a missing instrument is not
+    /// evidence the guest was busy. HVF always reports, so this arm cannot be
+    /// reached on this machine -- untested it would be a branch that has never
+    /// run, which is exactly the shape that ships broken.
+    #[test]
+    fn a_backend_with_no_park_counter_reports_no_signal_rather_than_busy() {
+        let none = IdleResidency::new(&[None, None]);
+        assert_eq!(
+            none.idle_over(Duration::from_secs(600)),
+            None,
+            "no counters must report no signal"
+        );
+        assert_eq!(none.percent_over(Duration::from_secs(600)), 0);
+
+        // And one that does report is a real verdict, not None.
+        let busy = IdleResidency::new(&[Some(Arc::new(AtomicU64::new(0)))]);
+        assert_eq!(busy.idle_over(Duration::from_secs(600)), Some(false));
+    }
+
+    /// The window opens when the guest last spoke, so residency is measured
+    /// across the silence and not across the whole run. A counter that was
+    /// already large before the window opened must not carry into it.
+    #[test]
+    fn restarting_the_window_discards_parked_time_from_before_it() {
+        let c = Arc::new(AtomicU64::new(0));
+        let mut r = IdleResidency::new(&[Some(Arc::clone(&c))]);
+        let window = Duration::from_secs(100);
+        let full = 100 * 1_000_000_000u64;
+
+        // A full window of parked time banked before the guest spoke.
+        c.store(full, Ordering::Relaxed);
+        assert_eq!(r.idle_over(window), Some(true));
+        r.restart();
+        assert_eq!(
+            r.idle_over(window),
+            Some(false),
+            "parked time from before the window must not count towards it"
+        );
+        assert_eq!(r.percent_over(window), 0);
+    }
+
+    /// Reporting saturates at 100 so a sampling boundary -- a counter read
+    /// after the window length was taken -- cannot print an impossible figure.
+    #[test]
+    fn the_reported_percentage_cannot_exceed_a_hundred() {
+        let c = Arc::new(AtomicU64::new(0));
+        let r = IdleResidency::new(&[Some(Arc::clone(&c))]);
+        // Raised after the window opened, so it all counts towards it.
+        c.store(u64::MAX, Ordering::Relaxed);
+        assert_eq!(r.percent_over(Duration::from_secs(1)), 100);
+    }
+
+    /// `CHM_TRACE_IDLE` is the instrument the bar was chosen from, so its parse
+    /// has to fail silent rather than loudly: an unusable value must leave the
+    /// supervisor quiet, never panic and never trace every pass.
+    #[test]
+    fn the_trace_cadence_only_accepts_a_positive_number_of_seconds() {
+        assert_eq!(idle_trace_interval(None), None, "unset is silent");
+        assert_eq!(idle_trace_interval(Some("")), None, "empty is silent");
+        assert_eq!(
+            idle_trace_interval(Some("yes")),
+            None,
+            "unparsable is silent"
+        );
+        assert_eq!(idle_trace_interval(Some("-5")), None, "negative is silent");
+        assert_eq!(
+            idle_trace_interval(Some("0")),
+            None,
+            "zero is silent, not every pass"
+        );
+        assert_eq!(
+            idle_trace_interval(Some("30")),
+            Some(Duration::from_secs(30))
+        );
+        assert_eq!(
+            idle_trace_interval(Some(" 30 ")),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    /// Every supervisor that decides a silent guest is idle must consult the
+    /// residency counter first.
+    ///
+    /// This reads the crate's own sources and enumerates, rather than checking
+    /// the two files known to have supervisors today: a third one added later
+    /// would restore console-silence-only idling with every behavioural test
+    /// still green, because an assertion about an outcome structurally cannot
+    /// see a decision path that no longer consults its evidence.
+    #[test]
+    fn every_supervisor_that_calls_a_silent_guest_idle_consults_residency() {
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut sites = 0usize;
+        let mut files: Vec<PathBuf> = fs::read_dir(&src_dir)
+            .expect("the crate source directory must be readable")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "rs"))
+            .collect();
+        files.sort();
+
+        // Assembled from parts: a literal needle would match this test's own
+        // source and so could never detect its removal from the code it guards.
+        let produces = format!("return Ok({}::Idle(", "Outcome");
+        let consults = format!(".{}(", "idle_over");
+
+        for path in files {
+            let src = fs::read_to_string(&path).expect("source file must be readable");
+            let lines: Vec<&str> = src.lines().collect();
+            for (i, line) in lines.iter().enumerate() {
+                if !line.contains(&produces) {
+                    continue;
+                }
+                sites += 1;
+                let back = i.saturating_sub(8);
+                let context = lines[back..=i].join("\n");
+                assert!(
+                    context.contains(&consults),
+                    "{}:{} decides a silent guest is idle without consulting residency",
+                    path.display(),
+                    i + 1
+                );
+            }
+        }
+        assert!(
+            sites >= 2,
+            "expected the CLI and daemon supervisors, found {sites}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -6301,4 +6724,5 @@ mod net_service_pass_tests {
             "an early delivery must not short-circuit the rest of the pass"
         );
     }
+
 }

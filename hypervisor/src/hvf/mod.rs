@@ -508,6 +508,7 @@ impl Vm for HvfVm {
             cnt_scale_den: AtomicU64::new(1),
             vtimer_reprogram_failed: AtomicBool::new(false),
             run_gen: Arc::new(AtomicU64::new(0)),
+            parked_ns: Arc::new(AtomicU64::new(0)),
             usgic: Mutex::new(UserGic::default()),
             inject_queue: Arc::new(Mutex::new(Vec::new())),
         }))
@@ -3329,6 +3330,12 @@ pub struct HvfVcpu {
     /// stalls the watchdog forces the vCPU out via [`Self::exit_signal`] so it
     /// re-enters and Apple re-evaluates pending interrupts / the timer deadline.
     run_gen: Arc<AtomicU64>,
+    /// Nanoseconds this vCPU has spent parked in the host-side WFI idle path,
+    /// accumulated across every `EC_WFX` exit. Read by a supervisor to tell a
+    /// genuinely idle guest from one doing silent compute — see
+    /// [`crate::cpu::Vcpu::wfi_parked_ns`]. Written only by this vCPU's own
+    /// thread; read from any.
+    parked_ns: Arc<AtomicU64>,
     /// Userspace GICv3 CPU interface (see [`UserGic`]). Active only when no
     /// managed GIC is used, and only once a caller has switched it on.
     usgic: Mutex<UserGic>,
@@ -5230,6 +5237,10 @@ impl Vcpu for HvfVcpu {
         Some(self.run_gen.clone())
     }
 
+    fn wfi_parked_ns(&self) -> Option<Arc<AtomicU64>> {
+        Some(self.parked_ns.clone())
+    }
+
     fn usgic_inject_queue(&self) -> Option<Arc<Mutex<Vec<u32>>>> {
         // Only expose the queue when the userspace GIC is actually in use — a
         // managed-GIC vCPU delivers cross-thread interrupts through the GIC, not
@@ -5380,6 +5391,10 @@ impl Vcpu for HvfVcpu {
                         // re-executes WFI and parks again.
                         let pc = self.get_reg(HV_REG_PC)?;
                         self.set_reg(HV_REG_PC, pc.wrapping_add(4))?;
+                        // Time the park itself, not the exit handling around it.
+                        // Started after the last `?` above so no early return can
+                        // skip the accumulation below, and closed on both arms.
+                        let park_started = std::time::Instant::now();
                         if self.usgic_enabled() {
                             // Halt IN THE HOST until the software GIC has an
                             // interrupt to deliver, then return so hv_vcpu_run
@@ -5456,6 +5471,10 @@ impl Vcpu for HvfVcpu {
                             // re-enters and the managed GIC redelivers.
                             let _ = self.kick.wait_timeout(self.wfi_park_ms());
                         }
+                        // Both arms land here: whatever the GIC mode, the guest
+                        // asked to idle and this is how long it idled for.
+                        self.parked_ns
+                            .fetch_add(park_started.elapsed().as_nanos() as u64, Ordering::Relaxed);
                         Ok(VmExit::Ignore)
                     }
                     EC_HVC64 => {

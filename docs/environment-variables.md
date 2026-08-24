@@ -43,6 +43,48 @@ stderr, so `2> trace.log` separates it from guest console output.
 | `CHM_TRACE_INPUT` | Bytes written into the guest console. | Keystrokes are not reaching the guest. Distinguishes "not delivered" from "delivered and ignored". |
 | `CHM_TRACE_WATCHDOG` | The run watchdog's liveness sampling. | A run is being killed and you want to see what the watchdog saw. |
 | `CHM_TRACE_TIMING` | `[startup] <elapsed> <label>` for each startup phase. | Start-up is slow and you want the phase, not a guess. |
+| `CHM_TRACE_IDLE` | Seconds between WFI-residency reports: `[idle] silent <n>s vcpus <n> parked <n> ms residency <n>% (bar <n>%)`. Unset, `0` or unparsable means silent. | `--idle-exit` suspended a guest that was working, or declined to suspend one that was not. This is the instrument the residency bar was chosen from -- see below. |
+
+### What `--idle-exit` actually measures
+
+Console silence alone cannot tell a login prompt from an agent thinking, so a
+silent window is only read as idle when the guest also spent enough of it
+parked in the host-side wait-for-interrupt path. Each vCPU publishes a
+monotonic count of parked nanoseconds; the increase across the window, divided
+by `window x vcpus`, is the residency figure, and it must reach **70%**.
+
+The threshold is not a guess. Measured on a rehydrated 2-vCPU Graviton capture
+by sampling `CHM_TRACE_IDLE`, against a 300--330 second window:
+
+| guest | host load | residency at 300s | rate over the final interval |
+| --- | --- | --- | --- |
+| idle at a prompt | 3.44 | 91% | 100.0% |
+| idle at a prompt | 11.96 | 86% | 100.0% |
+| one of two cores spinning | 7.79 | 44% | 49.9% |
+| both cores spinning | 6.5--7.7 | 0.3% | 0% |
+
+Two properties of that data decide the design:
+
+- The *rate* separates completely -- 100 / 50 / 0 -- and host load does not
+  move it. Load only delays how quickly the cumulative figure climbs.
+- The figure is cumulative over the whole silent window, so it carries a
+  40--60 second post-resume settling transient. A half-busy guest therefore
+  approaches 50% **from below** and can never reach 70, while an idle guest
+  crosses 70 somewhere between 120 and 150 seconds and keeps climbing.
+
+So an `--idle-exit` window shorter than roughly 150 seconds will decline to
+suspend a guest that is genuinely idle. That is the safe direction, and the
+default is 600 seconds, where an idle guest reads 93--96% even under heavy
+host load.
+
+Two limits worth knowing. Residency is aggregated across all vCPUs, so a
+multi-core guest doing silent background work on a fraction of one core still
+clears the bar -- still strictly better than the console-silence-only rule it
+replaces, which suspended it unconditionally. And a *wedged* guest reads as
+parked, because a vCPU with a permanently overdue deadline re-enters the park
+path every time; it is silent and it reads idle, so it is suspended, exactly as
+before this counter existed. The revision that suspend displaces stays
+resumable, so nothing that was previously protected is lost.
 
 ## Behavioural overrides
 
