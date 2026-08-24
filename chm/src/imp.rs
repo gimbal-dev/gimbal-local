@@ -6323,10 +6323,16 @@ mod tests {
     /// residency counter first.
     ///
     /// This reads the crate's own sources and enumerates, rather than checking
-    /// the two files known to have supervisors today: a third one added later
+    /// the files known to have supervisors today: a further one added later
     /// would restore console-silence-only idling with every behavioural test
     /// still green, because an assertion about an outcome structurally cannot
     /// see a decision path that no longer consults its evidence.
+    ///
+    /// #404 proved that this is not hypothetical -- and that a *needle* has the
+    /// same blind spot as a behavioural assertion. `chm create` grew an idle
+    /// supervisor that this guard passed straight over, because it reports
+    /// through an `ExitCode` rather than an `Outcome`. Hence two shapes below,
+    /// and a floor that names all three.
     #[test]
     fn every_supervisor_that_calls_a_silent_guest_idle_consults_residency() {
         let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -6341,14 +6347,23 @@ mod tests {
 
         // Assembled from parts: a literal needle would match this test's own
         // source and so could never detect its removal from the code it guards.
-        let produces = format!("return Ok({}::Idle(", "Outcome");
+        //
+        // Two shapes, because the two entry points report differently. The
+        // daemon returns an `Outcome`; `chm create` returns an `ExitCode` and
+        // marks the reason for its own teardown report, so it is invisible to
+        // the first needle -- which is exactly how #404 was able to ship an
+        // idle supervisor this guard could not see.
+        let produces = [
+            format!("return Ok({}::Idle(", "Outcome"),
+            format!("{}_idle = true;", "stopped"),
+        ];
         let consults = format!(".{}(", "idle_over");
 
         for path in files {
             let src = fs::read_to_string(&path).expect("source file must be readable");
             let lines: Vec<&str> = src.lines().collect();
             for (i, line) in lines.iter().enumerate() {
-                if !line.contains(&produces) {
+                if !produces.iter().any(|p| line.contains(p.as_str())) {
                     continue;
                 }
                 sites += 1;
@@ -6363,8 +6378,8 @@ mod tests {
             }
         }
         assert!(
-            sites >= 2,
-            "expected the CLI and daemon supervisors, found {sites}"
+            sites >= 3,
+            "expected the CLI, daemon and cold-boot supervisors, found {sites}"
         );
     }
 }

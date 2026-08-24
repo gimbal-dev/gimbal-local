@@ -34,7 +34,7 @@ use std::io::{stdin, IsTerminal, Write};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 use std::{fs, io, thread};
@@ -59,9 +59,9 @@ use crate::audit::{AuditLog, EgressTally};
 use crate::coldboot::{ColdBootConfig, VirtioKind};
 use crate::console::RawConsole;
 use crate::imp::{
-    CpuPowerSlot, NET_SERVICE_INTERVAL, PL011_BASE, PL011_SIZE, PsciCoordinator, UsgicCapture,
-    apply_psci_cpu_on_state, collect_usgic_checkpoint, egress_posture_line, net_service_pass,
-    wait_for_cpu_on_request,
+    CpuPowerSlot, IDLE_RESIDENCY_PERCENT, IdleResidency, NET_SERVICE_INTERVAL, PL011_BASE,
+    PL011_SIZE, PsciCoordinator, UsgicCapture, apply_psci_cpu_on_state, collect_usgic_checkpoint,
+    egress_posture_line, net_service_pass, wait_for_cpu_on_request,
 };
 use crate::oci::initramfs::installs_proxy_ca;
 use crate::oci::modules;
@@ -170,6 +170,19 @@ struct CreateArgs {
     /// unattended cold boot that produces no output really is the normal early
     /// failure mode and a deadline is what stops it hanging CI.
     max_seconds: u64,
+    /// Stop once the guest has been idle for this many seconds; `0` means no
+    /// idle supervisor. Off by default: a cold boot is the interactive path,
+    /// and stopping a session the operator never asked to have timed is the
+    /// #305 mistake in a second place.
+    ///
+    /// "Idle" is measured, not inferred. Console silence alone is a guess --
+    /// a guest compiling for ten minutes says nothing and is the busiest it
+    /// will ever be -- so a silent window only counts when the vCPUs were
+    /// parked in the host-side WFI path for most of it (#171, #403). This is
+    /// deliberately *not* a preservation control: what survives the stop is
+    /// `--originate`'s business, and it fires on this path exactly as it does
+    /// on the `--seconds` one.
+    idle_exit_secs: u64,
     /// Hosts the guest may reach, as `host:port`. Empty means the default
     /// deny-all posture, which is what an unconfigured sandbox gets everywhere
     /// else in this tree (see `docs/security-model.md` §1a).
@@ -248,8 +261,19 @@ fn usage() -> String {
      \x20                     Defaults to the --proxy-rules file's own\n\
      \x20                     directory, because a CA is a trust root that\n\
      \x20                     has to outlive the run.\n\
-     \x20 --seconds <n>       Stop after n seconds (default 30). 0 runs until\n\
-     \x20                     the guest powers off or you press Ctrl-A x.\n\
+     \x20 --seconds <n>       Stop after n seconds. Defaults to 0 (no deadline)\n\
+     \x20                     when stdin is a terminal -- a session you are\n\
+     \x20                     sitting at ends when you say so -- and to 30\n\
+     \x20                     when it is a pipe, where an unattended boot that\n\
+     \x20                     produces nothing would otherwise hang forever.\n\
+     \x20 --idle-exit <n>     Stop once the guest has been idle for n seconds\n\
+     \x20                     (default 0, off). Idle means measured idle: the\n\
+     \x20                     console has been silent for n seconds *and* the\n\
+     \x20                     vCPUs were parked for most of that window. A\n\
+     \x20                     guest that is quietly compiling keeps running,\n\
+     \x20                     and says so once per silent window.\n\
+     \x20                     It decides when to stop, not what to keep: pass\n\
+     \x20                     --originate as well to preserve the guest.\n\
      \x20 --originate <dir>   Snapshot this guest into <dir> when it stops, as\n\
      \x20                     a cloud-hypervisor snapshot directory that\n\
      \x20                     `chm run <dir>` resumes. This is how a lineage\n\
@@ -347,6 +371,7 @@ const CREATE_FLAGS: &[&str] = &[
     "--cpus",
     "--memory",
     "--seconds",
+    "--idle-exit",
     "--disk",
     "--net",
     "--egress-allow",
@@ -381,6 +406,7 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     let mut cfg = ColdBootConfig::default();
     let mut dry_run = false;
     let mut max_seconds = default_max_seconds(stdin().is_terminal());
+    let mut idle_exit_secs = 0u64;
     let mut kernel: Option<PathBuf> = None;
     let mut egress_allow: Vec<String> = Vec::new();
     let mut expose: Vec<u16> = Vec::new();
@@ -439,6 +465,11 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
                 max_seconds = value("--seconds")?
                     .parse()
                     .map_err(|e| format!("--seconds: {e}"))?;
+            }
+            "--idle-exit" => {
+                idle_exit_secs = value("--idle-exit")?
+                    .parse()
+                    .map_err(|e| format!("--idle-exit: {e}"))?;
             }
             "--disk" => cfg.disks.push(PathBuf::from(value("--disk")?)),
             "--net" => cfg.net = true,
@@ -569,6 +600,7 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
         cfg,
         dry_run,
         max_seconds,
+        idle_exit_secs,
         egress_allow,
         expose,
         proxy_rules,
@@ -967,11 +999,20 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     // outcome a caller most needs to hear about, and it costs one scan of bytes
     // that are being copied to stdout anyway.
     let panic_watch = Arc::new(PanicWatch::default());
+    // Bumped once per batch of guest output. The idle supervisor watches this
+    // rather than sharing an `Instant`: it only needs to know *that* the guest
+    // spoke since it last looked, and a counter needs no lock on a path that
+    // copies bytes to a terminal.
+    //
+    // The console thread is the only observer of guest output in this process,
+    // so this is the only place the fact is available at all.
+    let spoke = Arc::new(AtomicU64::new(0));
     let console = {
         let uart = uart.clone();
         let running = running.clone();
         let tail = tail.clone();
         let panic_watch = panic_watch.clone();
+        let spoke = spoke.clone();
         thread::Builder::new()
             .name("cold-console".into())
             .spawn(move || {
@@ -986,6 +1027,7 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                         t.push(&bytes);
                     }
                     panic_watch.push(&bytes);
+                    spoke.fetch_add(1, Ordering::Release);
                     let _ = out.write_all(&bytes);
                     let _ = out.flush();
                 }
@@ -995,6 +1037,7 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                         t.push(&rest);
                     }
                     panic_watch.push(&rest);
+                    spoke.fetch_add(1, Ordering::Release);
                     let _ = out.write_all(&rest);
                     let _ = out.flush();
                 }
@@ -1031,7 +1074,16 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     // so the run loop never re-reads `running` and the join below would wait for
     // a guest that is never coming back. `hv_vcpus_exit` is what makes
     // `--seconds` a promise rather than a hope.
-    type CpuReport = (usize, UsgicCpuHandle, Option<Arc<dyn Fn() + Send + Sync>>);
+    // The parked-nanoseconds counter travels the same way and for the same
+    // reason: `wfi_parked_ns()` can only be read from the vCPU it belongs to,
+    // and the idle supervisor that reads it lives on the orchestrator. It is
+    // what makes `--idle-exit` a measurement rather than a guess about silence.
+    type CpuReport = (
+        usize,
+        UsgicCpuHandle,
+        Option<Arc<dyn Fn() + Send + Sync>>,
+        Option<Arc<AtomicU64>>,
+    );
     let (setup_tx, setup_rx) = mpsc::channel::<Result<CpuReport, String>>();
     // The origination capture channel (#341). `Some` only when `--originate`
     // asked for a snapshot, so an ordinary cold boot does no capture work at
@@ -1092,7 +1144,8 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                         return;
                     };
                     let exit = vcpu.exit_signal();
-                    if setup_tx.send(Ok((id, handle, exit))).is_err() {
+                    let parked = vcpu.wfi_parked_ns();
+                    if setup_tx.send(Ok((id, handle, exit, parked))).is_err() {
                         return;
                     }
                     drop(setup_tx);
@@ -1206,11 +1259,15 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     // vCPU id, and the channel does not promise arrival order.
     let mut handles: Vec<Option<UsgicCpuHandle>> = (0..vcpus).map(|_| None).collect();
     let mut exits: Vec<Option<Arc<dyn Fn() + Send + Sync>>> = (0..vcpus).map(|_| None).collect();
+    // Indexed by id like the others, though the idle supervisor only ever sums
+    // it: a residency figure is about the machine, not about any one core.
+    let mut all_parked: Vec<Option<Arc<AtomicU64>>> = (0..vcpus).map(|_| None).collect();
     for _ in 0..vcpus {
         match setup_rx.recv() {
-            Ok(Ok((id, h, exit))) => {
+            Ok(Ok((id, h, exit, parked))) => {
                 handles[id] = Some(h);
                 exits[id] = exit;
+                all_parked[id] = parked;
             }
             Ok(Err(e)) => {
                 running.store(false, Ordering::Release);
@@ -1423,16 +1480,78 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     // printed -- is a worse failure than waiting. Same "who is driving?"
     // distinction as `default_max_seconds`, and for the same reason.
     let unattended = !stdin().is_terminal();
+    // `--idle-exit 0` means no idle supervisor, the same way `--seconds 0` means
+    // no deadline.
+    let idle = (args.idle_exit_secs > 0).then(|| Duration::from_secs(args.idle_exit_secs));
+    let mut residency = IdleResidency::new(&all_parked);
+    let mut last_output = Instant::now();
+    let mut last_spoke = spoke.load(Ordering::Acquire);
+    // One explanation per silent window, not one per 50 ms poll. Cleared when
+    // the guest speaks, so a second quiet stretch is reported again.
+    let mut withheld = false;
+    // Distinguishes this stop from the `--seconds` one in the report below.
+    // `timed_out` cannot tell them apart: both leave `running` true with no
+    // shutdown requested.
+    let mut stopped_idle = false;
     while running.load(Ordering::Acquire)
         && deadline.is_none_or(|d| Instant::now() < d)
         && !console::shutdown_requested()
         && !(unattended && panic_watch.settled_after_panic(PANIC_SILENCE_GRACE, Instant::now()))
     {
         thread::sleep(Duration::from_millis(50));
+        let Some(idle) = idle else { continue };
+        // The console thread bumped its counter, so the guest said something
+        // since the last poll: the silent window starts again from here.
+        let now_spoke = spoke.load(Ordering::Acquire);
+        if now_spoke != last_spoke {
+            last_spoke = now_spoke;
+            last_output = Instant::now();
+            residency.restart();
+            withheld = false;
+            continue;
+        }
+        let silent_for = last_output.elapsed();
+        residency.trace(silent_for);
+        if silent_for < idle {
+            continue;
+        }
+        match residency.idle_over(silent_for) {
+            // Silent and genuinely parked: the guest is waiting, not working.
+            // `None` is "no vCPU publishes a counter" -- a missing instrument is
+            // not evidence of busyness, and the pre-#171 behaviour was to stop
+            // on silence alone, so this is where that lands.
+            Some(true) | None => {
+                stopped_idle = true;
+                break;
+            }
+            // Silent but running guest code -- a compile, an agent thinking, a
+            // package resolve. Console silence was the only thing that ever made
+            // this look idle, and it was wrong.
+            Some(false) => {
+                if !withheld {
+                    withheld = true;
+                    eprintln!(
+                        "[idle] guest silent for {}s but its vCPUs were parked only {}% of it \
+                         (idle needs {}%), so it is working, not idle -- not stopping",
+                        silent_for.as_secs(),
+                        residency.percent_over(silent_for),
+                        IDLE_RESIDENCY_PERCENT,
+                    );
+                }
+            }
+        }
     }
     // Only a deadline that actually expired counts as a timeout; an operator
-    // ending the session is a normal exit, not a run that overran.
-    let timed_out = running.load(Ordering::Acquire) && !console::shutdown_requested();
+    // ending the session is a normal exit, not a run that overran. Nor is an
+    // idle stop, which has its own report.
+    //
+    // `!stopped_idle` is redundant *today*: the idle arm below is matched
+    // first, so this value is never read on an idle stop. It is kept so the
+    // two stops are exclusive by predicate rather than by position, and it is
+    // recorded here that removing it fires no test -- the arm order is what
+    // `the_idle_stop_reports_itself_rather_than_the_deadline` actually guards.
+    let timed_out =
+        running.load(Ordering::Acquire) && !console::shutdown_requested() && !stopped_idle;
     running.store(false, Ordering::Release);
 
     // Release any secondary still parked waiting for a CPU_ON that will not
@@ -1523,6 +1642,24 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
             Ok(ExitCode::SUCCESS)
         }
         Some(Err(e)) => Err(e),
+        None if stopped_idle => {
+            println!(
+                "\nchm create: stopped after {}s idle -- the --idle-exit supervisor, not \
+                 the guest.\n  The guest was silent and its vCPUs were parked for at least \
+                 {}% of that window, so it was waiting rather than working.\n  Use \
+                 `--idle-exit N` to allow longer, or `--idle-exit 0` for no idle \
+                 supervisor.{}",
+                args.idle_exit_secs,
+                IDLE_RESIDENCY_PERCENT,
+                if args.originate.is_some() {
+                    ""
+                } else {
+                    "\n  Nothing was preserved: --idle-exit chooses when to stop, and \
+                     --originate chooses what to keep."
+                }
+            );
+            Ok(ExitCode::SUCCESS)
+        }
         None if timed_out => {
             println!(
                 "\nchm create: stopped after {}s -- the --seconds deadline, not the \
@@ -2275,11 +2412,24 @@ mod tests {
     ///
     /// The bar is our own egress line, which they praised in the same session
     /// and resolved unaided: it names the rule, the reason, and the flag.
+    ///
+    /// The anchor is deliberately the `-- the` that follows the number rather
+    /// than the number alone: #404 added a second `stopped after {}s` message
+    /// above this one, and the shorter needle silently began describing that
+    /// one instead. A needle that matches in more than one place cannot detect
+    /// its removal from the one that matters.
     #[test]
     fn the_deadline_message_says_whose_deadline_it_was_and_how_to_change_it() {
         let src = include_str!("create.rs");
+        let anchor = format!("chm create: stopped after {{}}s -- {}", "the");
+        assert_eq!(
+            src.matches(anchor.as_str()).count(),
+            1,
+            "the anchor must name exactly one message, or this guard describes \
+             a message nobody meant it to"
+        );
         let (_, after) = src
-            .split_once("chm create: stopped after {}s")
+            .split_once(anchor.as_str())
             .expect("the deadline message is still here");
         let msg = &after[..500.min(after.len())];
 
@@ -2289,6 +2439,37 @@ mod tests {
                 "the deadline message must mention {needed:?}"
             );
         }
+    }
+
+    /// The idle stop has a different cause and a different remedy, so it needs
+    /// its own sentence rather than the deadline's -- otherwise a caller who
+    /// never passed `--seconds` is told their `--seconds` deadline expired and
+    /// goes looking for a flag they did not set.
+    #[test]
+    fn the_idle_message_says_it_was_the_supervisor_and_what_it_measured() {
+        let src = include_str!("create.rs");
+        let anchor = format!("chm create: stopped after {{}}s {}", "idle");
+        let (_, after) = src
+            .split_once(anchor.as_str())
+            .expect("the idle message is still here");
+        let msg = &after[..600.min(after.len())];
+
+        for needed in [
+            "--idle-exit N",
+            "--idle-exit 0",
+            "parked",
+            "waiting rather than working",
+        ] {
+            assert!(
+                msg.contains(needed),
+                "the idle message must mention {needed:?}"
+            );
+        }
+        assert!(
+            msg.contains("Nothing was preserved"),
+            "a stop that keeps nothing must say so, or the silence reads as a \
+             snapshot that was taken"
+        );
     }
 
     #[test]
@@ -3482,5 +3663,110 @@ mod tests {
                  reported as a clean stop, which is the defect"
             );
         }
+    }
+
+    /// The idle supervisor is off unless asked for, and parses like its sibling.
+    ///
+    /// Deliberately not tty-dependent the way `--seconds` is (#305): a deadline
+    /// answers "how long may this run at most", which an unattended pipe needs
+    /// an answer to. An idle teardown is a different question, and adding one
+    /// nobody asked for to an interactive session would be #305 in reverse.
+    #[test]
+    fn idle_exit_is_off_until_asked_for() {
+        let off = parse(&args(&["--kernel", "/tmp/Image"])).unwrap();
+        assert_eq!(
+            off.idle_exit_secs, 0,
+            "an unasked-for idle stop is a surprise"
+        );
+
+        let on = parse(&args(&["--kernel", "/tmp/Image", "--idle-exit", "45"])).unwrap();
+        assert_eq!(on.idle_exit_secs, 45);
+        assert_eq!(
+            on.max_seconds,
+            default_max_seconds(stdin().is_terminal()),
+            "--idle-exit says when to stop, and must not also move the deadline"
+        );
+
+        let e = parse(&args(&["--kernel", "/tmp/Image", "--idle-exit", "soon"])).unwrap_err();
+        assert!(
+            e.contains("--idle-exit"),
+            "the refusal must name the flag: {e}"
+        );
+    }
+
+    /// #404's open question, answered in the source rather than in a comment.
+    ///
+    /// `--idle-exit` decides *when* a run stops; `--originate` decides *what*
+    /// survives it. Implying one from the other would write a snapshot the
+    /// caller never asked for, and there is no way to un-ask for it.
+    #[test]
+    fn idle_exit_does_not_imply_originate() {
+        let a = parse(&args(&["--kernel", "/tmp/Image", "--idle-exit", "30"])).unwrap();
+        assert!(
+            a.originate.is_none(),
+            "asking when to stop is not asking for a lineage"
+        );
+    }
+
+    /// The two stops have different causes and different remedies, so a caller
+    /// reading the last line of a run must be able to tell which fired. They
+    /// are indistinguishable to `timed_out` -- both leave the guest running
+    /// with no shutdown requested -- so the reason is carried explicitly.
+    #[test]
+    fn the_idle_stop_reports_itself_rather_than_the_deadline() {
+        let src = include_str!("create.rs");
+        let marker = format!("None if {}_idle =>", "stopped");
+        assert!(
+            src.contains(&marker),
+            "the idle stop needs its own arm before the timeout one, or it \
+             reports a --seconds deadline the caller never set"
+        );
+        let idle_at = src.find(&marker).unwrap();
+        let timeout_at = src.find("None if timed_out =>").unwrap();
+        assert!(
+            idle_at < timeout_at,
+            "the idle arm must come first: an idle stop also satisfies the \
+             timeout arm's shape"
+        );
+    }
+
+    /// The residency counter can only be read from the vCPU that owns it, so if
+    /// it does not travel with the GIC handle it cannot reach the supervisor at
+    /// all -- and `IdleResidency::new` would see an empty slice, report `None`,
+    /// and stop on console silence alone. That is the pre-#171 behaviour
+    /// wearing #404's flag, which is the worst of both.
+    #[test]
+    fn every_vcpu_reports_its_parked_counter_to_the_supervisor() {
+        let src = include_str!("create.rs");
+        let read = format!("vcpu.{}()", "wfi_parked_ns");
+        assert!(
+            src.contains(&read),
+            "no vCPU reads its parked counter, so residency has no evidence"
+        );
+        assert!(
+            src.contains(&format!("{}[id] = parked;", "all_parked")),
+            "the drain must place each counter by vCPU id, since the channel \
+             does not promise arrival order"
+        );
+        assert!(
+            src.contains(&format!("{}::new(&all_parked)", "IdleResidency")),
+            "the supervisor must be built from the collected counters"
+        );
+    }
+
+    /// The console thread is this process's only observer of guest output, so a
+    /// silent-window clock that it does not feed can never restart -- and every
+    /// run would be declared idle exactly `--idle-exit` seconds after boot,
+    /// however loud the guest was.
+    #[test]
+    fn both_console_drains_report_that_the_guest_spoke() {
+        let src = include_str!("create.rs");
+        let call = format!("{}.fetch_add(1, Ordering::Release);", "spoke");
+        let sites = src.matches(&call).count();
+        assert_eq!(
+            sites, 2,
+            "expected the loop body and the post-loop drain to both report \
+             output, found {sites}"
+        );
     }
 }
