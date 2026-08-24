@@ -43,6 +43,72 @@ pub mod pci;
 pub mod queue;
 pub mod rng;
 
+/// The surface a host-side net service thread needs from a virtio NIC,
+/// independent of the transport that carries it.
+///
+/// A cold-booted guest's NIC is virtio-mmio; a restored cloud-hypervisor
+/// snapshot's is virtio-pci. The loop that pumps frames does not care which:
+/// it attaches a wake handle, services the backend, and drains the egress
+/// decisions the audit trail is built from. Naming that surface once is what
+/// lets a single service loop serve both, rather than the tree carrying two
+/// renderings of one posture -- which drift, and the drift is invisible until
+/// a sandbox that was supposed to be recording reaches a host with an empty
+/// trail behind it.
+pub trait NetIo: Send + Sync {
+    /// The device's name, as it appears in an audit record or a refusal.
+    fn name(&self) -> &str;
+    /// Attach the wake handle the service thread waits on, so a guest transmit
+    /// does not have to wait out the poll interval.
+    fn set_net_kick(&self, kick: std::sync::Arc<net::NetKick>);
+    /// Advance the net backend and deliver any frames it produced. Returns
+    /// whether a frame reached the guest.
+    fn service_net(&self) -> bool;
+    /// Take the egress decisions recorded since the last call. Draining is not
+    /// optional: the NAT buffers every decision until somebody takes them.
+    fn drain_egress_events(&self) -> Vec<nat::EgressEvent>;
+    /// Attach (or clear) the credential proxy's interception decision. On the
+    /// trait rather than the concrete types so one caller installs the proxy on
+    /// every NIC however it arrived: two renderings of one security posture
+    /// drift, and the drift is invisible until a guest reaches a host unsigned.
+    fn set_net_intercept(&self, decider: Option<std::sync::Arc<dyn nat::InterceptDecider>>);
+}
+
+impl NetIo for pci::VirtioPciDevice {
+    fn name(&self) -> &str {
+        pci::VirtioPciDevice::name(self)
+    }
+    fn set_net_kick(&self, kick: std::sync::Arc<net::NetKick>) {
+        pci::VirtioPciDevice::set_net_kick(self, kick);
+    }
+    fn service_net(&self) -> bool {
+        pci::VirtioPciDevice::service_net(self)
+    }
+    fn drain_egress_events(&self) -> Vec<nat::EgressEvent> {
+        pci::VirtioPciDevice::drain_egress_events(self)
+    }
+    fn set_net_intercept(&self, decider: Option<std::sync::Arc<dyn nat::InterceptDecider>>) {
+        pci::VirtioPciDevice::set_net_intercept(self, decider);
+    }
+}
+
+impl NetIo for mmio::VirtioMmioDevice {
+    fn name(&self) -> &str {
+        mmio::VirtioMmioDevice::name(self)
+    }
+    fn set_net_kick(&self, kick: std::sync::Arc<net::NetKick>) {
+        mmio::VirtioMmioDevice::set_net_kick(self, kick);
+    }
+    fn service_net(&self) -> bool {
+        mmio::VirtioMmioDevice::service_net(self)
+    }
+    fn drain_egress_events(&self) -> Vec<nat::EgressEvent> {
+        mmio::VirtioMmioDevice::drain_egress_events(self)
+    }
+    fn set_net_intercept(&self, decider: Option<std::sync::Arc<dyn nat::InterceptDecider>>) {
+        mmio::VirtioMmioDevice::set_net_intercept(self, decider);
+    }
+}
+
 /// A contiguous guest-physical RAM region backed by a host pointer.
 struct Region {
     gpa: u64,
@@ -301,6 +367,8 @@ pub mod features {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn guest_memory_read_write_roundtrip() {
@@ -320,5 +388,109 @@ mod tests {
         mem.register_owned(0x4000_0000, 0x1000);
         mem.read_u32(0x4000_0ffe).unwrap_err(); // straddles the end
         mem.read_u32(0x5000_0000).unwrap_err(); // unbacked
+    }
+
+    /// Both transports, reached the way the net service thread reaches them.
+    /// A device reached the way the net service thread reaches it, paired with
+    /// the name it should answer with.
+    type NamedNic = (&'static str, Arc<dyn NetIo>);
+
+    fn as_net_io() -> (Arc<AtomicUsize>, Vec<NamedNic>) {
+        use net::{NetDevice, NetResponder};
+
+        // A responder that always has one decision to hand over and one frame
+        // to deliver, so an impl that answered with an empty vec is visibly
+        // wrong rather than coincidentally right.
+        struct Talkative(Arc<AtomicUsize>);
+        impl NetResponder for Talkative {
+            fn accept(&mut self, _frame: &[u8]) {}
+            fn set_intercept(&mut self, _d: Option<Arc<dyn nat::InterceptDecider>>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn service(&mut self) -> Vec<Vec<u8>> {
+                vec![vec![0u8; 64]]
+            }
+            fn drain_egress_events(&mut self) -> Vec<nat::EgressEvent> {
+                vec![nat::EgressEvent {
+                    domain: "tcp",
+                    target: "203.0.113.1:443".into(),
+                    allowed: false,
+                    rule: "default-deny".into(),
+                    policy: "test".into(),
+                }]
+            }
+        }
+        let intercepts = Arc::new(AtomicUsize::new(0));
+        let backend =
+            || devcore::Backend::Net(NetDevice::new(Box::new(Talkative(intercepts.clone()))));
+        let mem = || {
+            let m = Arc::new(GuestMemory::new());
+            m.register_owned(0x4000_0000, 0x1000);
+            m
+        };
+        let pci = Arc::new(pci::VirtioPciDevice::new(
+            "pcidev",
+            backend(),
+            mem(),
+            pci::RestoreParams {
+                features: features::VERSION_1,
+                queues: vec![],
+                queue_vectors: vec![],
+                device_status: 0x0f,
+                device_config: vec![],
+            },
+        ));
+        let m = Arc::new(mmio::VirtioMmioDevice::new(
+            "mmiodev",
+            backend(),
+            mem(),
+            mmio::MmioParams {
+                device_id: mmio::device_id::NET,
+                features: 0,
+                num_queues: 2,
+                device_config: vec![0; 8],
+            },
+        ));
+        (
+            intercepts,
+            vec![
+                ("pcidev", pci as Arc<dyn NetIo>),
+                ("mmiodev", m as Arc<dyn NetIo>),
+            ],
+        )
+    }
+
+    #[test]
+    fn a_net_device_is_reached_by_the_same_surface_on_either_transport() {
+        // The service thread holds `Arc<dyn NetIo>` and never learns which
+        // transport carries the NIC. An impl that answered for the wrong object
+        // -- or answered with a constant -- would leave the audit trail of one
+        // whole transport silently empty, which is the failure this trait
+        // exists to make impossible.
+        let (intercepts, devices) = as_net_io();
+        for (n, (expected, dev)) in devices.into_iter().enumerate() {
+            assert_eq!(dev.name(), expected, "each impl must answer for itself");
+            let events = dev.drain_egress_events();
+            assert_eq!(
+                events.len(),
+                1,
+                "{expected}: the responder's decisions must reach the audit trail"
+            );
+            assert_eq!(events[0].target, "203.0.113.1:443");
+            // No RX queue is published in this fixture, so nothing can be
+            // delivered into the guest and both transports must say so. Weak on
+            // its own -- the drain assertion above is what carries the property
+            // -- but it does catch an impl answering for a different object.
+            assert!(
+                !dev.service_net(),
+                "{expected}: with no RX queue, no frame can reach the guest"
+            );
+            dev.set_net_intercept(None);
+            assert_eq!(
+                intercepts.load(Ordering::SeqCst),
+                n + 1,
+                "{expected}: the credential proxy must reach this device's own NAT"
+            );
+        }
     }
 }

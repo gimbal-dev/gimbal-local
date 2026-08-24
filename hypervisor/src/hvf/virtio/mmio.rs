@@ -431,6 +431,31 @@ impl VirtioMmioDevice {
         delivered
     }
 
+    /// Complete anything the guest made available before the capture that the
+    /// capture-side device never consumed.
+    ///
+    /// A resumed guest will not re-notify a queue it has already kicked: from
+    /// its side the request is outstanding and the completion is owed. Without
+    /// this, a checkpoint taken with a disk read in flight resumes into a guest
+    /// blocked forever on a read nothing will finish. `notify` only signals an
+    /// interrupt when it actually completes a request, so a device whose queues
+    /// were quiesced at capture pops nothing and stays silent.
+    ///
+    /// This goes through the transport's own `notify` rather than straight to
+    /// the core, because that is where `QueueReady` is consulted. [`restored`]
+    /// gives an unready queue its recorded ring addresses but deliberately
+    /// skips seeding its cursors from those rings -- so `next_avail` reads 0
+    /// against a ring the driver may already have advanced, and walking one
+    /// would complete a request that does not exist.
+    ///
+    /// [`restored`]: Self::restored
+    pub fn drain_on_resume(&self) {
+        let n = self.core.lock().unwrap().queues.len();
+        for qi in 0..n as u16 {
+            self.notify(qi);
+        }
+    }
+
     /// Drain the net backend's egress-decision events for the audit trail.
     pub fn drain_egress_events(&self) -> Vec<super::nat::EgressEvent> {
         let mut core = self.core.lock().unwrap();
@@ -1117,5 +1142,62 @@ mod tests {
             .expect("seed used.idx");
         let d = VirtioMmioDevice::restored(a_backend(), mem.clone(), s);
         (d, mem)
+    }
+
+    /// Lay down a one-descriptor virtio-blk read the guest published but the
+    /// capture-side device never consumed: `avail.idx = 1` against a device
+    /// cursor of 0.
+    fn an_unconsumed_read(mem: &GuestMemory, desc: u64, avail: u64) {
+        let wr = |gpa: u64, addr: u64, len: u32, flags: u16, next: u16| {
+            mem.write(gpa, &addr.to_le_bytes()).unwrap();
+            mem.write_u32(gpa + 8, len).unwrap();
+            mem.write_u16(gpa + 12, flags).unwrap();
+            mem.write_u16(gpa + 14, next).unwrap();
+        };
+        wr(desc, 0x4000_4000, 16, 0x1, 1); // header, NEXT
+        wr(desc + 16, 0x4000_5000, 512, 0x3, 2); // data, NEXT|WRITE
+        wr(desc + 32, 0x4000_6000, 1, 0x2, 0); // status, WRITE
+        mem.write_u32(0x4000_4000, 0).unwrap(); // VIRTIO_BLK_T_IN
+        mem.write_u64(0x4000_4008, 0).unwrap(); // sector 0
+        mem.write_u16(avail + 4, 0).unwrap(); // ring[0] = head 0
+        mem.write_u16(avail + 2, 1).unwrap(); // avail.idx = 1
+    }
+
+    #[test]
+    fn a_resume_completes_the_request_the_capture_never_consumed() {
+        // The guest kicked this queue before the checkpoint, so from its side
+        // the completion is owed and it will never kick again. Nothing else
+        // will finish the read.
+        let (d, mem) = restored_from(&a_ready_queue_state());
+        an_unconsumed_read(&mem, RING_DESC, RING_AVAIL);
+        d.drain_on_resume();
+        assert_eq!(
+            mem.read_u16(RING_USED + 2).unwrap(),
+            1,
+            "the used ring must have advanced"
+        );
+        assert_eq!(
+            mem.read_u32(0x4000_5000).unwrap(),
+            0xabab_abab,
+            "the disk contents must have reached the guest's buffer"
+        );
+    }
+
+    #[test]
+    fn a_resume_does_not_walk_a_queue_the_driver_never_published() {
+        // `restored` keeps an unready queue's *recorded* addresses and only
+        // skips seeding its cursors -- so a drain that bypassed the transport's
+        // QueueReady gate would walk a ring the driver was partway through
+        // publishing, and complete a request that does not exist.
+        let mut s = a_ready_queue_state();
+        s.queues[0].ready = false;
+        let (d, mem) = restored_from(&s);
+        an_unconsumed_read(&mem, RING_DESC, RING_AVAIL);
+        d.drain_on_resume();
+        assert_eq!(
+            mem.read_u16(RING_USED + 2).unwrap(),
+            0,
+            "a half-published ring must be left alone"
+        );
     }
 }
