@@ -232,6 +232,7 @@ impl VirtioMmioDevice {
             device_config: params.device_config,
             isr_status: 0,
             mem,
+            transport_signals: true,
             injector: Box::new(LoggingInjector::new(name.clone())),
         };
         Self {
@@ -327,6 +328,7 @@ impl VirtioMmioDevice {
             device_config: state.device_config.clone(),
             isr_status: 0,
             mem,
+            transport_signals: true,
             injector: Box::new(LoggingInjector::new(state.name.clone())),
         };
         Self {
@@ -1198,6 +1200,215 @@ mod tests {
             mem.read_u16(RING_USED + 2).unwrap(),
             0,
             "a half-published ring must be left alone"
+        );
+    }
+
+    /// Counts the edges a device actually asks the interrupt controller for.
+    struct CountingInjector(Arc<Mutex<usize>>);
+    impl InterruptInjector for CountingInjector {
+        fn signal(&self, _vector: u16) {
+            *self.0.lock().unwrap() += 1;
+        }
+    }
+
+    #[test]
+    fn one_notification_raises_one_edge() {
+        // virtio-mmio has a single wired interrupt and the driver's handler
+        // reads `InterruptStatus` to learn why it fired, reporting `IRQ_NONE`
+        // when it reads zero. `raise` is the only thing that sets that
+        // register, so a second edge from anywhere else necessarily arrives
+        // ahead of it and tells the driver nothing -- and Linux counts
+        // unhandled edges on a line towards disabling it outright. Holding the
+        // count at one is therefore also what keeps the ordering right: it
+        // leaves `raise` as the sole signaller on this transport.
+        let (d, mem) = restored_from(&a_ready_queue_state());
+        an_unconsumed_read(&mem, RING_DESC, RING_AVAIL);
+        let edges = Arc::new(Mutex::new(0usize));
+        d.set_injector(Box::new(CountingInjector(edges.clone())));
+        d.notify(0);
+        assert_eq!(
+            mem.read_u16(RING_USED + 2).unwrap(),
+            1,
+            "the notification must have completed work, or there is no edge to count"
+        );
+        assert_eq!(
+            read32(&d, 0x060) & INT_USED_RING,
+            INT_USED_RING,
+            "the driver must be able to read why it was interrupted"
+        );
+        assert_eq!(
+            *edges.lock().unwrap(),
+            1,
+            "one completed notification must raise exactly one edge"
+        );
+    }
+
+    #[test]
+    fn a_net_service_tick_raises_one_edge_for_both_completions() {
+        // The net paths are the ones that can actually be observed torn: they
+        // run on the service thread while the guest is executing, so a bare
+        // edge really can reach the driver before `raise` has said why. One
+        // tick completes a TX descriptor and delivers an RX frame -- two
+        // separate signal sites -- and the transport still owes the driver
+        // exactly one edge, raised after `InterruptStatus` is set.
+        use super::super::net::{EchoResponder, NetDevice, VIRTIO_NET_HDR_LEN};
+
+        let guest_mac: [u8; 6] = [0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc];
+        let guest_ip: [u8; 4] = [192, 168, 249, 2];
+        let gw_ip: [u8; 4] = [192, 168, 249, 1];
+        let gw_mac: [u8; 6] = [0x02, 0, 0, 0, 0, 1];
+
+        let mem = Arc::new(GuestMemory::new());
+        mem.register_owned(0x4000_0000, 0x2_0000);
+        let wr_desc = |gpa: u64, addr: u64, len: u32, flags: u16| {
+            mem.write(gpa, &addr.to_le_bytes()).unwrap();
+            mem.write_u32(gpa + 8, len).unwrap();
+            mem.write_u16(gpa + 12, flags).unwrap();
+            mem.write_u16(gpa + 14, 0).unwrap();
+        };
+
+        // RX queue (index 0): one empty device-writable buffer.
+        let (rx_desc, rx_avail, rx_used, rx_buf) = (
+            0x4000_1000u64,
+            0x4000_1100u64,
+            0x4000_1200u64,
+            0x4000_1400u64,
+        );
+        wr_desc(rx_desc, rx_buf, 256, 0x2);
+        mem.write_u16(rx_avail + 4, 0).unwrap();
+        mem.write_u16(rx_avail + 2, 1).unwrap();
+
+        // TX queue (index 1): a virtio-net header followed by an ARP request.
+        let (tx_desc, tx_avail, tx_used, tx_buf) = (
+            0x4000_2000u64,
+            0x4000_2100u64,
+            0x4000_2200u64,
+            0x4000_2400u64,
+        );
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0xff; 6]);
+        frame.extend_from_slice(&guest_mac);
+        frame.extend_from_slice(&0x0806u16.to_be_bytes());
+        frame.extend_from_slice(&1u16.to_be_bytes());
+        frame.extend_from_slice(&0x0800u16.to_be_bytes());
+        frame.push(6);
+        frame.push(4);
+        frame.extend_from_slice(&1u16.to_be_bytes()); // request
+        frame.extend_from_slice(&guest_mac);
+        frame.extend_from_slice(&guest_ip);
+        frame.extend_from_slice(&[0u8; 6]);
+        frame.extend_from_slice(&gw_ip);
+        let mut tx_payload = vec![0u8; VIRTIO_NET_HDR_LEN];
+        tx_payload.extend_from_slice(&frame);
+        mem.write(tx_buf, &tx_payload).unwrap();
+        wr_desc(tx_desc, tx_buf, tx_payload.len() as u32, 0x0);
+        mem.write_u16(tx_avail + 4, 0).unwrap();
+        mem.write_u16(tx_avail + 2, 1).unwrap();
+
+        let q = |desc, driver, device| MmioQueueState {
+            size: 8,
+            desc,
+            driver,
+            device,
+            ready: true,
+        };
+        let state = MmioTransportState {
+            name: "net0".into(),
+            device_id: device_id::NET,
+            device_features: super::super::features::VERSION_1,
+            driver_features: super::super::features::VERSION_1,
+            device_features_sel: 1,
+            driver_features_sel: 1,
+            queue_sel: 0,
+            interrupt_status: 0,
+            device_status: 0xf,
+            config_generation: 0,
+            queues: vec![q(rx_desc, rx_avail, rx_used), q(tx_desc, tx_avail, tx_used)],
+            device_config: vec![],
+        };
+        let responder = EchoResponder::new(gw_ip, gw_mac);
+        let d = VirtioMmioDevice::restored(
+            Backend::Net(NetDevice::new(Box::new(responder))),
+            mem.clone(),
+            &state,
+        );
+        let edges = Arc::new(Mutex::new(0usize));
+        d.set_injector(Box::new(CountingInjector(edges.clone())));
+
+        // The guest transmits; the reply is produced off the vCPU thread, so
+        // the service tick is what injects it back into RX.
+        d.notify(1);
+        let tx_edges = *edges.lock().unwrap();
+        assert!(d.service_net(), "the service tick injected the reply");
+
+        assert_eq!(
+            mem.read_u16(tx_used + 2).unwrap(),
+            1,
+            "TX descriptor completed"
+        );
+        assert_eq!(mem.read_u16(rx_used + 2).unwrap(), 1, "RX reply injected");
+        assert_eq!(
+            read32(&d, 0x060) & INT_USED_RING,
+            INT_USED_RING,
+            "the driver must be able to read why it was interrupted"
+        );
+        assert_eq!(
+            tx_edges, 1,
+            "the transmit notification owes exactly one edge"
+        );
+        assert_eq!(
+            *edges.lock().unwrap(),
+            2,
+            "the service tick owes exactly one further edge, not one per queue"
+        );
+    }
+
+    #[test]
+    fn a_cold_booted_device_raises_one_edge_too() {
+        // A cold-booted guest never sees the restore constructor: it negotiates
+        // and brings the device up itself over the register interface. That is
+        // the *only* transport such a guest has, so the same one-edge property
+        // has to hold on the path it actually takes.
+        let (d, mem) = dev();
+        write32(&d, 0x070, 0x1 | 0x2); // ACKNOWLEDGE | DRIVER
+        write32(&d, 0x024, 1); // DriverFeaturesSel = high half
+        write32(&d, 0x020, 1); // VIRTIO_F_VERSION_1
+        write32(&d, 0x070, 0x1 | 0x2 | u32::from(DEVICE_STATUS_FEATURES_OK));
+        write32(&d, 0x030, 0); // QueueSel = 0
+        write32(&d, 0x038, 64); // QueueNum
+        write32(&d, 0x080, RING_DESC as u32);
+        write32(&d, 0x084, (RING_DESC >> 32) as u32);
+        write32(&d, 0x090, RING_AVAIL as u32);
+        write32(&d, 0x094, (RING_AVAIL >> 32) as u32);
+        write32(&d, 0x0a0, RING_USED as u32);
+        write32(&d, 0x0a4, (RING_USED >> 32) as u32);
+        write32(&d, 0x044, 1); // QueueReady
+        write32(
+            &d,
+            0x070,
+            0x1 | 0x2 | u32::from(DEVICE_STATUS_FEATURES_OK) | u32::from(DEVICE_STATUS_DRIVER_OK),
+        );
+        assert!(d.driver_ok(), "the bring-up sequence must have taken");
+
+        an_unconsumed_read(&mem, RING_DESC, RING_AVAIL);
+        let edges = Arc::new(Mutex::new(0usize));
+        d.set_injector(Box::new(CountingInjector(edges.clone())));
+        write32(&d, 0x050, 0); // QueueNotify, as the guest writes it
+
+        assert_eq!(
+            mem.read_u16(RING_USED + 2).unwrap(),
+            1,
+            "the notification must have completed work, or there is no edge to count"
+        );
+        assert_eq!(
+            read32(&d, 0x060) & INT_USED_RING,
+            INT_USED_RING,
+            "the driver must be able to read why it was interrupted"
+        );
+        assert_eq!(
+            *edges.lock().unwrap(),
+            1,
+            "a negotiated device owes exactly one edge per notification too"
         );
     }
 }

@@ -175,6 +175,21 @@ pub(super) struct DeviceCore {
     pub(super) isr_status: u8,
     pub(super) mem: Arc<GuestMemory>,
     pub(super) injector: Box<dyn InterruptInjector>,
+    /// Whether this device's transport raises the completion edge itself, in
+    /// which case this core must not raise one too.
+    ///
+    /// On virtio-pci there is no register a driver must see set before the
+    /// vector arrives, so signalling from here *is* the delivery. On
+    /// virtio-mmio there is: the driver's handler reads `InterruptStatus` to
+    /// learn why it fired and reports `IRQ_NONE` when it reads zero, and only
+    /// `VirtioMmioDevice::raise` sets that register -- so an edge raised from
+    /// here necessarily arrives ahead of it, carrying no reason. Linux counts
+    /// unhandled edges on a line towards disabling it, so those are not free.
+    ///
+    /// Suppressing this edge can never cost a delivery: every site below sets
+    /// `isr_status` before signalling, and that is exactly the condition
+    /// `raise` requires to fire.
+    pub(super) transport_signals: bool,
 }
 impl DeviceCore {
     /// Service a queue notification: drain and process the available ring.
@@ -235,7 +250,7 @@ impl DeviceCore {
                         queue.next_used, queue.event_idx
                     );
                 }
-                if needs {
+                if needs && !self.transport_signals {
                     let vector = self
                         .queue_vectors
                         .get(queue_index as usize)
@@ -303,7 +318,7 @@ impl DeviceCore {
                     .get(NET_TX_QUEUE as usize)
                     .and_then(|q| q.needs_interrupt(&mem, old_used, q.next_used).ok())
                     .unwrap_or(true);
-                if needs {
+                if needs && !self.transport_signals {
                     let vector = self.queue_vectors.get(NET_TX_QUEUE as usize).copied().unwrap_or(0);
                     self.injector.signal(vector);
                 }
@@ -398,7 +413,7 @@ impl DeviceCore {
                 .get(NET_RX_QUEUE as usize)
                 .and_then(|q| q.needs_interrupt(&mem, old_used, q.next_used).ok())
                 .unwrap_or(true);
-            if needs {
+            if needs && !self.transport_signals {
                 let vector = self.queue_vectors.get(NET_RX_QUEUE as usize).copied().unwrap_or(0);
                 self.injector.signal(vector);
             }
