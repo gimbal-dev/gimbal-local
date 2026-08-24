@@ -461,6 +461,18 @@ pub fn default_init(
     }
     let cd = workdir.map_or_else(String::new, |d| format!("cd {} 2>/dev/null\n", sh_quote(d)));
 
+    // The banner *reports* the entrypoint; the handover below *runs* it. Those
+    // are different jobs, so they need different quoting, and only one of them
+    // is documented as taking shell source.
+    //
+    // Unquoted here, an entrypoint containing a double quote closes the echo's
+    // own string and the rest of it becomes live operators in this script: a
+    // `&` backgrounds part of the banner, a `;` runs the remainder as an init
+    // command, before the trap and before the exec. Measured on
+    // `/bin/sh -c "sleep 900 & wait; echo X"`, which printed X at boot from
+    // this line. The init still parses, so `sh -n` cannot see it.
+    let banner_entrypoint = sh_quote(entrypoint);
+
     // Make the entrypoint survive the console reset, when the entrypoint is not
     // an interactive shell.
     //
@@ -846,7 +858,7 @@ gimbal: --memory; until then HTTPS through the proxy fails a certificate check."
 fi
 unset __ca_sent
 
-echo "gimbal: container rootfs up; starting {entrypoint}"
+echo "gimbal: container rootfs up; starting" {banner_entrypoint}
 
 # Hand over with a controlling terminal, so job control works and Ctrl-C
 # interrupts something.
@@ -1738,6 +1750,58 @@ mod tests {
             1,
             "the entrypoint must be spelled out exactly once:\n{s}"
         );
+    }
+
+    /// The one line of the generated init that reports the entrypoint.
+    fn banner_line(script: &str) -> String {
+        script
+            .lines()
+            .find(|l| l.starts_with("echo \"gimbal: container rootfs up;"))
+            .unwrap_or_else(|| panic!("no banner line in:\n{script}"))
+            .to_string()
+    }
+
+    /// The banner *reports* the entrypoint; the handover *runs* it. Only the
+    /// second is documented as taking shell source, so a double quote in an
+    /// entrypoint must not turn the first into live shell operators.
+    ///
+    /// Asked of a real shell by *running* the line, because the broken form is
+    /// still valid shell: `sh -n` parses it happily and it simply means
+    /// something else. A parse check or a substring assertion is structurally
+    /// blind to this, which is why it survived until a guest measured it.
+    #[test]
+    fn the_banner_reports_the_entrypoint_and_runs_nothing_else() {
+        use std::process::{self, Command};
+        use std::{env, fs};
+
+        let sentinel = env::temp_dir().join(format!("chm-banner-{}", process::id()));
+        let _ = fs::remove_file(&sentinel);
+
+        for entrypoint in [
+            // Measured: this printed INIT_FELL_THROUGH at boot, from the banner,
+            // because `&` and `;` escaped the echo's own quotes.
+            r#"/bin/sh -c "sleep 900 & wait; echo INIT_FELL_THROUGH""#.to_string(),
+            format!(r#"/app "; touch {} ; echo ""#, sentinel.display()),
+            // Controls: already safe, and must stay reported verbatim.
+            "/bin/sh -c 'echo hi'".to_string(),
+            "/usr/local/bin/gunicorn".to_string(),
+        ] {
+            let line = banner_line(&default_init(&entrypoint, &[], None, &[]));
+            let out = Command::new("/bin/sh")
+                .args(["-c", &line])
+                .output()
+                .expect("run the banner line");
+            assert_eq!(
+                String::from_utf8_lossy(&out.stdout),
+                format!("gimbal: container rootfs up; starting {entrypoint}\n"),
+                "the banner must report the entrypoint verbatim, for {entrypoint:?}"
+            );
+            assert!(
+                !sentinel.exists(),
+                "the banner ran part of the entrypoint, for {entrypoint:?}"
+            );
+        }
+        let _ = fs::remove_file(&sentinel);
     }
 
     #[test]
