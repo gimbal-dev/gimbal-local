@@ -95,16 +95,35 @@ times to find four mistakes is one people stop running.
 
 | Section | Issue | What it would take |
 | --- | --- | --- |
-| `extensions` | #183 | The spec's replacement for Dev Container Features, keyed by OCI ref (`ghcr.io/agent-environments/extensions/bash`). Needs a rootfs build stage — #153. |
+| `extensions` | #183 | The spec's replacement for Dev Container Features, keyed by OCI ref (`ghcr.io/agent-environments/extensions/bash`). `chm image build` produces the image; what is missing is a stage that runs an installer inside it. |
 | `securityModules` | #184 | seccomp / LSM / capability policy *inside* the guest. |
 | `dataPolicy` | #185 | Classifying and restricting what leaves. |
 | `toolPolicy.approval` | #186 | Per-tool allow/deny. Needs MCP mediation (#157) — nothing in `chm` sees the agent's tool calls. |
 | `identity` | #187 | Workload identity and attestation. |
 | `observability` | #188 | Structured trace/metric export. |
-| `image.oci` | #153 | Building a bootable rootfs from an OCI image. |
+| `image.oci` | -- | A boundary rather than a gap. See below. |
 | `lifecycle` hooks | #189 | Ten in the spec (`initializeCommand`, `preBootCommand`, `onCreateCommand`, `preTaskCommand`, `postTaskCommand`, `preSnapshotCommand`, `postRestoreCommand`, `preShutdownCommand`, `waitFor`). We implement `postBootCommand` only — the one we have a channel for, and since V9.10 it is genuinely delivered rather than refused. |
 
 Umbrella: **#182**.
+
+### `image.oci` is refused on purpose, and always will be
+
+Not a missing feature. A spec expands into `chm create` argv and the same parser
+runs, which is the whole of why a spec cannot start a sandbox the flags could
+not. Honouring `image.oci` would give a document a private route to a network
+pull and a rootfs build that `chm create` has no flag for.
+
+Build the image first, then name what it wrote:
+
+```console
+$ chm image build alpine:3.20 --kernel ./Image --out ./demo
+```
+
+```json
+{ "image": { "kernel": "./demo/Image", "initramfs": "./demo/initramfs" } }
+```
+
+With `--disk`, name `./demo/rootfs.img` under `disks` instead.
 
 `toolPolicy.capabilities` is the one that is *partly* real today. Omitting
 `"network"` means no NIC is attached — a verifiable fact about the guest, not a

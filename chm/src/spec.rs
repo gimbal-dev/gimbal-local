@@ -109,8 +109,9 @@ pub const UNIMPLEMENTED: &[(&str, u32, &str)] = &[
     (
         "extensions",
         183,
-        "installing tools into the image (bash, node, python). Needs a rootfs \
-         build stage, which is #153",
+        "installing tools into the image (bash, node, python). `chm image build` \
+         produces the image; what is missing is a stage that runs an installer \
+         inside it",
     ),
     (
         "securityModules",
@@ -187,7 +188,7 @@ pub const UNIMPLEMENTED: &[(&str, u32, &str)] = &[
         "waitFor",
         189,
         "names the hook that must finish before the agent gets the machine; \
-         needs a real readiness signal (#171)",
+         needs a real readiness signal, which this build does not have",
     ),
     ("lifecycle", 189, "the lifecycle hook block as a whole"),
 ];
@@ -326,9 +327,13 @@ fn default_spec_version() -> u32 {
 pub struct ImageSpec {
     /// An OCI image reference, the spec's native way to name a root filesystem.
     ///
-    /// Accepted and refused today: turning an OCI image into a bootable rootfs
-    /// is #153. It is named here rather than omitted so that a conforming
-    /// document gets "not yet, see #153" instead of "unknown field".
+    /// Accepted and refused today, and the refusal is a boundary rather than a
+    /// gap: a spec expands into `chm create` argv and the same parser runs, so
+    /// honouring this field would give a spec a private route to a network pull
+    /// and a rootfs build that the flags it expands to do not have. `chm image
+    /// build` does that job; name what it wrote here. It is named rather than
+    /// omitted so a conforming document gets that sentence instead of "unknown
+    /// field".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oci: Option<String>,
 
@@ -783,8 +788,10 @@ impl SandboxSpec {
         if let Some(img) = &self.image {
             if img.oci.is_some() {
                 problems.push(
-                    "image.oci: building a bootable rootfs from an OCI image is not implemented \
-                     yet — see #153. Use `kernel` + `disks` for now."
+                    "image.oci: a spec names something already bootable, and `chm create` boots \
+                     rather than builds. Build the image first with `chm image build <REFERENCE> \
+                     --kernel <Image> --out <DIR>`, then name what it wrote: `kernel` and \
+                     `initramfs`, or `kernel` plus its rootfs.img under `disks`."
                         .into(),
                 );
             }
@@ -2200,6 +2207,146 @@ mod tests {
                 .iter()
                 .any(|p| p.contains("GITHUB_TOKEN") && p.contains("secrets.rulesFile")),
             "{problems:?}"
+        );
+    }
+
+    /// #386: the `image.oci` refusal cited #153, and #153 shipped -- so a user
+    /// reading it was sent to a closed issue for a thing that now exists.
+    ///
+    /// The class is sharper than one stale number. `image.oci` cited a
+    /// *dependency*, and a dependency closes the moment it ships, so the
+    /// citation was guaranteed to rot. The `UNIMPLEMENTED` table never rotted
+    /// because its numbers track the features themselves. So the rule this
+    /// pins is: a refusal cites the issue tracking the missing thing, or it
+    /// cites nothing at all.
+    ///
+    /// Asserted against the strings a user is handed, not against the source.
+    /// A source scan cannot tell a refusal from the comment above it, and the
+    /// comments here legitimately discuss shipped issues by number.
+    #[test]
+    fn no_refusal_sends_a_reader_to_an_issue_that_does_not_track_it() {
+        let mut tracked: Vec<String> = UNIMPLEMENTED
+            .iter()
+            .map(|(_, issue, _)| issue.to_string())
+            .collect();
+        // Refusals outside the table, each citing the issue that tracks the
+        // missing thing rather than something it depends on. A new entry here
+        // is a deliberate claim, which is the point.
+        //
+        // 186 -- toolPolicy.approval and toolPolicy.capabilities: both need the
+        //        agent's tool calls to pass through chm, which nothing arranges.
+        tracked.push("186".into());
+
+        // Every section the table refuses, one document each -- the shape
+        // `unimplemented_sections_are_refused_by_name_not_ignored` already
+        // proves parses -- plus the ad-hoc refusals a partial spec never reaches.
+        let mut problems: Vec<String> = UNIMPLEMENTED
+            .iter()
+            .flat_map(|(name, _, _)| {
+                spec_from(&format!(r#"{{"specVersion":1,"{name}":{{}}}}"#)).validate()
+            })
+            .collect();
+        let adhoc = [
+            r#"{"specVersion":1,"image":{"oci":"alpine:3.20"}}"#,
+            r#"{"specVersion":1,"toolPolicy":{"approval":{}}}"#,
+            r#"{"specVersion":1,"toolPolicy":{"capabilities":["subprocess","quantum"]}}"#,
+            r#"{"specVersion":1,"networkPolicy":{"egress":[{"domains":["*.example.com"]}]}}"#,
+        ];
+        for doc in adhoc {
+            let found = spec_from(doc).validate();
+            assert!(
+                !found.is_empty(),
+                "this document no longer trips a refusal, so the guard reads less \
+                 than it claims to: {doc}"
+            );
+            problems.extend(found);
+        }
+
+        for problem in &problems {
+            let mut rest = problem.as_str();
+            while let Some(at) = rest.find('#') {
+                rest = &rest[at + 1..];
+                let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+                if digits.is_empty() {
+                    continue;
+                }
+                assert!(
+                    tracked.contains(&digits),
+                    "a refusal cites #{digits}, which tracks none of the sections this \
+                     build refuses. Cite the issue for the missing thing, or say the \
+                     reason plainly with no number -- a dependency's number goes stale \
+                     the day the dependency ships (#386). Refusal: {problem}"
+                );
+            }
+        }
+    }
+
+    /// The remedy has to be a command that exists. Read the flags out of the
+    /// builder's own usage text rather than restating them here, or a rename
+    /// leaves this message pointing at nothing -- the #306 shape.
+    #[test]
+    fn the_oci_refusal_names_the_real_builder_invocation() {
+        let problems = spec_from(r#"{"specVersion":1,"image":{"oci":"alpine:3.20"}}"#).validate();
+        let refusal = problems
+            .iter()
+            .find(|p| p.starts_with("image.oci:"))
+            .unwrap_or_else(|| panic!("image.oci must still be refused: {problems:?}"));
+
+        let usage = crate::oci::image::usage();
+        for flag in ["chm image build", "--kernel", "--out"] {
+            assert!(
+                names(&usage, flag),
+                "`{flag}` is not in `chm image build`'s own usage text any more, so \
+                 the image.oci refusal is recommending something that does not exist"
+            );
+            assert!(
+                names(refusal, flag),
+                "the image.oci refusal must name `{flag}`: {refusal}"
+            );
+        }
+    }
+
+    /// `contains` is the wrong question for a flag: `--out` is a substring of
+    /// `--outdir`, so a rename reads as still present. Require the match to end
+    /// at something that cannot continue the token.
+    fn names(hay: &str, needle: &str) -> bool {
+        hay.match_indices(needle).any(|(at, _)| {
+            hay[at + needle.len()..]
+                .chars()
+                .next()
+                .is_none_or(|c| !c.is_alphanumeric() && c != '-' && c != '_')
+        })
+    }
+
+    /// The user-facing table is a second copy of the same judgement, and #386
+    /// was visible in both. Whitespace is flattened first: prose wraps, and a
+    /// guard defeated by a line break reports safety it does not provide. The
+    /// remedy is looked for in the section that explains the refusal, not
+    /// anywhere in the file -- `chm image build` appears in several places, so
+    /// a whole-file search would stay green while the one paragraph a refused
+    /// reader is sent to lost it.
+    #[test]
+    fn the_docs_table_does_not_send_a_reader_to_the_closed_dependency() {
+        let doc = include_str!("../../docs/sandbox-spec.md");
+        let flat = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+        let stale = format!("{}153", "#");
+        assert!(
+            !flat.contains(&stale),
+            "docs/sandbox-spec.md still cites {stale}, which shipped (#386)"
+        );
+
+        let heading = format!("### `image.{}` is refused on purpose", "oci");
+        let at = doc
+            .find(&heading)
+            .unwrap_or_else(|| panic!("docs/sandbox-spec.md lost the section headed `{heading}`"));
+        let rest = &doc[at + heading.len()..];
+        let section = &rest[..rest.find("\n## ").unwrap_or(rest.len())];
+        let flat_section = section.split_whitespace().collect::<Vec<_>>().join(" ");
+        let remedy = format!("chm image {}", "build");
+        assert!(
+            flat_section.contains(&remedy),
+            "the docs must name `{remedy}` where they explain the image.oci refusal, \
+             or a reader is told no and given nowhere to go"
         );
     }
 }
