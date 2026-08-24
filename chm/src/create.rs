@@ -211,6 +211,13 @@ struct CreateArgs {
     /// So this writes the real thing: a vanilla snapshot directory, in the
     /// layout `vanilla_export` produces and `chm run` reads.
     originate: Option<PathBuf>,
+    /// `chm` flags a greedy `--post-boot` handed to the guest's command instead.
+    ///
+    /// Carried rather than printed from inside `parse` so the detection is
+    /// reachable from a test that goes through the real parser -- the flag is
+    /// swallowed by the parser, so a check that does not run the parser is
+    /// checking something else.
+    post_boot_swallowed: Vec<String>,
 }
 
 fn usage() -> String {
@@ -327,6 +334,54 @@ fn parse_expose(raw: &str) -> Result<u16, String> {
     Ok(port)
 }
 
+/// Every long option `parse` understands.
+///
+/// It exists for one reader: the note that tells you a greedy `--post-boot`
+/// swallowed a flag you meant for `chm`. `create_flags_named_in_the_parser`
+/// reads the parser's own match arms out of this file and requires each to
+/// appear here, so a new flag cannot be added and quietly left out of the note.
+const CREATE_FLAGS: &[&str] = &[
+    "--kernel",
+    "--initramfs",
+    "--initrd",
+    "--cmdline",
+    "--cmdline-extra",
+    "--proxy-rules",
+    "--workspace",
+    "--originate",
+    "--cpus",
+    "--memory",
+    "--seconds",
+    "--disk",
+    "--net",
+    "--egress-allow",
+    "--expose",
+    "--env",
+    "--post-boot",
+    "--post-boot-arg",
+    "--dry-run",
+    "-h",
+    "--help",
+];
+
+/// The `chm` flags a greedy `--post-boot` took as arguments to the guest's
+/// command.
+///
+/// `--post-boot` has to be greedy -- the guest's command is entitled to its own
+/// `--dry-run` and we cannot know it was not meant for the guest. But being
+/// *right* is not the same as being *legible*: `--originate` typed after it
+/// produced no lineage, no error and an exit status of 0, and the only trace was
+/// the guest echoing our own flag back inside its argv. So say what happened.
+///
+/// Pure, and it returns the flags rather than a sentence, so the decision is
+/// testable without a console and the phrasing can change without the test.
+fn post_boot_swallowed_chm_flags(argv: &[String]) -> Vec<String> {
+    argv.iter()
+        .filter(|a| CREATE_FLAGS.contains(&a.as_str()))
+        .cloned()
+        .collect()
+}
+
 fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     let mut cfg = ColdBootConfig::default();
     let mut dry_run = false;
@@ -341,6 +396,7 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     let mut originate: Option<PathBuf> = None;
     let mut env: BTreeMap<String, String> = BTreeMap::new();
     let mut post_boot: Option<Vec<String>> = None;
+    let mut post_boot_swallowed: Vec<String> = Vec::new();
 
     let mut i = 0;
     while i < raw.len() {
@@ -431,6 +487,7 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
                 }
                 // Replaces rather than appends: a command is a whole thing, so
                 // a flag overrides a spec's instead of concatenating onto it.
+                post_boot_swallowed = post_boot_swallowed_chm_flags(&rest);
                 post_boot = Some(rest);
                 i = raw.len();
                 continue;
@@ -514,6 +571,7 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
         workspace,
         postboot: postboot::Plan { env, post_boot },
         originate,
+        post_boot_swallowed,
     })
 }
 
@@ -583,6 +641,17 @@ pub fn create_main(raw: &[String]) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    if !args.post_boot_swallowed.is_empty() {
+        let named = args.post_boot_swallowed.join(" ");
+        eprintln!(
+            "chm: note: --post-boot takes every remaining word as the guest's \
+             command, so {named} went to the guest and not to chm. If you meant \
+             it for chm, put it before --post-boot; if you meant it for the \
+             guest, this is already what you asked for. (--post-boot-arg takes \
+             one argv element at a time and is not greedy.)"
+        );
+    }
 
     match run(&args) {
         Ok(code) => code,
@@ -2809,6 +2878,125 @@ mod tests {
             src.contains("but the snapshot describes"),
             "the refusal must name both counts, or the operator is told a \
              lineage failed without being told what was missing from it"
+        );
+    }
+
+    /// The bug: `--originate` typed after `--post-boot` was taken as an argument
+    /// to the guest's command. No lineage, no error, exit 0 -- the only trace
+    /// was the guest echoing our own flag back inside its argv, and the run
+    /// otherwise looked perfect. Greed is correct (a guest command may carry a
+    /// word we also use) so the cure is legibility, not a parse change.
+    #[test]
+    fn a_chm_flag_after_post_boot_is_reported_as_swallowed() {
+        let a = parse(&args(&[
+            "--kernel",
+            "/tmp/Image",
+            "--post-boot",
+            "sh",
+            "-c",
+            "true",
+            "--originate",
+            "/tmp/lin",
+        ]))
+        .unwrap();
+        assert_eq!(a.originate, None, "greed is the behaviour under test");
+        assert_eq!(
+            a.post_boot_swallowed,
+            vec!["--originate".to_string()],
+            "the flag the parser ate has to be nameable, or the note cannot say \
+             which word went to the guest"
+        );
+    }
+
+    /// The other half, and the one that decides whether the note is worth
+    /// having: an ordinary command must not be accused of anything. A guest
+    /// command routinely carries words that are not our flags.
+    #[test]
+    fn an_ordinary_post_boot_command_is_not_reported() {
+        let a = parse(&args(&[
+            "--originate",
+            "/tmp/lin",
+            "--kernel",
+            "/tmp/Image",
+            "--post-boot",
+            "sh",
+            "-c",
+            "echo --net --disk hello",
+        ]))
+        .unwrap();
+        assert!(
+            a.post_boot_swallowed.is_empty(),
+            "--net and --disk inside a quoted shell word are one argv element, \
+             not flags, and a note that fires on them is noise"
+        );
+        assert!(
+            a.originate.is_some(),
+            "a flag before --post-boot still lands"
+        );
+    }
+
+    /// `CREATE_FLAGS` is a second copy of the parser's vocabulary, and a second
+    /// copy drifts: a flag added to the match and not here would be swallowed
+    /// silently, which is the bug this note exists to close. So read the
+    /// parser's own arms out of this file rather than trusting the list.
+    #[test]
+    fn create_flags_named_in_the_parser() {
+        let src = include_str!("create.rs");
+        let body = src
+            .split_once("fn parse(raw: &[String])")
+            .expect("the parser must still be named this")
+            .1;
+        let body = body.split_once("\n    Ok(CreateArgs {").unwrap().0;
+        let mut found = 0usize;
+        for line in body.lines() {
+            let t = line.trim();
+            // A match arm, not a string used in a message: `"--x" =>` or
+            // `"--x" | "--y" =>`.
+            if !t.starts_with('"') || !t.contains("=>") {
+                continue;
+            }
+            for flag in t.split("=>").next().unwrap().split('|') {
+                let flag = flag.trim().trim_matches('"');
+                if !flag.starts_with('-') {
+                    continue;
+                }
+                found += 1;
+                assert!(
+                    CREATE_FLAGS.contains(&flag),
+                    "{flag} is a create flag the parser understands but \
+                     CREATE_FLAGS does not, so typing it after --post-boot \
+                     would be swallowed with no note"
+                );
+            }
+        }
+        assert!(
+            found >= 15,
+            "only {found} arms found -- the extraction stopped matching the \
+             parser's shape, so this guard is passing without reading anything"
+        );
+    }
+
+    /// A test can see that `parse` *recorded* the swallowed flags and still not
+    /// see that nobody prints them: an assertion about a value cannot observe a
+    /// call site that no longer exists. This repo has been caught by that seven
+    /// times, so read the source.
+    #[test]
+    fn the_swallowed_flags_are_actually_printed() {
+        let src = include_str!("create.rs");
+        let needle = format!("args.{}.is_empty()", "post_boot_swallowed");
+        assert!(
+            src.contains(&needle),
+            "nothing consults the swallowed flags, so they are recorded and \
+             never said out loud -- which is the original bug with extra steps"
+        );
+        // Assembled, because a literal here would be found by `contains` in
+        // this very assertion -- a needle that matches its own test can never
+        // detect its removal from the code (§43).
+        let remedy = format!("put it {} --post-boot", "before");
+        assert!(
+            src.contains(&remedy),
+            "the note must carry the remedy: a true sentence that leaves the \
+             reader with no next step is what #305 and #306 were about"
         );
     }
 }
