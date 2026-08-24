@@ -1413,9 +1413,20 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         }
     };
 
+    // A panicked guest that never resets is the one case with no other way out:
+    // `running` stays true because no vCPU ever exits, and `--seconds 0` means
+    // no deadline will fire either. See `PANIC_SILENCE_GRACE`.
+    //
+    // Only when nobody is driving. On a tty the operator can see the panic on
+    // their own screen and end the session themselves, and tearing down a
+    // session someone is sitting at -- on the strength of a string the guest
+    // printed -- is a worse failure than waiting. Same "who is driving?"
+    // distinction as `default_max_seconds`, and for the same reason.
+    let unattended = !stdin().is_terminal();
     while running.load(Ordering::Acquire)
         && deadline.is_none_or(|d| Instant::now() < d)
         && !console::shutdown_requested()
+        && !(unattended && panic_watch.settled_after_panic(PANIC_SILENCE_GRACE, Instant::now()))
     {
         thread::sleep(Duration::from_millis(50));
     }
@@ -1554,6 +1565,10 @@ struct PanicWatch {
     panicked: AtomicBool,
     unchecked_fs: AtomicBool,
     carry: Mutex<String>,
+    /// When the console last produced any output at all. `None` until the first
+    /// byte arrives, so a guest that has never spoken is never mistaken for one
+    /// that has fallen silent.
+    last_output: Mutex<Option<Instant>>,
 }
 
 impl PanicWatch {
@@ -1566,6 +1581,13 @@ impl PanicWatch {
     const UNCHECKED: &'static str = "mounting unchecked fs";
 
     fn push(&self, bytes: &[u8]) {
+        self.push_at(bytes, Instant::now());
+    }
+
+    /// The body of [`push`](Self::push) with the clock supplied, so the silence
+    /// window is testable without sleeping for it.
+    fn push_at(&self, bytes: &[u8], now: Instant) {
+        *self.last_output.lock().unwrap() = Some(now);
         let mut carry = self.carry.lock().unwrap();
         carry.push_str(&String::from_utf8_lossy(bytes));
         for (needle, flag) in [
@@ -1597,7 +1619,38 @@ impl PanicWatch {
     fn unchecked_fs(&self) -> bool {
         self.unchecked_fs.load(Ordering::Relaxed)
     }
+
+    /// Whether a panic has been seen and the console has said nothing since,
+    /// for at least `grace`.
+    ///
+    /// Two conditions, not one, and the second is what makes this safe to act
+    /// on. `Kernel panic - not syncing` is matched as a substring of guest
+    /// output, so a guest that merely *prints* the words trips the flag -- and
+    /// a guest still printing is a guest still running. Silence after the fact
+    /// is the part that says the kernel actually stopped.
+    fn settled_after_panic(&self, grace: Duration, now: Instant) -> bool {
+        self.panicked()
+            && self
+                .last_output
+                .lock()
+                .unwrap()
+                .is_some_and(|at| now.duration_since(at) >= grace)
+    }
 }
+
+/// How long a panicked guest must stay silent before `chm` stops waiting on it.
+///
+/// A panic is only fatal to the run when the kernel *halts*, and it halts only
+/// when the command line carries no `panic=N`. With one, the guest resets, the
+/// vCPU threads see it, and the ordinary exit path runs long before this does --
+/// so this is the backstop for the case where nothing else can ever fire.
+///
+/// Fifteen seconds is chosen to sit clear of a slow console drain while still
+/// being a bound a person will wait through. It is deliberately not tuneable:
+/// a knob here would be a knob for how long to wait for something that is never
+/// coming.
+const PANIC_SILENCE_GRACE: Duration = Duration::from_secs(15);
+
 /// What to say about a guest that panicked.
 ///
 /// Named as an error rather than folded into the success message because the
@@ -3271,6 +3324,73 @@ mod tests {
             !w.panicked(),
             "a dirty rootfs is a report about an earlier run; calling it a panic \
              would blame this one for something it did not do"
+        );
+    }
+
+    /// The four states the silence window has to tell apart. A halting panic
+    /// (#390) is the only one with no other way out of the wait loop: `running`
+    /// stays true because no vCPU ever exits, and `--seconds 0` means no
+    /// deadline fires either.
+    #[test]
+    fn only_a_panic_followed_by_silence_ends_the_wait() {
+        let grace = Duration::from_secs(15);
+        let t0 = Instant::now();
+        let after = t0 + grace + Duration::from_secs(1);
+
+        let quiet = PanicWatch::default();
+        assert!(
+            !quiet.settled_after_panic(grace, after),
+            "a guest that has never printed anything has not panicked; silence \
+             alone must never end a run"
+        );
+
+        let busy = PanicWatch::default();
+        busy.push_at(b"[    3.0] an ordinary line\n", t0);
+        assert!(
+            !busy.settled_after_panic(grace, after),
+            "long silence without a panic is an idle guest, which is normal"
+        );
+
+        let talking = PanicWatch::default();
+        talking.push_at(b"[    3.0] Kernel panic - not syncing: test\n", t0);
+        talking.push_at(b"[   40.0] and yet here I still am\n", after);
+        assert!(
+            !talking.settled_after_panic(grace, after),
+            "the panic string is matched in guest output, so a guest that merely \
+             printed the words trips the flag -- and one still printing is still \
+             running. This is the false positive the silence half exists to stop."
+        );
+
+        let halted = PanicWatch::default();
+        halted.push_at(b"[    3.0] Kernel panic - not syncing: test\n", t0);
+        assert!(
+            halted.settled_after_panic(grace, after),
+            "panicked and silent since: nothing else can ever end this run"
+        );
+        assert!(
+            !halted.settled_after_panic(grace, t0 + Duration::from_secs(1)),
+            "and not before the grace has actually elapsed"
+        );
+    }
+
+    /// The loop condition is where the fix lives; a `PanicWatch` that knows it
+    /// has settled changes nothing if nobody asks it. Sixth-plus instance of
+    /// the call-site class in this repo, so it gets its own guard.
+    #[test]
+    fn the_wait_loop_asks_whether_a_panicked_guest_has_settled() {
+        let src = include_str!("create.rs");
+        let call = format!("panic_watch.{}(PANIC_SILENCE_GRACE,", "settled_after_panic");
+        assert!(
+            src.contains(&call),
+            "the wait loop must consult {call:?}, or a halting panic hangs \
+             forever with `--seconds 0`"
+        );
+        let gate = format!("let {} = !stdin().is_terminal();", "unattended");
+        assert!(
+            src.contains(&gate),
+            "and it must be gated on {gate:?}: an operator at a tty can see the \
+             panic and end the session themselves, and tearing down a session \
+             someone is sitting at is the worse failure"
         );
     }
 
