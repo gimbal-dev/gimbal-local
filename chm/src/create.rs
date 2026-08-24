@@ -384,7 +384,6 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     let mut kernel: Option<PathBuf> = None;
     let mut egress_allow: Vec<String> = Vec::new();
     let mut expose: Vec<u16> = Vec::new();
-    let mut cmdline_explicit = false;
     let mut cmdline_extra: Vec<String> = Vec::new();
     let mut proxy_rules: Option<PathBuf> = None;
     let mut workspace: Option<PathBuf> = None;
@@ -409,7 +408,6 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
             }
             "--cmdline" => {
                 cfg.cmdline = value("--cmdline")?;
-                cmdline_explicit = true;
             }
             // Append rather than replace, so one extra kernel argument does not
             // cost you the auto-detected `root=`. Without this the only way to
@@ -514,19 +512,30 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     if proxy_rules.is_some() && !cfg.net {
         return Err("--proxy-rules needs --net; there is no traffic to intercept".into());
     }
-    // Only when the caller did not write a command line themselves: an explicit
-    // `--cmdline` is the caller saying they know what the kernel needs, and
-    // appending to it could contradict a `root=` they chose deliberately.
-    if !cmdline_explicit && let Some(extra) = coldboot::implied_root_args(&cfg) {
+    // Only when the caller's own command line does not name a root filesystem.
+    //
+    // The rule used to be `!cmdline_explicit` -- *any* `--cmdline` at all
+    // suppressed this -- and that is the same false analogy #224 fixed for the
+    // wall clock, one field over. Naming a console is not choosing a root
+    // device. A caller who passes `--disk` has already said what they want
+    // mounted, and there is no command line for which "and therefore this guest
+    // has no root filesystem" is the intent; the kernel's only report is
+    // `VFS: Unable to mount root fs`, which reads as a broken disk image.
+    //
+    // Measured blast radius, same as #224's: the app emits
+    // `--cmdline console=ttyAMA0` on every cold boot, so every app-started
+    // guest with a disk and no initramfs took the suppressed path.
+    //
+    // A caller who writes `root=` themselves is still taken at their word, and
+    // then owns the mount flags that travel with it.
+    let root_set = coldboot::mentions_root(&cfg.cmdline)
+        || cmdline_extra.iter().any(|e| coldboot::mentions_root(e));
+    if !root_set && let Some(extra) = coldboot::implied_root_args(&cfg) {
         cfg.cmdline = format!("{} {extra}", cfg.cmdline);
     }
-    // The guest's wall clock. Deliberately **not** under the `cmdline_explicit`
-    // guard above, and that difference is the whole point: `root=` is a choice a
-    // caller can make differently, so appending ours could contradict theirs.
-    // The wall clock is not a choice — it is a fact about the moment this guest
-    // is booting, and there is no command line for which "and therefore the year
-    // is 1970" is the caller's intent.
-    //
+    // The guest's wall clock. Appended on the same terms and for the same
+    // reason: it is a fact about the moment this guest is booting, not a choice
+    // the caller made differently.
     // Suppressing it here was a real, measured bug rather than a hypothetical:
     // the app emits `--cmdline console=ttyAMA0` on every cold boot, so every
     // app-started guest took this branch. On a kernel with PL031 builtin the
@@ -1589,7 +1598,6 @@ impl PanicWatch {
         self.unchecked_fs.load(Ordering::Relaxed)
     }
 }
-
 /// What to say about a guest that panicked.
 ///
 /// Named as an error rather than folded into the success message because the
@@ -2511,6 +2519,82 @@ mod tests {
             .collect();
         assert_eq!(roots, ["root=/dev/vda2"], "on {:?}", a.cfg.cmdline);
         assert!(a.cfg.cmdline.starts_with("console=ttyAMA0 root=/dev/vda2 ro"));
+    }
+
+    #[test]
+    fn an_explicit_cmdline_without_a_root_still_gets_one() {
+        // The bug (#389): the rule was `!cmdline_explicit`, so *any* `--cmdline`
+        // suppressed the derived `root=`. Naming a console is not choosing a
+        // root device, and the kernel's only report is `VFS: Unable to mount
+        // root fs`, which reads as a broken disk image. The app emits
+        // `--cmdline console=ttyAMA0` on every cold boot, so this was the
+        // ordinary path, not a corner.
+        let a = parse(&args(&[
+            "--kernel",
+            "/tmp/Image",
+            "--disk",
+            "/tmp/a.img",
+            "--cmdline",
+            "console=ttyAMA0 quiet",
+        ]))
+        .unwrap();
+        let roots: Vec<_> = a
+            .cfg
+            .cmdline
+            .split_whitespace()
+            .filter(|w| w.starts_with("root="))
+            .collect();
+        assert_eq!(roots, ["root=/dev/vda"], "on {:?}", a.cfg.cmdline);
+        assert!(
+            a.cfg.cmdline.starts_with("console=ttyAMA0 quiet"),
+            "the caller's own line is kept intact: {:?}",
+            a.cfg.cmdline
+        );
+    }
+
+    #[test]
+    fn a_root_in_cmdline_extra_also_suppresses_the_implied_one() {
+        // `--cmdline-extra` is appended after this decision is taken, so a root
+        // named there has to be consulted here or the guest gets two.
+        let a = parse(&args(&[
+            "--kernel",
+            "/tmp/Image",
+            "--disk",
+            "/tmp/a.img",
+            "--cmdline-extra",
+            "root=/dev/vda3",
+        ]))
+        .unwrap();
+        let roots: Vec<_> = a
+            .cfg
+            .cmdline
+            .split_whitespace()
+            .filter(|w| w.starts_with("root="))
+            .collect();
+        assert_eq!(roots, ["root=/dev/vda3"], "on {:?}", a.cfg.cmdline);
+    }
+
+    #[test]
+    fn a_key_that_merely_ends_in_root_is_not_a_root() {
+        // Word-and-key-wise, not a substring search. `dm-mod.create=...` and
+        // friends genuinely appear on real command lines, and treating one as a
+        // root would put us back at the panic this all exists to prevent.
+        for theirs in ["vroot=/dev/x", "myroot=/dev/x", "rootwait"] {
+            let a = parse(&args(&[
+                "--kernel",
+                "/tmp/Image",
+                "--disk",
+                "/tmp/a.img",
+                "--cmdline",
+                theirs,
+            ]))
+            .unwrap();
+            assert!(
+                a.cfg.cmdline.contains("root=/dev/vda"),
+                "{theirs:?} is not a root assignment, so one is still owed: {:?}",
+                a.cfg.cmdline
+            );
+        }
     }
 
     #[test]
