@@ -345,7 +345,7 @@ const SHELL_NAMES: &[&str] = &["sh", "bash", "ash", "dash", "zsh", "ksh", "mksh"
 /// `busybox` is a shell only when told to be one -- `busybox sh` is, plain
 /// `busybox` prints its applet list and exits -- so it is the one name whose
 /// next token matters.
-fn entrypoint_is_shell(entrypoint: &str) -> bool {
+pub(super) fn entrypoint_is_shell(entrypoint: &str) -> bool {
     let mut tokens = entrypoint.split_whitespace();
     let Some(first) = tokens.next() else {
         return false;

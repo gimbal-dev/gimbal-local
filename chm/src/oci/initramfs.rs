@@ -461,6 +461,41 @@ pub fn default_init(
     }
     let cd = workdir.map_or_else(String::new, |d| format!("cd {} 2>/dev/null\n", sh_quote(d)));
 
+    // Make the entrypoint survive the console reset, when the entrypoint is not
+    // a shell.
+    //
+    // `ETX` is the only state-independent console reset chm has, and every
+    // framed write opens with it (`exec.rs:62`). The line discipline turns it
+    // into `SIGINT` for the foreground process group. Against a shell that
+    // costs a prompt and nothing else, which is the precondition `exec.rs`
+    // reasons from. Against anything else `SIGINT` is fatal by default, and
+    // when the foreground process is PID 1's only child, killing it takes the
+    // machine: #385 measured the readiness probe's own reset ending a browser
+    // guest in `Attempted to kill init!` before the post-boot command was ever
+    // delivered.
+    //
+    // A `SIG_IGN` disposition survives `exec` -- POSIX requires signals set to
+    // be ignored to stay ignored across it -- so trapping here, in the shell
+    // that is about to become the entrypoint, leaves the entrypoint itself
+    // ignoring `SIGINT`. That is also what a container started without a TTY
+    // gets, so it is the ordinary disposition for this kind of process rather
+    // than a special case invented for chm.
+    //
+    // Decided by the same predicate that prints the build-time "this is not a
+    // shell" warning, so the warning and the trap cannot drift into disagreeing
+    // about what a shell is. A shell deliberately keeps the default
+    // disposition: `SIGINT` is both how the reset returns it from `PS2` to
+    // `PS1` and how a human types Ctrl-C.
+    let sigint = if super::image::entrypoint_is_shell(entrypoint) {
+        String::new()
+    } else {
+        "# Not a shell, so SIGINT would be fatal. chm's console reset sends one\n\
+         # before every framed write; SIG_IGN is inherited across the handover\n\
+         # below. See #385.\n\
+         trap '' INT\n"
+            .to_string()
+    };
+
     // The drivers the kernel needs before it can see anything chm attached.
     //
     // Order is the caller's, resolved from each module's own `depends=`, and
@@ -548,7 +583,7 @@ gimbal_start() {{
 if [ -z "${{NODE_EXTRA_CA_CERTS:-}}" ] && [ -r {ca_env} ]; then
     . {ca_env}
 fi
-{cd}exec {entrypoint}
+{cd}{sigint}exec {entrypoint}
 }}
 
 # Stop the machine, rather than letting init exit.
@@ -1331,6 +1366,64 @@ mod tests {
         );
     }
 
+    /// The body of `gimbal_start`, which is the only code both handover paths
+    /// run.
+    fn start_body(entrypoint: &str) -> String {
+        let s = default_init(entrypoint, &[], None, &[]);
+        let start = s.find("gimbal_start() {").expect("no gimbal_start");
+        let end = s[start..].find("\n}\n").expect("unterminated") + start;
+        s[start..end].to_string()
+    }
+
+    /// chm opens every framed console write with `ETX`, and the line discipline
+    /// turns that into `SIGINT` for the foreground process group.
+    ///
+    /// Pinned in **both** directions, because a trap that is always set is as
+    /// wrong as one that is never set. Against a shell the reset is the
+    /// mechanism, not a hazard: `SIGINT` is what returns it from `PS2` to `PS1`,
+    /// so ignoring it there would break the thing `CONSOLE_RESET` exists to do.
+    #[test]
+    fn a_non_shell_entrypoint_ignores_sigint_and_a_shell_keeps_it() {
+        let not_a_shell = start_body("/opt/gimbal-browser/start");
+        assert!(
+            not_a_shell.contains("trap '' INT"),
+            "a non-shell entrypoint must be exec'd with SIGINT ignored, or chm's \
+             own console reset kills the guest -- #385 measured exactly that, as \
+             `Attempted to kill init!`.\n{not_a_shell}"
+        );
+        assert!(
+            not_a_shell.find("trap '' INT").expect("no trap")
+                < not_a_shell.find("\nexec ").expect("no exec"),
+            "the trap must be set before the exec: SIG_IGN survives exec, but a \
+             disposition set afterwards is set in the wrong process.\n{not_a_shell}"
+        );
+
+        let a_shell = start_body("/bin/sh");
+        assert!(
+            !a_shell.contains("trap '' INT"),
+            "a shell must keep the default SIGINT disposition: it is how the \
+             console reset returns it from PS2 to PS1, and how a human types \
+             Ctrl-C.\n{a_shell}"
+        );
+    }
+
+    /// The entrypoint that made #385 real, named rather than described.
+    ///
+    /// Read from the browser module's own constant and assembled the way
+    /// `image.rs` assembles it, so this cannot pass against a spelling the
+    /// shipped image does not use.
+    #[test]
+    fn the_browser_launcher_is_the_entrypoint_this_protects() {
+        let entrypoint = format!("/{}", super::super::browser::LAUNCH_PATH);
+        let body = start_body(&entrypoint);
+        assert!(
+            body.contains("trap '' INT"),
+            "the browser launcher is the entrypoint measured dying to chm's own \
+             reset in #385. If it ever classifies as a shell, the bug is back and \
+             the sandbox becomes unreachable by exec and --post-boot.\n{body}"
+        );
+    }
+
     /// The marker exists to be read back, so it is worthless if it can drift
     /// away from the installer it describes. Pinned in both directions: an init
     /// with the installer carries the marker, and an init without it does not.
@@ -1600,6 +1693,17 @@ mod tests {
                         "A=b c'd".to_string(),
                     ],
                     Some("/srv/app"),
+                    &[],
+                ),
+            ),
+            (
+                // The shipped browser image: a non-shell entrypoint, so this is
+                // the case that carries the `trap` from #385.
+                "browser launcher",
+                default_init(
+                    &format!("/{}", super::super::browser::LAUNCH_PATH),
+                    &[],
+                    None,
                     &[],
                 ),
             ),
