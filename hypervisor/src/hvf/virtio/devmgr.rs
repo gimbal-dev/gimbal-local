@@ -13,6 +13,7 @@
 //! [`VirtioDeviceDesc`] and builds a live [`VirtioPciDevice`] from it, restoring
 //! the queues exactly where the guest left them (no re-negotiation).
 
+use std::net::SocketAddrV4;
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -497,6 +498,7 @@ fn restore_queue(qs: &QueueState, features: u64, mem: &GuestMemory) -> Queue {
 /// overlay (in `overlay_dir`) for block devices whose real image is absent.
 ///
 /// Returns the BAR base + size for bus registration alongside the device.
+#[allow(clippy::too_many_arguments)]
 pub fn build_device(
     desc: &VirtioDeviceDesc,
     mem: Arc<GuestMemory>,
@@ -505,6 +507,7 @@ pub fn build_device(
     net_policy: Option<EgressPolicy>,
     net_limits: NatLimits,
     allow_local_egress: bool,
+    expose: &[SocketAddrV4],
 ) -> Result<(u64, u64, Arc<VirtioPciDevice>), DevMgrError> {
     let queues = desc
         .queues
@@ -522,6 +525,7 @@ pub fn build_device(
         net_policy,
         net_limits,
         allow_local_egress,
+        expose,
     )?;
     let device_config = match &desc.backend {
         BackendKind::Block { nsectors, .. } => blk_device_config(*nsectors),
@@ -550,6 +554,7 @@ pub fn build_device(
 /// configuration verbatim, so unlike the PCI path nothing is recomputed here --
 /// the guest already negotiated it, and recomputing would let this build's
 /// opinion overwrite what the guest was actually told.
+#[allow(clippy::too_many_arguments)]
 pub fn build_mmio_device(
     desc: &VirtioMmioDeviceDesc,
     mem: Arc<GuestMemory>,
@@ -558,6 +563,7 @@ pub fn build_mmio_device(
     net_policy: Option<EgressPolicy>,
     net_limits: NatLimits,
     allow_local_egress: bool,
+    expose: &[SocketAddrV4],
 ) -> Result<Arc<VirtioMmioDevice>, DevMgrError> {
     let backend = build_backend(
         &desc.name,
@@ -569,6 +575,7 @@ pub fn build_mmio_device(
         net_policy,
         net_limits,
         allow_local_egress,
+        expose,
     )?;
     Ok(Arc::new(VirtioMmioDevice::restored(
         backend,
@@ -600,7 +607,18 @@ pub fn build_backend(
     net_policy: Option<EgressPolicy>,
     net_limits: NatLimits,
     allow_local_egress: bool,
+    expose: &[SocketAddrV4],
 ) -> Result<Backend, DevMgrError> {
+    if !expose.is_empty() && !matches!(kind, BackendKind::Net) {
+        // Refuse rather than ignore. A port silently dropped here reads as a
+        // working sandbox right up until whatever was meant to dial it times
+        // out, and the timeout names the network, not the missing forward.
+        return Err(DevMgrError::Io(format!(
+            "device {name} was asked to expose {} guest port(s) but it is not a \
+             NIC, and only a NIC can carry ingress",
+            expose.len()
+        )));
+    }
     let backend = match kind {
         BackendKind::Block {
             disk_path,
@@ -646,12 +664,24 @@ pub fn build_backend(
                      guard disabled); the guest can reach host loopback/LAN"
                 );
             }
-            let responder = NatResponder::new(
+            let mut responder = NatResponder::new(
                 [192, 168, 249, 1],
                 [0x02, 0, 0, 0, 0, 1],
                 policy,
                 net_limits,
             );
+            // Arm ingress before the responder is handed to the device, because
+            // afterwards it is owned by the NIC and nobody can reach it. A
+            // failure to bind is fatal for the same reason it is on the cold-boot
+            // path: a guest running without the port somebody asked for is not
+            // the sandbox they asked for, and the difference is invisible until
+            // whatever was supposed to dial it times out.
+            for guest in expose {
+                let exposure = responder
+                    .expose(*guest)
+                    .map_err(|e| DevMgrError::Io(format!("exposing guest {guest}: {e}")))?;
+                eprintln!("chm: {}", exposure.describe());
+            }
             Backend::Net(NetDevice::new(Box::new(responder)).with_features(features))
         }
         BackendKind::Unsupported { virtio_type } => {
@@ -1587,6 +1617,7 @@ mod tests {
             None,
             NatLimits::default(),
             false,
+            &[],
         ) {
             Err(e) => format!("{e:?}"),
             Ok(_) => panic!("an unmodelled virtio type must be refused, not mismodelled"),
@@ -1624,6 +1655,7 @@ mod tests {
             None,
             NatLimits::default(),
             false,
+            &[],
         )
         .expect("a block device with a shipped disk builds");
         assert_eq!(dev.name(), "blk0");
@@ -1669,6 +1701,7 @@ mod tests {
             None,
             NatLimits::default(),
             false,
+            &[],
         )
         .expect("a block device with no shipped disk still builds");
         let mut got = [0u8; 8];
@@ -1734,6 +1767,7 @@ mod tests {
                 None,
                 NatLimits::default(),
                 false,
+                &[],
             );
             // `Backend` is not `Debug`, so `expect_err` will not do here.
             match built {
@@ -1805,5 +1839,97 @@ mod tests {
             mmio_builder.contains(&mmio) && !mmio_builder.contains(&pci),
             "the virtio-mmio builder must pass {mmio} and nothing else"
         );
+    }
+
+    /// A guest port named on a device that cannot carry ingress must stop the
+    /// run, not be dropped.
+    ///
+    /// The failure a silent drop produces is the worst-shaped one available
+    /// here: the guest boots, the device works, and the only symptom is
+    /// whatever was meant to dial the port timing out much later against an
+    /// error that names the network rather than the missing forward.
+    #[test]
+    fn a_port_asked_of_something_that_is_not_a_nic_is_refused() {
+        let addr = SocketAddrV4::new(std::net::Ipv4Addr::new(192, 168, 249, 2), 9222);
+        let dir = std::env::temp_dir().join(format!("chm-expnonet-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let msg = match build_backend(
+            "rng0",
+            &BackendKind::Rng,
+            Transport::Mmio,
+            0,
+            &dir,
+            false,
+            None,
+            NatLimits::default(),
+            false,
+            &[addr],
+        ) {
+            Err(e) => format!("{e:?}"),
+            Ok(_) => panic!("a non-NIC asked to publish a port must be refused"),
+        };
+        assert!(msg.contains("rng0"), "names the device: {msg}");
+        assert!(msg.contains('1'), "names how many ports were dropped: {msg}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The exposure loop must propagate what `NatResponder::expose` decides.
+    ///
+    /// This is the call-site half, and it is the half this repository has got
+    /// wrong seven times: `expose` refusing a duplicate is worth nothing if the
+    /// builder discards the `Result`. Two copies of one address is the cheapest
+    /// refusal `expose` can be made to produce without a bind failure, so it is
+    /// the one that proves the error is carried rather than swallowed.
+    #[test]
+    fn a_refused_exposure_stops_the_nic_being_built() {
+        let addr = SocketAddrV4::new(std::net::Ipv4Addr::new(192, 168, 249, 2), 9222);
+        let dir = std::env::temp_dir().join(format!("chm-expdup-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let msg = match build_backend(
+            "net0",
+            &BackendKind::Net,
+            Transport::Mmio,
+            0,
+            &dir,
+            false,
+            None,
+            NatLimits::default(),
+            false,
+            &[addr, addr],
+        ) {
+            Err(e) => format!("{e:?}"),
+            Ok(_) => panic!("a refused exposure must stop the NIC being built"),
+        };
+        assert!(
+            msg.contains("9222"),
+            "names the port that could not be published: {msg}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A NIC that *can* honour the request builds, so the refusal above is a
+    /// judgement about the device and not a blanket rejection of `--expose`.
+    #[test]
+    fn a_nic_asked_for_a_port_still_builds() {
+        let addr = SocketAddrV4::new(std::net::Ipv4Addr::new(192, 168, 249, 2), 9222);
+        let dir = std::env::temp_dir().join(format!("chm-expok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(
+            build_backend(
+                "net0",
+                &BackendKind::Net,
+                Transport::Mmio,
+                0,
+                &dir,
+                false,
+                None,
+                NatLimits::default(),
+                false,
+                &[addr],
+            )
+            .is_ok(),
+            "a NIC must be able to publish a guest port"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }
