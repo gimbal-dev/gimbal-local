@@ -331,7 +331,29 @@ pub(crate) fn take_socket(raw: &[String]) -> Result<(PathBuf, Vec<String>), Stri
 // Daemon (`chm serve`)
 // ---------------------------------------------------------------------------
 
+pub(crate) const SERVE_USAGE: &str = "\
+usage: chm serve <LIBRARY_DIR> [--socket PATH] [--idle-exit SECS] [--max-seconds SECS]
+
+Run the daemon that owns this process's one HVF slot, serving snapshots out of
+LIBRARY_DIR. Drive it with `chm ctl` (see `chm ctl --help`) or `chm exec`.
+
+  <LIBRARY_DIR>        directory of snapshot workspaces to offer
+  --socket PATH        where to listen (default: <tmpdir>/gimbal-local/chm.sock)
+  --idle-exit SECS     exit after SECS with no guest running (0 disables)
+  --max-seconds SECS   suspend the guest and exit after SECS (0 disables)
+
+The socket is created 0600. A deadline suspends and checkpoints the guest
+rather than cutting its power, so a resumable point survives.";
+
 pub fn serve_main(raw: &[String]) -> ExitCode {
+    // Before `serve()`, because the argument parser's job is to reject unknown
+    // options and `--help` would be one of them: a command that answers its own
+    // `--help` with "unknown option `--help`" teaches nothing and contradicts
+    // what `chm --help` promises about every subcommand.
+    if wants_help(raw) {
+        println!("{SERVE_USAGE}");
+        return ExitCode::SUCCESS;
+    }
     match serve(raw) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -382,7 +404,8 @@ fn parse_serve(raw: &[String]) -> Result<ServeArgs, String> {
         i += 1;
     }
 
-    let library_dir = library_dir.ok_or("missing <LIBRARY_DIR>")?;
+    let library_dir =
+        library_dir.ok_or_else(|| format!("missing <LIBRARY_DIR>\n\n{SERVE_USAGE}"))?;
     Ok(ServeArgs {
         library_dir,
         socket_path,
@@ -2174,13 +2197,79 @@ pub fn ctl_main(raw: &[String]) -> ExitCode {
     }
 }
 
+pub(crate) const CTL_USAGE: &str = "\
+usage: chm ctl [--socket PATH] <COMMAND> [ARGS...]
+
+Talk to a running `chm serve` daemon.
+
+THE LIBRARY AND ITS GUESTS
+  list [--json]                     snapshots this daemon can start
+  status [--json]                   what it is running now
+  start <NAME>                      start a snapshot from the library
+  stop                              stop the guest, saving a checkpoint
+  shutdown                          stop the guest and exit the daemon
+
+THE RUNNING GUEST
+  console                           stream the serial console (Ctrl-C detaches)
+  input [TEXT]                      type into the guest console
+  egress allow|deny <HOST[:PORT]>   change its egress policy without a restart
+
+WHAT THE DAEMON'S OWN ENVIRONMENT REPORTS (JSON)
+  posture [DIR] [--probe-guest]     which security controls are on
+  proxy [DIR]                       credential-injection rules
+  proxy check --host H [--port P] [--path X]
+  proxy ca [DIR]                    the CA a guest has to trust
+  audit [DIR] [--tail N]            the append-only session trail
+  capabilities [DIR]                what the daemon's own binary can do
+
+  These five read the *daemon's* environment. `chm posture`, `chm proxy show`
+  and `chm audit show` read yours, which is a different answer whenever the
+  daemon runs somewhere else -- and only the daemon's describes the guest.
+
+OPTIONS
+  --socket PATH   the daemon's socket (default: <tmpdir>/gimbal-local/chm.sock)
+
+A cold-booted guest (`chm create --socket`) serves the same socket but has no
+library, so the four library verbs are refused by name rather than answered
+misleadingly.";
+
+/// True when the first argument is a request for help.
+///
+/// First position only, deliberately. `chm ctl input <text>` sends its argument
+/// to the guest verbatim, so scanning the whole argument list would make
+/// `--help` unsendable -- and a flag that silently changes meaning depending on
+/// which verb precedes it is worse than one that only works where it reads
+/// naturally.
+pub(crate) fn wants_help(args: &[String]) -> bool {
+    matches!(
+        args.first().map(String::as_str),
+        Some("--help" | "-h" | "help")
+    )
+}
+
 fn ctl(raw: &[String]) -> Result<(), String> {
     let (socket, rest) = take_socket(raw)?;
+    // Answered before the connect, because the person who needs this most is
+    // the one with no daemon running: replying "cannot connect to daemon" to
+    // `chm ctl --help` is true, unrelated to the question, and leaves them with
+    // nowhere to go. `chm --help` promises every command takes its own.
+    if wants_help(&rest) {
+        println!("{CTL_USAGE}");
+        return Ok(());
+    }
     if rest.is_empty() {
-        return Err(
-            "missing command (list [--json] | status [--json] | start <name> | console | input [text] | stop | shutdown)"
-                .to_string(),
-        );
+        return Err(format!("missing command\n\n{CTL_USAGE}"));
+    }
+    // `egress` is the one verb carrying a grammar of its own, so it is the one
+    // whose `--help` a reader can plausibly ask for separately. Answered here
+    // rather than in `ctl_command` for the same reason as the block above: the
+    // question is about the grammar, and the daemon is not part of the answer.
+    // Deliberately not generalised to `<verb> --help` for every verb -- `chm ctl
+    // input --help` is a line of text bound for the guest's console, and a rule
+    // that swallowed it would be a silent data loss dressed as a kindness.
+    if rest[0] == "egress" && wants_help(&rest[1..]) {
+        println!("{EGRESS_USAGE}");
+        return Ok(());
     }
     let command = ctl_command(&rest)?;
 
@@ -3521,5 +3610,170 @@ mod guest_userns_probe_tests {
             .unwrap_or_else(|e| panic!("unescaped name broke the report: {e}\n{body}"));
         assert_eq!(v["egress_live"][0]["device"], "ne\"t0");
         assert_eq!(v["egress_live"][0]["policy"], "lab\\el");
+    }
+}
+
+#[cfg(test)]
+mod ctl_help_tests {
+    use super::*;
+
+    /// Every verb the daemon dispatches has to be named in `chm ctl --help`.
+    ///
+    /// `ctl_command`'s tail arm passes an unrecognised verb straight through, so
+    /// the dispatch table -- not the parser -- is the real `ctl` surface, and
+    /// the usage text is a hand-written list sitting a thousand lines away from
+    /// it. #156 added `egress` to the dispatch and left it out of the list, and
+    /// nothing failed: this is the drift V9.4's guard catches one level up, at
+    /// `chm --help`, with no equivalent down here.
+    ///
+    /// Both sides are read as *entries*, never as substrings. A verb also
+    /// appears in its own neighbours' descriptions ("stop the guest"), so a
+    /// `contains` would keep passing after the entry it guards was deleted --
+    /// the shape that defeated #296's first doc guard.
+    #[test]
+    fn every_dispatched_ctl_verb_is_named_in_the_usage() {
+        let src = include_str!("serve.rs");
+        // Needles assembled from parts so they cannot match this test's own text.
+        let q = '"';
+        let start = src
+            .find(&format!("        {q}ping{q} => {{"))
+            .expect("the dispatch table opens at the ping arm");
+        let end = start
+            + src[start..]
+                .find(&format!("        {} => {{", "other"))
+                .expect("the dispatch table closes at its catch-all arm");
+
+        let mut dispatched = Vec::new();
+        for line in src[start..end].lines() {
+            let t = line.trim_start();
+            if line.len() - t.len() != 8 {
+                continue;
+            }
+            let Some(rest) = t.strip_prefix(q) else {
+                continue;
+            };
+            let Some((verb, tail)) = rest.split_once(q) else {
+                continue;
+            };
+            if tail.starts_with(" =>") {
+                dispatched.push(verb);
+            }
+        }
+        assert!(
+            dispatched.len() >= 15,
+            "only {} dispatch arms found -- the anchors have moved: {dispatched:?}",
+            dispatched.len()
+        );
+
+        // An entry is a two-space-indented lower-case token with a description
+        // column after it. Prose wrapped to the same indent has no such column.
+        let documented: Vec<&str> = CTL_USAGE
+            .lines()
+            .filter_map(|l| {
+                let body = l.strip_prefix("  ")?;
+                if !body.starts_with(|c: char| c.is_ascii_lowercase()) {
+                    return None;
+                }
+                let (head, tail) = body.split_once(' ')?;
+                tail.contains("  ").then_some(head)
+            })
+            .collect();
+        assert!(
+            documented.contains(&"list"),
+            "the usage parser found no entries at all: {documented:?}"
+        );
+
+        for verb in dispatched {
+            // `ping` is a liveness probe the client sends on its own behalf. The
+            // `-json` arms are the wire protocol, reached by the human name
+            // `ctl_command` maps onto them -- except `exec-json`, which belongs
+            // to top-level `chm exec` and is not a `ctl` verb at all.
+            if verb == "ping" || verb.ends_with("-json") {
+                continue;
+            }
+            assert!(
+                documented.contains(&verb),
+                "`chm ctl {verb}` is dispatched but absent from CTL_USAGE, so the \
+                 only list a user can see does not mention it"
+            );
+        }
+    }
+
+    /// `chm ctl --help` must not need a daemon.
+    ///
+    /// It used to take the socket, hand `--help` to `ctl_command` (whose tail
+    /// arm turns anything into a wire command), and die at `UnixStream::connect`
+    /// -- so the person least likely to have a daemon running, the one reading
+    /// the help, got a connection error instead of an answer.
+    #[test]
+    fn ctl_answers_help_without_connecting() {
+        for form in ["--help", "-h", "help"] {
+            let args = vec![
+                "--socket".to_string(),
+                "/nonexistent/gimbal-ctl-help-guard/chm.sock".to_string(),
+                form.to_string(),
+            ];
+            assert!(
+                ctl(&args).is_ok(),
+                "`chm ctl {form}` reached the socket instead of answering"
+            );
+        }
+        assert!(!wants_help(&["status".to_string()]));
+        // `chm ctl input --help` is a payload, not a question.
+        assert!(!wants_help(&["input".to_string(), "--help".to_string()]));
+
+        // The one verb with a grammar of its own answers for that grammar,
+        // still without a daemon. A socket that cannot exist is what proves it.
+        for form in ["--help", "-h", "help"] {
+            let args = vec![
+                "--socket".to_string(),
+                "/nonexistent/gimbal-ctl-help-guard/chm.sock".to_string(),
+                "egress".to_string(),
+                form.to_string(),
+            ];
+            assert!(
+                ctl(&args).is_ok(),
+                "`chm ctl egress {form}` reached the socket instead of answering"
+            );
+        }
+        // And an actual amendment still travels: it must reach the connect and
+        // fail there, not be swallowed as a question.
+        let real = vec![
+            "--socket".to_string(),
+            "/nonexistent/gimbal-ctl-help-guard/chm.sock".to_string(),
+            "egress".to_string(),
+            "allow".to_string(),
+            "example.com:80".to_string(),
+        ];
+        assert!(
+            ctl(&real).is_err(),
+            "a real egress amendment was answered as help instead of being sent"
+        );
+    }
+
+    /// `chm serve` answers `--help` before its argument parser rejects it.
+    ///
+    /// A call-site guard rather than an outcome one: `serve_main` returns an
+    /// `ExitCode`, which cannot be compared, and the bug was purely one of
+    /// order -- `parse_serve` refuses every unknown option, `--help` included.
+    #[test]
+    fn serve_answers_help_before_it_parses() {
+        let src = include_str!("serve.rs");
+        let body = &src[src
+            .find(&format!(
+                "pub fn {}(raw: &[String]) -> ExitCode {{",
+                "serve_main"
+            ))
+            .expect("serve_main must be findable")..];
+        let asks = body
+            .find(&format!("if {}(raw) {{", "wants_help"))
+            .expect("serve_main must consult wants_help");
+        let acts = body
+            .find(&format!("match {}(raw) {{", "serve"))
+            .expect("serve_main must call serve");
+        assert!(
+            asks < acts,
+            "serve_main parses its arguments before answering --help"
+        );
     }
 }
