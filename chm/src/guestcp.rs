@@ -57,7 +57,7 @@ use std::{fmt::Write as _, fs, path::Path, path::PathBuf, process::ExitCode};
 
 use ring::digest::{SHA256, digest};
 
-use crate::{credproxy::base64, exec, serve};
+use crate::{credproxy::base64, exec, imp::help_anywhere, serve};
 
 /// Exit status when the copy itself failed, distinct from any guest command's.
 const CP_FAILURE_EXIT: u8 = 125;
@@ -87,6 +87,10 @@ in busybox's default applets.
 ";
 
 pub fn cp_main(raw: &[String]) -> ExitCode {
+    if help_anywhere(raw) {
+        println!("{USAGE}");
+        return ExitCode::SUCCESS;
+    }
     match cp_client(raw) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
@@ -110,12 +114,14 @@ pub(crate) struct CpPlan {
 /// someone else's filesystem, and letting this host's path rules normalise it
 /// would quietly rewrite what the caller asked for.
 pub(crate) fn parse_cp_args(rest: &[String]) -> Result<CpPlan, String> {
+    // `-h` / `--help` never reaches here: `cp_main` answers it before parsing,
+    // so the usage page is printed to stdout and the process exits 0 (#417).
+    // Leaving a second copy of the rule down here is how the two drift.
     let mut timeout = FINISH_TIMEOUT;
     let mut operands: Vec<String> = Vec::new();
     let mut i = 0;
     while i < rest.len() {
         match rest[i].as_str() {
-            "-h" | "--help" => return Err(USAGE.to_string()),
             "--timeout" => {
                 let v = rest
                     .get(i + 1)

@@ -30,7 +30,7 @@ use hypervisor::hvf::HvfHypervisor;
 use hypervisor::hvf::SysregFate;
 use hypervisor::hvf::sysreg_audit::{audit_snapshot, SysregFinding};
 
-use crate::imp::load_snapshot;
+use crate::imp::{help_anywhere, load_snapshot};
 
 /// Parsed `chm sysregs` invocation.
 struct Args {
@@ -69,7 +69,9 @@ fn parse(raw: &[String]) -> Result<Args, String> {
                 let v = raw.get(i).ok_or("--vcpu needs a number")?;
                 vcpu = v.parse().map_err(|_| format!("--vcpu: not a number: {v}"))?;
             }
-            "-h" | "--help" => return Err(usage().to_string()),
+            // `-h` / `--help` never reaches here: `sysregs_main` answers it
+            // before parsing, so the usage page goes to stdout and the process
+            // exits 0 (#417). A second copy of the rule here is how they drift.
             s if s.starts_with('-') => return Err(format!("unknown option: {s}")),
             s => dir = Some(PathBuf::from(s)),
         }
@@ -101,6 +103,10 @@ fn describe(f: &SysregFinding) -> (String, String) {
 }
 
 pub(crate) fn sysregs_main(raw: &[String]) -> ExitCode {
+    if help_anywhere(raw) {
+        println!("{}", usage());
+        return ExitCode::SUCCESS;
+    }
     let args = match parse(raw) {
         Ok(a) => a,
         Err(e) => {

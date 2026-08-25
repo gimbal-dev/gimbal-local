@@ -2052,16 +2052,33 @@ fn parse_connect(raw: &[String]) -> Parsed {
 /// disk overlays, re-parented in the lineage. `chm resume <DST>` then runs the
 /// fork, diverging from SRC. The graph branches here (see
 /// `docs/gimbal-local-fork-model.md`).
+/// True when any argument asks the subcommand to explain itself.
+///
+/// Every argument, deliberately -- the subcommands that use this take paths and
+/// ids, never a command line destined for someone else, so there is nothing a
+/// trailing `--help` could belong to except `chm`. The two rules that differ do
+/// so because they have a payload to protect: [`serve::wants_help`] looks at the
+/// first position only, because `chm ctl input <text>` sends its argument to the
+/// guest verbatim; and `chm exec` stops at `--`, because `chm exec -- mytool
+/// --help` must ask *mytool* to explain itself. Both of those keep the rule
+/// inside the parser that owns the boundary, rather than restating it here.
+pub(crate) fn help_anywhere(args: &[String]) -> bool {
+    args.iter().any(|a| a == "-h" || a == "--help")
+}
+
 fn fork(raw: &[String]) -> Result<ExitCode, String> {
     let positionals: Vec<&String> = raw.iter().filter(|a| !a.starts_with('-')).collect();
-    if raw.iter().any(|a| a == "-h" || a == "--help") || positionals.len() != 2 {
-        eprintln!(
-            "usage: chm fork <SRC_SNAPSHOT_DIR> <DST_SNAPSHOT_DIR>\n\
+    if help_anywhere(raw) || positionals.len() != 2 {
+        let usage = "usage: chm fork <SRC_SNAPSHOT_DIR> <DST_SNAPSHOT_DIR>\n\
              \n\
              Branch SRC's current saved revision into a new, independent\n\
              snapshot DST that shares SRC's base but diverges from a copy of\n\
-             its live state. Run the fork with `chm resume <DST>`."
-        );
+             its live state. Run the fork with `chm resume <DST>`.";
+        if help_anywhere(raw) {
+            println!("{usage}");
+            return Ok(ExitCode::SUCCESS);
+        }
+        eprintln!("{usage}");
         return if positionals.len() == 2 {
             Ok(ExitCode::SUCCESS)
         } else {
@@ -2085,9 +2102,8 @@ fn fork(raw: &[String]) -> Result<ExitCode, String> {
 /// and checkpoints, so N sandboxes from one image don't clobber each other.
 fn workspace(raw: &[String]) -> Result<ExitCode, String> {
     let positionals: Vec<&String> = raw.iter().filter(|a| !a.starts_with('-')).collect();
-    if raw.iter().any(|a| a == "-h" || a == "--help") || positionals.len() != 2 {
-        eprintln!(
-            "usage: chm workspace <IMAGE_DIR> <WORKSPACE_DIR>\n\
+    if help_anywhere(raw) || positionals.len() != 2 {
+        let usage = "usage: chm workspace <IMAGE_DIR> <WORKSPACE_DIR>\n\
              \n\
              Create an isolated sandbox workspace: it shares IMAGE_DIR's\n\
              read-only base (state.json, snapshot/, disks/ are symlinked) but\n\
@@ -2099,8 +2115,12 @@ fn workspace(raw: &[String]) -> Result<ExitCode, String> {
              Either way a later suspend saves a checkpoint inside the workspace.\n\
              \n\
              IMAGE_DIR must be a captured snapshot, not a `chm image build`\n\
-             output: those cold-boot with `chm create` and need no workspace."
-        );
+             output: those cold-boot with `chm create` and need no workspace.";
+        if help_anywhere(raw) {
+            println!("{usage}");
+            return Ok(ExitCode::SUCCESS);
+        }
+        eprintln!("{usage}");
         return if positionals.len() == 2 {
             Ok(ExitCode::SUCCESS)
         } else {
@@ -2377,7 +2397,11 @@ fn revisions(raw: &[String]) -> Result<ExitCode, String> {
     let arity = verb.and_then(|v| revisions_arity(v, clearing, all));
     let expected = arity.unwrap_or(1);
 
-    if raw.iter().any(|a| a == "-h" || a == "--help") || positionals.len() != expected {
+    if help_anywhere(raw) || positionals.len() != expected {
+        if help_anywhere(raw) {
+            println!("{REVISIONS_USAGE}");
+            return Ok(ExitCode::SUCCESS);
+        }
         eprintln!("{REVISIONS_USAGE}");
         return if positionals.len() == expected {
             Ok(ExitCode::SUCCESS)
@@ -2734,14 +2758,17 @@ pub(crate) fn human_bytes(n: u64) -> String {
 /// archived revision (appended as a fresh HEAD; history is preserved).
 fn rollback_cmd(raw: &[String]) -> Result<ExitCode, String> {
     let positionals: Vec<&String> = raw.iter().filter(|a| !a.starts_with('-')).collect();
-    if raw.iter().any(|a| a == "-h" || a == "--help") || positionals.len() != 2 {
-        eprintln!(
-            "usage: chm rollback <SNAPSHOT_DIR> <REVISION_ID>\n\
+    if help_anywhere(raw) || positionals.len() != 2 {
+        let usage = "usage: chm rollback <SNAPSHOT_DIR> <REVISION_ID>\n\
              \n\
              Roll the snapshot back to an archived revision: it becomes a fresh\n\
              HEAD descending from the target (history is preserved, not rewound).\n\
-             The target must still be `resumable`. Then `chm resume <DIR>`."
-        );
+             The target must still be `resumable`. Then `chm resume <DIR>`.";
+        if help_anywhere(raw) {
+            println!("{usage}");
+            return Ok(ExitCode::SUCCESS);
+        }
+        eprintln!("{usage}");
         return if positionals.len() == 2 {
             Ok(ExitCode::SUCCESS)
         } else {
@@ -4876,11 +4903,13 @@ mod tests {
         );
     }
 
-    /// `--help` is the only place a user can discover what `chm` does, and it
-    /// had drifted: seven dispatched subcommands were absent from it, including
-    /// `create` — the whole cold-boot path. Listing them once fixes today; this
-    /// test fixes the class, by reading the dispatch table out of this file's
-    /// own source and requiring every arm to be reachable from the help.
+    /// Every `Some("...")` arm of `main`'s dispatch table, read out of this
+    /// file's own source.
+    ///
+    /// Two guards need this list and they need the *same* list, so there is one
+    /// reader. A second copy of "how do we find the dispatch table" would
+    /// eventually disagree with this one, and the disagreement would be
+    /// invisible -- both would still return a list, just not the same one.
     ///
     /// The extraction is bounded to the dispatch `match` itself, tracked by
     /// brace balance from its head. Scanning the whole file was the first
@@ -4889,18 +4918,12 @@ mod tests {
     /// the guard reported `export` as an undocumented top-level subcommand.
     /// A guard that fires on things it was never meant to see gets weakened to
     /// silence it; bounding it to the table it is guarding keeps its teeth.
-    /// This guard had itself stopped running. A later test was inserted at
-    /// this function's `fn` header line, which left the doc comment and
-    /// `#[test]` above orphaned onto the newcomer and stole the attribute from
-    /// this one -- so from that commit until #357 the help was unguarded, and
-    /// the suite reported otherwise. Third time in this repo; the tell is a
-    /// `duplicated attribute` warning nobody reads. Append at the module's
-    /// closing brace instead of splicing at a `fn` line.
-    #[test]
-    fn every_dispatched_subcommand_appears_in_the_help() {
-        let src = include_str!("imp.rs");
-        let help = usage();
-
+    ///
+    /// The length assertion is an instrument check rather than a coverage rule.
+    /// An extractor that quietly finds nothing lets every caller report a clean
+    /// result it never measured, so failing to *locate* the table has to be a
+    /// failure in its own right.
+    fn dispatched_subcommands(src: &str) -> Vec<&str> {
         const HEAD: &str = "match raw.first().map(String::as_str) {";
         let start = src.find(HEAD).expect("the dispatch match head moved");
         let mut depth = 0i32;
@@ -4927,13 +4950,33 @@ mod tests {
             .collect();
         dispatched.sort_unstable();
         dispatched.dedup();
-
         assert!(
             dispatched.len() > 20,
-            "extraction found only {} subcommands — the dispatch match moved \
-             and this guard is no longer reading it",
+            "extraction found only {} subcommands -- the dispatch match moved \
+             and the guards built on this reader are no longer reading it",
             dispatched.len()
         );
+        dispatched
+    }
+
+    /// `--help` is the only place a user can discover what `chm` does, and it
+    /// had drifted: seven dispatched subcommands were absent from it, including
+    /// `create` — the whole cold-boot path. Listing them once fixes today; this
+    /// test fixes the class, by reading the dispatch table out of this file's
+    /// own source and requiring every arm to be reachable from the help.
+    ///
+    /// This guard had itself stopped running. A later test was inserted at
+    /// this function's `fn` header line, which left the doc comment and
+    /// `#[test]` above orphaned onto the newcomer and stole the attribute from
+    /// this one -- so from that commit until #357 the help was unguarded, and
+    /// the suite reported otherwise. Third time in this repo; the tell is a
+    /// `duplicated attribute` warning nobody reads. Append at the module's
+    /// closing brace instead of splicing at a `fn` line.
+    #[test]
+    fn every_dispatched_subcommand_appears_in_the_help() {
+        let src = include_str!("imp.rs");
+        let help = usage();
+        let dispatched = dispatched_subcommands(src);
 
         let missing: Vec<&str> = dispatched
             .iter()
@@ -4943,6 +4986,173 @@ mod tests {
         assert!(
             missing.is_empty(),
             "dispatched but absent from `chm --help`: {missing:?}"
+        );
+    }
+
+    /// The list this file's `main` dispatch reaches, paired with the entry point
+    /// it reaches it through. Kept next to the guards that use it so the two
+    /// cannot drift apart, and cross-checked against the real dispatch table by
+    /// [`no_subcommand_escapes_the_help_exit_code_guard`].
+    ///
+    /// `Box<dyn Fn>` rather than a plain `fn` pointer because five subcommands
+    /// return `Result<ExitCode, String>` and have to be wrapped; `main` does the
+    /// same wrapping inline.
+    #[allow(clippy::type_complexity)]
+    fn help_entry_points() -> Vec<(&'static str, Box<dyn Fn(&[String]) -> ExitCode>)> {
+        fn ok(r: Result<ExitCode, String>) -> ExitCode {
+            r.unwrap_or(ExitCode::FAILURE)
+        }
+        vec![
+            ("create", Box::new(|a: &[String]| create_main(a))),
+            ("cloud", Box::new(|a: &[String]| cloud::cloud_main(a))),
+            (
+                "runner",
+                Box::new(|a: &[String]| control_plane::runner_main(a)),
+            ),
+            ("push", Box::new(|a: &[String]| control_plane::push_main(a))),
+            ("pull", Box::new(|a: &[String]| control_plane::pull_main(a))),
+            (
+                "branches",
+                Box::new(|a: &[String]| control_plane::branches_main(a)),
+            ),
+            (
+                "policy",
+                Box::new(|a: &[String]| control_plane::policy_main(a)),
+            ),
+            (
+                "firewall",
+                Box::new(|a: &[String]| firewall::firewall_main(a)),
+            ),
+            ("limits", Box::new(|a: &[String]| limits::limits_main(a))),
+            ("audit", Box::new(|a: &[String]| audit::audit_main(a))),
+            ("posture", Box::new(|a: &[String]| posture::posture_main(a))),
+            (
+                "capabilities",
+                Box::new(|a: &[String]| capability::capabilities_main(a)),
+            ),
+            (
+                "proxy",
+                Box::new(|a: &[String]| credproxy::cli::proxy_main(a)),
+            ),
+            ("sysregs", Box::new(|a: &[String]| sysregs::sysregs_main(a))),
+            (
+                "manifest",
+                Box::new(|a: &[String]| signing::manifest_main(a)),
+            ),
+            (
+                "state-cdn",
+                Box::new(|a: &[String]| state_cdn::state_cdn_main(a)),
+            ),
+            ("serve", Box::new(|a: &[String]| serve::serve_main(a))),
+            ("ctl", Box::new(|a: &[String]| serve::ctl_main(a))),
+            ("exec", Box::new(|a: &[String]| serve::exec_main(a))),
+            ("cp", Box::new(|a: &[String]| guestcp::cp_main(a))),
+            ("ps", Box::new(|a: &[String]| runs::ps_main(a))),
+            (
+                "kernel",
+                Box::new(|a: &[String]| kernelimage::kernel_main(a)),
+            ),
+            ("spec", Box::new(|a: &[String]| spec::spec_main(a))),
+            ("image", Box::new(|a: &[String]| image_main(a))),
+            ("fork", Box::new(|a: &[String]| ok(fork(a)))),
+            ("vanilla", Box::new(|a: &[String]| ok(vanilla(a)))),
+            ("revisions", Box::new(|a: &[String]| ok(revisions(a)))),
+            ("workspace", Box::new(|a: &[String]| ok(workspace(a)))),
+            ("rollback", Box::new(|a: &[String]| ok(rollback_cmd(a)))),
+            // `main` inlines this one rather than calling a `*_main`, so the
+            // closure mirrors its arm: a parse that comes back `Help` is a
+            // success. Left out of the first draft of this list, and the
+            // dispatch-table guard below caught it.
+            (
+                "connect",
+                Box::new(|a: &[String]| match parse_connect(a) {
+                    Parsed::Help => ExitCode::SUCCESS,
+                    _ => ExitCode::FAILURE,
+                }),
+            ),
+        ]
+    }
+
+    /// Asking a program to explain itself is a question, not a failure, and a
+    /// shell cannot tell the difference: `set -e` aborts, `cmd --help ||
+    /// fallback` takes the fallback, and a docs step that renders help fails the
+    /// build. Eight subcommands got this wrong at once -- `exec` and `cp`
+    /// exiting **125**, which in the `env`/`docker`/`timeout` family specifically
+    /// means *the tool itself broke before running your command*, a far more
+    /// alarming claim than "you asked a question" (#417).
+    ///
+    /// The cause was one shortcut copied eight times: the usage page was carried
+    /// out through the `Err` channel, so it printed (to stderr) and the process
+    /// then exited with whatever that path mapped to. Four of them also appended
+    /// a diagnostic contradicting what the user actually did -- `chm fork
+    /// --help` ended with `expected exactly two directory arguments`.
+    ///
+    /// This checks behaviour, not spelling: it calls the same entry point
+    /// `main` calls. `ExitCode` has no `PartialEq`, so the comparison goes
+    /// through `Debug` against a locally built `SUCCESS` rather than against a
+    /// hardcoded string -- a literal would encode today's representation of a
+    /// value this test does not own.
+    ///
+    /// `exec` is absent from this reasoning on purpose. `chm exec -- mytool
+    /// --help` is asking *mytool* to explain itself, not `chm`, so its guard
+    /// lives beside `parse_exec_args` in `serve.rs` -- the only place that
+    /// knows where `exec`'s own flags stop. See
+    /// `exec_does_not_answer_a_help_flag_meant_for_the_guest` there.
+    #[test]
+    fn every_subcommand_answers_help_with_success() {
+        let want = format!("{:?}", ExitCode::SUCCESS);
+        let entries = help_entry_points();
+        assert!(
+            entries.len() > 20,
+            "only {} entry points listed -- this guard is barely checking anything",
+            entries.len()
+        );
+
+        let mut wrong: Vec<String> = Vec::new();
+        for (name, run) in &entries {
+            for flag in ["--help", "-h"] {
+                let got = format!("{:?}", run(&[flag.to_string()]));
+                if got != want {
+                    wrong.push(format!("chm {name} {flag} -> {got}"));
+                }
+            }
+        }
+        assert!(
+            wrong.is_empty(),
+            "`--help` reported failure (want {want}): {wrong:#?}"
+        );
+    }
+
+    /// The fix above is only worth as much as its resistance to a ninth case.
+    /// Listing the twenty-nine entry points by hand fixes today; reading the
+    /// dispatch table out of this file's own source is what stops a new
+    /// subcommand quietly opting out -- adding `Some("thing") => thing_main(..)`
+    /// fails this test until `thing` is covered too. Same technique, and the
+    /// same brace-balanced extraction, as
+    /// [`every_dispatched_subcommand_appears_in_the_help`]; see that guard for
+    /// why the bound matters.
+    ///
+    /// The child half of the HVF probe is the one arm this cannot see, and that
+    /// is structural rather than a decision: it dispatches on
+    /// `Some(capability::PROBE_ARG)`, a constant rather than a string literal,
+    /// so the extractor never picks it up. That suits -- it is spawned by `chm
+    /// capabilities`, never typed, and takes no arguments to ask help of. It is
+    /// absent from `chm --help` for the same reason.
+    #[test]
+    fn no_subcommand_escapes_the_help_exit_code_guard() {
+        let src = include_str!("imp.rs");
+        let dispatched = dispatched_subcommands(src);
+
+        let covered: Vec<&str> = help_entry_points().iter().map(|(n, _)| *n).collect();
+        let uncovered: Vec<&str> = dispatched
+            .iter()
+            .copied()
+            .filter(|c| !covered.contains(c))
+            .collect();
+        assert!(
+            uncovered.is_empty(),
+            "dispatched but not checked by `every_subcommand_answers_help_with_success`: \
+             {uncovered:?}"
         );
     }
 

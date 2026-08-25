@@ -40,6 +40,8 @@ use ring::rand::SystemRandom;
 use ring::signature::{self, Ed25519KeyPair, KeyPair, UnparsedPublicKey};
 use serde::{Deserialize, Serialize};
 
+use crate::imp::help_anywhere;
+
 /// The only signature algorithm the contract defines today.
 pub const SIG_ALG: &str = "ed25519";
 /// Ed25519 public keys are 32 bytes.
@@ -218,27 +220,32 @@ fn sig_path_for(manifest: &Path) -> PathBuf {
 }
 
 pub(crate) fn manifest_main(raw: &[String]) -> ExitCode {
+    const MANIFEST_USAGE: &str = "usage: chm manifest <command>\n\
+         \n\
+         Sign and verify snapshot manifests (M30.4). The signature covers\n\
+         the manifest file's raw bytes; a detached `<manifest>.sig` holds\n\
+         the Ed25519 signature + signing key id.\n\
+         \n\
+         commands:\n    \
+           keygen --out <dir> [--id <key-id>]   generate an Ed25519 keypair\n                                        \
+            (writes <dir>/<id>.pkcs8 + a trust\n                                        \
+            store <dir>/<id>.trust.json)\n    \
+           sign <manifest.json> --key <pkcs8> --id <key-id>\n                                        \
+            write <manifest.json>.sig\n    \
+           verify <manifest.json> --trust <store.json> [--sig <file>]\n                                        \
+            verify the signature against a trust store";
+
+    if help_anywhere(raw) {
+        println!("{MANIFEST_USAGE}");
+        return ExitCode::SUCCESS;
+    }
+
     let result = match raw.first().map(String::as_str) {
         Some("keygen") => manifest_keygen(&raw[1..]),
         Some("sign") => manifest_sign(&raw[1..]),
         Some("verify") => manifest_verify(&raw[1..]),
         _ => {
-            eprintln!(
-                "usage: chm manifest <command>\n\
-                 \n\
-                 Sign and verify snapshot manifests (M30.4). The signature covers\n\
-                 the manifest file's raw bytes; a detached `<manifest>.sig` holds\n\
-                 the Ed25519 signature + signing key id.\n\
-                 \n\
-                 commands:\n    \
-                   keygen --out <dir> [--id <key-id>]   generate an Ed25519 keypair\n                                        \
-                    (writes <dir>/<id>.pkcs8 + a trust\n                                        \
-                    store <dir>/<id>.trust.json)\n    \
-                   sign <manifest.json> --key <pkcs8> --id <key-id>\n                                        \
-                    write <manifest.json>.sig\n    \
-                   verify <manifest.json> --trust <store.json> [--sig <file>]\n                                        \
-                    verify the signature against a trust store"
-            );
+            eprintln!("{MANIFEST_USAGE}");
             return ExitCode::FAILURE;
         }
     };
