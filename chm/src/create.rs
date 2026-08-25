@@ -67,7 +67,7 @@ use crate::oci::initramfs::installs_proxy_ca;
 use crate::oci::modules;
 use crate::runs;
 use crate::spec::{Overrides, SandboxSpec, resolve, spec_file_for};
-use crate::{bundle, checkpoint, coldboot, console, credproxy, genesis, postboot};
+use crate::{bundle, checkpoint, coldboot, console, credproxy, genesis, postboot, serve};
 /// The NAT gateway the guest talks to, and the MAC we hand its NIC.
 ///
 /// Same subnet the restore path's NAT uses, so a guest image built for one
@@ -183,6 +183,17 @@ struct CreateArgs {
     /// `--originate`'s business, and it fires on this path exactly as it does
     /// on the `--seconds` one.
     idle_exit_secs: u64,
+    /// Where to publish this guest's control socket, or `None` for no socket
+    /// (#401).
+    ///
+    /// Cold boot's console was its only interface: the guest could be typed at
+    /// by whoever held the terminal, and by nobody else. So `chm exec`,
+    /// `chm ctl input/console/status` and `chm proxy ca --install` -- every
+    /// tool that drives a sandbox -- worked on daemon-started guests and not on
+    /// the one path a Mac with no snapshot can actually use. This publishes the
+    /// running guest behind the same `VmInner` those verbs already read, so
+    /// they serve it with no second implementation.
+    socket: Option<PathBuf>,
     /// Hosts the guest may reach, as `host:port`. Empty means the default
     /// deny-all posture, which is what an unconfigured sandbox gets everywhere
     /// else in this tree (see `docs/security-model.md` §1a).
@@ -239,7 +250,15 @@ fn usage() -> String {
      \x20 --initramfs <path>  initrd/initramfs cpio (optional). Without one\n\
      \x20                     the kernel panics at `VFS: unable to mount\n\
      \x20                     root fs`, which is correct: it has nothing to run.\n\
+     \x20 --initrd <path>     Alias for --initramfs, for anyone arriving from\n\
+     \x20                     a QEMU or libvirt command line.\n\
      \x20 --cmdline <str>     Kernel command line.\n\
+     \x20 --cmdline-extra <s> One more word on the kernel command line, appended\n\
+     \x20                     to whatever --cmdline said. Repeatable, so a spec\n\
+     \x20                     or a script can add an argument without having to\n\
+     \x20                     restate the whole line. A `root=` or\n\
+     \x20                     `gimbal.epoch=` here counts as yours, and\n\
+     \x20                     suppresses the one chm would have implied.\n\
      \x20 --cpus <n>          vCPUs (default 1).\n\
      \x20 --memory <MiB>      Guest RAM in MiB (default 1024).\n\
      \x20 --disk <path>       Raw disk image as virtio-blk. Repeatable; the\n\
@@ -274,6 +293,16 @@ fn usage() -> String {
      \x20                     and says so once per silent window.\n\
      \x20                     It decides when to stop, not what to keep: pass\n\
      \x20                     --originate as well to preserve the guest.\n\
+     \x20 --socket <path>     Serve the daemon's control socket for this cold\n\
+     \x20                     guest, so `chm exec`, `chm ctl input`, `chm ctl\n\
+     \x20                     console`, `chm ctl status` and `chm proxy ca\n\
+     \x20                     --install` reach it the same way they reach a\n\
+     \x20                     guest started by `chm serve`. The library verbs\n\
+     \x20                     (list, start, shutdown) are refused with a note\n\
+     \x20                     saying where they do work: a cold boot has no\n\
+     \x20                     library behind it. Put the socket under your\n\
+     \x20                     home directory -- /tmp is a symlink on macOS and\n\
+     \x20                     a private runtime dir may not be one.\n\
      \x20 --originate <dir>   Snapshot this guest into <dir> when it stops, as\n\
      \x20                     a cloud-hypervisor snapshot directory that\n\
      \x20                     `chm run <dir>` resumes. This is how a lineage\n\
@@ -300,7 +329,8 @@ fn usage() -> String {
      \x20                     describes this sandbox. It expands to exactly the\n\
      \x20                     flags below, which are then applied on top: the\n\
      \x20                     spec says what the sandbox is, flags say how this\n\
-     \x20                     run differs. See `chm spec`.\n"
+     \x20                     run differs. See `chm spec`.\n\
+     \x20 --help              This text.\n"
         .to_string()
 }
 
@@ -372,6 +402,7 @@ const CREATE_FLAGS: &[&str] = &[
     "--memory",
     "--seconds",
     "--idle-exit",
+    "--socket",
     "--disk",
     "--net",
     "--egress-allow",
@@ -407,6 +438,7 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
     let mut dry_run = false;
     let mut max_seconds = default_max_seconds(stdin().is_terminal());
     let mut idle_exit_secs = 0u64;
+    let mut socket: Option<PathBuf> = None;
     let mut kernel: Option<PathBuf> = None;
     let mut egress_allow: Vec<String> = Vec::new();
     let mut expose: Vec<u16> = Vec::new();
@@ -471,6 +503,7 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
                     .parse()
                     .map_err(|e| format!("--idle-exit: {e}"))?;
             }
+            "--socket" => socket = Some(PathBuf::from(value("--socket")?)),
             "--disk" => cfg.disks.push(PathBuf::from(value("--disk")?)),
             "--net" => cfg.net = true,
             "--egress-allow" => egress_allow.push(value("--egress-allow")?),
@@ -601,6 +634,7 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
         dry_run,
         max_seconds,
         idle_exit_secs,
+        socket,
         egress_allow,
         expose,
         proxy_rules,
@@ -728,6 +762,70 @@ fn ca_archive_for(args: &CreateArgs) -> Result<Option<Vec<u8>>, String> {
         return Ok(None);
     };
     credproxy::cli::ca_cpio_for(&ws)
+}
+
+/// Why a run that a control client stopped ended, for the operator watching
+/// this console -- who is not necessarily the person who issued the stop.
+///
+/// Every other ending explains itself: the idle and deadline arms, and the
+/// guest's own message. A `chm ctl stop` landed in the bare `None`
+/// fall-through and printed *nothing at all*, which is a worse version of the
+/// dead end #304/#305/#306 each closed -- not a true sentence with no next
+/// step, but no sentence. Reachable only since #401 gave cold boot a socket,
+/// so it is this change's to fix.
+///
+/// A value rather than an inline `println!` so the prose is testable: the
+/// three things it must say are what make it useful, and asserting them
+/// against source text cannot survive the line wrapping.
+fn client_stop_report(socket: Option<&Path>, originating: bool) -> String {
+    let where_from = socket.map_or_else(
+        || "the control socket".to_string(),
+        |p| format!("`chm ctl stop` on {}", p.display()),
+    );
+    let kept = if originating {
+        "--originate ran after the guest halted, so this run was preserved."
+    } else {
+        "Nothing was preserved: a stop chooses when to stop, --originate \
+         chooses what to keep."
+    };
+    format!(
+        "chm create: stopped on request -- {where_from}, so it was neither the \
+         guest halting nor a deadline expiring.\n  {kept}"
+    )
+}
+
+/// What `chm ctl status` should call this guest.
+///
+/// A cold boot is named by nothing -- there is no library entry to take a name
+/// from -- so use the directory the kernel came out of, which is what the
+/// operator picked and will recognise (`~/gimbal-images/final-alpine` reads back
+/// as `final-alpine`).
+fn cold_guest_name(args: &CreateArgs) -> String {
+    args.cfg
+        .kernel
+        .parent()
+        .and_then(Path::file_name)
+        .map(|n| n.to_string_lossy().into_owned())
+        .filter(|n| !n.is_empty())
+        .unwrap_or_else(|| "cold-boot".to_string())
+}
+
+/// The directory `posture`, `proxy` and `audit` should assess for this guest.
+///
+/// The same derivation the credential proxy uses below, deliberately: two
+/// derivations would eventually disagree, and `chm proxy ca --install` over this
+/// socket would then install a CA from one place while the proxy intercepted
+/// with another.
+fn cold_guest_dir(args: &CreateArgs) -> PathBuf {
+    args.workspace
+        .clone()
+        .or_else(|| {
+            args.proxy_rules
+                .as_deref()
+                .and_then(Path::parent)
+                .map(Path::to_path_buf)
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn run(args: &CreateArgs) -> Result<ExitCode, String> {
@@ -988,13 +1086,25 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     // Console: drain the UART to stdout on a helper thread so the vCPU thread
     // only ever runs the guest.
     //
-    // When something has to be delivered into the guest (#190), that thread also
-    // *tees* what it printed into a bounded tail, because `take_output` consumes
-    // and a second reader would steal bytes from the operator's own screen. The
-    // tee is `None` on every other run, so a plain `chm create` allocates
-    // nothing and behaves exactly as before.
-    let tail: Option<Arc<ConsoleTail>> =
-        (!args.postboot.is_empty()).then(|| Arc::new(ConsoleTail::default()));
+    // When something has to be delivered into the guest (#190) or a control
+    // client has to be able to read it (#401), that thread also *tees* what it
+    // printed into a bounded ring, because `take_output` consumes and a second
+    // reader would steal bytes from the operator's own screen.
+    //
+    // One ring serves both, and it is the daemon's own `VmInner`: `--socket`
+    // then reuses `handle_conn` verbatim rather than growing a second
+    // implementation of the exec framing, the input path and the console
+    // buffer. The tee is `None` on every other run, so a plain `chm create`
+    // allocates nothing and behaves exactly as before.
+    let control: Option<Arc<serve::ColdControl>> = match &args.socket {
+        Some(path) => Some(Arc::new(serve::ColdControl::bound(
+            &cold_guest_name(args),
+            cold_guest_dir(args),
+            path.clone(),
+        )?)),
+        None if !args.postboot.is_empty() => Some(Arc::new(serve::ColdControl::detached())),
+        None => None,
+    };
     // Unlike the tail, this is armed on every run: a panic is exactly the
     // outcome a caller most needs to hear about, and it costs one scan of bytes
     // that are being copied to stdout anyway.
@@ -1010,7 +1120,7 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     let console = {
         let uart = uart.clone();
         let running = running.clone();
-        let tail = tail.clone();
+        let control = control.clone();
         let panic_watch = panic_watch.clone();
         let spoke = spoke.clone();
         thread::Builder::new()
@@ -1023,8 +1133,8 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                         thread::sleep(Duration::from_millis(5));
                         continue;
                     }
-                    if let Some(t) = &tail {
-                        t.push(&bytes);
+                    if let Some(c) = &control {
+                        c.push(&bytes);
                     }
                     panic_watch.push(&bytes);
                     spoke.fetch_add(1, Ordering::Release);
@@ -1033,8 +1143,8 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                 }
                 let rest = uart.take_output();
                 if !rest.is_empty() {
-                    if let Some(t) = &tail {
-                        t.push(&rest);
+                    if let Some(c) = &control {
+                        c.push(&rest);
                     }
                     panic_watch.push(&rest);
                     spoke.fetch_add(1, Ordering::Release);
@@ -1406,6 +1516,27 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         )
     };
 
+    // Publish the guest's two control channels (#401).
+    //
+    // `input` is the same injector the console pump uses, deliberately: a second
+    // route into the FIFO could work when typing does not, or vice versa, and
+    // the symptom would be a socket that appears to work and delivers nothing.
+    // `kick` forces every vCPU out of `hv_vcpu_run` so a `stop` lands on a guest
+    // that is sitting in a trap rather than waiting for it to come out on its
+    // own. Both here rather than at construction because `exits` only exists
+    // once every vCPU has reported in.
+    if let Some(c) = &control {
+        let kicks: Vec<Arc<dyn Fn() + Send + Sync>> = exits.iter().flatten().cloned().collect();
+        c.publish(
+            console::console_input(uart.clone(), sink.clone(), None, coldboot::PL011_IRQ),
+            Arc::new(move || {
+                for kick in &kicks {
+                    kick();
+                }
+            }),
+        );
+    }
+
     // Deliver what the spec asked to happen inside the guest, on its own thread
     // so the orchestrator's deadline loop keeps running: readiness can take a
     // minute on a slow boot, and a `--seconds` promise must not become a hope
@@ -1415,9 +1546,11 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     // console sees the delivery happen rather than finding it already done.
     let postboot_result: Arc<Mutex<Option<Result<postboot::Report, postboot::Failure>>>> =
         Arc::new(Mutex::new(None));
-    let postboot_thread = match &tail {
-        None => None,
-        Some(tail) => {
+    // Gated on the plan, not on the ring: `--socket` arms the ring too, and
+    // spawning a delivery thread with nothing to deliver would drive a console
+    // probe into a guest whose operator asked for neither.
+    let postboot_thread = match (&control, args.postboot.is_empty()) {
+        (Some(control), false) => {
             let plan = args.postboot.clone();
             let slot = postboot_result.clone();
             let running_pb = running.clone();
@@ -1428,7 +1561,7 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                     None,
                     coldboot::PL011_IRQ,
                 ),
-                tail: tail.clone(),
+                control: control.clone(),
                 running: running.clone(),
             };
             Some(
@@ -1468,6 +1601,7 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                     .map_err(|e| format!("spawning the post-boot thread: {e}"))?,
             )
         }
+        _ => None,
     };
 
     // A panicked guest that never resets is the one case with no other way out:
@@ -1493,9 +1627,14 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     // `timed_out` cannot tell them apart: both leave `running` true with no
     // shutdown requested.
     let mut stopped_idle = false;
+    // A control client asked this guest to stop (#401). Read as a closure so
+    // the loop condition names the question rather than the plumbing, and so a
+    // run with no socket pays nothing for it.
+    let stop_asked = || control.as_ref().is_some_and(|c| c.stop_requested());
     while running.load(Ordering::Acquire)
         && deadline.is_none_or(|d| Instant::now() < d)
         && !console::shutdown_requested()
+        && !stop_asked()
         && !(unattended && panic_watch.settled_after_panic(PANIC_SILENCE_GRACE, Instant::now()))
     {
         thread::sleep(Duration::from_millis(50));
@@ -1543,15 +1682,19 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     }
     // Only a deadline that actually expired counts as a timeout; an operator
     // ending the session is a normal exit, not a run that overran. Nor is an
-    // idle stop, which has its own report.
+    // idle stop, which has its own report, nor a `chm ctl stop`, which is the
+    // same deliberate ending arriving over a socket instead of a keyboard.
     //
     // `!stopped_idle` is redundant *today*: the idle arm below is matched
     // first, so this value is never read on an idle stop. It is kept so the
     // two stops are exclusive by predicate rather than by position, and it is
     // recorded here that removing it fires no test -- the arm order is what
     // `the_idle_stop_reports_itself_rather_than_the_deadline` actually guards.
-    let timed_out =
-        running.load(Ordering::Acquire) && !console::shutdown_requested() && !stopped_idle;
+    let stopped_by_client = stop_asked();
+    let timed_out = running.load(Ordering::Acquire)
+        && !console::shutdown_requested()
+        && !stopped_idle
+        && !stopped_by_client;
     running.store(false, Ordering::Release);
 
     // Release any secondary still parked waiting for a CPU_ON that will not
@@ -1574,6 +1717,25 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
     }
     if let Some(t) = postboot_thread {
         let _ = t.join();
+    }
+
+    // Take the control socket down and record why the guest ended (#401).
+    //
+    // After the joins, because a `stop` client blocks until the status says
+    // `Stopped` and the honest moment to say so is once the vCPUs have actually
+    // gone -- but before `--originate` below, which can take a while on a large
+    // guest and must not hold a client waiting on a machine that has already
+    // halted.
+    if let Some(c) = &control {
+        c.finish(if stopped_by_client {
+            "stopped on request"
+        } else if stopped_idle {
+            "stopped idle"
+        } else if timed_out {
+            "deadline expired"
+        } else {
+            "guest ended"
+        });
     }
 
     // #341. This is the only window where both things are true at once: every
@@ -1666,6 +1828,13 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                  guest.\n  The guest was running and has been torn down. Use \
                  `--seconds N` to allow longer, or `--seconds 0` for no deadline.",
                 args.max_seconds
+            );
+            Ok(ExitCode::SUCCESS)
+        }
+        None if stopped_by_client => {
+            println!(
+                "\n{}",
+                client_stop_report(args.socket.as_deref(), args.originate.is_some())
             );
             Ok(ExitCode::SUCCESS)
         }
@@ -1812,52 +1981,14 @@ fn unchecked_fs_report() -> String {
         .into()
 }
 
-/// A bounded copy of what the console printed, so post-boot delivery can read
-/// the guest's answers without taking bytes off the operator's screen.
-///
-/// Bounded because a guest can print forever and this is a side-channel, not a
-/// log: only the recent tail can matter, since every framed step starts by
-/// noting the current length and reads forward from there. Losing older bytes is
-/// what [`exec::ExecOutcome::Truncated`] exists to report, so eviction becomes a
-/// named failure rather than a wrong answer.
-#[derive(Default)]
-struct ConsoleTail {
-    /// Text kept, oldest first.
-    buf: Mutex<String>,
-    /// How many bytes have been evicted from the front.
-    dropped: Mutex<usize>,
-}
-
-impl ConsoleTail {
-    /// Roughly the daemon's ring, and comfortably above `exec::MAX_OUTPUT`, so a
-    /// step that overflows is reported as overflow rather than as eviction.
-    const CAP: usize = 256 * 1024;
-
-    fn push(&self, bytes: &[u8]) {
-        let mut buf = self.buf.lock().unwrap();
-        buf.push_str(&String::from_utf8_lossy(bytes));
-        if buf.len() > Self::CAP {
-            // Trim on a char boundary: the tail is read as `&str`, and slicing
-            // mid-codepoint would panic on a guest that prints UTF-8.
-            let mut cut = buf.len() - Self::CAP;
-            while cut < buf.len() && !buf.is_char_boundary(cut) {
-                cut += 1;
-            }
-            *self.dropped.lock().unwrap() += cut;
-            let kept = buf.split_off(cut);
-            *buf = kept;
-        }
-    }
-
-    fn text(&self) -> String {
-        self.buf.lock().unwrap().clone()
-    }
-}
-
 /// The running cold guest, as [`postboot`] needs to see it.
+///
+/// Reads its transcript out of the same [`ColdControl`] ring a control client
+/// reads over the socket (#401), so the two cannot disagree about what the guest
+/// said.
 struct GuestConsole {
     input: console::ConsoleInput,
-    tail: Arc<ConsoleTail>,
+    control: Arc<serve::ColdControl>,
     running: Arc<AtomicBool>,
 }
 
@@ -1868,11 +1999,13 @@ impl postboot::Console for GuestConsole {
         // that could work when typing does not, or vice versa.
         (self.input)(bytes);
     }
-    fn transcript(&self) -> String {
-        self.tail.text()
+    fn transcript(&self) -> Vec<u8> {
+        self.control.transcript()
     }
     fn stopped(&self) -> bool {
-        !self.running.load(Ordering::Acquire) || console::shutdown_requested()
+        !self.running.load(Ordering::Acquire)
+            || console::shutdown_requested()
+            || self.control.stop_requested()
     }
 }
 
@@ -3433,6 +3566,39 @@ mod tests {
         );
     }
 
+    /// `CREATE_FLAGS` agreeing with the parser proves the flag is *understood*,
+    /// not that anyone can find out it exists. #151/V9.4 established that a
+    /// subcommand nobody can discover is a subcommand nobody has, and a flag is
+    /// the same claim one level down: `--socket` reached the parser first and
+    /// was absent from `--help`, so the only way to learn it existed was to
+    /// read the source.
+    ///
+    /// It reports every absentee in one failure rather than the first, because
+    /// its own first run found three (`--socket`, `--initrd`, `--cmdline-extra`)
+    /// and an assert inside the loop made that three full suite runs. A guard
+    /// that stops at the first finding charges a round trip per defect.
+    #[test]
+    fn every_create_flag_is_in_the_help() {
+        let help = usage();
+        let missing: Vec<&str> = CREATE_FLAGS
+            .iter()
+            .filter(|flag| !help.contains(**flag))
+            .copied()
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "{} are flags `chm create` accepts and `chm create --help` never \
+             mentions, so the only way to find them is to read the source",
+            missing.join(", ")
+        );
+        assert!(
+            CREATE_FLAGS.len() >= 20,
+            "only {} flags -- the list stopped being the parser's vocabulary, \
+             so this guard is passing without reading anything",
+            CREATE_FLAGS.len()
+        );
+    }
+
     /// A test can see that `parse` *recorded* the swallowed flags and still not
     /// see that nobody prints them: an assertion about a value cannot observe a
     /// call site that no longer exists. This repo has been caught by that seven
@@ -3767,6 +3933,212 @@ mod tests {
             sites, 2,
             "expected the loop body and the post-loop drain to both report \
              output, found {sites}"
+        );
+    }
+}
+
+/// Guards for the cold-boot control socket (#401).
+#[cfg(test)]
+mod cold_socket_tests {
+    use super::{CREATE_FLAGS, cold_guest_dir, cold_guest_name, parse};
+    use std::path::{Path, PathBuf};
+
+    fn args(extra: &[&str]) -> super::CreateArgs {
+        let mut v: Vec<String> = vec!["--kernel".into(), "/dev/null".into()];
+        v.extend(extra.iter().map(|s| (*s).to_string()));
+        parse(&v).expect("must parse")
+    }
+
+    #[test]
+    fn the_socket_flag_reaches_the_field_it_names() {
+        assert_eq!(args(&[]).socket, None, "no --socket must arm no socket");
+        assert_eq!(
+            args(&["--socket", "/Users/x/chm.sock"]).socket,
+            Some(PathBuf::from("/Users/x/chm.sock"))
+        );
+        assert!(CREATE_FLAGS.contains(&"--socket"));
+    }
+
+    /// `cold_guest_dir` exists only to *agree* with the credential proxy's own
+    /// workspace derivation. `ca_archive_for` states the hazard in full: two
+    /// derivations eventually disagree, and the symptom is a CA installed in the
+    /// guest that does not match the one intercepting its traffic -- a TLS
+    /// failure that names neither. `running_vm_dir` prefers `vm.dir`, and that
+    /// is what `posture`, `proxy` and `audit` assess over this socket, so a
+    /// third derivation would reintroduce exactly that bug one layer up.
+    #[test]
+    fn the_guest_dir_is_the_proxys_own_derivation() {
+        // Both set: the workspace wins, in both derivations.
+        let a = args(&[
+            "--net",
+            "--workspace",
+            "/ws/explicit",
+            "--proxy-rules",
+            "/other/rules.json",
+        ]);
+        assert_eq!(cold_guest_dir(&a), PathBuf::from("/ws/explicit"));
+
+        // Only rules: the rules file's parent, in both derivations.
+        let b = args(&["--net", "--proxy-rules", "/lab/one/proxy-rules.json"]);
+        assert_eq!(cold_guest_dir(&b), PathBuf::from("/lab/one"));
+
+        // Neither: there is nowhere to assess, and the current directory is what
+        // every other path here falls back to.
+        assert_eq!(cold_guest_dir(&args(&[])), PathBuf::from("."));
+
+        // And the shape is read out of the source, because agreeing today is not
+        // the property -- staying the same expression is.
+        let src = include_str!("create.rs");
+        let needle = format!("args.proxy_rules{}", "\n                .as_deref()");
+        assert!(
+            src.contains(&needle),
+            "cold_guest_dir must still derive from --proxy-rules the way \
+             ca_archive_for does, or `chm proxy ca --install` over this socket \
+             installs a CA the proxy is not using"
+        );
+    }
+
+    /// A cold boot has no library entry to take a name from, so `chm ctl status`
+    /// over this socket would otherwise report a guest called nothing.
+    #[test]
+    fn the_guest_is_named_after_the_image_the_operator_picked() {
+        let a = args(&[]);
+        let named = |k: &str| {
+            let mut b = a.clone();
+            b.cfg.kernel = PathBuf::from(k);
+            cold_guest_name(&b)
+        };
+        assert_eq!(
+            named("/Users/x/gimbal-images/final-alpine/Image"),
+            "final-alpine"
+        );
+        // A kernel with no parent directory still has to answer something a
+        // status line can print.
+        assert_eq!(named("Image"), "cold-boot");
+        assert_eq!(named("/Image"), "cold-boot");
+        assert!(!cold_guest_name(&a).is_empty());
+        assert!(Path::new("/dev/null").exists());
+    }
+
+    /// The teardown decisions are all *call sites*, and this repo has been
+    /// caught seven times by a rule that stayed correct while nothing consulted
+    /// it. Every one of these is invisible to an assertion about a value.
+    ///
+    /// Needles are assembled from parts: a literal would match this test's own
+    /// source and pass while `run` did none of it.
+    #[test]
+    fn the_teardown_still_consults_the_socket() {
+        let src = include_str!("create.rs");
+
+        let waits = format!("&& !{}()", "stop_asked");
+        assert!(
+            src.contains(&waits),
+            "the wait loop must consult stop_requested, or `chm ctl stop` over \
+             this socket sets a flag nobody reads and the guest runs on"
+        );
+
+        let excluded = format!("&& !{};", "stopped_by_client");
+        assert!(
+            src.contains(&excluded),
+            "timed_out must exclude a client stop: a stop leaves `running` true \
+             with no shutdown requested, which is the exact shape timed_out was \
+             testing for, so a deliberate stop reports as a deadline overrun"
+        );
+
+        // Spanning the binding, not just the call: a first draft matched
+        // `c.finish(if stopped_by_client` alone and stayed green when the
+        // mutation swapped `&control` for a `None`, leaving the call text
+        // present and unreachable. A needle that survives the removal of the
+        // thing it guards reports safety it does not provide.
+        let finished = format!(
+            "if let Some(c) = &control {{\n        c.{}(if stopped_by_client",
+            "finish"
+        );
+        assert!(
+            src.contains(&finished),
+            "the socket must be taken down with a reason, and from the ring the \
+             run actually armed, or a `stop` client blocks forever on a guest \
+             that has already halted"
+        );
+
+        // Gated on the plan, not on the ring: `--socket` arms the ring too, so
+        // `match &control` alone would drive a console probe into a guest whose
+        // operator asked for neither.
+        let gated = format!("match (&control, args.postboot.{})", "is_empty()");
+        assert!(
+            src.contains(&gated),
+            "the post-boot thread must be gated on the plan, or --socket alone \
+             starts delivering a plan nobody wrote"
+        );
+    }
+}
+
+#[cfg(test)]
+mod client_stop_report_tests {
+    use super::client_stop_report;
+    use std::path::Path;
+
+    /// The three things an operator needs from an ending they did not cause:
+    /// who stopped it, that it was not the guest or a deadline, and what
+    /// survived. A message missing the last one leaves them guessing whether
+    /// their work is gone.
+    #[test]
+    fn the_report_names_the_actor_the_channel_and_what_survived() {
+        let msg = client_stop_report(Some(Path::new("/tmp/x.sock")), false);
+        assert!(
+            msg.contains("/tmp/x.sock"),
+            "name the socket the stop came in on, or the operator cannot tell \
+             which of several sandboxes was stopped: {msg}"
+        );
+        assert!(
+            msg.contains("neither the guest") && msg.contains("deadline"),
+            "the neighbouring arms blame the guest and the deadline, so this \
+             one must rule both out or it reads as one of them: {msg}"
+        );
+        assert!(
+            msg.contains("Nothing was preserved"),
+            "with no --originate a stop keeps nothing, and silence about that \
+             is how someone learns it the expensive way: {msg}"
+        );
+        let kept = client_stop_report(Some(Path::new("/tmp/x.sock")), true);
+        assert!(
+            kept.contains("--originate ran") && !kept.contains("Nothing was preserved"),
+            "and it must not claim a loss that did not happen: {kept}"
+        );
+    }
+
+    /// `--socket` is optional, and a report that renders an empty path is worse
+    /// than one that admits it does not know.
+    #[test]
+    fn the_report_survives_a_run_with_no_socket_path() {
+        let msg = client_stop_report(None, false);
+        assert!(
+            msg.contains("the control socket"),
+            "fall back to naming the channel generically: {msg}"
+        );
+        assert!(
+            !msg.contains("on \n") && !msg.contains("on ,"),
+            "and never render a blank where a path should be: {msg}"
+        );
+    }
+
+    /// A pure function nobody calls reports nothing. The call-site class has
+    /// caught this repo eight times, so read the source of the arm itself.
+    #[test]
+    fn the_ending_match_actually_calls_it() {
+        let src = include_str!("create.rs");
+        // Assembled from parts, or this assertion is its own needle (§43).
+        let arm = format!("None if {} =>", "stopped_by_client");
+        assert!(
+            src.contains(&arm),
+            "without its own arm a client stop falls through to the bare `None` \
+             and the run ends in silence again"
+        );
+        let call = format!("{}(args.socket.as_deref()", "client_stop_report");
+        assert!(
+            src.contains(&call),
+            "the arm must call the function this module tests, or the prose \
+             proved here is not the prose printed"
         );
     }
 }

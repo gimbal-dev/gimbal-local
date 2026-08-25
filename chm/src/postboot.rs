@@ -270,8 +270,18 @@ pub(crate) fn export_fragment(env: &BTreeMap<String, String>) -> Option<String> 
 pub(crate) trait Console {
     /// Write bytes to the guest's serial input.
     fn send(&self, bytes: &[u8]);
-    /// Console text produced since the run began, oldest first.
-    fn transcript(&self) -> String;
+    /// Console bytes produced since the run began, oldest first.
+    ///
+    /// Bytes, not text, because every caller uses the length as a *mark* and
+    /// slices from it later. A console carries raw UART output, so a multi-byte
+    /// character can arrive split across two reads and a ring can evict part of
+    /// one -- and `String::from_utf8_lossy` renders those as a 3-byte U+FFFD
+    /// that collapses back to the real character once the rest lands. So a mark
+    /// taken from a decoded transcript is not a char boundary in the *next*
+    /// one, and slicing at it panics rather than merely returning the wrong
+    /// text. Slice the bytes, then decode the slice -- which is what
+    /// `serve::exec_run` has always done.
+    fn transcript(&self) -> Vec<u8>;
     /// Has the guest stopped?
     fn stopped(&self) -> bool;
 }
@@ -347,7 +357,12 @@ fn wait_ready(console: &dyn Console, timeout: Duration) -> Result<(), Failure> {
         // transcript from `mark` below is defence in depth, and deliberately
         // recorded as such rather than credited with protection it does not
         // add — a mutation that removes it does not fail a single test, which
-        // is exactly the signal that it is not the guard.
+        // is exactly the signal that it is not the guard. (Re-measured when the
+        // transcript became bytes: still true of *removal*. What is now guarded
+        // is the slice's **type** — `split_codepoint_tests` panics on a `String`
+        // transcript, because a byte mark into a re-decoded `String` can land
+        // inside a codepoint. Untested existence, tested type; the two are not
+        // the same claim and only one of them holds.)
         let nonce = Nonce::mint();
         let line = exec::frame(&nonce, "true").map_err(Failure::Unsendable)?;
         let mark = console.transcript().len();
@@ -356,8 +371,8 @@ fn wait_ready(console: &dyn Console, timeout: Duration) -> Result<(), Failure> {
         let until = Instant::now() + PROBE_INTERVAL;
         while Instant::now() < until {
             let full = console.transcript();
-            let since = &full[mark.min(full.len())..];
-            if let ExecOutcome::Completed { .. } = exec::parse(&nonce, since) {
+            let since = String::from_utf8_lossy(&full[mark.min(full.len())..]);
+            if let ExecOutcome::Completed { .. } = exec::parse(&nonce, &since) {
                 return Ok(());
             }
             thread::sleep(Duration::from_millis(25));
@@ -388,8 +403,8 @@ fn run_step(
     let deadline = Instant::now() + timeout;
     loop {
         let full = console.transcript();
-        let since = &full[mark.min(full.len())..];
-        match exec::parse(&nonce, since) {
+        let since = String::from_utf8_lossy(&full[mark.min(full.len())..]);
+        match exec::parse(&nonce, &since) {
             ExecOutcome::Completed { code, output } => {
                 if code == 0 {
                     return Ok(code);
@@ -686,8 +701,8 @@ mod tests {
             t.push_str(&line);
             t.push_str(&format!("\n{nonce}BEG\nsome output\n{nonce}END:{code}\n"));
         }
-        fn transcript(&self) -> String {
-            self.transcript.lock().unwrap().clone()
+        fn transcript(&self) -> Vec<u8> {
+            self.transcript.lock().unwrap().clone().into_bytes()
         }
         fn stopped(&self) -> bool {
             *self.stopped.lock().unwrap()
@@ -955,5 +970,93 @@ mod tests {
             m.contains("did produce output") && m.contains("mid-command"),
             "a wedged shell must be named as one: {m}"
         );
+    }
+}
+
+/// Guards for the one hazard byte-orientation removed.
+///
+/// `run_step` and `wait_ready` take a mark from `console.transcript().len()` and
+/// later slice from it. While `transcript()` returned a `String`, that mark was
+/// an index into a *decoded* buffer and the decoding was not stable: a UART read
+/// that ends mid-codepoint decodes to U+FFFD (3 bytes), and the very next read
+/// completes the character (2 bytes for `é`), so the same prefix gets shorter
+/// and the mark lands inside a character. `&str` slicing panics there, and the
+/// panic is in a delivery thread of a running guest.
+///
+/// Reproduced standalone before the fix, and the message is the whole finding:
+/// `byte index 3 is not a char boundary; it is inside 'é' (bytes 2..4)`.
+/// Restoring the `String` transcript makes both tests below panic rather than
+/// fail, which is what proves they are the guard.
+#[cfg(test)]
+mod split_codepoint_tests {
+    use super::{Console, run_step, wait_ready};
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// A console whose bytes arrive the way a UART's do: the buffer is already
+    /// sitting on the first byte of a two-byte character when the mark is taken,
+    /// and the second byte turns up in the next read.
+    struct SplitGuest {
+        bytes: Mutex<Vec<u8>>,
+    }
+
+    impl SplitGuest {
+        fn new() -> Self {
+            // A lone 0xc3 -- the lead byte of `é`, with its continuation byte
+            // still in flight.
+            Self {
+                bytes: Mutex::new(vec![0xc3]),
+            }
+        }
+    }
+
+    impl Console for SplitGuest {
+        fn send(&self, bytes: &[u8]) {
+            let line = String::from_utf8_lossy(bytes).to_string();
+            if line.trim().is_empty() {
+                return;
+            }
+            let nonce = line
+                .split('\'')
+                .find(|s| s.starts_with("chm"))
+                .unwrap_or("chm")
+                .to_string();
+            let mut t = self.bytes.lock().unwrap();
+            // The continuation byte lands, completing the character the mark
+            // was taken in the middle of, and another whole `é` follows it so a
+            // stale decoded offset points inside a character rather than past
+            // the end.
+            t.extend_from_slice(&[0xa9, 0xc3, 0xa9]);
+            t.extend_from_slice(line.as_bytes());
+            t.extend_from_slice(format!("\n{nonce}BEG\nout\n{nonce}END:0\n").as_bytes());
+        }
+        fn transcript(&self) -> Vec<u8> {
+            self.bytes.lock().unwrap().clone()
+        }
+        fn stopped(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn run_step_survives_a_codepoint_split_across_two_reads() {
+        let g = SplitGuest::new();
+        let code = run_step(&g, "probe", "true", Duration::from_secs(2))
+            .expect("the step answered, so the only way this fails is the slice");
+        assert_eq!(code, 0);
+        let t = g.transcript();
+        assert!(
+            std::str::from_utf8(&t[..1]).is_err(),
+            "the guard is only meaningful if the mark really was taken inside a \
+             character -- if this prefix decodes, the fake stopped modelling a \
+             split read"
+        );
+    }
+
+    #[test]
+    fn wait_ready_survives_a_codepoint_split_across_two_reads() {
+        let g = SplitGuest::new();
+        wait_ready(&g, Duration::from_secs(2))
+            .expect("a shell answered, so the only way this fails is the slice");
     }
 }
