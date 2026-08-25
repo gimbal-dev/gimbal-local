@@ -52,7 +52,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use hypervisor::hvf::virtio::nat::EgressEvent;
+use hypervisor::hvf::virtio::nat::{EgressEvent, POLICY_EVENT_DOMAIN};
 use serde_json::{Map, Value, json};
 
 /// The per-workspace audit file.
@@ -169,6 +169,23 @@ impl AuditLog {
         m.insert("rule".into(), json!(rule));
         m.insert("policy".into(), json!(policy));
         self.record("egress-allow", m);
+    }
+
+    /// Record a live change to the sandbox's egress policy (#156).
+    ///
+    /// Deliberately *not* routed through [`EgressTally`]. Every other egress
+    /// line is one-per-distinct-flow because a chatty guest would otherwise
+    /// drown the trail; an amendment is one operator action and there will never
+    /// be many, so folding repeats or dropping it at the cap would lose the only
+    /// record of what the policy became. `policy` here is the label *after* the
+    /// change, which is what the flow records following it will carry.
+    pub(crate) fn egress_amend(&self, target: &str, rule: &str, policy: &str, allowed: bool) {
+        let mut m = Map::new();
+        m.insert("target".into(), json!(target));
+        m.insert("rule".into(), json!(rule));
+        m.insert("policy".into(), json!(policy));
+        m.insert("allowed".into(), json!(allowed));
+        self.record("egress-amend", m);
     }
 
     /// Record the totals for a session's egress, including whether the
@@ -499,6 +516,18 @@ fn summarize(line: &str) -> String {
 /// [`crate::imp::net_service_pass`], which is the only thing that calls this.
 pub(crate) fn record_egress(events: Vec<EgressEvent>, tally: &mut EgressTally, audit: &AuditLog) {
     for ev in events {
+        // A live policy amendment is an administrative act, not a flow, and it
+        // must not go through the flow tally. `observe` folds repeats and stops
+        // recording entirely once MAX_DISTINCT_FLOWS distinct flows have been
+        // seen -- and a chatty sandbox that has exhausted that budget is exactly
+        // the sandbox somebody is amending. Losing the amendment there would
+        // leave the trail full of decisions labelled `+liveN` with no record of
+        // what `+liveN` was, breaking the one property the label exists to
+        // provide (#156).
+        if ev.domain == POLICY_EVENT_DOMAIN {
+            audit.egress_amend(&ev.target, &ev.rule, &ev.policy, ev.allowed);
+            continue;
+        }
         if !tally.observe(ev.domain, &ev.target, &ev.rule, ev.allowed) {
             continue;
         }
@@ -668,5 +697,60 @@ mod tests {
         let summary = r#"{"event":"egress-summary","ts":"2026-07-16T09:00:00.000Z","allowed":9000,"denied":2,"distinct_allowed":512,"distinct_denied":2,"truncated":true}"#;
         let s = summarize(summary);
         assert!(s.contains("TRUNCATED"), "an incomplete record must say so: {s}");
+    }
+
+    /// The sandbox somebody is amending is the one likeliest to have exhausted
+    /// the flow budget, so the amendment must not be recorded through the flow
+    /// tally.
+    ///
+    /// `observe` stops recording entirely once [`MAX_DISTINCT_FLOWS`] distinct
+    /// flows have been seen. Routing an amendment through it would leave the
+    /// trail full of decisions stamped `+liveN` with no record anywhere of what
+    /// `+liveN` permitted -- the label's whole job is to let a reader answer
+    /// "what policy made this call?", and that would make it unanswerable
+    /// exactly when it matters (#156).
+    #[test]
+    fn an_amendment_is_recorded_even_after_the_flow_budget_is_spent() {
+        let ws = env::temp_dir().join(format!("chm-amend-budget-{}", process::id()));
+        let _ = fs::remove_dir_all(&ws);
+        fs::create_dir_all(&ws).unwrap();
+        let audit = AuditLog::open(&ws);
+        let mut tally = EgressTally::default();
+
+        // Spend the budget the way a chatty guest does.
+        for i in 0..MAX_DISTINCT_FLOWS + 8 {
+            tally.observe("tcp", &format!("10.0.{}.{}:443", i / 251, i % 251), "allow", true);
+        }
+        assert!(tally.truncated, "the budget was not actually exhausted");
+
+        record_egress(
+            vec![EgressEvent {
+                domain: POLICY_EVENT_DOMAIN,
+                target: "foo.com".into(),
+                allowed: true,
+                rule: "allow foo.com".into(),
+                policy: "sha256:cafe+live1".into(),
+            }],
+            &mut tally,
+            &audit,
+        );
+
+        let text = fs::read_to_string(ws.join(AUDIT_FILE)).unwrap();
+        let recorded: Vec<Value> = text
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(
+            recorded.len(),
+            1,
+            "the amendment was dropped by the flow tally: {text}"
+        );
+        assert_eq!(recorded[0]["target"], "foo.com");
+        assert_eq!(
+            recorded[0]["policy"], "sha256:cafe+live1",
+            "the record does not name the policy it created"
+        );
+
+        let _ = fs::remove_dir_all(&ws);
     }
 }
