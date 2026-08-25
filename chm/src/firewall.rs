@@ -31,6 +31,8 @@ use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use crate::imp::require_workspace_dir;
+
 use serde::{Deserialize, Serialize};
 
 /// The per-workspace policy file `chm` reads to govern a sandbox's egress.
@@ -167,6 +169,7 @@ pub(crate) fn firewall_main(raw: &[String]) -> ExitCode {
 fn show(raw: &[String]) -> Result<(), String> {
     let json = raw.iter().any(|a| a == "--json");
     let dir = positional(raw).ok_or("usage: chm firewall show <WORKSPACE_DIR> [--json]")?;
+    require_workspace_dir(&dir)?;
 
     let (doc, source) = effective_policy(&dir)?;
     if json {
@@ -402,5 +405,37 @@ mod tests {
         assert_eq!(v["default"], "deny");
         assert_eq!(v["allow"][0], "api.github.com:443");
         assert_eq!(v["label"], "local");
+    }
+}
+
+/// #421 -- the call site, not the helper: `chm firewall show` must consult
+/// `require_workspace_dir` itself, or it keeps reporting on a directory that
+/// is not there while the helper's own tests stay green.
+#[cfg(test)]
+mod workspace_arg_tests {
+    use super::*;
+
+    fn ghost(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("chm-ws421-fw-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        assert!(!p.exists(), "precondition: {} must be absent", p.display());
+        p
+    }
+
+    #[test]
+    fn firewall_show_refuses_a_workspace_that_is_not_there() {
+        let d = ghost("fw");
+        let e = show(&[d.display().to_string()]).unwrap_err();
+        assert!(e.contains("no such workspace directory"), "{e}");
+        assert!(e.contains(&d.display().to_string()), "{e}");
+    }
+
+    /// The security half: reporting `no policy -- unrestricted egress` for a
+    /// workspace nobody has is a reading that was never measured.
+    #[test]
+    fn firewall_show_json_refuses_it_too() {
+        let d = ghost("fwj");
+        let e = show(&[d.display().to_string(), "--json".to_string()]).unwrap_err();
+        assert!(e.contains("no such workspace directory"), "{e}");
     }
 }

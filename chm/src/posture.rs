@@ -40,6 +40,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::credproxy;
+use crate::imp::require_workspace_dir;
 use crate::limits;
 use crate::runs;
 use crate::signing;
@@ -589,6 +590,13 @@ pub(crate) fn posture_main(raw: &[String]) -> ExitCode {
         eprintln!("chm posture: usage: chm posture <WORKSPACE_DIR> [--json]");
         return ExitCode::FAILURE;
     };
+    // Before any control is assessed, and in `--json` too: a gate that prints
+    // `"weakened": 0` for a directory it never opened is the failure this
+    // guards, and the JSON form is the one a gate actually reads.
+    if let Err(e) = require_workspace_dir(&dir) {
+        eprintln!("chm posture: {e}");
+        return ExitCode::FAILURE;
+    }
 
     // Never probes. This process has no guest -- `chm posture` reads a
     // directory -- and reaching for one would mean opening a control socket
@@ -1079,6 +1087,49 @@ mod guest_userns_tests {
         assert!(
             script.contains(APPARMOR_USERNS_SYSCTL),
             "the browser's remedy no longer names {APPARMOR_USERNS_SYSCTL}"
+        );
+    }
+}
+
+/// #421 -- the call site, not the helper. `chm posture` is a documented gate:
+/// exiting 0 on a workspace that was never opened is the
+/// mechanism-reports-safety-it-does-not-provide shape, at whole-workspace
+/// level.
+#[cfg(test)]
+mod workspace_arg_tests {
+    use super::*;
+
+    fn ghost(tag: &str) -> PathBuf {
+        let p = env::temp_dir().join(format!("chm-ws421-post-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        assert!(!p.exists(), "precondition: {} must be absent", p.display());
+        p
+    }
+
+    /// ExitCode has no `PartialEq`, so compare through `Debug`. This assertion
+    /// discriminates precisely: before #421 this exact input returned SUCCESS
+    /// along with `"No control is weakened from its default"`.
+    #[test]
+    fn posture_refuses_a_workspace_that_is_not_there() {
+        let d = ghost("post");
+        let got = posture_main(&[d.display().to_string()]);
+        assert_eq!(
+            format!("{got:?}"),
+            format!("{:?}", ExitCode::FAILURE),
+            "a posture for a directory that is not there is a reading nobody took"
+        );
+    }
+
+    /// The load-bearing half: `--json` is the form a CI gate reads, so it must
+    /// refuse *before* `render_json`, never emit `"weakened": 0`.
+    #[test]
+    fn posture_json_refuses_identically() {
+        let d = ghost("postj");
+        let got = posture_main(&[d.display().to_string(), "--json".to_string()]);
+        assert_eq!(
+            format!("{got:?}"),
+            format!("{:?}", ExitCode::FAILURE),
+            "the JSON gate must not report a clean posture for an absent workspace"
         );
     }
 }
