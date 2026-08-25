@@ -84,6 +84,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::imp::DEFAULT_IDLE_EXIT_SECS;
 use crate::postboot;
+use hypervisor::hvf::virtio::nat::INGRESS_BIND_ADDR;
 
 /// The spec format version.
 ///
@@ -433,6 +434,13 @@ pub struct NetworkPolicy {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egress: Vec<EgressRule>,
 
+    /// Guest ports to publish on this Mac's loopback.
+    ///
+    /// The spec's name for this, and its array-of-rules shape, are upstream's;
+    /// what a rule may *say* is deliberately much narrower. See [`IngressRule`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ingress: Vec<IngressRule>,
+
     /// A full egress-policy document to use instead of inline `egress` rules.
     /// A `chm` extension: our policy files predate this spec and remain the
     /// authority for anything a control plane issued.
@@ -466,6 +474,162 @@ pub struct EgressRule {
     /// Why this rule exists. Not enforced; read by whoever reviews the diff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+}
+
+/// One ingress rule: a guest port to publish on this Mac's loopback.
+///
+/// # Why this is upstream's name but not upstream's shape
+///
+/// The agent-compute spec's `networkPolicy.ingress` is an array of *firewall
+/// rules* -- `allow` / `deny` / `host` / `port` / `protocol`, "applied in
+/// order", where `port` is `oneOf` integer or string so it can carry a range.
+/// That models **filtering inbound traffic that would otherwise arrive**.
+///
+/// Nothing otherwise arrives here. The userspace NAT is strictly outbound and
+/// there is no listener at all until `--expose` creates one, so an ordering
+/// filter has nothing to order and a `deny` rule has nothing to deny. What this
+/// build does is the opposite operation: it **creates** one loopback listener
+/// for one guest TCP port.
+///
+/// So the name and the array shape are upstream's -- a conforming document
+/// parses -- and every field that would make this a *wider door than the flag*
+/// is refused by name in [`SandboxSpec::validate`] rather than dropped. That
+/// direction matters: a spec is meant to be committed and reviewed, and a
+/// document whose `host` or port range was silently ignored would describe a
+/// sandbox that does not exist.
+///
+/// The narrowing has precedent in this same file: [`EgressRule::ports`] is
+/// `Vec<u16>` where upstream's is `oneOf` integer or string, and
+/// [`EgressRule::domains`] refuses the wildcards upstream permits.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct IngressRule {
+    /// The guest TCP port to publish.
+    ///
+    /// A JSON number. Typed as a `Value` rather than `u16` on purpose: upstream
+    /// permits a string here, and a document written to upstream's schema must
+    /// receive [`IngressRule::port_number`]'s sentence explaining that ranges
+    /// are named one port at a time -- not a serde type error naming a Rust
+    /// integer width.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub port: Option<serde_json::Value>,
+
+    /// Upstream permits `tcp` / `udp` / `icmp` / `any`. Only `tcp` is honoured;
+    /// the others are refused by name, because ingress here is a TCP listener
+    /// and accepting `any` would promise a UDP path that does not exist.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<String>,
+
+    /// Upstream's host matcher. **Refused**: every listener binds
+    /// `INGRESS_BIND_ADDR`, deliberately a constant rather than a flag, and a
+    /// spec field naming a host is exactly the accident that constant exists to
+    /// prevent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<String>,
+
+    /// Upstream's source matcher. **Refused**: a published port is reachable by
+    /// anything on this Mac, so there is no source this build could filter on,
+    /// and a rule implying otherwise would report protection it does not
+    /// provide.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<String>,
+
+    /// Upstream's deny rule. **Refused**: with no listener there is nothing to
+    /// deny, so honouring it would be a no-op wearing the shape of a control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deny: Option<String>,
+
+    /// Why this port is published. Not enforced; read by whoever reviews the
+    /// diff. Ours, like [`EgressRule::description`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+}
+
+impl IngressRule {
+    /// The guest port this rule names, or why it names none.
+    ///
+    /// The single place a rule becomes a port. [`SandboxSpec::validate`] calls
+    /// it to report, [`resolve`] calls it to act; two readings of one JSON value
+    /// would eventually disagree, and the disagreement would be a sandbox that
+    /// validated and then published something else.
+    pub fn port_number(&self) -> Result<u16, String> {
+        match &self.port {
+            None => Err("names no `port`, so it publishes nothing".to_string()),
+            Some(serde_json::Value::Number(n)) => match n.as_u64() {
+                Some(0) => Err(
+                    "`port` is 0, which is the OS's word for \"choose one\", not a \
+                                port a guest can listen on"
+                        .to_string(),
+                ),
+                Some(p) if p <= u16::MAX as u64 => Ok(p as u16),
+                _ => Err(format!("`port` {n} is not a TCP port (1-{})", u16::MAX)),
+            },
+            Some(serde_json::Value::String(s)) => Err(format!(
+                "`port` is the string \"{s}\"; write it as a number. The spec permits a string \
+                 so it can carry a range, and this build has no range form -- each published \
+                 port is named on its own, because each gets its own host port"
+            )),
+            Some(other) => Err(format!("`port` must be a number, not {other}")),
+        }
+    }
+
+    /// Every reason this rule cannot be honoured, in field order.
+    ///
+    /// [`SandboxSpec::validate`] reports these and [`resolve`] publishes a port
+    /// only when this is empty, so a rule that is refused can never also be
+    /// acted on. Splitting the two -- reporting here, deciding there -- is how a
+    /// document comes to validate as refused and start as honoured, which is
+    /// the failure this whole module exists to prevent.
+    ///
+    /// Duplicate ports are deliberately *not* here: that is a property of the
+    /// list, not of a rule, so it belongs to the caller that can see the list.
+    pub fn refusals(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if let Err(e) = self.port_number() {
+            out.push(e);
+        }
+        if let Some(proto) = self.protocol.as_deref()
+            && !proto.eq_ignore_ascii_case("tcp")
+        {
+            out.push(format!(
+                ".protocol: `{proto}` is in the spec but this build publishes a TCP listener \
+                 and nothing else. Accepting it would promise a path that does not exist; \
+                 write `tcp`, or leave it out."
+            ));
+        }
+        if let Some(h) = &self.host {
+            out.push(format!(
+                ".host: `{h}` cannot be honoured. Every published port binds \
+                 {INGRESS_BIND_ADDR}, which is a constant rather than a flag precisely so that \
+                 widening it stays a decision somebody takes on purpose. A spec that could name \
+                 a host would be a wider door than `--expose` is."
+            ));
+        }
+        if let Some(a) = &self.allow {
+            out.push(format!(
+                ".allow: `{a}` cannot be honoured. A published port is reachable by anything on \
+                 this Mac, so there is no source to filter on, and a rule that reads like one \
+                 would report protection this build does not provide."
+            ));
+        }
+        if let Some(d) = &self.deny {
+            out.push(format!(
+                ".deny: `{d}` cannot be honoured. Nothing reaches a guest until `ingress` \
+                 publishes a port, so a deny rule has nothing to deny -- it would be a no-op \
+                 wearing the shape of a control. Remove the port instead."
+            ));
+        }
+        out
+    }
+
+    /// The port to publish, or `None` when any field refuses the rule.
+    pub fn publishable_port(&self) -> Option<u16> {
+        if self.refusals().is_empty() {
+            self.port_number().ok()
+        } else {
+            None
+        }
+    }
 }
 
 /// Credentials the sandbox needs.
@@ -908,6 +1072,36 @@ impl SandboxSpec {
                     }
                 }
             }
+
+            // Ingress. Upstream models a filter on inbound traffic; this build
+            // creates a listener. Every field that would widen the door beyond
+            // what `--expose` accepts is refused *by name* -- dropping one would
+            // publish a port while the document claimed something narrower.
+            if n.enabled == Some(false) && !n.ingress.is_empty() {
+                problems.push(
+                    "networkPolicy: `ingress` publishes guest ports but `enabled` is false, so \
+                     there is no NIC for a host connection to arrive on"
+                        .into(),
+                );
+            }
+            let mut seen: Vec<u16> = Vec::new();
+            for (i, rule) in n.ingress.iter().enumerate() {
+                for r in rule.refusals() {
+                    // A field refusal already names its field; a port refusal
+                    // names none, so it reads straight off the index.
+                    let sep = if r.starts_with('.') { "" } else { ": " };
+                    problems.push(format!("networkPolicy.ingress[{i}]{sep}{r}"));
+                }
+                if let Ok(p) = rule.port_number() {
+                    if seen.contains(&p) {
+                        problems.push(format!(
+                            "networkPolicy.ingress[{i}]: port {p} is published twice; each \
+                             guest port is published once, on one host port"
+                        ));
+                    }
+                    seen.push(p);
+                }
+            }
         }
 
         if let Some(tp) = &self.tool_policy {
@@ -1104,6 +1298,13 @@ pub struct Resolved {
     pub net: Sourced<bool>,
     /// Egress as `host:port`, which is what the rest of the tree speaks.
     pub egress_allow: Sourced<Vec<String>>,
+    /// Guest ports to publish, which is all `--expose` accepts.
+    ///
+    /// A `Vec<u16>` rather than the spec's rules, because that is the whole of
+    /// what survives [`SandboxSpec::validate`] -- everything a rule could say
+    /// beyond a port number is refused there. Keeping the richer shape here
+    /// would leave room for a later reader to honour a field this build cannot.
+    pub ingress: Sourced<Vec<u16>>,
     pub egress_policy_file: Option<Sourced<PathBuf>>,
     pub allow_local_egress: Sourced<bool>,
 
@@ -1305,6 +1506,22 @@ pub fn resolve(spec: Option<&SandboxSpec>, spec_path: Option<PathBuf>, ov: &Over
                 ov.egress_allow.clone(),
                 Origin::Flag("--egress-allow".into()),
             ),
+        ingress: Sourced::new(Vec::new(), Origin::Default).or_from(
+            np.map(|n| {
+                // `publishable_port` is the one predicate, shared with
+                // `validate`. A rule it refuses is reported there and
+                // contributes nothing here, so a document that fails validation
+                // cannot publish a port on the strength of a field this build
+                // does not honour -- and that holds whether or not the caller
+                // remembered to validate first.
+                n.ingress
+                    .iter()
+                    .filter_map(|r| r.publishable_port())
+                    .collect::<Vec<u16>>()
+            })
+            .filter(|p: &Vec<u16>| !p.is_empty()),
+            Origin::Spec,
+        ),
         egress_policy_file: opt(
             np.and_then(|n| n.policy_file.clone()),
             ov.egress_policy_file.clone(),
@@ -1428,6 +1645,21 @@ impl Resolved {
                     &self.egress_allow.origin,
                 );
             }
+            if !self.ingress.value.is_empty() {
+                row(
+                    "ingress",
+                    format!(
+                        "{} on {INGRESS_BIND_ADDR}",
+                        self.ingress
+                            .value
+                            .iter()
+                            .map(u16::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    &self.ingress.origin,
+                );
+            }
         }
         if let Some(p) = &self.egress_policy_file {
             row("egress policy", p.value.display().to_string(), &p.origin);
@@ -1525,6 +1757,13 @@ impl Resolved {
         }
         for h in &self.egress_allow.value {
             push(&mut argv, "--egress-allow", h.clone());
+        }
+        // A published port leaves here as `--expose <PORT>` and nothing else,
+        // so a spec cannot open a door the flag could not. Whatever this emits
+        // goes back through the same `parse()` a typed flag does, which is what
+        // makes that a property of the code rather than a promise.
+        for p in &self.ingress.value {
+            push(&mut argv, "--expose", p.to_string());
         }
         if let Some(r) = &self.proxy_rules {
             push(&mut argv, "--proxy-rules", r.value.display().to_string());
@@ -2347,6 +2586,238 @@ mod tests {
             flat_section.contains(&remedy),
             "the docs must name `{remedy}` where they explain the image.oci refusal, \
              or a reader is told no and given nowhere to go"
+        );
+    }
+
+    // --- #155: guest ingress, named in the spec ---------------------------
+
+    /// The load-bearing guard: a spec cannot open a door the flag could not.
+    ///
+    /// Everything `ingress` contributes to the command line must be
+    /// `--expose <PORT>` pairs and nothing else. Asserting the pairs are
+    /// *present* would not catch that -- an extra `--expose-host` token would
+    /// sit alongside them and pass. So this diffs the argv against the same
+    /// spec with no ingress and requires the difference to be exactly those
+    /// tokens.
+    #[test]
+    fn ingress_can_add_nothing_to_the_argv_but_expose_pairs() {
+        let base = spec_from(
+            r#"{"specVersion":1,"image":{"kernel":"/k/Image"},
+                "networkPolicy":{"enabled":true}}"#,
+        );
+        let with = spec_from(
+            r#"{"specVersion":1,"image":{"kernel":"/k/Image"},
+                "networkPolicy":{"enabled":true,"ingress":[
+                    {"port":9222,"protocol":"tcp","description":"CDP"},
+                    {"port":3000}]}}"#,
+        );
+        assert!(with.validate().is_empty(), "{:?}", with.validate());
+
+        let a = resolve(Some(&base), None, &Overrides::default()).to_create_argv();
+        let b = resolve(Some(&with), None, &Overrides::default()).to_create_argv();
+        let added: Vec<String> = b.iter().filter(|t| !a.contains(t)).cloned().collect();
+        assert_eq!(
+            added,
+            vec!["--expose", "9222", "--expose", "3000"],
+            "ingress must reach the guest as --expose and nothing else; \
+             anything more is a door the spec opened that the flag cannot"
+        );
+    }
+
+    /// `port_number` is the one place a rule becomes a port.
+    ///
+    /// `validate` reports with it and `resolve` acts on it. A second reading of
+    /// the same JSON would eventually disagree, and the disagreement would be a
+    /// document that validated and then published a different port -- so this
+    /// reads the production `resolve` and requires it to call the shared
+    /// function rather than reach into `.port` itself.
+    #[test]
+    fn resolve_decides_a_port_only_where_validate_does() {
+        let src = include_str!("spec.rs");
+        let body = src
+            .split_once("pub fn resolve(")
+            .expect("resolve must exist to be checked")
+            .1
+            .split_once("\n}\n")
+            .expect("resolve must end")
+            .0;
+        let shared = format!("{}{}()", "publishable", "_port");
+        assert!(
+            body.contains(&shared),
+            "resolve must turn a rule into a port through `{shared}`, the same predicate \
+             validate reports from, or the two can disagree about one document"
+        );
+    }
+
+    /// Each refusal names the field it refuses, so a reader can find it.
+    #[test]
+    fn every_field_ingress_cannot_honour_is_refused_by_name() {
+        for (json, needle) in [
+            (r#"{"port":"3000-3010"}"#, "no range form"),
+            (r#"{"port":8080,"host":"0.0.0.0"}"#, ".host"),
+            (r#"{"port":8081,"allow":"10.0.0.0/8"}"#, ".allow"),
+            (r#"{"port":8082,"deny":"0.0.0.0/0"}"#, ".deny"),
+            (r#"{"port":8083,"protocol":"udp"}"#, ".protocol"),
+            (r#"{"description":"none"}"#, "names no `port`"),
+            (r#"{"port":0}"#, "choose one"),
+            (r#"{"port":70000}"#, "is not a TCP port"),
+        ] {
+            let doc = spec_from(&format!(
+                r#"{{"specVersion":1,"networkPolicy":{{"enabled":true,"ingress":[{json}]}}}}"#
+            ));
+            let problems = doc.validate();
+            assert!(
+                problems.iter().any(|p| p.contains(needle)),
+                "`{json}` must be refused with `{needle}`, not dropped; got {problems:?}"
+            );
+            // And it must reach nothing.
+            let argv = resolve(Some(&doc), None, &Overrides::default()).to_create_argv();
+            assert!(
+                !argv.join(" ").contains("--expose"),
+                "`{json}` was refused, so it must publish no port; got {argv:?}"
+            );
+        }
+    }
+
+    /// A published port needs a NIC to arrive on, and `--expose` already
+    /// refuses without `--net`. The spec must refuse the same combination
+    /// rather than emit an argv the parser will reject later.
+    #[test]
+    fn ingress_without_a_network_device_is_refused() {
+        let doc = spec_from(
+            r#"{"specVersion":1,
+                "networkPolicy":{"enabled":false,"ingress":[{"port":9222}]}}"#,
+        );
+        let problems = doc.validate();
+        assert!(
+            problems.iter().any(|p| p.contains("no NIC")),
+            "ingress with the network off must be refused; got {problems:?}"
+        );
+    }
+
+    /// The bind address is read, never restated. A refusal that named its own
+    /// literal would keep saying `127.0.0.1` after the constant moved.
+    ///
+    /// This needs **two** guards and neither subsumes the other. The content
+    /// check below cannot see a re-hardcoded literal, because the literal is
+    /// what the constant currently renders to -- it would sail past a message
+    /// that had frozen the address. The source check is what sees that, and it
+    /// in turn cannot tell whether the interpolation reaches the sentence a
+    /// user reads. Measured: mutating the interpolation to `127.0.0.1` leaves
+    /// the content check green.
+    #[test]
+    fn the_host_refusal_names_the_address_the_bind_actually_uses() {
+        let doc = spec_from(
+            r#"{"specVersion":1,
+                "networkPolicy":{"enabled":true,"ingress":[{"port":80,"host":"0.0.0.0"}]}}"#,
+        );
+        let problems = doc.validate();
+        assert!(
+            problems
+                .iter()
+                .any(|p| p.contains(&INGRESS_BIND_ADDR.to_string())),
+            "the refusal must name {INGRESS_BIND_ADDR}, read from the constant the \
+             listener binds; got {problems:?}"
+        );
+
+        // Scoped to `refusals`, because the constant's name appears elsewhere
+        // in this file -- including in this test -- and a needle in more than
+        // one place cannot detect its removal from the one that matters.
+        let src = include_str!("spec.rs");
+        let body = src
+            .split_once("pub fn refusals(&self)")
+            .expect("refusals must exist to be guarded")
+            .1
+            .split_once("\n    }\n")
+            .expect("refusals must close")
+            .0;
+        let needle = format!("{{{}}}", "INGRESS_BIND_ADDR");
+        assert!(
+            body.contains(&needle),
+            "the host refusal must interpolate the constant rather than restate \
+             its value, or it will keep naming an address the listener no longer binds"
+        );
+    }
+
+    /// The doc's refusal table and `refusals()` must name the same fields.
+    ///
+    /// The safe direction of drift is a doc that lists fewer refusals than the
+    /// code makes. The dangerous one is the reverse: a table promising that
+    /// `deny` is refused, over code that has quietly started accepting it,
+    /// tells a reader they have a control they do not have -- the #179 shape,
+    /// one layer up. So this reads the field names out of `refusals()` itself
+    /// rather than holding a list of its own.
+    #[test]
+    fn the_doc_promises_exactly_the_refusals_the_code_makes() {
+        let src = include_str!("spec.rs");
+        let body = src
+            .split_once("pub fn refusals(&self)")
+            .expect("refusals() must exist")
+            .1
+            .split_once("\n    }\n")
+            .expect("refusals() must close")
+            .0;
+
+        let doc = include_str!("../../docs/sandbox-spec.md");
+        let section = doc
+            .split_once("## `networkPolicy.ingress`")
+            .expect("the spec doc must have an ingress section")
+            .1
+            .split_once("\n## ")
+            .expect("the ingress section must end")
+            .0;
+        // Prose wraps, so a claim can be split across a newline and sail past a
+        // substring search. Flatten before looking (see #288's doc guard).
+        let flat = section.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        for field in ["host", "allow", "deny", "protocol"] {
+            let refused_in_code = body.contains(&format!(".{field}: "));
+            let named_in_doc = flat.contains(&format!("| `{field}"));
+            assert_eq!(
+                refused_in_code, named_in_doc,
+                "`{field}`: refusals() refuses it = {refused_in_code}, the doc's table \
+                 names it = {named_in_doc}. These must agree -- a doc promising a refusal \
+                 the code no longer makes reports a control that is not there."
+            );
+        }
+    }
+
+    /// A port published twice is a property of the *list*, not of any one
+    /// rule, so `refusals()` cannot see it and `validate` keeps it. Measured:
+    /// deleting this refusal leaves every other ingress guard green, because
+    /// each rule is individually perfect.
+    #[test]
+    fn a_port_named_twice_is_refused_once_by_name() {
+        let doc = spec_from(
+            r#"{"specVersion":1,"networkPolicy":{"enabled":true,
+                "ingress":[{"port":8080},{"port":9222},{"port":8080}]}}"#,
+        );
+        let problems = doc.validate();
+        assert_eq!(
+            problems.len(),
+            1,
+            "one collision is one refusal, naming the second mention; got {problems:?}"
+        );
+        assert!(
+            problems[0].contains("8080") && problems[0].contains("twice"),
+            "the refusal must name the port and say it was published twice; got {problems:?}"
+        );
+        assert!(
+            !problems[0].contains("9222"),
+            "the port that is fine must not be implicated; got {problems:?}"
+        );
+    }
+
+    /// Ingress is additive, so it costs no version bump -- an older build
+    /// reading a document that names it is incomplete, never wrong.
+    #[test]
+    fn a_document_naming_ingress_still_parses_without_it() {
+        let doc = spec_from(r#"{"specVersion":1,"networkPolicy":{"enabled":true}}"#);
+        assert!(
+            doc.network_policy
+                .as_ref()
+                .is_some_and(|n| n.ingress.is_empty()),
+            "a policy that names no ingress publishes nothing"
         );
     }
 }

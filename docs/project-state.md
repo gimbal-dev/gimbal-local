@@ -211,9 +211,8 @@ reports only what chm does to a guest, never what the guest can do)
 (observability), [#189](https://github.com/gimbal-dev/gimbal-local/issues/189)
 (lifecycle hooks)
 
-**Product tracks:** [#155](https://github.com/gimbal-dev/gimbal-local/issues/155)
-(name guest ingress in the spec — the `--expose` mechanism ships, the spec
-surface does not), [#156](https://github.com/gimbal-dev/gimbal-local/issues/156)
+**Product tracks:**
+[#156](https://github.com/gimbal-dev/gimbal-local/issues/156)
 (change egress policy without restarting),
 [#157](https://github.com/gimbal-dev/gimbal-local/issues/157) (drive a sandbox
 as an MCP server), [#159](https://github.com/gimbal-dev/gimbal-local/issues/159)

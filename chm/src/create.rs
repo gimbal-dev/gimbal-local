@@ -3935,6 +3935,96 @@ mod tests {
              output, found {sites}"
         );
     }
+
+    /// #155: what a spec asks for has to survive the parser it is spliced into.
+    ///
+    /// `expand_spec` renders a document to argv and hands it back to `parse`,
+    /// so a spec can only ever request ingress that a typed `--expose` could
+    /// have requested. Asserting that in `spec.rs` would assert it against a
+    /// model of the parser; asserting it here runs the parser.
+    #[test]
+    fn a_specs_ingress_is_something_the_flag_could_have_asked_for() {
+        let doc: crate::spec::SandboxSpec = serde_json::from_str(
+            r#"{"specVersion":1,"image":{"kernel":"/tmp/Image"},
+                "networkPolicy":{"enabled":true,"ingress":[
+                    {"port":9222,"protocol":"tcp"},{"port":3000}]}}"#,
+        )
+        .expect("the fixture must parse");
+        assert!(doc.validate().is_empty(), "{:?}", doc.validate());
+
+        let mut argv = crate::spec::resolve(Some(&doc), None, &crate::spec::Overrides::default())
+            .to_create_argv();
+        if argv.first().map(String::as_str) == Some("create") {
+            argv.remove(0);
+        }
+        let parsed = parse(&argv).expect("a spec must render argv this parser accepts");
+        assert_eq!(
+            parsed.expose,
+            vec![9222, 3000],
+            "the spec's ports must arrive as the parser's ports, in the order named"
+        );
+    }
+
+    /// #155: a document that validates as *refused* must never start as
+    /// *honoured*. That is the whole milestone, and it has two independent
+    /// halves.
+    ///
+    /// This is the first: `expand_spec` refuses before anything starts. The
+    /// second is that `resolve` publishes only through `publishable_port()`,
+    /// so it does not depend on this call having happened -- measured by
+    /// deleting the `validate()` below and running the real binary, which
+    /// rendered **zero** `--expose` flags for this same document. Both halves
+    /// are kept: this one refuses the *whole* document, including the sections
+    /// this build cannot honour at all, which no per-rule predicate can see.
+    #[test]
+    fn a_document_validate_refuses_cannot_start() {
+        let dir = std::env::temp_dir().join(format!("chm-specref-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        std::fs::write(
+            dir.join("sandbox.json"),
+            r#"{"specVersion":1,"networkPolicy":{"enabled":true,
+                "ingress":[{"port":8080,"host":"0.0.0.0"}]}}"#,
+        )
+        .expect("write the spec");
+
+        let raw = args(&[
+            "--spec",
+            &dir.display().to_string(),
+            "--kernel",
+            "/tmp/Image",
+        ]);
+        let e = expand_spec(&raw).expect_err("a refused document must not expand into a command");
+        assert!(
+            e.contains("host") || e.contains("0.0.0.0"),
+            "the refusal must survive to the caller and name what it refused; got {e}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The spec is spliced *before* the caller's flags, so naming the same port
+    /// in both is the parser's existing duplicate refusal -- and that is the
+    /// honest answer, because there is only one host port per guest port.
+    /// Silently collapsing them would hide that the document and the command
+    /// line disagreed.
+    #[test]
+    fn a_port_named_by_both_the_spec_and_a_flag_is_refused_by_name() {
+        let e = parse(&args(&[
+            "--kernel",
+            "/tmp/Image",
+            "--net",
+            "--expose",
+            "9222",
+            "--expose",
+            "9222",
+        ]))
+        .unwrap_err();
+        assert!(
+            e.contains("9222") && e.contains("twice"),
+            "the collision must name the port and say it was given twice; got {e}"
+        );
+    }
+
 }
 
 /// Guards for the cold-boot control socket (#401).
