@@ -53,6 +53,68 @@ document that is briefly nicer to type.
 | `networkPolicy.policyFile` | A `chm` extension. Our policy files predate this spec and stay authoritative for anything a control plane issued. |
 | Named tiers (`micro`…`performance`) | Not in the spec at all — a `chm` convenience, labelled as such by `chm spec tiers`. |
 | Wildcards (`*.github.com`) refused | In the spec; **not implemented here**. Our matcher takes literal hostnames, so a wildcard would compile to a rule that never fires — permissive-looking and denying everything. Refused rather than silently under-enforced. |
+| `networkPolicy.ingress` narrowed to `port` + `protocol: tcp` | The spec models a *filter*; `--expose` creates a *listener*. Every other field is refused by name. See below. |
+
+## `networkPolicy.ingress`: a listener, not a filter
+
+```jsonc
+"networkPolicy": {
+  "enabled": true,
+  "ingress": [
+    { "port": 9222, "description": "CDP for Playwright" },
+    { "port": 3000, "protocol": "tcp" }
+  ]
+}
+```
+
+Each entry publishes one guest port on one host port, and that is the whole of
+it. `chm spec show <dir> --argv` renders `--expose 9222 --expose 3000`; there is
+no second route into the guest, because a spec becomes flags and the same
+parser runs.
+
+**Every published port binds loopback.** Reachable from processes on this Mac
+and from nowhere else. That address is a constant in the NAT
+(`INGRESS_BIND_ADDR`), not a flag, precisely because a flag that accepts
+`0.0.0.0` is how a sandbox's innards end up on the LAN by accident. The refusal
+message interpolates the constant rather than restating it, so the sentence you
+read cannot drift from the address that is actually bound.
+
+### What is refused, and why each one
+
+The upstream schema describes ingress as a filter over traffic that would arrive
+anyway. Our NAT is outbound-only, so there is no arriving traffic to filter and
+nothing to filter it with. Accepting the vocabulary would describe a control
+this build does not have.
+
+| Field | Verdict | Why |
+| --- | --- | --- |
+| `port: 9222` | ✅ | The one thing `--expose` can do. |
+| `port: "3000-3010"` | ❌ | Each published port gets its own host port, so each is named on its own. A range hides how many listeners it opens. |
+| `host: "0.0.0.0"` | ❌ | See above. Widening stays a decision somebody takes on purpose. |
+| `allow: [...]` | ❌ | There is no source to filter on. A rule that reads like one would report protection this build does not provide. |
+| `deny: [...]` | ❌ | Worse: a no-op wearing the shape of a control. Remove the port instead — that is the deny. |
+| `protocol: "tcp"` | ✅ | |
+| `protocol: "udp"` \| `"icmp"` \| `"any"` | ❌ | This build publishes a TCP listener and nothing else. |
+| `description` | ✅ | Carried for the reader; affects nothing. |
+
+Ingress with `networkPolicy.enabled: false` is refused too — there would be no
+NIC for a host connection to arrive on, so the document asks for a listener on a
+machine with no network.
+
+### A port named twice
+
+Spec ingress splices in *before* your flags and runs the same duplicate check
+everything else does, so naming the same port in both places is refused rather
+than quietly opening one listener:
+
+```console
+$ chm create --spec ./ws --kernel … --expose 9222 --dry-run
+chm create: from ./ws/sandbox.json (9 flags)
+chm create: --expose 9222 was given twice; each guest port is exposed once, on one host port
+```
+
+A *different* port on the command line accumulates normally — that is the
+precedence rule for repeatables, not a special case for ingress.
 
 ## What it refuses, and why refusing is the feature
 
