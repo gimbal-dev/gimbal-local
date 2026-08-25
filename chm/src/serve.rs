@@ -826,6 +826,15 @@ pub(crate) fn cold_boot_refusal(cmd: &str) -> Option<String> {
     }
 }
 
+/// The prefix the daemon puts on a reply that reports a failure.
+///
+/// One constant, written by every daemon reply that refuses and read by the one
+/// client that classifies replies. A second copy of this string is exactly how
+/// `chm ctl` would go back to reporting failures as success: the daemon would
+/// carry on saying so and the client would quietly stop hearing it, with
+/// nothing failing in between.
+pub(crate) const REPLY_ERROR_PREFIX: &str = "error\t";
+
 fn handle_conn(stream: UnixStream, daemon: &Daemon) {
     // Only accept commands from the daemon's own user: a co-tenant process must
     // not be able to drive start/stop/console/shutdown even if it can reach the
@@ -868,7 +877,7 @@ fn handle_conn(stream: UnixStream, daemon: &Daemon) {
     if daemon.role == Role::ColdBoot
         && let Some(why) = cold_boot_refusal(cmd)
     {
-        let _ = writer.write_all(format!("error\t{why}\n").as_bytes());
+        let _ = writer.write_all(format!("{REPLY_ERROR_PREFIX}{why}\n").as_bytes());
         return;
     }
 
@@ -924,7 +933,7 @@ fn handle_conn(stream: UnixStream, daemon: &Daemon) {
         "start" => {
             let resp = match start_vm(daemon, arg) {
                 Ok(msg) => format!("ok\t{msg}\n"),
-                Err(e) => format!("error\t{e}\n"),
+                Err(e) => format!("{REPLY_ERROR_PREFIX}{e}\n"),
             };
             let _ = writer.write_all(resp.as_bytes());
         }
@@ -932,21 +941,21 @@ fn handle_conn(stream: UnixStream, daemon: &Daemon) {
         "input" => {
             let resp = match send_input(daemon, arg) {
                 Ok(n) => format!("ok\t{n} byte(s)\n"),
-                Err(e) => format!("error\t{e}\n"),
+                Err(e) => format!("{REPLY_ERROR_PREFIX}{e}\n"),
             };
             let _ = writer.write_all(resp.as_bytes());
         }
         "egress" => {
             let resp = match amend_egress(daemon, arg) {
                 Ok(msg) => format!("ok\t{msg}\n"),
-                Err(e) => format!("error\t{e}\n"),
+                Err(e) => format!("{REPLY_ERROR_PREFIX}{e}\n"),
             };
             let _ = writer.write_all(resp.as_bytes());
         }
         "stop" => {
             let resp = match stop_vm(daemon) {
                 Ok(msg) => format!("ok\t{msg}\n"),
-                Err(e) => format!("error\t{e}\n"),
+                Err(e) => format!("{REPLY_ERROR_PREFIX}{e}\n"),
             };
             let _ = writer.write_all(resp.as_bytes());
         }
@@ -960,7 +969,8 @@ fn handle_conn(stream: UnixStream, daemon: &Daemon) {
             exit(0);
         }
         other => {
-            let _ = writer.write_all(format!("error\tunknown command `{other}`\n").as_bytes());
+            let _ = writer
+                .write_all(format!("{REPLY_ERROR_PREFIX}unknown command `{other}`\n").as_bytes());
         }
     }
 }
@@ -2247,6 +2257,82 @@ pub(crate) fn wants_help(args: &[String]) -> bool {
     )
 }
 
+/// True when the daemon's reply is raw guest output rather than a protocol reply.
+///
+/// `console` hands the connection over to the guest's serial output, so its
+/// bytes are never classified: a guest is entirely free to print a line
+/// beginning `error<TAB>`, and that is the guest's text, not our protocol. Every
+/// other verb answers with one bounded protocol reply, so every other verb can
+/// be judged. Decided from the wire command we sent rather than from the shape
+/// of what came back -- only the sender knows which of the two this is.
+fn reply_is_guest_bytes(command: &str) -> bool {
+    command == "console"
+}
+
+/// Pass the daemon's reply on to `out`, or report it as the failure it is.
+///
+/// A reply that opens with [`REPLY_ERROR_PREFIX`] is the daemon refusing, and
+/// the only honest way to hand that to a caller is out of the `Err` channel: it
+/// then reaches stderr and a non-zero exit, so `chm ctl start missing` can no
+/// longer be mistaken for a start that worked -- by a person, a shell script, or
+/// the app, which throws on a non-zero status and so believed every refusal.
+///
+/// Generic over the reader and writer so the classification is testable without
+/// a daemon, a socket or a guest.
+fn relay_reply<R: Read, W: Write>(
+    reader: &mut R,
+    out: &mut W,
+    classify: bool,
+) -> Result<(), String> {
+    let needle = REPLY_ERROR_PREFIX.as_bytes();
+    // `None` until enough bytes have arrived to tell. A reply we were told not
+    // to classify starts decided, so guest bytes are never inspected at all.
+    let mut verdict: Option<bool> = (!classify).then_some(false);
+    let mut pending: Vec<u8> = Vec::new();
+    let mut failure: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 8192];
+
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("read daemon: {e}")),
+        };
+        pending.extend_from_slice(&buf[..n]);
+        if verdict.is_none() {
+            if pending.len() < needle.len() {
+                continue;
+            }
+            verdict = Some(pending.starts_with(needle));
+        }
+        if verdict == Some(true) {
+            failure.append(&mut pending);
+            continue;
+        }
+        match out.write_all(&pending).and_then(|()| out.flush()) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::BrokenPipe => break,
+            Err(e) => return Err(format!("write stdout: {e}")),
+        }
+        pending.clear();
+    }
+
+    // A reply too short to carry the prefix cannot be one, so it is output.
+    if verdict.is_none() && !pending.is_empty() {
+        out.write_all(&pending)
+            .and_then(|()| out.flush())
+            .map_err(|e| format!("write stdout: {e}"))?;
+    }
+
+    if verdict == Some(true) {
+        let text = String::from_utf8_lossy(&failure);
+        let text = text.strip_prefix(REPLY_ERROR_PREFIX).unwrap_or(&text);
+        return Err(text.trim_end().to_string());
+    }
+    Ok(())
+}
+
 fn ctl(raw: &[String]) -> Result<(), String> {
     let (socket, rest) = take_socket(raw)?;
     // Answered before the connect, because the person who needs this most is
@@ -2284,23 +2370,14 @@ fn ctl(raw: &[String]) -> Result<(), String> {
         .map_err(|e| format!("send command: {e}"))?;
     stream.flush().ok();
 
-    // Stream the daemon's reply (console takes over the connection and streams
-    // raw guest output; everything else is a short text response) to stdout.
-    let mut stdout = io::stdout();
-    let mut buf = [0u8; 8192];
-    loop {
-        match stream.read(&mut buf) {
-            Ok(0) => break,
-            Ok(n) => match stdout.write_all(&buf[..n]).and_then(|()| stdout.flush()) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::BrokenPipe => break,
-                Err(e) => return Err(format!("write stdout: {e}")),
-            },
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-            Err(e) => return Err(format!("read daemon: {e}")),
-        }
-    }
-    Ok(())
+    // Hand the daemon's reply on -- to stdout when it is an answer, and out of
+    // the `Err` channel when it is a refusal, so a refused command exits
+    // non-zero instead of looking exactly like one that worked.
+    relay_reply(
+        &mut stream,
+        &mut io::stdout(),
+        !reply_is_guest_bytes(&command),
+    )
 }
 
 /// Map `chm ctl <args>` onto the one-line daemon protocol.
@@ -3813,6 +3890,156 @@ mod ctl_help_tests {
         assert!(
             asks < acts,
             "serve_main parses its arguments before answering --help"
+        );
+    }
+}
+
+#[cfg(test)]
+mod ctl_reply_tests {
+    use super::*;
+
+    /// The daemon's own source, so a guard here reads what ships rather than
+    /// what a test rebuilt.
+    const SRC: &str = include_str!("serve.rs");
+
+    /// The prefix as it appears in Rust source, assembled from parts.
+    ///
+    /// Written out whole it would appear in this assertion too, and a needle
+    /// that matches its own test can never detect the thing it guards going
+    /// missing -- banked twice in this repo already.
+    fn source_literal() -> String {
+        format!("{}{}t", "error", '\\')
+    }
+
+    fn relay(reply: &[u8], classify: bool) -> (Result<(), String>, String) {
+        let mut out: Vec<u8> = Vec::new();
+        let r = relay_reply(&mut &reply[..], &mut out, classify);
+        (r, String::from_utf8(out).unwrap())
+    }
+
+    #[test]
+    fn a_refusal_leaves_stdout_untouched_and_comes_back_as_an_error() {
+        let reply = format!("{REPLY_ERROR_PREFIX}no VM running\n");
+        let (r, out) = relay(reply.as_bytes(), true);
+        assert_eq!(
+            r,
+            Err("no VM running".to_string()),
+            "the prefix is stripped and the trailing newline trimmed, so \
+             ctl_main prints `chm ctl: no VM running`"
+        );
+        assert!(
+            out.is_empty(),
+            "a refusal must not be written to stdout, or `chm ctl list --json \
+             | jq` is fed the refusal text: got {out:?}"
+        );
+    }
+
+    #[test]
+    fn an_answer_reaches_stdout_verbatim_and_succeeds() {
+        let (r, out) = relay(b"idle\tlibrary /x\n", true);
+        assert_eq!(r, Ok(()));
+        assert_eq!(out, "idle\tlibrary /x\n");
+    }
+
+    #[test]
+    fn a_reply_shorter_than_the_prefix_is_an_answer_not_a_refusal() {
+        // `ping` answers `pong\n` -- five bytes against a six-byte prefix, so
+        // the decision is never reached and EOF has to settle it as output.
+        assert!(
+            "pong\n".len() < REPLY_ERROR_PREFIX.len(),
+            "this test only means anything while pong is the shorter of the two"
+        );
+        let (r, out) = relay(b"pong\n", true);
+        assert_eq!(r, Ok(()));
+        assert_eq!(out, "pong\n", "a short reply must still reach the caller");
+    }
+
+    #[test]
+    fn a_refusal_split_across_reads_is_still_recognised() {
+        struct Dribble(Vec<Vec<u8>>);
+        impl Read for Dribble {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0.is_empty() {
+                    return Ok(0);
+                }
+                let chunk = self.0.remove(0);
+                buf[..chunk.len()].copy_from_slice(&chunk);
+                Ok(chunk.len())
+            }
+        }
+        let mut src = Dribble(vec![b"err".to_vec(), b"or\tno VM running\n".to_vec()]);
+        let mut out: Vec<u8> = Vec::new();
+        let r = relay_reply(&mut src, &mut out, true);
+        assert_eq!(
+            r,
+            Err("no VM running".to_string()),
+            "the prefix arrives over two reads and must not be judged early"
+        );
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn guest_bytes_are_never_classified() {
+        assert!(
+            reply_is_guest_bytes("console"),
+            "console hands the connection to raw guest output"
+        );
+        for verb in ["status", "list", "start", "stop", "input", "egress", "ping"] {
+            assert!(
+                !reply_is_guest_bytes(verb),
+                "{verb} answers with one bounded protocol reply and can be judged"
+            );
+        }
+
+        // A guest is free to print this. It is the guest's text, not our wire.
+        let guest = format!("{REPLY_ERROR_PREFIX}fsck: unable to resolve 'LABEL=x'\n");
+        let (r, out) = relay(guest.as_bytes(), false);
+        assert_eq!(r, Ok(()), "guest output is never a chm failure");
+        assert_eq!(out, guest, "and it reaches the terminal unaltered");
+    }
+
+    /// Every daemon reply that refuses has to be written with the shared
+    /// constant.
+    ///
+    /// This is the drift the whole fix rests on. If one site went back to its
+    /// own literal and the constant later changed, the daemon would carry on
+    /// refusing and `chm ctl` would quietly stop hearing it -- rc back to 0,
+    /// nothing failing anywhere in between. An outcome assertion cannot see
+    /// that: it would still pass against whichever sites did use the constant.
+    #[test]
+    fn no_daemon_reply_writes_the_prefix_as_its_own_literal() {
+        let bare = source_literal();
+        let hits: Vec<&str> = SRC
+            .lines()
+            .filter(|l| l.contains(&bare))
+            .map(str::trim)
+            .collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "exactly one line in serve.rs may spell the prefix out -- the \
+             constant's own declaration. Found: {hits:?}"
+        );
+        assert!(
+            hits[0].contains("REPLY_ERROR_PREFIX"),
+            "the one spelling must be the constant, not a reply: {:?}",
+            hits[0]
+        );
+    }
+
+    /// `ctl` has to ask which kind of reply it is expecting.
+    ///
+    /// Every guard above asserts an *outcome*, and an outcome assertion is
+    /// structurally blind to a call site that stopped taking the path -- this
+    /// repo has been bitten by exactly that seven times. Hardcoding `false`
+    /// here would restore the original bug with every test above still green.
+    #[test]
+    fn ctl_decides_by_the_verb_it_sent() {
+        let needle = format!("!{}(&command)", "reply_is_guest_bytes");
+        assert!(
+            SRC.contains(&needle),
+            "ctl must pass the classification decision to relay_reply, keyed \
+             on the wire command it sent"
         );
     }
 }
