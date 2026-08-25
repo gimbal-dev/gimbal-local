@@ -122,4 +122,12 @@ since been superseded** and none of those users can learn that from the app.
 This is the concrete cost of the gap, not a hypothetical one: it is the reason
 a security fix currently has no route to anybody who already has a build.
 
-Tracked as [#391](https://github.com/gimbal-dev/gimbal-local/issues/391).
+Tracked as [#410](https://github.com/gimbal-dev/gimbal-local/issues/410).
+
+This paragraph used to name #391, which is **closed** -- closed by the change
+that added this very document. #391 covered both halves of distribution: the
+notarisation facts, which shipped here, and the update channel, which did not.
+Closing it took the surviving gap's tracker with it, and for a while the only
+record that this was still outstanding was a sentence pointing at a closed
+issue. A doc citing a closed issue as its tracker is how a gap stops being
+counted, so the pointer is now #410 and the scope there is the channel alone.
