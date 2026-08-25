@@ -662,11 +662,26 @@ impl ColdControl {
 
     /// Publish the channels a control client needs: `input` types into the
     /// guest's console, `kick` forces its vCPUs out of `run()` so a `stop`
-    /// lands on a guest that is not trapping.
-    pub(crate) fn publish(&self, input: ConsoleInput, kick: Arc<dyn Fn() + Send + Sync>) {
+    /// lands on a guest that is not trapping, and `egress` amends the live
+    /// policy on every NIC it has.
+    ///
+    /// `egress` is a required argument rather than a later setter, and `None`
+    /// has to be passed deliberately. A cold guest reaches the same verb
+    /// surface as a daemon-run one, so a path that quietly forgot to publish
+    /// this would refuse `chm ctl egress` with "this VM exposes no amendable
+    /// network device" on a guest that plainly has one -- true about the
+    /// plumbing and useless to the operator reading it. Making the omission a
+    /// compile error is the only version of that guard which cannot be skipped.
+    pub(crate) fn publish(
+        &self,
+        input: ConsoleInput,
+        kick: Arc<dyn Fn() + Send + Sync>,
+        egress: Option<EgressAmender>,
+    ) {
         let mut g = self.inner.lock().unwrap();
         g.input = Some(input);
         g.kick = Some(kick);
+        g.egress = egress;
     }
 
     /// Push guest serial output into the ring.
