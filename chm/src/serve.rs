@@ -1808,6 +1808,11 @@ fn run_guest_usgic(
         // shape. The daemon takes the cadence from its own environment, which
         // is the one an operator sets when starting the service.
         snapshot_every: None,
+        // `chm ctl start` names a snapshot, not a run shape, so there is no
+        // flag here either. Publishing a guest port is an authorisation the
+        // caller gives one run; a daemon serving a whole library has nobody to
+        // take it from.
+        expose: &[],
     };
 
     let outcome = run_usgic_engine(&cfg, loaded, &mut |s| supervise_daemon(s, opts, inner))?;

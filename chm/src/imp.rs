@@ -6,13 +6,14 @@
 
 use std::collections::HashSet;
 use std::io::{Read, Write};
+use std::net::{Ipv4Addr, SocketAddrV4};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{self, ExitCode};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::{env, fs, io, thread};
+use std::{env, fs, io, mem, thread};
 
 use crate::bundle;
 use crate::checkpoint;
@@ -21,7 +22,7 @@ use crate::livesnap;
 use crate::kernelimage;
 use crate::runs;
 use crate::vanilla_export;
-use crate::create::create_main;
+use crate::create::{GUEST_IP, create_main, push_expose};
 use crate::oci::image::image_main;
 use crate::cloud;
 use crate::console::{self, RawConsole};
@@ -859,6 +860,11 @@ pub(crate) fn wire_virtio(
     // parameter cannot serve: it is `None` on the userspace-GIC resume path,
     // which is exactly the path a cold-booted lineage resumes down.
     spi_sink: Option<&Arc<dyn MsiSink>>,
+    // Guest TCP ports to publish on the host, for the resume path's `--expose`.
+    // Bare ports rather than full addresses because the guest's IP is `chm`'s
+    // convention (`create::GUEST_IP`) and the device manager deliberately does
+    // not hold a second copy of it.
+    expose_ports: &[u16],
 ) -> Result<WiredVirtio, String> {
     let descs =
         devmgr::parse_devices(state_json).map_err(|e| format!("parse virtio devices: {e}"))?;
@@ -951,7 +957,28 @@ pub(crate) fn wire_virtio(
     // teaches them to skip the line that matters.
     if run_has_a_nic(&descs, &mmio_descs) {
         eprintln!("chm: {}", egress_posture_line(enforced_policy.as_ref()));
+    } else if !expose_ports.is_empty() {
+        // Refuse rather than start. There is no NIC to carry the forward, so
+        // every one of these ports would be silently dropped and the guest
+        // would look like it had started correctly.
+        return Err(format!(
+            "--expose names {} guest port(s) but this snapshot has no NIC, so \
+             there is nothing to publish them through",
+            expose_ports.len()
+        ));
     }
+
+    // Ingress is armed on the *first* NIC and only the first. A host port
+    // forwards to exactly one guest endpoint, so a second NIC taking the same
+    // list would ask for the same guest port twice -- which `NatResponder`
+    // rightly refuses -- and the run would fail for a reason that reads like a
+    // bug rather than an ambiguity. The egress policy above is cloned for the
+    // opposite reason: every NIC must be governed, but only one can be dialled.
+    let ingress: Vec<SocketAddrV4> = expose_ports
+        .iter()
+        .map(|p| SocketAddrV4::new(Ipv4Addr::from(GUEST_IP), *p))
+        .collect();
+    let mut ingress_pending = ingress.as_slice();
 
     for desc in &descs {
         let kind = match &desc.backend {
@@ -968,6 +995,11 @@ pub(crate) fn wire_virtio(
         // Clone (not take) so a second NIC is governed by the same policy.
         let policy = if is_net { enforced_policy.clone() } else { None };
         let dev_limits = if is_net { net_limits.clone() } else { NatLimits::default() };
+        let dev_ingress: &[SocketAddrV4] = if is_net {
+            mem::take(&mut ingress_pending)
+        } else {
+            &[]
+        };
         let (base, size, dev) = devmgr::build_device(
             desc,
             guest_mem.clone(),
@@ -976,6 +1008,7 @@ pub(crate) fn wire_virtio(
             policy,
             dev_limits,
             allow_local_egress,
+            dev_ingress,
         )
         .map_err(|e| format!("build device {}: {e}", desc.name))?;
         if !desc.vector_events.is_empty() {
@@ -1041,6 +1074,11 @@ pub(crate) fn wire_virtio(
         } else {
             NatLimits::default()
         };
+        let dev_ingress: &[SocketAddrV4] = if is_net {
+            mem::take(&mut ingress_pending)
+        } else {
+            &[]
+        };
         let dev = devmgr::build_mmio_device(
             desc,
             guest_mem.clone(),
@@ -1049,6 +1087,7 @@ pub(crate) fn wire_virtio(
             policy,
             dev_limits,
             allow_local_egress,
+            dev_ingress,
         )
         .map_err(|e| format!("build mmio device {}: {e}", desc.name))?;
         // An mmio device has one legacy IRQ, not a table of MSI-X vectors, so
@@ -1509,6 +1548,12 @@ struct Args {
     /// default: the reserved-address guard (M31.1) denies those regardless of
     /// the egress policy. Set by `--allow-local-egress` or `CHM_ALLOW_LOCAL_EGRESS`.
     allow_local_egress: bool,
+    /// Guest TCP ports to publish on the host for this run (`--expose`), the
+    /// resume-path counterpart of the same flag on `chm create`. Each is
+    /// forwarded from an ephemeral host port bound on loopback only; the host
+    /// port is printed, because nobody can dial a number they were not told.
+    /// Empty is the default -- ingress is opt-in on every entry point.
+    expose: Vec<u16>,
 }
 
 struct ConnectArgs {
@@ -1731,6 +1776,10 @@ fn usage() -> String {
          address ranges (loopback, private LAN, link-local metadata). OFF by\n                        \
          default: the NAT blocks them regardless of policy (M31.1). Also via\n                        \
          `CHM_ALLOW_LOCAL_EGRESS=1`.\n    \
+         --expose <PORT>      Publish a guest TCP port on the host, so something\n                        \
+         outside can dial into the sandbox (repeatable). The host port is\n                        \
+         ephemeral and bound on loopback only; chm prints it. Requires the\n                        \
+         snapshot to have a NIC, and arms the first one.\n    \
          --checkpoint         Use live checkpoints: resume from a saved\n                        \
          checkpoint in the snapshot dir if present, and capture a fresh one on\n                        \
          a clean stop so the next start continues where this left off. Implied\n                        \
@@ -1803,6 +1852,7 @@ fn parse(raw: &[String]) -> Parsed {
     let mut limits_file: Option<PathBuf> = None;
     let mut allow_local_egress = env_flag("CHM_ALLOW_LOCAL_EGRESS");
     let mut snapshot_every: Option<u64> = None;
+    let mut expose: Vec<u16> = Vec::new();
 
     let mut i = 0;
     // A leading `run`/`restore` subcommand is accepted but optional; `resume`
@@ -1842,6 +1892,15 @@ fn parse(raw: &[String]) -> Parsed {
                     return Parsed::Error(format!("{a} requires a value"));
                 };
                 limits_file = Some(PathBuf::from(v));
+            }
+            "--expose" => {
+                i += 1;
+                let Some(v) = raw.get(i) else {
+                    return Parsed::Error(format!("{a} requires a value"));
+                };
+                if let Err(e) = push_expose(&mut expose, v) {
+                    return Parsed::Error(e);
+                }
             }
             "--max-seconds" | "--idle-exit" | "--snapshot-every" => {
                 i += 1;
@@ -1883,6 +1942,7 @@ fn parse(raw: &[String]) -> Parsed {
             limits_file,
             allow_local_egress,
             snapshot_every,
+            expose,
         }),
         None => Parsed::Error("missing <SNAPSHOT_DIR>".to_string()),
     }
@@ -1902,6 +1962,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
     let mut limits_file: Option<PathBuf> = None;
     let mut allow_local_egress = env_flag("CHM_ALLOW_LOCAL_EGRESS");
     let mut snapshot_every: Option<u64> = None;
+    let mut expose: Vec<u16> = Vec::new();
 
     let mut i = 0;
     while i < raw.len() {
@@ -1914,7 +1975,8 @@ fn parse_connect(raw: &[String]) -> Parsed {
             "--checkpoint" => checkpoint = true,
             "--allow-local-egress" => allow_local_egress = true,
             "--socket" | "--max-seconds" | "--idle-exit" | "--session-lock"
-            | "--egress-policy" | "--proxy-rules" | "--limits" | "--snapshot-every" => {
+            | "--egress-policy" | "--proxy-rules" | "--limits" | "--snapshot-every"
+            | "--expose" => {
                 i += 1;
                 let Some(v) = raw.get(i) else {
                     return Parsed::Error(format!("{a} requires a value"));
@@ -1925,6 +1987,11 @@ fn parse_connect(raw: &[String]) -> Parsed {
                     "--egress-policy" => egress_policy = Some(PathBuf::from(v)),
                     "--proxy-rules" => proxy_rules = Some(PathBuf::from(v)),
                     "--limits" => limits_file = Some(PathBuf::from(v)),
+                    "--expose" => {
+                        if let Err(e) = push_expose(&mut expose, v) {
+                            return Parsed::Error(e);
+                        }
+                    }
                     "--max-seconds" | "--idle-exit" | "--snapshot-every" => {
                         let Ok(n) = v.parse::<u64>() else {
                             return Parsed::Error(format!("{a}: `{v}` is not a number"));
@@ -1965,6 +2032,7 @@ fn parse_connect(raw: &[String]) -> Parsed {
                 limits_file,
                 allow_local_egress,
                 snapshot_every,
+                expose,
             },
             socket_path,
             no_stop_daemon,
@@ -2901,10 +2969,11 @@ fn run_usgic(args: &Args, loaded: Loaded, kind: runs::Kind) -> Result<ExitCode, 
         &args.snapshot_dir.display().to_string(),
         loaded.num_vcpus,
         loaded.total_ram / (1 << 20),
-        // `chm run` and `chm connect` have no `--expose` (#341: cold boot has
-        // the networking flags, the snapshot path has the checkpoints, and the
-        // two sets are disjoint). No ingress to declare, so declare none.
-        &[],
+        // What `--expose` asked for, so `chm ps` and the app report a resumed
+        // guest's published ports the same way they report a cold-booted one's.
+        // Recorded before the NIC is wired: the host ports are chosen later,
+        // and a run that is reachable but invisible is the #225 shape again.
+        &args.expose,
     )
     .unwrap_or_else(|e| {
         eprintln!("chm: warning: could not record this run: {e}");
@@ -2938,6 +3007,7 @@ fn run_usgic(args: &Args, loaded: Loaded, kind: runs::Kind) -> Result<ExitCode, 
         checkpoint_source: "connect",
         interactive: true,
         snapshot_every: args.snapshot_every,
+        expose: &args.expose,
     };
     let outcome = run_usgic_engine(&cfg, loaded, &mut |s| {
         run_console(s.uart, s.running, args, s.limits, s.overlay_dir, s.parked)
@@ -2985,6 +3055,10 @@ pub(crate) struct UsgicConfig<'a> {
     /// Live-snapshot cadence in seconds, from `--snapshot-every`. `None` defers
     /// to `CHM_SNAPSHOT_INTERVAL_SECS`; see [`snapshot_interval`].
     pub snapshot_every: Option<u64>,
+    /// Guest TCP ports to publish on the host (`--expose`). Empty for the
+    /// daemon, which has no flag for it: ingress is authorised per run by the
+    /// caller who typed the flag, not inherited from a library-wide service.
+    pub expose: &'a [u16],
 }
 
 /// The live handles a supervisor needs while the guest runs.
@@ -3494,6 +3568,7 @@ pub(crate) fn run_usgic_engine(
         Some(usgic_lpi_sink),
         cfg.proxy_rules,
         Some(&serial_sink),
+        cfg.expose,
     ) {
         Ok(wired) => {
             if !wired.summary.is_empty() && !cfg.quiet {
@@ -5696,6 +5771,249 @@ mod tests {
         );
     }
 
+    /// `--expose` has to reach `Args` from *both* parsers, or the flag works
+    /// on `chm run` and silently does nothing on `chm connect` -- which is the
+    /// same sandbox reached by a different door.
+    #[test]
+    fn both_entry_points_take_expose() {
+        let argv = |extra: &[&str]| -> Vec<String> {
+            let mut v: Vec<String> = vec!["snap".to_string()];
+            v.extend(extra.iter().map(|s| (*s).to_string()));
+            v
+        };
+
+        match parse(&argv(&["--expose", "9222", "--expose", "7777"])) {
+            Parsed::Run(a) => assert_eq!(a.expose, vec![9222, 7777]),
+            _ => panic!("run: expected Parsed::Run"),
+        }
+        match parse(&argv(&[])) {
+            Parsed::Run(a) => assert!(
+                a.expose.is_empty(),
+                "no flag must publish nothing; ingress is opt-in"
+            ),
+            _ => panic!("run: expected Parsed::Run"),
+        }
+        match parse_connect(&argv(&["--expose", "9222"])) {
+            Parsed::Connect(a) => assert_eq!(a.run.expose, vec![9222]),
+            _ => panic!("connect: expected Parsed::Connect"),
+        }
+    }
+
+    /// The resume path must refuse exactly what `chm create` refuses.
+    ///
+    /// It does so by calling `create::push_expose` rather than restating the
+    /// rules, so this test is really asking whether that call is still there:
+    /// re-implementing the parse inline would leave these cases accepted here
+    /// and refused there, and a flag spelled the same on two entry points that
+    /// disagree about what it means is worse than not having it on one of them.
+    #[test]
+    fn the_resume_path_refuses_what_create_refuses() {
+        let argv = |extra: &[&str]| -> Vec<String> {
+            let mut v: Vec<String> = vec!["snap".to_string()];
+            v.extend(extra.iter().map(|s| (*s).to_string()));
+            v
+        };
+
+        for (bad, needle) in [
+            (vec!["--expose", "8080:80"], "plain number"),
+            (vec!["--expose", "0"], "port 0"),
+            (vec!["--expose", "9222", "--expose", "9222"], "twice"),
+        ] {
+            match parse(&argv(&bad)) {
+                Parsed::Error(e) => assert!(
+                    e.contains(needle),
+                    "`{bad:?}` should be refused naming `{needle}`, got: {e}"
+                ),
+                _ => panic!("`{bad:?}` should have been refused"),
+            }
+        }
+    }
+
+    /// `--expose` with nothing to publish through is a refusal, not a warning.
+    ///
+    /// A dropped forward produces the worst-shaped failure available here: the
+    /// guest resumes, every device works, and the only symptom is whatever was
+    /// meant to dial the port timing out later against an error that blames the
+    /// network rather than naming the missing NIC.
+    #[test]
+    fn expose_on_a_snapshot_with_no_nic_is_refused() {
+        let dir = std::env::temp_dir().join(format!("chm-expnonic-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".chm-overlays")).unwrap();
+        let doc = an_mmio_doc("rng0", 4, 0x1000_0000, 44, &[0u8; 8]);
+        let wired = wire_virtio(
+            &Arc::new(MmioBus::new()),
+            &Arc::new(GuestMemory::new()),
+            &doc,
+            &dir.join(".chm-overlays"),
+            None,
+            false,
+            None,
+            &NatLimits::default(),
+            false,
+            None,
+            None,
+            None,
+            &[9222],
+        );
+        let err = match wired {
+            Err(e) => e,
+            Ok(_) => panic!("a snapshot with no NIC cannot publish a port"),
+        };
+        assert!(err.contains("9222") || err.contains('1'), "{err}");
+        assert!(err.contains("NIC"), "names what is missing: {err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A NIC-bearing snapshot must still wire, so the refusal above is about
+    /// the missing NIC rather than a blanket rejection of the flag.
+    #[test]
+    fn expose_on_a_snapshot_with_a_nic_wires() {
+        let dir = std::env::temp_dir().join(format!("chm-expnic-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".chm-overlays")).unwrap();
+        let doc = an_mmio_doc("net0", 1, 0x1000_0000, 44, &[0u8; 8]);
+        assert!(
+            wire_virtio(
+                &Arc::new(MmioBus::new()),
+                &Arc::new(GuestMemory::new()),
+                &doc,
+                &dir.join(".chm-overlays"),
+                None,
+                false,
+                None,
+                &NatLimits::default(),
+                false,
+                None,
+                None,
+                None,
+                &[9222],
+            )
+            .is_ok(),
+            "a NIC-bearing snapshot must be able to publish a guest port"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The device loop must actually hand the list to the device it built.
+    ///
+    /// Every other guard here would stay green if `wire_virtio` resolved the
+    /// ports, refused the no-NIC case, and then passed `&[]` to the builder:
+    /// the refusals are decided before the loop and a NIC handed nothing still
+    /// wires cleanly. This is the call-site class, and it is the one this
+    /// repository has now missed seven times.
+    ///
+    /// Two copies of one port is the cheapest refusal reachable from here --
+    /// `NatResponder::expose` will not publish the same guest endpoint twice --
+    /// so it can only be produced if the list travelled the whole way. The CLI
+    /// cannot construct it (`create::push_expose` refuses a duplicate first),
+    /// which is precisely why it is safe to use as a probe.
+    #[test]
+    fn the_device_loop_hands_the_ports_to_the_device() {
+        let dir = std::env::temp_dir().join(format!("chm-expcall-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join(".chm-overlays")).unwrap();
+        let doc = an_mmio_doc("net0", 1, 0x1000_0000, 44, &[0u8; 8]);
+        let wired = wire_virtio(
+            &Arc::new(MmioBus::new()),
+            &Arc::new(GuestMemory::new()),
+            &doc,
+            &dir.join(".chm-overlays"),
+            None,
+            false,
+            None,
+            &NatLimits::default(),
+            false,
+            None,
+            None,
+            None,
+            &[9222, 9222],
+        );
+        match wired {
+            Err(e) => assert!(e.contains("9222"), "names the port: {e}"),
+            Ok(_) => panic!(
+                "the resolved ports never reached the device: a duplicate that \
+                 `NatResponder` refuses wired cleanly instead"
+            ),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The call sites, read out of this file's own source.
+    ///
+    /// Every guard above asserts an *outcome*, and an outcome assertion is
+    /// structurally blind to a call site that stops passing the value -- the
+    /// mistake this repository has now made seven times. `wire_virtio` reaching
+    /// for the config's list and `runs::register` reaching for the parsed one
+    /// are the two places the flag can be dropped while every behavioural test
+    /// above stays green, because each function would still be correct about
+    /// the empty list it was handed.
+    ///
+    /// The registration needle is searched **inside that call only**. The same
+    /// expression also builds `UsgicConfig` a few lines below, and a needle
+    /// that appears in more than one place cannot detect its removal from the
+    /// one that matters. Measured, not assumed: this guard's first draft passed
+    /// while the registration was mutated to `&[]`, and so did its second,
+    /// whose end marker silently failed to match and so searched the whole
+    /// file. Hence `expect` on both ends -- a scope that quietly widens to
+    /// everything is not a scope.
+    #[test]
+    fn the_run_path_hands_the_requested_ports_on() {
+        let src = include_str!("imp.rs");
+        let prod = &src[..src.find("mod tests {").expect("this file has tests")];
+
+        // Assembled from parts so the needles cannot match this assertion.
+        let wanted = format!("{}.{}", "cfg", "expose");
+        assert!(
+            prod.contains(&wanted),
+            "`wire_virtio` must still be handed the requested ports"
+        );
+
+        let open = format!("let _registration = {}::register(", "runs");
+        let start = prod.find(&open).expect("the run announces itself");
+        let call = &prod[start..];
+        let end = call
+            .find(".unwrap_or_else(")
+            .expect("the registration call still ends where this guard looks");
+        let call = &call[..end];
+        let declared = format!("&{}.{}", "args", "expose");
+        assert!(
+            call.contains(&declared),
+            "the registration must declare the ports this run asked for; a run \
+             that is reachable but reports none is the #225 shape again:\n{call}"
+        );
+        // Both transports, because only one of them is reachable from a test.
+        // `the_device_loop_hands_the_ports_to_the_device` drives the mmio loop
+        // with a real `wire_virtio` call; the pci loop needs a whole
+        // cloud-hypervisor device tree that nothing in this crate can build, so
+        // dropping `dev_ingress` there left all 1057 tests green -- measured.
+        // A vanilla cloud capture is pci throughout, so that is the loop real
+        // snapshots take, and leaving it unguarded would guard only the path
+        // this repository does not ship against.
+        for (builder, what) in [
+            ("build_device(", "pci"),
+            ("build_mmio_device(", "mmio"),
+        ] {
+            let at = prod
+                .find(&format!("{}::{builder}", "devmgr"))
+                .unwrap_or_else(|| panic!("the {what} loop still builds a device"));
+            let args = &prod[at..];
+            let end = args
+                .find("\n        )")
+                .expect("the builder call still ends where this guard looks");
+            let args = &args[..end];
+            assert!(
+                args.contains("dev_ingress"),
+                "the {what} device loop must hand the ports on; a loop that \
+                 passes an empty list builds a NIC that publishes nothing and \
+                 says so nowhere:\n{args}"
+            );
+        }
+    }
+
+    /// A flag nobody can discover is a flag nobody has.
+    #[test]
+    fn the_help_names_expose() {
+        assert!(usage().contains("--expose"), "{}", usage());
+    }
+
     #[test]
     fn both_entry_points_take_snapshot_every() {
         let argv = |extra: &[&str]| -> Vec<String> {
@@ -5881,6 +6199,7 @@ mod tests {
             None,
             None,
             sink,
+            &[],
         )
         .expect("wire the document");
         (bus, wired, mem)
@@ -6098,6 +6417,7 @@ mod tests {
             None,
             None,
             Some(&(sink.clone() as Arc<dyn MsiSink>)),
+            &[],
         )
         .expect("wire the document");
 
@@ -6144,6 +6464,7 @@ mod tests {
             None,
             None,
             None,
+            &[],
         )
         .expect("wire the document with no sink");
         let used_idx2 = u16::from_le_bytes([ram2[0x6002], ram2[0x6003]]);

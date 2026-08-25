@@ -187,6 +187,23 @@ pub struct Exposure {
     pub guest: SocketAddrV4,
 }
 
+impl Exposure {
+    /// The one sentence that tells a user which port to dial.
+    ///
+    /// Lives here rather than at each call site because two entry points arm
+    /// ingress -- a cold boot builds its own NAT, a resume gets one back from
+    /// the device manager -- and a host port nobody can dial is the same
+    /// failure whichever path produced it. Two copies of this sentence would
+    /// be free to drift, and the drift would only ever be visible to whoever
+    /// was reading the *other* path's output.
+    pub fn describe(&self) -> String {
+        format!(
+            "ingress {}:{} -> guest {} (loopback only)",
+            INGRESS_BIND_ADDR, self.host_port, self.guest
+        )
+    }
+}
+
 /// Where an admitted flow should be sent, instead of straight to its origin.
 ///
 /// Carries the destination *and* the bytes to send first, because the NAT has

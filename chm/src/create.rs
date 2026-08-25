@@ -47,7 +47,7 @@ use hypervisor::hvf::virtio::block::{BlockDevice, FileBackend};
 use hypervisor::hvf::virtio::devcore::{Backend, MsiSink, MsiSpiInjector};
 use hypervisor::hvf::virtio::devmgr::{self, SerialRegs};
 use hypervisor::hvf::virtio::mmio::{self, MmioParams, VirtioMmioDevice, device_id};
-use hypervisor::hvf::virtio::nat::{EgressPolicy, INGRESS_BIND_ADDR, NatLimits, NatResponder};
+use hypervisor::hvf::virtio::nat::{EgressPolicy, NatLimits, NatResponder};
 use hypervisor::hvf::virtio::net::{NetDevice, NetKick};
 use hypervisor::hvf::virtio::{GuestMemory, NetIo, features};
 use hypervisor::hvf::{
@@ -363,7 +363,7 @@ fn default_max_seconds(stdin_is_tty: bool) -> u64 {
 /// of a sandbox becomes reachable from the host. The refusal says what the
 /// value would have had to be, because "invalid" alone leaves the caller to
 /// find out by experiment which of the four they typed.
-fn parse_expose(raw: &str) -> Result<u16, String> {
+pub(crate) fn parse_expose(raw: &str) -> Result<u16, String> {
     let port: u16 = raw.parse().map_err(|_| {
         format!(
             "--expose {raw}: expose takes one guest TCP port and nothing else, \
@@ -381,6 +381,27 @@ fn parse_expose(raw: &str) -> Result<u16, String> {
         );
     }
     Ok(port)
+}
+
+/// Accept one `--expose <PORT>` into a run's list, refusing what cannot be
+/// honoured.
+///
+/// Shared by `chm create` and the resume path (`chm run`/`resume`/`connect`)
+/// deliberately: a flag spelled the same on two entry points that disagreed
+/// about what it accepts would be worse than not having it on one of them, and
+/// the duplicate rule in particular is a judgement call rather than a parse.
+pub(crate) fn push_expose(expose: &mut Vec<u16>, raw: &str) -> Result<(), String> {
+    let port = parse_expose(raw)?;
+    // Ambiguous rather than harmless: the same port named twice would get two
+    // host ports, and nothing would say which one the caller meant to hand out.
+    if expose.contains(&port) {
+        return Err(format!(
+            "--expose {port} was given twice; each guest port is \
+             exposed once, on one host port"
+        ));
+    }
+    expose.push(port);
+    Ok(())
 }
 
 /// Every long option `parse` understands.
@@ -507,19 +528,7 @@ fn parse(raw: &[String]) -> Result<CreateArgs, String> {
             "--disk" => cfg.disks.push(PathBuf::from(value("--disk")?)),
             "--net" => cfg.net = true,
             "--egress-allow" => egress_allow.push(value("--egress-allow")?),
-            "--expose" => {
-                let port = parse_expose(&value("--expose")?)?;
-                // Ambiguous rather than harmless: the same port named twice
-                // would get two host ports, and nothing would say which one the
-                // caller meant to hand out.
-                if expose.contains(&port) {
-                    return Err(format!(
-                        "--expose {port} was given twice; each guest port is \
-                         exposed once, on one host port"
-                    ));
-                }
-                expose.push(port);
-            }
+            "--expose" => push_expose(&mut expose, &value("--expose")?)?,
             "--env" => {
                 let (k, v) = postboot::parse_assignment(&value("--env")?)?;
                 env.insert(k, v);
@@ -2044,12 +2053,7 @@ fn await_ready(ready: &Arc<(Mutex<bool>, Condvar)>) {
 fn expose_guest_ports(mut nat: NatResponder, ports: &[u16]) -> Result<NatResponder, String> {
     for &port in ports {
         let exposure = nat.expose(SocketAddrV4::new(Ipv4Addr::from(GUEST_IP), port))?;
-        eprintln!(
-            "chm: ingress {}:{} -> guest {} (loopback only)",
-            INGRESS_BIND_ADDR,
-            exposure.host_port,
-            exposure.guest
-        );
+        eprintln!("chm: {}", exposure.describe());
     }
     Ok(nat)
 }
