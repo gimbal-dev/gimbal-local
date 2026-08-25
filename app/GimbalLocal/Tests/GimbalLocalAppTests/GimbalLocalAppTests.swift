@@ -1257,20 +1257,13 @@ final class LocalOnlyModeTests: XCTestCase {
 /// the app's timeline only ever filled from manual suspends and the app had no
 /// way to say otherwise.
 final class SnapshotCadenceTests: XCTestCase {
-    private func defaults(_ name: String) -> UserDefaults {
-        let suite = "gimbal.tests.cadence.\(name).\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        addTeardownBlock { UserDefaults.standard.removePersistentDomain(forName: suite) }
-        return defaults
-    }
-
-    func testAFirstLaunchIsOff() {
+    func testAFirstLaunchIsOff() throws {
         // An absent key reads as 0, which is also `.off`. That is the right
         // answer while off is the default, and the doc comment on `stored`
         // records where the distinction goes if the default ever changes — a
         // presence check today could not change any answer, and this test
         // deliberately does not claim one is there.
-        let store = defaults("absent")
+        let store = try throwawayDefaults()
         XCTAssertEqual(SnapshotCadence.stored(in: store, key: "cadence"), .off)
 
         store.set(SnapshotCadence.everyMinute.seconds, forKey: "cadence")
@@ -1280,17 +1273,17 @@ final class SnapshotCadenceTests: XCTestCase {
         XCTAssertEqual(SnapshotCadence.stored(in: store, key: "cadence"), .off)
     }
 
-    func testAnUnknownStoredValueFallsBackToOff() {
+    func testAnUnknownStoredValueFallsBackToOff() throws {
         // A cadence written by a newer build must not resolve to some nearby
         // value: freezing someone's guest on a cadence they never chose is a
         // worse answer than not freezing it at all.
-        let store = defaults("unknown")
+        let store = try throwawayDefaults()
         store.set(37, forKey: "cadence")
         XCTAssertEqual(SnapshotCadence.stored(in: store, key: "cadence"), .off)
     }
 
-    func testEveryCadenceRoundTrips() {
-        let store = defaults("roundtrip")
+    func testEveryCadenceRoundTrips() throws {
+        let store = try throwawayDefaults()
         for cadence in SnapshotCadence.allCases {
             store.set(cadence.seconds, forKey: "cadence")
             XCTAssertEqual(
@@ -1438,30 +1431,24 @@ final class SnapshotCadenceWiringTests: XCTestCase {
 /// silently re-enable the control plane for everyone who deliberately turned it
 /// off.
 final class LocalOnlyDefaultTests: XCTestCase {
-    private func store(_ name: String) -> UserDefaults {
-        let d = UserDefaults(suiteName: "gimbal.tests.localonly.\(name).\(ProcessInfo.processInfo.processIdentifier)")!
-        d.removePersistentDomain(forName: d.description)
-        return d
-    }
-
-    func test_a_fresh_install_is_local_only() {
-        let d = store("fresh")
+    func test_a_fresh_install_is_local_only() throws {
+        let d = try throwawayDefaults()
         d.removeObject(forKey: "gimbal.localOnly")
         XCTAssertTrue(
             AppModel.storedLocalOnly(in: d),
             "a first launch must not reach for a control plane it cannot have")
     }
 
-    func test_an_explicit_false_is_honoured() {
-        let d = store("explicitoff")
+    func test_an_explicit_false_is_honoured() throws {
+        let d = try throwawayDefaults()
         d.set(false, forKey: "gimbal.localOnly")
         XCTAssertFalse(
             AppModel.storedLocalOnly(in: d),
             "a user who turned local-only off must stay off across launches")
     }
 
-    func test_an_explicit_true_is_honoured() {
-        let d = store("expliciton")
+    func test_an_explicit_true_is_honoured() throws {
+        let d = try throwawayDefaults()
         d.set(true, forKey: "gimbal.localOnly")
         XCTAssertTrue(AppModel.storedLocalOnly(in: d))
     }
