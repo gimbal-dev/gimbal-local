@@ -29,7 +29,11 @@
 #   scripts/hvf/browser-sandbox-acceptance.sh [IMAGE_DIR]
 #
 # IMAGE_DIR defaults to $CHM_BROWSER_IMAGE, then ~/gimbal-images/browser. Build
-# one with:  chm image build --browser -o ~/gimbal-images/browser
+# one with:
+#   chm image build --browser --kernel ~/gimbal-images/ubuntu/Image --out ~/gimbal-images/browser
+#
+# --kernel is required: a container image carries no kernel, only a root
+# filesystem. `chm image build` with no --kernel lists the ones on this machine.
 #
 # Requires a signed chm (scripts/build-chm.sh) and playwright-core on the host:
 #   npm i playwright-core     # no browser download needed, the browser is in the VM
@@ -101,7 +105,8 @@ fi
 for f in Image rootfs.img; do
   [ -f "$IMAGE_DIR/$f" ] || {
     echo "no $f in $IMAGE_DIR -- build one with:" >&2
-    echo "  $CHM image build --browser -o $IMAGE_DIR" >&2
+    echo "  $CHM image build --browser --kernel <PATH-TO-Image> --out $IMAGE_DIR" >&2
+    echo "  (run '$CHM image build' with no --kernel to list the kernels here)" >&2
     exit 2
   }
 done

@@ -2010,4 +2010,86 @@ mod tests {
             "the init is no longer built from the installer's own return value"
         );
     }
+
+    /// Every `chm image build` command we print at a reader must be one this
+    /// parser would actually accept.
+    ///
+    /// #361's segment found `chm image build --browser -o <DIR>` in the doc
+    /// that teaches the browser sandbox *and* in the acceptance script's own
+    /// remedy. `-o` is not an option (it is `--out`) and `--kernel` is
+    /// required, so both dead-ended the first command a reader runs -- the
+    /// §53a shape, where a true-looking instruction leaves you with no next
+    /// step. Checking the flags against `usage()` rather than against a
+    /// hardcoded list is what makes this survive a flag being renamed.
+    #[test]
+    fn the_advice_only_uses_flags_this_parser_accepts() {
+        let help = usage();
+        let sources = [
+            (
+                "docs/browser-sandbox.md",
+                include_str!("../../../docs/browser-sandbox.md"),
+            ),
+            (
+                "docs/container-images.md",
+                include_str!("../../../docs/container-images.md"),
+            ),
+            (
+                "scripts/hvf/browser-sandbox-acceptance.sh",
+                include_str!("../../../scripts/hvf/browser-sandbox-acceptance.sh"),
+            ),
+        ];
+
+        // Assembled from parts so the needle cannot match this test's own
+        // assertion text.
+        let verb = format!("{} build --{}", "image", "browser");
+        for (name, src) in sources {
+            let mut checked = 0usize;
+            for line in src.lines() {
+                let Some(rest) = line.split_once(&verb).map(|(_, r)| r) else {
+                    continue;
+                };
+                // A closed inline-code span naming just the command is a
+                // reference to the feature, not an instruction to run it --
+                // a file table, a heading. This guard fired on exactly such a
+                // row on its own first run, which is how the line is drawn.
+                if rest.starts_with('`') {
+                    continue;
+                }
+                let rest = rest.split('`').next().unwrap_or(rest);
+                let flags: Vec<&str> = rest
+                    .split_whitespace()
+                    .filter(|t| t.starts_with('-'))
+                    .map(|t| t.trim_end_matches(['"', ',', '.']))
+                    .collect();
+                checked += 1;
+                // Checked against usage() rather than a list written here, so
+                // renaming a flag keeps the guard honest instead of turning it
+                // into a stale blocklist.
+                for f in &flags {
+                    assert!(
+                        help.contains(f),
+                        "{name} tells a reader to run `{verb}{rest}`, but this \
+                         parser does not accept {f}"
+                    );
+                }
+                // A vocabulary check structurally cannot see a *missing*
+                // required flag, so --kernel is asserted separately: a
+                // container image carries no kernel, only a root filesystem.
+                assert!(
+                    flags.contains(&"--kernel"),
+                    "{name} tells a reader to run `{verb}{rest}`, which this \
+                     parser refuses -- --kernel is required"
+                );
+            }
+            // Counted per source, not across the set. A count over the whole
+            // set stays green while one file goes dark, because another
+            // carries more than one command -- measured, not reasoned: that
+            // mutation was silent until this moved inside the loop.
+            assert!(
+                checked > 0,
+                "{name} no longer tells anyone how to build one -- this guard \
+                 has stopped reading the advice it guards"
+            );
+        }
+    }
 }

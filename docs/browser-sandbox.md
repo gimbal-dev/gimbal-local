@@ -12,7 +12,7 @@ anything hypervisor-side.
 ## Build one
 
 ```console
-$ chm image build --browser -o ~/gimbal-images/browser
+$ chm image build --browser --kernel ~/gimbal-images/ubuntu/Image --out ~/gimbal-images/browser
 ```
 
 That produces an arm64 rootfs holding `chromium-headless-shell`, the shared
