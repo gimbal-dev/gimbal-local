@@ -45,6 +45,65 @@ impl Decision {
     }
 }
 
+/// A live change to a running sandbox's egress policy (V9.8 / #156).
+///
+/// Egress used to be resolved at start and fixed for the life of the guest, so
+/// granting the one host an agent turned out to need meant restarting the
+/// sandbox that discovered it -- destroying the work that produced the finding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Amendment {
+    /// Permit `host[:port]`.
+    Allow(String),
+    /// Refuse `host[:port]`.
+    Deny(String),
+}
+
+impl Amendment {
+    /// The `host[:port]` this amendment names.
+    pub fn entry(&self) -> &str {
+        match self {
+            Amendment::Allow(e) | Amendment::Deny(e) => e,
+        }
+    }
+
+    /// Whether this amendment permits (rather than refuses).
+    pub fn is_allow(&self) -> bool {
+        matches!(self, Amendment::Allow(_))
+    }
+}
+
+/// What an [`Amendment`] actually did, so the caller can report it rather than
+/// assume it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AmendOutcome {
+    /// The effective policy label *after* the change. Every egress decision
+    /// recorded from here on carries this, not the label the sandbox started
+    /// with.
+    pub label: String,
+    /// The rule as it was parsed, which is not always the text that was typed.
+    pub rule: String,
+    /// Whether this was an allow (true) or a deny (false).
+    pub allowed: bool,
+    /// Rules on the opposing list that named the same host and port, and were
+    /// removed so this amendment could take effect. See [`EgressPolicy::amend`]
+    /// for why they are removed rather than left in place.
+    pub superseded: Vec<String>,
+    /// How many guest TCP flows were already established when this amendment
+    /// landed, and therefore continue under the *old* decision.
+    ///
+    /// Amendments govern admission -- the DNS query and the TCP SYN -- so a
+    /// flow that is already up was admitted by the policy in force at the time
+    /// and is not torn down. That is the deliberate choice (#156): severing
+    /// established connections would destroy the session's work, which is the
+    /// exact cost this feature exists to avoid.
+    ///
+    /// It is reported rather than merely documented because "your deny did not
+    /// take effect on the connection you are watching" is precisely the thing an
+    /// operator must not have to infer. Set by the NAT, which owns the flow
+    /// table; [`EgressPolicy::amend`] leaves it zero.
+    pub established_retained: usize,
+}
+
 /// How a rule matches a hostname or IP literal.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum HostMatch {
@@ -172,8 +231,26 @@ pub struct EgressPolicy {
     allow: Vec<Rule>,
     deny: Vec<Rule>,
     resolve_cache: ResolveCache,
-    /// A human label for the governing policy (e.g. the digest), for tracing.
+    /// A human label for the *effective* policy (e.g. the digest), for tracing.
+    ///
+    /// Cached rather than computed in [`EgressPolicy::label`] because that
+    /// returns a `&str` and is called on every flow decision.
     label: String,
+    /// The label this policy was built with, never mutated: it is the
+    /// provenance, and a live amendment must not be able to launder itself into
+    /// looking like a cloud-issued digest.
+    base_label: String,
+    /// How many live amendments have been applied since construction.
+    ///
+    /// This is what keeps the audit record honest once the policy can change
+    /// under a running guest. [`EgressEvent::policy`] exists to name "the exact
+    /// policy that made *this* call"; if amending the rules left the label
+    /// alone, two different rule sets would share one digest and every record
+    /// after the first amendment would misattribute itself to the policy that
+    /// did not decide it.
+    ///
+    /// [`EgressEvent::policy`]: super::EgressEvent::policy
+    amendments: u32,
     /// When false (the default), connects to reserved / host-internal address
     /// ranges (loopback, private LAN, link-local metadata, …) are denied
     /// *regardless* of the allow/deny rules — the guest must not reach the host's
@@ -205,6 +282,8 @@ impl EgressPolicy {
             deny: Vec::new(),
             resolve_cache: ResolveCache::default(),
             label: "allow-all".to_string(),
+            base_label: "allow-all".to_string(),
+            amendments: 0,
             allow_local_egress: false,
         }
     }
@@ -217,6 +296,7 @@ impl EgressPolicy {
         deny: &[String],
         label: impl Into<String>,
     ) -> Self {
+        let label = label.into();
         Self {
             default_allow: !default.eq_ignore_ascii_case("deny"),
             allow: allow.iter().map(|r| Rule::parse(r)).collect(),
@@ -225,7 +305,9 @@ impl EgressPolicy {
                 entries: HashMap::new(),
                 ttl: Some(Duration::from_secs(600)),
             },
-            label: label.into(),
+            base_label: label.clone(),
+            label,
+            amendments: 0,
             allow_local_egress: false,
         }
     }
@@ -263,6 +345,78 @@ impl EgressPolicy {
     /// Whether reserved / host-internal egress has been explicitly opted in.
     pub fn allow_local_egress(&self) -> bool {
         self.allow_local_egress
+    }
+
+    /// Apply a live [`Amendment`] to a policy that is already governing a
+    /// running guest, and report what it did.
+    ///
+    /// **The label changes on every amendment.** [`super::EgressEvent::policy`]
+    /// exists to name the exact policy that decided a flow, so that a
+    /// cloud-issued digest can be shown to be the one enforcing on the Mac. A
+    /// mutable policy that kept one label would break precisely that: records
+    /// from before and after a change would claim the same digest while being
+    /// governed by different rules. The effective label therefore becomes
+    /// `<base>+live<N>`, which is deliberately *not* mistakable for a digest the
+    /// control plane issued -- the provenance stays visible, and the suffix says
+    /// how many local changes have been laid on top of it.
+    ///
+    /// **A contradicted amendment supersedes rather than silently failing.**
+    /// Deny rules are matched before allow rules, so appending `allow x` while a
+    /// `deny x` is present would report success and change nothing -- the worst
+    /// possible outcome for an operator trying to unblock a stuck agent. Any
+    /// rule on the opposing list naming the same host *and* the same port is
+    /// removed and returned in [`AmendOutcome::superseded`], so the change takes
+    /// effect and the caller can say what it displaced.
+    ///
+    /// Note this does not touch the reserved-address guard (M31.1): amending a
+    /// policy cannot reach the host's own networks, which stays governed by
+    /// `--allow-local-egress` alone.
+    pub fn amend(&mut self, amendment: &Amendment) -> AmendOutcome {
+        let rule = Rule::parse(amendment.entry());
+        let allowed = amendment.is_allow();
+
+        let (winners, losers) = if allowed {
+            (&mut self.allow, &mut self.deny)
+        } else {
+            (&mut self.deny, &mut self.allow)
+        };
+
+        let mut superseded = Vec::new();
+        losers.retain(|r| {
+            if r.host == rule.host && r.port == rule.port {
+                superseded.push(r.describe());
+                false
+            } else {
+                true
+            }
+        });
+        let raw = rule.raw.clone();
+        winners.push(rule);
+
+        self.amendments += 1;
+        self.label = format!("{}+live{}", self.base_label, self.amendments);
+
+        AmendOutcome {
+            label: self.label.clone(),
+            rule: raw,
+            allowed,
+            superseded,
+            established_retained: 0,
+        }
+    }
+
+    /// How many live amendments have been applied since this policy was built.
+    ///
+    /// Surfaced so `posture` can report that the policy in force is no longer
+    /// the policy the sandbox started with -- a report that showed only the
+    /// current rules would be true and still misleading.
+    pub fn amendments(&self) -> u32 {
+        self.amendments
+    }
+
+    /// The label this policy was constructed with, before any live amendment.
+    pub fn base_label(&self) -> &str {
+        &self.base_label
     }
 
     /// Whether this policy actually restricts anything (a default-allow policy
@@ -306,6 +460,19 @@ impl EgressPolicy {
         };
         if self.allow_local_egress {
             s.push_str("; the host, this LAN and cloud metadata are reachable too");
+        }
+        // A summary of the *current* rules is true and still misleading if the
+        // reader assumes it describes the sandbox they configured. Say that it
+        // has moved, so "what is in force now" and "what did I start" are
+        // visibly different questions (#156).
+        if self.amendments > 0 {
+            s.push_str(&format!(
+                "; changed live since start ({} amendment{}, policy {} was {})",
+                self.amendments,
+                if self.amendments == 1 { "" } else { "s" },
+                self.label,
+                self.base_label,
+            ));
         }
         s
     }
@@ -676,5 +843,93 @@ mod posture_tests {
         let s = allowing(&many).posture_summary();
         assert!(s.contains("and 2 more"), "{s}");
         assert!(!s.contains("e:5"), "{s}");
+    }
+
+    /// Appending an allow while an opposing deny stands must not report success
+    /// and change nothing.
+    ///
+    /// `decide_dns`/`decide_connect` consult `deny` **before** `allow`, so a
+    /// naive append leaves the flow refused by the rule it was meant to lift --
+    /// the worst available outcome for an operator unblocking a stuck agent,
+    /// because the console says the change landed.
+    #[test]
+    fn an_allow_supersedes_the_deny_that_would_have_beaten_it() {
+        let mut p = EgressPolicy::from_profile("allow", &[], &["foo.com".into()], "base");
+        assert!(!p.decide_dns("foo.com").is_allow());
+
+        let out = p.amend(&Amendment::Allow("foo.com".to_string()));
+
+        assert!(
+            p.decide_dns("foo.com").is_allow(),
+            "the amendment reported success and the deny still wins"
+        );
+        assert!(
+            !out.superseded.is_empty(),
+            "the displaced deny was not reported: {out:?}"
+        );
+    }
+
+    /// Superseding is scoped to the same host *and* port.
+    ///
+    /// `deny foo.com:22` and `allow foo.com:443` are two different statements;
+    /// lifting one because the other was written would widen the sandbox past
+    /// what was asked for.
+    #[test]
+    fn superseding_does_not_reach_a_different_port() {
+        let mut p = EgressPolicy::from_profile("allow", &[], &["foo.com:22".into()], "base");
+
+        let out = p.amend(&Amendment::Allow("foo.com:443".to_string()));
+
+        assert!(
+            out.superseded.is_empty(),
+            "a rule on another port was displaced: {out:?}"
+        );
+        assert!(
+            !p.decide_dns("foo.com").is_allow(),
+            "lifting :443 also lifted the deny on :22"
+        );
+    }
+
+    /// The audit label must move with the policy.
+    ///
+    /// `EgressEvent.policy` is documented as naming the exact policy that made
+    /// *this* call, and that is what proves a cloud-issued digest is the one
+    /// enforcing the flow. `label` is a string handed in, not derived from the
+    /// rules, so an amendment that left it alone would stamp every later record
+    /// with the pre-amendment digest -- a durable record that is confidently
+    /// wrong about the thing it exists to prove.
+    #[test]
+    fn an_amendment_moves_the_label_off_the_digest_it_started_from() {
+        let mut p = EgressPolicy::from_profile("allow", &[], &[], "sha256:cafe");
+        let first = p.amend(&Amendment::Deny("a.com".to_string()));
+        let second = p.amend(&Amendment::Deny("b.com".to_string()));
+
+        assert_ne!(first.label, "sha256:cafe", "the label did not move");
+        assert_ne!(second.label, first.label, "two amendments share one label");
+        assert_eq!(p.base_label(), "sha256:cafe", "the base label was overwritten");
+        assert_eq!(p.amendments(), 2);
+        assert!(
+            !second.label.starts_with("sha256:cafe") || second.label.contains("+live"),
+            "the amended label is mistakable for a cloud-issued digest: {}",
+            second.label
+        );
+    }
+
+    /// A reader must be able to tell that what is in force is not what was
+    /// configured.
+    #[test]
+    fn the_summary_says_the_policy_moved_after_it_moved() {
+        let mut p = EgressPolicy::from_profile("allow", &[], &[], "base");
+        let before = p.posture_summary();
+        assert!(!before.contains("changed live"), "unamended: {before}");
+
+        p.amend(&Amendment::Deny("a.com".to_string()));
+        let after = p.posture_summary();
+
+        assert!(
+            after.contains("changed live"),
+            "the summary still describes the starting policy: {after}"
+        );
+        assert!(after.contains("base"), "the starting policy is not named: {after}");
     }
 }

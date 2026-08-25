@@ -534,6 +534,19 @@ impl VirtioMmioDevice {
         }
     }
 
+    /// Apply a live egress-policy change to this device's NAT, if it is a NIC
+    /// enforcing a policy (see [`super::nat::NatResponder::amend_policy`]).
+    pub fn amend_net_egress(
+        &self,
+        amendment: &super::nat::Amendment,
+    ) -> Option<super::nat::AmendOutcome> {
+        let mut core = self.core.lock().unwrap();
+        match &mut core.backend {
+            Backend::Net(n) => n.amend_egress(amendment),
+            _ => None,
+        }
+    }
+
     /// Apply the negotiated feature set to the backend, once the driver has
     /// written `FEATURES_OK`.
     fn commit_features(&self, acked: u64) {

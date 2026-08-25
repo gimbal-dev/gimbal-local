@@ -1809,6 +1809,10 @@ fn usage() -> String {
          sent as-is, so end it with \\n (or run the\n                                \
          command bare) to press Enter. A resumed\n                                \
          guest is idle until it is typed at.\n    \
+         chm ctl egress allow|deny <HOST[:PORT]>\n      \
+         Change the running guest's egress policy without\n      \
+         restarting it. Established connections continue\n      \
+         under the decision that admitted them.\n    \
          chm ctl stop                Stop the running guest.\n    \
          chm ctl shutdown            Stop the guest and exit the daemon.\n    \
          chm exec [--timeout N] [--json] -- <CMD> [ARG...]\n      \
@@ -3084,6 +3088,10 @@ pub(crate) struct UsgicSession<'a> {
     /// Delivers host bytes to the guest's serial console. The CLI drives this
     /// from stdin; the daemon exposes it as the `input` command.
     pub input: &'a console::ConsoleInput,
+    /// The guest's NICs, so a supervisor can change the egress policy of a
+    /// sandbox that is already running rather than making the operator restart
+    /// the session that discovered it needed changing (#156).
+    pub nics: &'a [Arc<dyn NetIo>],
 }
 
 /// Resume a snapshot onto the **userspace GICv3** (no managed GIC) with an
@@ -3533,6 +3541,10 @@ pub(crate) fn run_usgic_engine(
     // VMs in one process, so an accept loop left running past its VM would leak a
     // thread and hold its port for the life of the daemon.
     let mut running_proxy: Option<credproxy::server::RunningProxy> = None;
+    // The guest's NICs, published to the supervisor so a control client can
+    // amend egress on a live sandbox. Empty when no device model was wired,
+    // which is honest: there is nothing to amend.
+    let mut session_nics: Vec<Arc<dyn NetIo>> = Vec::new();
     // Host-side writers to guest memory that a live checkpoint must hold still.
     // Created before the device model is wired because the net service registers
     // itself as it starts.
@@ -3578,6 +3590,11 @@ pub(crate) fn run_usgic_engine(
                 }
             }
             running_proxy = wired.proxy;
+            // Keep a handle to the NICs before the service thread takes the Vec.
+            // Cloning is an Arc bump, and without it the control socket has no
+            // route to the running NAT -- the same reason ingress must be armed
+            // before the responder is handed to the device (#156).
+            session_nics = wired.net_devices.clone();
             let exits: Arc<Mutex<Vec<ExitSignal>>> = Arc::new(Mutex::new(all_exits.clone()));
             spawn_net_service(
                 wired.net_devices,
@@ -3698,6 +3715,7 @@ pub(crate) fn run_usgic_engine(
         exits: &all_exits,
         parked: &all_parked,
         input: &console_input,
+        nics: &session_nics,
     });
 
     // Stop: clear the flag, force every vCPU out of any in-flight run(), join.
@@ -6966,6 +6984,12 @@ mod net_service_pass_tests {
             std::mem::take(&mut self.buffered.lock().unwrap())
         }
         fn set_net_intercept(&self, _decider: Option<Arc<dyn InterceptDecider>>) {}
+        fn amend_net_egress(
+            &self,
+            _amendment: &hypervisor::hvf::virtio::nat::Amendment,
+        ) -> Option<hypervisor::hvf::virtio::nat::AmendOutcome> {
+            None
+        }
     }
 
     fn event(target: &str, allowed: bool) -> EgressEvent {

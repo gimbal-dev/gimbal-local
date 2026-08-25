@@ -193,6 +193,19 @@ impl VirtioPciDevice {
             n.set_intercept(decider);
         }
     }
+
+    /// Apply a live egress-policy change to this device's NAT, if it is a NIC
+    /// enforcing a policy (see [`super::nat::NatResponder::amend_policy`]).
+    pub fn amend_net_egress(
+        &self,
+        amendment: &super::nat::Amendment,
+    ) -> Option<super::nat::AmendOutcome> {
+        let mut inner = self.inner.lock().unwrap();
+        match &mut inner.backend {
+            Backend::Net(n) => n.amend_egress(amendment),
+            _ => None,
+        }
+    }
 }
 
 /// The virtio-pci *common configuration* window, laid out as

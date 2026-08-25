@@ -24,6 +24,8 @@ use crate::audit;
 use crate::capability;
 use crate::checkpoint;
 use crate::console::ConsoleInput;
+use hypervisor::hvf::virtio::NetIo;
+use hypervisor::hvf::virtio::nat::{AmendOutcome, Amendment};
 use crate::disktail;
 use crate::credproxy::cli;
 use crate::console_filter::ConsoleFilter;
@@ -82,6 +84,16 @@ const CONSOLE_CAP: usize = 256 * 1024;
 // of the same scaffolding constant is how it stayed wrong in both places.
 use crate::imp::DEFAULT_IDLE_EXIT_SECS;
 
+/// Applies one live egress amendment to every NIC a guest has, returning what
+/// each device did, paired with the name it reported it under.
+///
+/// Named rather than written inline because it appears at both the field and
+/// the publication site, and the two must not drift: a mismatch there is a
+/// compile error only by luck, since both are `Arc<dyn Fn…>` and coercion is
+/// what connects them.
+pub(crate) type EgressAmender =
+    Arc<dyn Fn(&Amendment) -> Vec<(String, AmendOutcome)> + Send + Sync>;
+
 /// Where the running guest's state lives, shared between the worker thread that
 /// drives the vCPU and the connection handlers that read console / status.
 ///
@@ -105,6 +117,24 @@ pub(crate) struct VmInner {
     /// alongside `kick`; without it the daemon's console is read-only and a
     /// client could watch a guest but never type into it.
     pub(crate) input: Option<ConsoleInput>,
+    /// Applies a live egress amendment to every NIC this guest has, reporting
+    /// per-NIC what each one did. Published by the worker alongside `input`.
+    ///
+    /// `None` means this guest exposes no amendable NIC -- either no device
+    /// model was wired, or the path that started it does not publish one. That
+    /// is reported as such rather than as a silent success, because "your
+    /// change did nothing" is the one answer an operator must never have to
+    /// infer (#156).
+    pub(crate) egress: Option<EgressAmender>,
+    /// Per NIC, the effective policy label the *device* reported after the last
+    /// amendment, so `posture` can say the policy in force is no longer the one
+    /// the workspace configures.
+    ///
+    /// Recorded rather than recomputed: the label is the NIC's own answer,
+    /// carried verbatim. Deriving a second label here from the amendments this
+    /// process happens to have sent would be a second rendering of the policy,
+    /// and #202/#203 are two records of what that costs.
+    pub(crate) egress_live: Vec<(String, String)>,
 }
 
 impl VmInner {
@@ -117,6 +147,8 @@ impl VmInner {
             stop_requested: false,
             kick: None,
             input: None,
+            egress: None,
+            egress_live: Vec::new(),
         }
     }
 }
@@ -630,11 +662,26 @@ impl ColdControl {
 
     /// Publish the channels a control client needs: `input` types into the
     /// guest's console, `kick` forces its vCPUs out of `run()` so a `stop`
-    /// lands on a guest that is not trapping.
-    pub(crate) fn publish(&self, input: ConsoleInput, kick: Arc<dyn Fn() + Send + Sync>) {
+    /// lands on a guest that is not trapping, and `egress` amends the live
+    /// policy on every NIC it has.
+    ///
+    /// `egress` is a required argument rather than a later setter, and `None`
+    /// has to be passed deliberately. A cold guest reaches the same verb
+    /// surface as a daemon-run one, so a path that quietly forgot to publish
+    /// this would refuse `chm ctl egress` with "this VM exposes no amendable
+    /// network device" on a guest that plainly has one -- true about the
+    /// plumbing and useless to the operator reading it. Making the omission a
+    /// compile error is the only version of that guard which cannot be skipped.
+    pub(crate) fn publish(
+        &self,
+        input: ConsoleInput,
+        kick: Arc<dyn Fn() + Send + Sync>,
+        egress: Option<EgressAmender>,
+    ) {
         let mut g = self.inner.lock().unwrap();
         g.input = Some(input);
         g.kick = Some(kick);
+        g.egress = egress;
     }
 
     /// Push guest serial output into the ring.
@@ -866,6 +913,13 @@ fn handle_conn(stream: UnixStream, daemon: &Daemon) {
             };
             let _ = writer.write_all(resp.as_bytes());
         }
+        "egress" => {
+            let resp = match amend_egress(daemon, arg) {
+                Ok(msg) => format!("ok\t{msg}\n"),
+                Err(e) => format!("error\t{e}\n"),
+            };
+            let _ = writer.write_all(resp.as_bytes());
+        }
         "stop" => {
             let resp = match stop_vm(daemon) {
                 Ok(msg) => format!("ok\t{msg}\n"),
@@ -1042,10 +1096,57 @@ fn posture_json(daemon: &Daemon, arg: &str) -> String {
     // one decoder handles both this and `chm posture --json`.
     let spliced = body.replacen(
         '{',
-        &format!("{{\n  \"source\": \"daemon\",\n  \"assessed\": \"{assessed}\","),
+        &format!(
+            "{{\n  \"source\": \"daemon\",\n  \"assessed\": \"{assessed}\",{}",
+            live_egress_json(daemon)
+        ),
         1,
     );
     format!("{spliced}\n")
+}
+
+/// The policy the running guest's NICs are enforcing *now*, when it is no
+/// longer the one the workspace configures (#156).
+///
+/// The rest of the report reads the configured sources -- `CHM_EGRESS_POLICY`,
+/// `egress-policy.json` -- and after a live amendment those are still a true
+/// description of what the sandbox *started* from and no longer a description
+/// of what it enforces. Reporting only them would be the #202/#203 shape: a
+/// statement that is accurate about its own source and wrong about the world.
+///
+/// Empty when nothing has been amended, so an unamended sandbox's report is
+/// byte-identical to what it was before this feature existed.
+fn live_egress_json(daemon: &Daemon) -> String {
+    let guard = daemon.current.lock().unwrap();
+    let Some(vm) = guard.as_ref() else {
+        return String::new();
+    };
+    let live = vm.inner.lock().unwrap().egress_live.clone();
+    render_live_egress(&live)
+}
+
+/// Render the live-policy key, separately from reading it off a running guest.
+///
+/// Split for the same reason as [`parse_amendment`]: the read needs a live
+/// [`Daemon`], and the property that matters -- that an *unamended* report is
+/// byte-identical to the one this build produced before #156 -- is a property
+/// of the rendering, not of the lock.
+fn render_live_egress(live: &[(String, String)]) -> String {
+    if live.is_empty() {
+        return String::new();
+    }
+    let nics = live
+        .iter()
+        .map(|(nic, label)| {
+            format!(
+                "{{ \"device\": {}, \"policy\": {} }}",
+                posture::json_str(nic),
+                posture::json_str(label)
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("\n  \"egress_live\": [{nics}],")
 }
 
 /// How long the guest gets to answer the user-namespace probe.
@@ -1575,6 +1676,105 @@ fn send_input(daemon: &Daemon, arg: &str) -> Result<usize, String> {
     Ok(bytes.len())
 }
 
+/// Change the running guest's egress policy without restarting it (#156).
+///
+/// `arg` is `allow <host[:port]>` or `deny <host[:port]>`. The reply names the
+/// rule as it was *parsed*, the effective policy label afterwards, anything the
+/// change displaced, and how many established flows carry on under the old
+/// decision -- because an amendment governs admission, not connections that are
+/// already up, and an operator watching a connection survive their `deny` must
+/// not be left to work that out for themselves.
+fn amend_egress(daemon: &Daemon, arg: &str) -> Result<String, String> {
+    let amendment = parse_amendment(arg)?;
+
+    let guard = daemon.current.lock().unwrap();
+    let vm = guard.as_ref().ok_or("no VM running")?;
+    let amend = {
+        let inner = vm.inner.lock().unwrap();
+        if let RunStatus::Stopped(ref why) = inner.status {
+            return Err(format!("`{}` is stopped ({why})", vm.name));
+        }
+        inner.egress.clone()
+    };
+    // Reported as a refusal, never as a quiet success: a guest with no NIC to
+    // amend has not had its policy changed, and saying "ok" would be the exact
+    // false sell this feature exists to remove.
+    let amend = amend.ok_or(
+        "this VM exposes no amendable network device, so its egress policy \
+         cannot be changed while it runs",
+    )?;
+    let outcomes = amend(&amendment);
+    if !outcomes.is_empty() {
+        let mut inner = vm.inner.lock().unwrap();
+        inner.egress_live = outcomes
+            .iter()
+            .map(|(nic, o)| (nic.clone(), o.label.clone()))
+            .collect();
+    }
+    if outcomes.is_empty() {
+        return Err(
+            "this VM has a network device but it enforces no egress policy, so \
+             there is nothing to amend"
+                .to_string(),
+        );
+    }
+    Ok(describe_amendments(&outcomes))
+}
+
+/// One line per NIC saying what the amendment did there.
+///
+/// Per NIC rather than once overall because the NICs are amended independently
+/// and could in principle disagree; collapsing them to a single sentence would
+/// invent an agreement nobody measured.
+fn describe_amendments(outcomes: &[(String, AmendOutcome)]) -> String {
+    let mut lines = Vec::new();
+    for (nic, o) in outcomes {
+        let verb = if o.allowed { "allow" } else { "deny" };
+        let mut line = format!("{nic}: {verb} {} -- policy now {}", o.rule, o.label);
+        if !o.superseded.is_empty() {
+            line.push_str(&format!("; superseded {}", o.superseded.join(", ")));
+        }
+        line.push_str(&format!(
+            "; {} established flow(s) continue under the previous decision",
+            o.established_retained
+        ));
+        lines.push(line);
+    }
+    lines.join("\n\t")
+}
+
+/// Read `allow|deny <host[:port]>` out of a request line.
+///
+/// A pure function rather than four lines inside [`amend_egress`], because that
+/// one needs a live [`Daemon`] and a running guest -- so every refusal a user
+/// can reach by mistyping would otherwise be testable only through a VM, which
+/// means in practice not at all.
+fn parse_amendment(arg: &str) -> Result<Amendment, String> {
+    let mut parts = arg.split_whitespace();
+    let verb = parts.next().unwrap_or("");
+    let entry = parts.next().unwrap_or("");
+    if let Some(extra) = parts.next() {
+        return Err(format!("unexpected argument `{extra}`; {EGRESS_USAGE}"));
+    }
+    if entry.is_empty() {
+        return Err(format!("a host is required; {EGRESS_USAGE}"));
+    }
+    match verb {
+        "allow" => Ok(Amendment::Allow(entry.to_string())),
+        "deny" => Ok(Amendment::Deny(entry.to_string())),
+        other => Err(format!("unknown action `{other}`; {EGRESS_USAGE}")),
+    }
+}
+
+/// The shape `chm ctl egress` accepts, quoted verbatim in every refusal so a
+/// user who typed it wrong is told the form rather than the category.
+///
+/// `pub(crate)` for the guard in `hygiene.rs` that holds `docs/networking.md`
+/// to this exact string. A doc teaching a form the parser rejects sends a
+/// reader to the one place that cannot help them, and a constant retyped in
+/// the test would pass happily through exactly that bug.
+pub(crate) const EGRESS_USAGE: &str = "usage: chm ctl egress allow|deny <host[:port]>";
+
 /// Serialises exec requests: two commands typed into one console interleave
 /// their characters and both come back wrong. A second caller is refused rather
 /// than queued, so a stuck exec cannot silently stall a fleet of them.
@@ -1865,6 +2065,19 @@ fn supervise_daemon(
             }
         }));
         g.input = Some(s.input.clone());
+        // Reach the live NAT the same way `set_net_intercept` already does:
+        // every NIC is behind its own mutex, so an amendment from the control
+        // thread is synchronous and costs the packet path nothing. See the
+        // trait note on `NetIo::amend_net_egress` for why one caller must reach
+        // every NIC -- two renderings of one security posture drift.
+        let nics: Vec<Arc<dyn NetIo>> = s.nics.to_vec();
+        g.egress = (!nics.is_empty()).then(|| {
+            Arc::new(move |a: &Amendment| {
+                nics.iter()
+                    .filter_map(|n| n.amend_net_egress(a).map(|o| (n.name().to_string(), o)))
+                    .collect::<Vec<_>>()
+            }) as EgressAmender
+        });
     }
 
     let start = Instant::now();
@@ -2819,6 +3032,7 @@ mod cold_control_tests {
             "status-json",
             "exec-json",
             "input",
+            "egress",
             "console",
             "stop",
             "proxy-json",
@@ -3164,5 +3378,148 @@ mod guest_userns_probe_tests {
         assert_eq!(posture_request(""), (false, ""));
         // A near-miss must not be read as consent to write to the console.
         assert!(!posture_request("--probe-guests").0);
+    }
+
+    /// Every way of mistyping the verb must name the form, not the category.
+    ///
+    /// This is the whole reachable surface of `chm ctl egress` for a user who
+    /// gets it wrong, and #156 exists because the alternative to amending a
+    /// policy is destroying the session -- so a refusal that leaves someone
+    /// guessing costs the session anyway.
+    #[test]
+    fn every_way_of_mistyping_an_amendment_is_told_the_form() {
+        for bad in ["", "allow", "deny", "permit foo.com", "allow foo.com extra"] {
+            let err = parse_amendment(bad).expect_err("accepted `{bad}`");
+            assert!(
+                err.contains(EGRESS_USAGE),
+                "refusing `{bad}` did not quote the usage: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_well_formed_amendment_carries_the_verb_and_the_entry() {
+        assert!(matches!(
+            parse_amendment("allow api.github.com:443"),
+            Ok(Amendment::Allow(ref e)) if e == "api.github.com:443"
+        ));
+        assert!(matches!(
+            parse_amendment("deny  evil.test"),
+            Ok(Amendment::Deny(ref e)) if e == "evil.test"
+        ));
+    }
+
+    /// Retaining established flows is the deliberate choice #156 made -- cutting
+    /// them destroys the work the session exists to protect -- so it has to be
+    /// *reported*, or a user reasonably reads "deny" as "that connection is
+    /// gone now".
+    #[test]
+    fn a_denial_says_that_established_flows_were_kept() {
+        let out = AmendOutcome {
+            label: "base+live1".into(),
+            rule: "evil.test".into(),
+            allowed: false,
+            superseded: Vec::new(),
+            established_retained: 3,
+        };
+        let line = describe_amendments(&[("net0".to_string(), out)]);
+        assert!(line.contains("net0"), "{line}");
+        assert!(line.contains("deny evil.test"), "{line}");
+        assert!(line.contains("base+live1"), "{line}");
+        assert!(
+            line.contains("3 established flow(s) continue"),
+            "the retained flows were not reported: {line}"
+        );
+    }
+
+    /// A superseded rule must be named, because the alternative is silence
+    /// about a rule the operator wrote and we then removed.
+    #[test]
+    fn a_superseded_rule_is_named_in_the_reply() {
+        let out = AmendOutcome {
+            label: "base+live1".into(),
+            rule: "foo.com".into(),
+            allowed: true,
+            superseded: vec!["deny foo.com".into()],
+            established_retained: 0,
+        };
+        let line = describe_amendments(&[("net0".to_string(), out)]);
+        assert!(
+            line.contains("superseded") && line.contains("deny foo.com"),
+            "the displaced rule was not named: {line}"
+        );
+    }
+
+    /// A posture report for a guest nobody has amended must be byte-identical
+    /// to the one this build produced before #156.
+    ///
+    /// `posture_json` promises in its own doc comment that one decoder handles
+    /// both it and `chm posture --json`; a key that appears unconditionally
+    /// would make every existing reader parse a shape it has never seen, to say
+    /// nothing new.
+    #[test]
+    fn an_unamended_guest_adds_nothing_to_the_posture_report() {
+        assert_eq!(render_live_egress(&[]), "");
+    }
+
+    /// The live label has to reach the report, or `posture` keeps describing
+    /// the policy the sandbox *started* from -- true about its own source and
+    /// wrong about the world, which is the #202/#203 failure shape.
+    #[test]
+    fn an_amended_guest_reports_the_label_that_is_actually_enforcing() {
+        let out = render_live_egress(&[("net0".into(), "sha256:cafe+live2".into())]);
+        assert!(out.contains("\"egress_live\""), "{out}");
+        assert!(out.contains("net0") && out.contains("sha256:cafe+live2"), "{out}");
+        let body = format!("{{{out}\n  \"controls\": []\n}}");
+        serde_json::from_str::<serde_json::Value>(&body)
+            .unwrap_or_else(|e| panic!("the spliced report is not parseable: {e}\n{body}"));
+    }
+
+    /// `amend_egress` must go through `parse_amendment`, not re-parse inline.
+    ///
+    /// Every guard above asserts an *outcome*, and an outcome assertion is
+    /// structurally blind to a path that is no longer taken -- this repo has
+    /// been bitten by that call-site class seven times. The refusals are only
+    /// reachable by a user if the verb handler actually consults them.
+    #[test]
+    fn the_egress_verb_refuses_through_the_parser_it_is_tested_against() {
+        let src = include_str!("serve.rs");
+        // Assembled, or this assertion is its own needle (§43).
+        let call = format!("let amendment = {}(arg)?;", "parse_amendment");
+        assert!(
+            src.contains(&call),
+            "amend_egress must call parse_amendment: an inline re-parse would \
+             leave every refusal test asserting about a path nobody reaches"
+        );
+    }
+
+    /// The same class again, for the other pure function.
+    ///
+    /// Every test above calls [`render_live_egress`] directly, so a
+    /// `posture_json` that stops splicing its result leaves all of them green
+    /// -- measured: dropping the call passes the whole suite. And the failure
+    /// it hides is the exact one #156 exists to remove: a report that describes
+    /// the policy the sandbox *started* from while the guest enforces another.
+    #[test]
+    fn the_posture_report_actually_splices_the_live_policy() {
+        let src = include_str!("serve.rs");
+        // Assembled, or this assertion is its own needle (§43).
+        let call = format!("            {}(daemon)\n", "live_egress_json");
+        assert!(
+            src.contains(&call),
+            "posture_json must splice live_egress_json into the body it returns, \
+             or an amended guest reports the policy it no longer enforces"
+        );
+    }
+
+    /// A device name is not ours, so it cannot be pasted into JSON unescaped.
+    #[test]
+    fn a_hostile_device_name_cannot_break_out_of_the_report() {
+        let out = render_live_egress(&[("ne\"t0".into(), "lab\\el".into())]);
+        let body = format!("{{{out}\n  \"controls\": []\n}}");
+        let v: serde_json::Value = serde_json::from_str(&body)
+            .unwrap_or_else(|e| panic!("unescaped name broke the report: {e}\n{body}"));
+        assert_eq!(v["egress_live"][0]["device"], "ne\"t0");
+        assert_eq!(v["egress_live"][0]["policy"], "lab\\el");
     }
 }

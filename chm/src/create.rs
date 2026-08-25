@@ -47,7 +47,7 @@ use hypervisor::hvf::virtio::block::{BlockDevice, FileBackend};
 use hypervisor::hvf::virtio::devcore::{Backend, MsiSink, MsiSpiInjector};
 use hypervisor::hvf::virtio::devmgr::{self, SerialRegs};
 use hypervisor::hvf::virtio::mmio::{self, MmioParams, VirtioMmioDevice, device_id};
-use hypervisor::hvf::virtio::nat::{EgressPolicy, NatLimits, NatResponder};
+use hypervisor::hvf::virtio::nat::{Amendment, EgressPolicy, NatLimits, NatResponder};
 use hypervisor::hvf::virtio::net::{NetDevice, NetKick};
 use hypervisor::hvf::virtio::{GuestMemory, NetIo, features};
 use hypervisor::hvf::{
@@ -66,6 +66,7 @@ use crate::imp::{
 use crate::oci::initramfs::installs_proxy_ca;
 use crate::oci::modules;
 use crate::runs;
+use crate::serve::EgressAmender;
 use crate::spec::{Overrides, SandboxSpec, resolve, spec_file_for};
 use crate::{bundle, checkpoint, coldboot, console, credproxy, genesis, postboot, serve};
 /// The NAT gateway the guest talks to, and the MAC we hand its NIC.
@@ -1459,6 +1460,16 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         coldboot::PL011_IRQ,
     );
 
+    // Reach the live NAT the same way the daemon does: every NIC is behind its
+    // own mutex, so an amendment from the control thread is synchronous and
+    // costs the packet path nothing. Cloned here because the service thread
+    // below takes ownership of `net_devices`, and these are `Arc`s -- the clone
+    // is a refcount bump, not a second device.
+    let amendable: Vec<Arc<dyn NetIo>> = net_devices
+        .iter()
+        .map(|d| d.clone() as Arc<dyn NetIo>)
+        .collect();
+
     // The NAT lives on its own thread: a guest transmit only enqueues the frame
     // and wakes it, so the vCPU returns to the guest from its MMIO exit instead
     // of running a TCP stack inside it.
@@ -1525,15 +1536,19 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
         )
     };
 
-    // Publish the guest's two control channels (#401).
+    // Publish the guest's three control channels (#401, #156).
     //
     // `input` is the same injector the console pump uses, deliberately: a second
     // route into the FIFO could work when typing does not, or vice versa, and
     // the symptom would be a socket that appears to work and delivers nothing.
     // `kick` forces every vCPU out of `hv_vcpu_run` so a `stop` lands on a guest
     // that is sitting in a trap rather than waiting for it to come out on its
-    // own. Both here rather than at construction because `exits` only exists
-    // once every vCPU has reported in.
+    // own. `egress` amends the live policy without restarting the guest, which
+    // matters most here: a cold-booted sandbox is the one a Mac with no control
+    // plane actually runs, so if this path alone could not amend, the feature
+    // would be missing from the only path most users have. Both here rather
+    // than at construction because `exits` only exists once every vCPU has
+    // reported in.
     if let Some(c) = &control {
         let kicks: Vec<Arc<dyn Fn() + Send + Sync>> = exits.iter().flatten().cloned().collect();
         c.publish(
@@ -1542,6 +1557,14 @@ fn run(args: &CreateArgs) -> Result<ExitCode, String> {
                 for kick in &kicks {
                     kick();
                 }
+            }),
+            (!amendable.is_empty()).then(|| {
+                Arc::new(move |a: &Amendment| {
+                    amendable
+                        .iter()
+                        .filter_map(|n| n.amend_net_egress(a).map(|o| (n.name().to_string(), o)))
+                        .collect::<Vec<_>>()
+                }) as EgressAmender
             }),
         );
     }
@@ -3453,6 +3476,46 @@ mod tests {
              built from. Deriving them from `coldboot`'s constants instead \
              would let the recorded windows drift from the ones the guest's \
              drivers are actually bound to."
+        );
+    }
+
+    /// A cold guest must publish a *real* egress amender, not `None`.
+    ///
+    /// `ColdControl::publish` takes the amender as a required argument, so
+    /// forgetting it is a compile error. `None` is not: it compiles, every
+    /// test stays green, and the only symptom is `chm ctl egress` refusing a
+    /// guest that plainly has a NIC with "this VM exposes no amendable network
+    /// device". That refusal is *true about the plumbing* and useless to the
+    /// operator reading it, which is the worst kind of correct message.
+    ///
+    /// This is the call-site class, which has cost this repository eight
+    /// separate defects: an assertion about an *outcome* cannot see a path
+    /// that is no longer taken. So this reads the source instead -- and the
+    /// needle is assembled from parts, because a literal spelt out here would
+    /// match its own assertion text and pass while the code was gone (#222).
+    #[test]
+    fn a_cold_guest_publishes_an_amender_for_the_nics_it_has() {
+        let src = include_str!("create.rs");
+
+        let published = format!("(!{}.is_empty()).then(|| {{", "amendable");
+        assert!(
+            src.contains(&published),
+            "cold boot must publish an amender whenever it has at least one \
+             NIC. Passing `None` here compiles and leaves every test green, \
+             but removes live egress amendment from the *only* path a Mac \
+             with no control plane actually runs (#156)."
+        );
+
+        let named = format!(
+            ".{}(a).map(|o| (n.name().to_string(), o))",
+            "amend_net_egress"
+        );
+        assert!(
+            src.contains(&named),
+            "the amendment must report the name each device answered under. \
+             Reporting a blank name would leave a multi-homed guest unable to \
+             tell which NIC took the new policy -- and `chm ctl egress` prints \
+             that name as the operator's only confirmation of what changed."
         );
     }
 

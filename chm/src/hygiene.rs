@@ -1241,4 +1241,57 @@ mod tests {
         // Two spaces is alignment, not a weld.
         assert!(!welds_a_statement("    fn f() {  let x = 1;"));
     }
+
+    /// `docs/networking.md` teaches the live-amendment surface that exists.
+    ///
+    /// Three claims on that page are load-bearing and each fails in a different
+    /// direction if it drifts from the code (#156):
+    ///
+    /// - The **command form** is quoted from `EGRESS_USAGE`, the same constant
+    ///   every refusal quotes. A doc that teaches a form the parser rejects
+    ///   sends a user to the one place that cannot help them.
+    /// - The **`+live` label** is the reason an amended policy cannot be
+    ///   mistaken for a cloud-issued digest. If `amend()` stopped moving the
+    ///   label, the page would still promise a marker that no longer appears,
+    ///   and a reader comparing an audit record against a bound digest would
+    ///   conclude they matched.
+    /// - **Established flows are retained**, which is the sentence that stops a
+    ///   user believing a `deny` severed the transfer they are watching.
+    ///
+    /// The needles are read out of the source rather than retyped, so a rename
+    /// fails here instead of leaving the page quietly wrong. `flattened` is
+    /// load-bearing for the prose ones: a wrapped line defeats a raw `contains`
+    /// (#288's guard was caught by exactly that).
+    #[test]
+    fn the_networking_guide_teaches_the_amendment_surface_that_exists() {
+        let doc = flattened(include_str!("../../docs/networking.md"));
+
+        assert!(
+            doc.contains(crate::serve::EGRESS_USAGE),
+            "docs/networking.md must quote the form `chm ctl egress` actually \
+             accepts ({}), or it teaches a command the parser refuses",
+            crate::serve::EGRESS_USAGE
+        );
+
+        for (needle, why) in [
+            (
+                "labelled `<base>+liven`",
+                "the page promises an amended policy is labelled `<base>+liveN`, \
+                 which is what stops it being read as a cloud-issued digest. The \
+                 needle is the whole claim, not the bare `+live`: that substring \
+                 also appears in the worked example below it, so a needle short \
+                 enough to match both could not see the claim being deleted",
+            ),
+            (
+                "established flows continue",
+                "the page must say an amendment governs admission only, or a \
+                 user reads a still-running transfer as a failed deny",
+            ),
+        ] {
+            assert!(
+                doc.to_lowercase().contains(needle),
+                "docs/networking.md no longer says `{needle}`: {why}"
+            );
+        }
+    }
 }
