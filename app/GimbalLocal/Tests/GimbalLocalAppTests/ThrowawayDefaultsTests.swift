@@ -107,4 +107,51 @@ extension ThrowawayDefaultsTests {
             "the teardown no longer calls destroy, so the file is left behind"
         )
     }
+
+    /// Every test that wants a real `UserDefaults` must get it from the helper.
+    ///
+    /// This is the guard the other four structurally could not be. All of them
+    /// assert on the helper -- that it deletes the file, that it refuses a path
+    /// it cannot vouch for, that it registers its teardown. **None of them can
+    /// see a test that never calls the helper at all**, and two had been
+    /// opening their own suites since before the helper existed:
+    ///
+    /// - `SnapshotCadenceTests` tore down with `removePersistentDomain`, which
+    ///   is the exact API this helper exists because it does less than its name
+    ///   suggests: the values go, the plist stays.
+    /// - `LocalOnlyDefaultTests` passed a `UserDefaults` object's `description`
+    ///   as a domain name, which is not one, so it cleared nothing whatsoever.
+    ///   It also keyed the suite on the process id, which the kernel recycles,
+    ///   so a file left by an earlier run could be read back by a later one as
+    ///   though this run had written it -- a flake with an invisible cause.
+    ///
+    /// Measured after a full `swift test`: seven plists left behind in
+    /// `~/Library/Preferences`, five of them from those two classes.
+    ///
+    /// The needle is assembled from parts so this guard cannot match its own
+    /// assertion text. A source guard that satisfies itself reports safety it
+    /// does not provide.
+    func testEveryTestGetsItsSuiteFromTheHelper() throws {
+        let dir = URL(fileURLWithPath: #filePath).deletingLastPathComponent()
+        let needle = "UserDefaults(" + "suiteName:"
+        let names = try FileManager.default.contentsOfDirectory(atPath: dir.path)
+            .filter { $0.hasSuffix(".swift") && $0 != "ThrowawayDefaults.swift" }
+            .sorted()
+
+        // Prove the instrument can see anything at all before recording that it
+        // found nothing: an empty file list would pass this test by default.
+        XCTAssertFalse(names.isEmpty, "no sibling test sources were read, so this guard checked nothing")
+
+        var offenders: [String] = []
+        for name in names {
+            let source = try String(contentsOf: dir.appendingPathComponent(name), encoding: .utf8)
+            if source.contains(needle) { offenders.append(name) }
+        }
+
+        XCTAssertEqual(
+            offenders, [],
+            "these open a defaults suite directly instead of calling throwawayDefaults(), "
+                + "so each one leaves a plist in ~/Library/Preferences after every run"
+        )
+    }
 }
