@@ -15,7 +15,7 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, exit};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{env, fs, mem, ptr, thread};
@@ -84,24 +84,44 @@ use crate::imp::DEFAULT_IDLE_EXIT_SECS;
 
 /// Where the running guest's state lives, shared between the worker thread that
 /// drives the vCPU and the connection handlers that read console / status.
-struct VmInner {
-    console: Vec<u8>,
+///
+/// `pub(crate)` because `chm create` publishes its cold-booted guest through the
+/// same structure (#401). Cold boot builds its VM itself rather than through
+/// [`run_guest`], but everything downstream of the console -- `exec`, `input`,
+/// `console`, `status` -- reads only this, so sharing it is what lets the whole
+/// verb surface serve a cold guest with no second implementation.
+pub(crate) struct VmInner {
+    pub(crate) console: Vec<u8>,
     /// Number of console bytes evicted from the front of `console` (so a client
     /// cursor is an absolute byte offset into the whole stream).
-    dropped: usize,
-    status: RunStatus,
-    stop_requested: bool,
+    pub(crate) dropped: usize,
+    pub(crate) status: RunStatus,
+    pub(crate) stop_requested: bool,
     /// Cross-thread handle that forces the vCPU out of `run()` (HVF
     /// `hv_vcpus_exit`). Published by the worker once the VM is built, so a
     /// `stop` can interrupt even a guest that is spinning without trapping.
-    kick: Option<Arc<dyn Fn() + Send + Sync>>,
+    pub(crate) kick: Option<Arc<dyn Fn() + Send + Sync>>,
     /// Delivers bytes to the guest's serial console. Published by the worker
     /// alongside `kick`; without it the daemon's console is read-only and a
     /// client could watch a guest but never type into it.
-    input: Option<ConsoleInput>,
+    pub(crate) input: Option<ConsoleInput>,
 }
 
-enum RunStatus {
+impl VmInner {
+    /// An empty ring for a guest that is starting.
+    pub(crate) fn new() -> Self {
+        Self {
+            console: Vec::new(),
+            dropped: 0,
+            status: RunStatus::Running,
+            stop_requested: false,
+            kick: None,
+            input: None,
+        }
+    }
+}
+
+pub(crate) enum RunStatus {
     Running,
     Stopped(String),
 }
@@ -109,6 +129,11 @@ enum RunStatus {
 struct Vm {
     name: String,
     started: Instant,
+    /// The directory this guest's state lives in, when the daemon knows it
+    /// without consulting its library. A cold-booted guest has no library entry
+    /// to look up, so without this `posture`/`proxy`/`audit` would silently
+    /// assess the library root instead and report it as such.
+    dir: Option<PathBuf>,
     inner: Arc<Mutex<VmInner>>,
 }
 
@@ -119,7 +144,24 @@ struct Entry {
     total_ram: u64,
 }
 
+/// What kind of endpoint a [`Daemon`] is, so the verbs that only make sense for
+/// one of them can be refused by name rather than answered wrongly.
+///
+/// `chm serve` manages a *library* of snapshots and starts guests out of it on
+/// request. `chm create --socket` manages exactly one guest that is already
+/// running and has no library at all. Every verb that reads the running guest
+/// is identical for both; the four that are not are the whole of the
+/// difference, and naming it here is what keeps that difference in one place.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Role {
+    /// `chm serve`: a library, and guests started from it.
+    Library,
+    /// `chm create --socket`: one guest, no library, already running.
+    ColdBoot,
+}
+
 struct Daemon {
+    role: Role,
     library: Vec<Entry>,
     /// The library root this daemon was started on, so `posture` has something
     /// to assess when no VM is running.
@@ -382,6 +424,7 @@ fn serve(raw: &[String]) -> Result<(), String> {
     }
 
     let daemon = Arc::new(Daemon {
+        role: Role::Library,
         library,
         library_dir: args.library_dir.clone(),
         idle_exit_secs: args.idle_exit_secs,
@@ -439,6 +482,214 @@ fn serve(raw: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// The console ring of a guest `chm create` is driving, optionally published on
+/// a control socket (#401).
+///
+/// Cold boot builds its own VM rather than going through [`start_vm`], so
+/// nothing here starts a guest. What it does is put that guest behind the
+/// *same* [`VmInner`] every control verb already reads, which is what lets
+/// `exec`, `input`, `console` and `status` serve a cold-booted sandbox without
+/// a second implementation of the exec framing, the truncation window or the
+/// input path. Those are the pieces that would silently diverge.
+/// Counts one accepted connection for the whole time it is being served.
+///
+/// The increment and the decrement live in one type on purpose. When the
+/// `fetch_add` sat at the accept site instead, deleting it left all 1020 tests
+/// green -- the call-site class that has caught this repo nine times, and here
+/// it would silently restore the very race `finish`'s drain exists to close.
+/// As a value it is reachable from a unit test, so the counting is guarded
+/// rather than assumed.
+///
+/// `Drop` gives the count back however the handler leaves, including a panic,
+/// so one bad connection cannot hold teardown open for the full drain.
+struct Served(Arc<AtomicUsize>);
+
+impl Served {
+    fn begin(inflight: &Arc<AtomicUsize>) -> Self {
+        inflight.fetch_add(1, Ordering::AcqRel);
+        Self(Arc::clone(inflight))
+    }
+}
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// How long [`ColdControl::finish`] will wait for an in-flight reply to land
+/// before dropping the socket anyway.
+///
+/// A ceiling, not a delay: the reply a `stop` client is waiting for is one small
+/// write issued within one 50 ms poll of the status flipping, so the usual cost
+/// is milliseconds. It is only reached by a connection that is not waiting for a
+/// reply at all -- `ctl console` streams until the socket closes -- and making
+/// that case wait two seconds is the price of not truncating everyone else.
+const FINISH_DRAIN: Duration = Duration::from_secs(2);
+
+pub(crate) struct ColdControl {
+    inner: Arc<Mutex<VmInner>>,
+    /// Cleared at teardown to stop the accept loop. `None` when no socket was
+    /// asked for, in which case this is only a console ring.
+    serving: Option<Arc<AtomicBool>>,
+    /// Connections currently being served, so teardown can let a reply finish
+    /// rather than racing it. See [`ColdControl::finish`].
+    inflight: Option<Arc<AtomicUsize>>,
+    socket_path: Option<PathBuf>,
+}
+
+impl ColdControl {
+    /// A console ring with no socket -- what `--post-boot` needs on its own.
+    pub(crate) fn detached() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(VmInner::new())),
+            serving: None,
+            inflight: None,
+            socket_path: None,
+        }
+    }
+
+    /// Bind `socket_path` and serve this guest's control verbs on it.
+    ///
+    /// Same hygiene as [`serve`]: a private 0700 runtime dir that refuses a
+    /// symlink, a 0600 socket, and a peer-uid check on every connection. `dir`
+    /// is what `posture`/`proxy`/`audit` assess, since there is no library
+    /// entry to look the guest up in.
+    pub(crate) fn bound(name: &str, dir: PathBuf, socket_path: PathBuf) -> Result<Self, String> {
+        if let Some(parent) = socket_path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            ensure_private_runtime_dir(parent)?;
+        }
+        remove_stale_socket(&socket_path);
+        let listener = UnixListener::bind(&socket_path)
+            .map_err(|e| format!("bind {}: {e}", socket_path.display()))?;
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&socket_path, fs::Permissions::from_mode(0o600))
+                .map_err(|e| format!("chmod 0600 {}: {e}", socket_path.display()))?;
+        }
+        listener
+            .set_nonblocking(true)
+            .map_err(|e| format!("set listener non-blocking: {e}"))?;
+
+        let inner = Arc::new(Mutex::new(VmInner::new()));
+        let daemon = Arc::new(Daemon {
+            role: Role::ColdBoot,
+            library: Vec::new(),
+            library_dir: dir.clone(),
+            idle_exit_secs: 0,
+            max_seconds: 0,
+            socket_path: socket_path.clone(),
+            current: Mutex::new(Some(Vm {
+                name: name.to_string(),
+                started: Instant::now(),
+                dir: Some(dir),
+                inner: Arc::clone(&inner),
+            })),
+        });
+
+        let serving = Arc::new(AtomicBool::new(true));
+        let loop_serving = Arc::clone(&serving);
+        let inflight = Arc::new(AtomicUsize::new(0));
+        let loop_inflight = Arc::clone(&inflight);
+        thread::Builder::new()
+            .name("cold-control".into())
+            .spawn(move || {
+                while loop_serving.load(Ordering::Acquire) {
+                    match listener.accept() {
+                        Ok((stream, _addr)) => {
+                            let _ = stream.set_nonblocking(false);
+                            let daemon = Arc::clone(&daemon);
+                            // Counted before the thread exists, so teardown can
+                            // never observe zero for a connection it has already
+                            // accepted.
+                            let served = Served::begin(&loop_inflight);
+                            thread::spawn(move || {
+                                let _served = served;
+                                handle_conn(stream, &daemon);
+                            });
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(100));
+                        }
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                        Err(e) => eprintln!("chm create: accept error: {e}"),
+                    }
+                }
+            })
+            .map_err(|e| format!("spawning the control socket thread: {e}"))?;
+
+        Ok(Self {
+            inner,
+            serving: Some(serving),
+            inflight: Some(inflight),
+            socket_path: Some(socket_path),
+        })
+    }
+
+    /// Publish the channels a control client needs: `input` types into the
+    /// guest's console, `kick` forces its vCPUs out of `run()` so a `stop`
+    /// lands on a guest that is not trapping.
+    pub(crate) fn publish(&self, input: ConsoleInput, kick: Arc<dyn Fn() + Send + Sync>) {
+        let mut g = self.inner.lock().unwrap();
+        g.input = Some(input);
+        g.kick = Some(kick);
+    }
+
+    /// Push guest serial output into the ring.
+    pub(crate) fn push(&self, bytes: &[u8]) {
+        append_console(&self.inner, bytes);
+    }
+
+    /// Everything still in the ring.
+    ///
+    /// Bytes, not text: the ring evicts whole bytes and the UART delivers them
+    /// in arbitrary batches, so a multi-byte character can be cut at either end.
+    /// Callers mark a position and slice from it later, and decoding first makes
+    /// those marks move -- see [`postboot::Console::transcript`], which explains
+    /// why that panics rather than merely reading the wrong text.
+    pub(crate) fn transcript(&self) -> Vec<u8> {
+        self.inner.lock().unwrap().console.clone()
+    }
+
+    /// Whether a control client has asked this guest to stop.
+    pub(crate) fn stop_requested(&self) -> bool {
+        self.inner.lock().unwrap().stop_requested
+    }
+
+    /// Record why the guest ended and take the socket down.
+    ///
+    /// The status matters even though the process is about to exit: a `stop`
+    /// waits for [`RunStatus::Stopped`] before replying, so without this the
+    /// client that asked would time out on a guest that had already halted.
+    pub(crate) fn finish(&self, reason: &str) {
+        self.inner.lock().unwrap().status = RunStatus::Stopped(reason.to_string());
+        // A `ctl stop` client is blocked polling for exactly the status just
+        // published, and the reply is written by a connection thread nothing
+        // here joins. Clearing `serving` and unlinking the socket in the same
+        // breath races that write, and the client loses: measured 0 bytes of
+        // reply, twice, on hardware -- `chm ctl stop` appeared to do nothing
+        // while having stopped the guest correctly.
+        //
+        // So publish first, then let the reply land, then take the socket away.
+        // Bounded by FINISH_DRAIN, because a client that never reads must not
+        // be able to hold teardown open.
+        if let Some(inflight) = &self.inflight {
+            let deadline = Instant::now() + FINISH_DRAIN;
+            while inflight.load(Ordering::Acquire) > 0 && Instant::now() < deadline {
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        if let Some(serving) = &self.serving {
+            serving.store(false, Ordering::Release);
+        }
+        if let Some(path) = &self.socket_path {
+            let _ = fs::remove_file(path);
+        }
+    }
+}
+
 /// Request the running VM to stop and wait up to `timeout` for the worker to
 /// finish (its checkpoint capture + `hv_vm_destroy` complete when the worker
 /// records `Stopped`). Used by the shutdown paths, which need to wait longer
@@ -472,6 +723,39 @@ fn stop_vm_blocking(daemon: &Daemon, timeout: Duration) -> Result<String, String
     Ok(format!("stop requested for `{name}` (still draining)"))
 }
 
+/// Why a verb does not apply to a cold-boot control socket, or `None` if it does.
+///
+/// A pure function so the refusals can be asserted without a socket, a guest or
+/// a `Daemon`: the reason each one is refused is the part worth guarding, and it
+/// is prose that a test can hold to.
+pub(crate) fn cold_boot_refusal(cmd: &str) -> Option<String> {
+    let library = |verb: &str| {
+        Some(format!(
+            "`{verb}` needs a snapshot library and this socket belongs to a \
+             cold-booted guest, which was started from a kernel rather than \
+             chosen out of one -- run `chm serve <library>` and ask that socket \
+             instead"
+        ))
+    };
+    match cmd {
+        "list" | "list-json" => library(cmd),
+        "start" => Some(
+            "`start` needs a snapshot library and this socket belongs to a \
+             cold-booted guest, which is already running -- HVF is one VM per \
+             process, so this endpoint will never start a second one"
+                .to_string(),
+        ),
+        "shutdown" => Some(
+            "`shutdown` exits the daemon, and exiting this process here would \
+             skip the teardown that captures `--originate` and releases the HVF \
+             slot -- use `stop`, which asks the guest to halt and lets the \
+             cold-boot path finish"
+                .to_string(),
+        ),
+        _ => None,
+    }
+}
+
 fn handle_conn(stream: UnixStream, daemon: &Daemon) {
     // Only accept commands from the daemon's own user: a co-tenant process must
     // not be able to drive start/stop/console/shutdown even if it can reach the
@@ -502,6 +786,21 @@ fn handle_conn(stream: UnixStream, daemon: &Daemon) {
     let mut parts = line.trim().splitn(2, ' ');
     let cmd = parts.next().unwrap_or("");
     let arg = parts.next().unwrap_or("").trim();
+
+    // Four verbs are about a *library*, and a cold-booted guest has none: this
+    // process was handed a kernel, it did not pick a snapshot out of a
+    // directory. Answering `list` with "(library is empty)" would be true of
+    // this endpoint and read as "you have no snapshots", which is the shape of
+    // wrong answer #304 is about -- so say which endpoint this is and where the
+    // verb does work. `shutdown` is refused for a different reason: it calls
+    // `exit(0)` from this thread, which on the cold path would skip the
+    // teardown that captures `--originate` and destroys the VM.
+    if daemon.role == Role::ColdBoot
+        && let Some(why) = cold_boot_refusal(cmd)
+    {
+        let _ = writer.write_all(format!("error\t{why}\n").as_bytes());
+        return;
+    }
 
     match cmd {
         "ping" => {
@@ -891,7 +1190,11 @@ fn proxy_check_json(daemon: &Daemon, arg: &str) -> String {
 /// happen today, since `start` resolves through it).
 fn running_vm_dir(daemon: &Daemon) -> Option<PathBuf> {
     let guard = daemon.current.lock().unwrap();
-    let name = guard.as_ref().map(|vm| vm.name.clone())?;
+    let vm = guard.as_ref()?;
+    if let Some(dir) = vm.dir.clone() {
+        return Some(dir);
+    }
+    let name = vm.name.clone();
     drop(guard);
     daemon
         .library
@@ -998,14 +1301,7 @@ fn start_vm(daemon: &Daemon, name: &str) -> Result<String, String> {
         ));
     }
 
-    let inner = Arc::new(Mutex::new(VmInner {
-        console: Vec::new(),
-        dropped: 0,
-        status: RunStatus::Running,
-        stop_requested: false,
-        kick: None,
-        input: None,
-    }));
+    let inner = Arc::new(Mutex::new(VmInner::new()));
 
     let opts = EngineOpts {
         idle_exit_secs: daemon.idle_exit_secs,
@@ -1023,6 +1319,9 @@ fn start_vm(daemon: &Daemon, name: &str) -> Result<String, String> {
     *guard = Some(Vm {
         name: display_name.clone(),
         started: Instant::now(),
+        // The library is the authority for a daemon-started guest, and
+        // `running_vm_dir` looks it up there.
+        dir: None,
         inner,
     });
     Ok(format!("started `{display_name}`"))
@@ -1518,7 +1817,7 @@ fn supervise_daemon(
 
 /// Push guest serial output into the shared console ring, evicting from the
 /// front (and bumping the dropped counter) when it exceeds the cap.
-fn append_console(inner: &Arc<Mutex<VmInner>>, bytes: &[u8]) {
+pub(crate) fn append_console(inner: &Arc<Mutex<VmInner>>, bytes: &[u8]) {
     let mut g = inner.lock().unwrap();
     g.console.extend_from_slice(bytes);
     if g.console.len() > CONSOLE_CAP {
@@ -1917,6 +2216,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("chm-posture-{}", process::id()));
         fs::create_dir_all(&dir).unwrap();
         let daemon = Daemon {
+            role: Role::Library,
             library: Vec::new(),
             library_dir: dir.clone(),
             idle_exit_secs: 0,
@@ -1953,6 +2253,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("chm-statuslib-{}", process::id()));
         fs::create_dir_all(&dir).unwrap();
         let daemon = Daemon {
+            role: Role::Library,
             library: Vec::new(),
             library_dir: dir.clone(),
             idle_exit_secs: 0,
@@ -1982,6 +2283,7 @@ mod tests {
     fn status_escapes_a_library_path_that_needs_it() {
         let dir = std::env::temp_dir().join(format!("chm-esc-\"{}", process::id()));
         let daemon = Daemon {
+            role: Role::Library,
             library: Vec::new(),
             library_dir: dir.clone(),
             idle_exit_secs: 0,
@@ -2001,6 +2303,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("chm-proxy-{}", process::id()));
         fs::create_dir_all(&dir).unwrap();
         let daemon = Daemon {
+            role: Role::Library,
             library: Vec::new(),
             library_dir: dir.clone(),
             idle_exit_secs: 0,
@@ -2244,6 +2547,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("chm-exec-{}", process::id()));
         fs::create_dir_all(&dir).unwrap();
         let daemon = Daemon {
+            role: Role::Library,
             library: Vec::new(),
             library_dir: dir.clone(),
             idle_exit_secs: 0,
@@ -2268,6 +2572,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("chm-execbad-{}", process::id()));
         fs::create_dir_all(&dir).unwrap();
         let daemon = Daemon {
+            role: Role::Library,
             library: Vec::new(),
             library_dir: dir.clone(),
             idle_exit_secs: 0,
@@ -2306,6 +2611,288 @@ mod tests {
             src.contains(&reports),
             "stop_vm must report the worker's own reason: a bare `stopped` is \
              what #288 printed over a wedged guest"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cold_control_tests {
+    use super::{Role, cold_boot_refusal};
+
+    /// The refusals are the whole of #401's contract with a user who points a
+    /// library verb at a cold guest. A bare `error` would be true and useless;
+    /// #304/#305/#306 are three separate records of a true sentence that leaves
+    /// the reader with no next step. So assert the prose, not just the refusal.
+    #[test]
+    fn a_library_verb_says_where_it_does_work() {
+        for verb in ["list", "list-json", "start"] {
+            let why = cold_boot_refusal(verb)
+                .unwrap_or_else(|| panic!("{verb} needs a library and must be refused here"));
+            assert!(
+                why.contains(verb),
+                "the refusal for {verb} must name the verb: {why}"
+            );
+            assert!(
+                why.contains("library"),
+                "the refusal for {verb} must say a library is what is missing, \
+                 or it reads as `you have no snapshots`: {why}"
+            );
+        }
+        // Assembled from parts: a literal remedy here would be found by
+        // `contains` in this very assertion if the check ever moved to reading
+        // the source, and a needle that matches its own test is born dead.
+        let remedy = format!("chm serve {}library>", "<");
+        for verb in ["list", "list-json"] {
+            let why = cold_boot_refusal(verb).unwrap();
+            assert!(
+                why.contains(&remedy),
+                "{verb} must name the socket that does answer it: {why}"
+            );
+        }
+        let start = cold_boot_refusal("start").unwrap();
+        assert!(
+            start.contains("one VM per process"),
+            "`start` is refused for a second reason -- HVF's single slot -- and \
+             a reader who fixes only the library half would try again: {start}"
+        );
+    }
+
+    /// `shutdown` is the one refusal that is not about the library, and the
+    /// reason matters: it calls `exit(0)` from the connection thread, so on this
+    /// path it would skip `--originate` capture and the HVF release.
+    #[test]
+    fn shutdown_names_the_teardown_it_would_skip() {
+        let why = cold_boot_refusal("shutdown").expect("shutdown must be refused on a cold socket");
+        assert!(
+            why.contains("--originate"),
+            "the refusal must name what would be lost, not just say no: {why}"
+        );
+        assert!(
+            why.contains("`stop`"),
+            "and it must name the verb that does the intended thing: {why}"
+        );
+    }
+
+    /// The far more expensive mistake is refusing a verb that works: every
+    /// served verb reads only the running guest, and a cold guest is a running
+    /// guest. A refusal here would make `--socket` useless while looking
+    /// deliberate.
+    #[test]
+    fn every_verb_about_the_running_guest_is_served() {
+        for verb in [
+            "ping",
+            "status",
+            "status-json",
+            "exec-json",
+            "input",
+            "console",
+            "stop",
+            "proxy-json",
+            "proxy-check-json",
+            "proxy-ca-json",
+            "posture-json",
+            "audit-json",
+            "capabilities-json",
+        ] {
+            assert!(
+                cold_boot_refusal(verb).is_none(),
+                "{verb} reads only the running guest, so refusing it would make \
+                 --socket a socket that answers nothing"
+            );
+        }
+    }
+
+    /// A pure function that nobody calls refuses nothing. This repo has been
+    /// caught by the call-site class seven times, so read the source rather than
+    /// asserting on a value the production path may no longer compute.
+    #[test]
+    fn handle_conn_actually_consults_the_refusal() {
+        let src = include_str!("serve.rs");
+        // Assembled, or this assertion is its own needle (§43).
+        let gate = format!("daemon.role == Role::{}", "ColdBoot");
+        assert!(
+            src.contains(&gate),
+            "handle_conn must gate on the role, or a cold socket answers library \
+             verbs about a library it does not have"
+        );
+        let consulted = format!("let Some(why) = {}(cmd)", "cold_boot_refusal");
+        assert!(
+            src.contains(&consulted),
+            "the gate must consult cold_boot_refusal itself: a second copy of \
+             the verb list would drift from this one"
+        );
+        assert!(
+            Role::ColdBoot != Role::Library,
+            "the two roles must stay distinguishable, or the gate is a no-op"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cold_finish_drain_tests {
+    use super::{ColdControl, FINISH_DRAIN, RunStatus, VmInner};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+
+    fn control(inflight: usize) -> (ColdControl, Arc<AtomicUsize>, Arc<AtomicBool>) {
+        let n = Arc::new(AtomicUsize::new(inflight));
+        let serving = Arc::new(AtomicBool::new(true));
+        let c = ColdControl {
+            inner: Arc::new(Mutex::new(VmInner::new())),
+            serving: Some(Arc::clone(&serving)),
+            inflight: Some(Arc::clone(&n)),
+            socket_path: None,
+        };
+        (c, n, serving)
+    }
+
+    /// The bug this guards was measured on hardware twice: `chm ctl stop`
+    /// stopped the guest correctly and printed *nothing*, because `finish`
+    /// published the `Stopped` status the client was polling for and tore the
+    /// socket down in the same breath. The client could only lose that race.
+    ///
+    /// The property is ordering, so hold a connection in flight and prove
+    /// `finish` waited for it rather than asserting on a message.
+    #[test]
+    fn finish_waits_for_an_inflight_reply_before_it_stops_serving() {
+        let (c, n, serving) = control(1);
+        let releaser = Arc::clone(&n);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(250));
+            releaser.fetch_sub(1, Ordering::AcqRel);
+        });
+        let began = Instant::now();
+        c.finish("stopped on request");
+        let waited = began.elapsed();
+        assert!(
+            waited >= Duration::from_millis(200),
+            "finish returned in {waited:?} with a reply still in flight -- that \
+             is the race that ate the client's confirmation"
+        );
+        assert!(
+            !serving.load(Ordering::Acquire),
+            "it must still stop serving once the reply has landed"
+        );
+    }
+
+    /// The status has to be published *before* the wait, or the client is
+    /// polling for something that only appears after it has been given up on --
+    /// a deadlock dressed as a timeout.
+    #[test]
+    fn the_status_is_published_before_the_drain_begins() {
+        let (c, n, _) = control(1);
+        let inner = Arc::clone(&c.inner);
+        let releaser = Arc::clone(&n);
+        std::thread::spawn(move || {
+            // Stand in for the connection thread: it only finishes once it can
+            // see the status, exactly as `stop_vm_blocking` does.
+            for _ in 0..200 {
+                if matches!(inner.lock().unwrap().status, RunStatus::Stopped(_)) {
+                    releaser.fetch_sub(1, Ordering::AcqRel);
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let began = Instant::now();
+        c.finish("stopped on request");
+        assert!(
+            began.elapsed() < FINISH_DRAIN,
+            "the drain hit its ceiling, so the waiter never saw the status -- \
+             publishing after the wait cannot work"
+        );
+        assert!(matches!(
+            c.inner.lock().unwrap().status,
+            RunStatus::Stopped(_)
+        ));
+    }
+
+    /// A client that never reads must not be able to hold teardown open --
+    /// `ctl console` streams until the socket closes and is never going to
+    /// decrement.
+    #[test]
+    fn a_connection_that_never_finishes_cannot_hold_teardown_open() {
+        let (c, _n, serving) = control(1);
+        let began = Instant::now();
+        c.finish("stopped on request");
+        let waited = began.elapsed();
+        assert!(
+            waited >= FINISH_DRAIN,
+            "it should have waited the full ceiling: {waited:?}"
+        );
+        assert!(
+            waited < FINISH_DRAIN + Duration::from_secs(2),
+            "but it must be a ceiling, not a wait for a decrement that is never \
+             coming: {waited:?}"
+        );
+        assert!(!serving.load(Ordering::Acquire));
+    }
+
+    /// The counting itself, which the tests above take on trust because they
+    /// set the counter by hand. Deleting the `fetch_add` used to leave all 1020
+    /// tests green (the call-site class); it is a value now so it can fail.
+    #[test]
+    fn a_served_connection_is_counted_for_exactly_as_long_as_it_is_served() {
+        use super::Served;
+        let n = Arc::new(AtomicUsize::new(0));
+        {
+            let _a = Served::begin(&n);
+            assert_eq!(
+                n.load(Ordering::Acquire),
+                1,
+                "an accepted connection must be counted before it is handed to a \
+                 thread, or teardown can observe zero for a reply already owed"
+            );
+            let _b = Served::begin(&n);
+            assert_eq!(n.load(Ordering::Acquire), 2, "and they must accumulate");
+        }
+        assert_eq!(
+            n.load(Ordering::Acquire),
+            0,
+            "and be given back on the way out, or the first client to disconnect \
+             makes every later teardown pay the full ceiling"
+        );
+    }
+
+    /// Handlers panic. If that leaked a count, one bad connection would tax
+    /// every teardown for the rest of the process's life.
+    #[test]
+    fn a_panicking_handler_still_gives_its_count_back() {
+        use super::Served;
+        let n = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&n);
+        let _ = std::thread::spawn(move || {
+            let _served = Served::begin(&counter);
+            panic!("handler exploded");
+        })
+        .join();
+        assert_eq!(n.load(Ordering::Acquire), 0);
+    }
+
+    /// A `Served` nobody constructs counts nothing. The accept loop is not
+    /// reachable from a unit test -- it needs a bound socket -- so read it.
+    #[test]
+    fn the_accept_loop_actually_counts_the_connections_it_accepts() {
+        let src = include_str!("serve.rs");
+        // Assembled from parts, or this assertion is its own needle.
+        let needle = format!("let served = {}::begin(&loop_inflight);", "Served");
+        assert!(
+            src.contains(&needle),
+            "the accept loop must count through Served::begin; anything else \
+             leaves finish() draining a counter that never rises"
+        );
+    }
+
+    /// And the common case pays nothing: no client attached, no delay.
+    #[test]
+    fn an_idle_socket_tears_down_immediately() {
+        let (c, _n, _) = control(0);
+        let began = Instant::now();
+        c.finish("guest ended");
+        assert!(
+            began.elapsed() < Duration::from_millis(200),
+            "a guest that ended on its own must not pay the drain"
         );
     }
 }
