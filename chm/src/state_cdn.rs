@@ -30,6 +30,7 @@ use std::process::{self, Command, ExitCode, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 
+use crate::imp::answer_group_help;
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
 use serde::Deserialize;
 
@@ -533,8 +534,7 @@ pub fn state_cdn_main(raw: &[String]) -> ExitCode {
         Some("serve") => run(cmd_serve(&raw[1..]), "serve"),
         Some("register-peer") => run(cmd_register_peer(&raw[1..]), "register-peer"),
         Some("-h") | Some("--help") | None => {
-            print!("{}", state_cdn_usage());
-            ExitCode::SUCCESS
+            answer_group_help("state-cdn", !raw.is_empty(), &state_cdn_usage())
         }
         Some(other) => {
             eprintln!("chm state-cdn: unknown subcommand `{other}`\n\n{}", state_cdn_usage());

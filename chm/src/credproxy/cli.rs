@@ -9,6 +9,7 @@
 //! what it would do before you trust it with a credential, and confirm it can
 //! actually reach an origin from this machine.
 
+use crate::imp::answer_group_help;
 use crate::imp::require_workspace_dir;
 use crate::oci::entry::EntryKind;
 use crate::oci::initramfs::{Rootfs, write_cpio};
@@ -264,10 +265,7 @@ pub(crate) fn proxy_main(args: &[String]) -> ExitCode {
         Some("show") => show(&args[1..]),
         Some("ca") => ca(&args[1..]),
         Some("check") => check(&args[1..]),
-        Some("-h") | Some("--help") | None => {
-            print!("{USAGE}");
-            ExitCode::SUCCESS
-        }
+        Some("-h") | Some("--help") | None => answer_group_help("proxy", !args.is_empty(), USAGE),
         Some(other) => {
             eprintln!("chm proxy: unknown command `{other}`\n\n{USAGE}");
             ExitCode::FAILURE

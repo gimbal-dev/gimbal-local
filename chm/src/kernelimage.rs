@@ -46,6 +46,7 @@ use std::path::Path;
 use std::process::ExitCode;
 use std::str;
 
+use crate::imp::answer_group_help;
 use flate2::read::GzDecoder;
 use zstd::stream::copy_decode;
 
@@ -337,14 +338,12 @@ pub fn kernel_main(raw: &[String]) -> ExitCode {
     match raw.first().map(String::as_str) {
         Some("probe") => probe_main(&raw[1..]),
         Some("-h" | "--help") | None => {
-            println!("{}", kernel_usage());
             // No subcommand is a usage error, not a success: a script that
-            // typed nothing did not get what it asked for.
-            if raw.is_empty() {
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
-            }
+            // typed nothing did not get what it asked for. That exit code was
+            // already right here; what was missing was the reason, and a
+            // refusal delivered on stdout with an empty stderr is a refusal
+            // delivered where nobody checking for one is looking (#423).
+            answer_group_help("kernel", !raw.is_empty(), &format!("{}\n", kernel_usage()))
         }
         Some(other) => {
             eprintln!(

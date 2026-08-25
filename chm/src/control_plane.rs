@@ -33,6 +33,7 @@ use serde_json::{Value, json};
 
 use crate::audit;
 use crate::firewall;
+use crate::imp::answer_group_help;
 use crate::policy;
 use crate::signing::{self, DetachedSignature, TrustStore};
 
@@ -644,8 +645,7 @@ pub fn runner_main(raw: &[String]) -> ExitCode {
             }
         },
         Some("-h") | Some("--help") | None => {
-            print!("{}", runner_usage());
-            ExitCode::SUCCESS
+            answer_group_help("runner", !raw.is_empty(), &runner_usage())
         }
         Some(other) => {
             eprintln!("chm runner: unknown subcommand `{other}`\n\n{}", runner_usage());
@@ -1258,28 +1258,30 @@ pub fn policy_main(raw: &[String]) -> ExitCode {
             }
         },
         Some("-h") | Some("--help") | None => {
-            print!(
-                "chm policy — inspect the control plane's per-sandbox governance\n\
-                 \n\
-                 USAGE:\n    \
-                     chm policy show --sandbox ID [--substrate apple-hvf] [--json] [--api URL]\n    \
-                     chm policy bind --sandbox ID <WORKSPACE_DIR> [--substrate S] [--api URL]\n\
-                 \n\
-                 `show` fetches the sandbox's effective policy, verifies the policy_digest,\n\
-                 and prints the compiled egress/fs posture chm would enforce.\n\
-                 \n\
-                 `bind` brings that policy DOWN: it verifies the digest the same way the\n\
-                 runner does, then writes the workspace's egress-policy.json labelled with\n\
-                 that digest, so a local `chm run` enforces the plane's allow-list and every\n\
-                 denial is audited under the control plane's policy digest.\n"
-            );
-            ExitCode::SUCCESS
+            answer_group_help("policy", !raw.is_empty(), &policy_usage())
         }
         Some(other) => {
             eprintln!("chm policy: unknown subcommand `{other}`");
             ExitCode::FAILURE
         }
     }
+}
+
+fn policy_usage() -> String {
+    "chm policy — inspect the control plane's per-sandbox governance\n\
+     \n\
+     USAGE:\n    \
+         chm policy show --sandbox ID [--substrate apple-hvf] [--json] [--api URL]\n    \
+         chm policy bind --sandbox ID <WORKSPACE_DIR> [--substrate S] [--api URL]\n\
+     \n\
+     `show` fetches the sandbox's effective policy, verifies the policy_digest,\n\
+     and prints the compiled egress/fs posture chm would enforce.\n\
+     \n\
+     `bind` brings that policy DOWN: it verifies the digest the same way the\n\
+     runner does, then writes the workspace's egress-policy.json labelled with\n\
+     that digest, so a local `chm run` enforces the plane's allow-list and every\n\
+     denial is audited under the control plane's policy digest.\n"
+        .to_string()
 }
 
 fn cmd_policy_show(raw: &[String]) -> Result<(), String> {

@@ -4,10 +4,11 @@
 
 //! Local-managed cloud helper commands for the BYO-subscription loop.
 
+use crate::imp::answer_group_help;
+use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode, Stdio};
-use std::env;
 
 const DEFAULT_PROJECT: &str = "gimbal-local";
 const DEFAULT_INSTANCE_TYPE: &str = "c7g.metal";
@@ -52,10 +53,8 @@ pub(crate) fn cloud_main(raw: &[String]) -> ExitCode {
             }
         },
         CloudCommand::CleanupAws(args) => cleanup_aws(args),
-        CloudCommand::Help => {
-            print!("{}", usage());
-            ExitCode::SUCCESS
-        }
+        CloudCommand::Help => answer_group_help("cloud", true, &usage()),
+        CloudCommand::MissingCommand => answer_group_help("cloud", false, &usage()),
         CloudCommand::Error(msg) => {
             eprintln!("chm cloud: {msg}\n");
             eprint!("{}", usage());
@@ -115,6 +114,14 @@ enum CloudCommand {
     CaptureAws(AwsArgs),
     CleanupAws(AwsArgs),
     Help,
+    /// Invoked with nothing after `chm cloud`.
+    ///
+    /// Deliberately a separate variant from [`CloudCommand::Help`]. The parser
+    /// used to fold both into `Help`, which destroyed the distinction before
+    /// the dispatcher could act on it -- so "I asked for help" and "I typed
+    /// nothing" were literally indistinguishable by the time anything could
+    /// answer them (#423).
+    MissingCommand,
     Error(String),
 }
 
@@ -160,7 +167,7 @@ fn usage() -> String {
 
 fn parse(raw: &[String]) -> CloudCommand {
     if raw.is_empty() {
-        return CloudCommand::Help;
+        return CloudCommand::MissingCommand;
     }
     if matches!(raw[0].as_str(), "-h" | "--help") {
         return CloudCommand::Help;

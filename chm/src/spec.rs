@@ -83,6 +83,7 @@ use std::process::ExitCode;
 use serde::{Deserialize, Serialize};
 
 use crate::imp::DEFAULT_IDLE_EXIT_SECS;
+use crate::imp::answer_group_help;
 use crate::postboot;
 use hypervisor::hvf::virtio::nat::INGRESS_BIND_ADDR;
 
@@ -1880,12 +1881,7 @@ fn print_problems(path: &Path, problems: &[String]) {
 pub fn spec_main(args: &[String]) -> ExitCode {
     let verb = args.first().map(String::as_str);
     if verb.is_none() || matches!(verb, Some("--help" | "-h" | "help")) {
-        print!("{SPEC_USAGE}");
-        return if verb.is_none() {
-            ExitCode::FAILURE
-        } else {
-            ExitCode::SUCCESS
-        };
+        return answer_group_help("spec", verb.is_some(), SPEC_USAGE);
     }
     match verb {
         Some("tiers") => {
@@ -1896,8 +1892,14 @@ pub fn spec_main(args: &[String]) -> ExitCode {
         Some("show") => spec_show(&args[1..]),
         Some("validate") => spec_validate(&args[1..]),
         Some(other) => {
-            eprintln!("chm spec: unknown command `{other}`\n");
-            print!("{SPEC_USAGE}");
+            // Message and usage on the same stream, as `kernel`, `image` and
+            // `ctl` all do. Splitting them sends the half that tells you what
+            // to do next to stdout, where a caller reading stderr for the
+            // reason never sees it.
+            eprintln!(
+                "chm spec: unknown command `{other}`\n\n{}",
+                SPEC_USAGE.trim_end_matches('\n')
+            );
             ExitCode::FAILURE
         }
         None => unreachable!("handled above"),

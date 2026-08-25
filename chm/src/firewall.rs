@@ -33,6 +33,7 @@ use std::process::ExitCode;
 
 use crate::imp::require_workspace_dir;
 
+use crate::imp::answer_group_help;
 use serde::{Deserialize, Serialize};
 
 /// The per-workspace policy file `chm` reads to govern a sandbox's egress.
@@ -149,8 +150,7 @@ pub(crate) fn firewall_main(raw: &[String]) -> ExitCode {
         Some("clear") => clear(&raw[1..]),
         Some("validate") => validate(&raw[1..]),
         Some("-h") | Some("--help") | None => {
-            print!("{}", usage());
-            return ExitCode::SUCCESS;
+            return answer_group_help("firewall", !raw.is_empty(), &usage());
         }
         Some(other) => Err(format!("unknown subcommand `{other}`")),
     };
