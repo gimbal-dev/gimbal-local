@@ -88,6 +88,7 @@ use super::initramfs::Rootfs;
 use super::targz::{Layer, TarEntry};
 use crate::create::GUEST_IP;
 use crate::imp::human_bytes;
+use crate::posture::{APPARMOR_USERNS_SYSCTL, USERNS_PROBE_ARGV};
 
 /// Where the browser lands in the guest. Under `/opt` because it is neither
 /// distribution-managed nor something a user of this image is expected to
@@ -965,7 +966,7 @@ set -- --remote-debugging-port={port} \
 # Can this kernel give an unprivileged process a user namespace? That is what
 # Chromium's own sandbox needs, and it is a property of the kernel rather than
 # of the image -- so it is measured here rather than decided at build time.
-if unshare --user --map-root-user true 2>/dev/null; then
+if {probe} 2>/dev/null; then
     echo "{tag}: user namespaces work; running sandboxed as uid {uid}"
     chown -R {uid} "$PROFILE" 2>/dev/null
     setpriv --reuid={uid} --regid={uid} --clear-groups \
@@ -985,7 +986,7 @@ else
     echo "{tag}: no unprivileged user namespace; running as root with"
     echo "{tag}: --no-sandbox. The VM boundary is the only isolation here."
     echo "{tag}: if this is a rehydrated Ubuntu 24.04 capture, run"
-    echo "{tag}:   sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0"
+    echo "{tag}:   sudo sysctl -w {sysctl}=0"
     echo "{tag}: and restart, to get Chromium's own sandbox back as well."
     {dir}/headless_shell --no-sandbox "$@" &
 fi
@@ -1048,6 +1049,12 @@ echo "{failed} the browser exited with status $?"
 "#,
         port = CDP_PORT,
         uid = RUN_UID,
+        // Read, never restated. `chm ctl posture --probe-guest` reports on the
+        // same command this script runs; two copies would eventually ask two
+        // different questions and the report would describe a capability the
+        // browser does not depend on (#363).
+        probe = USERNS_PROBE_ARGV.join(" "),
+        sysctl = APPARMOR_USERNS_SYSCTL,
         dir = format_args!("/{GUEST_DIR}"),
         fwd = cdpfwd::GUEST_PATH,
         guest_ip = format_args!(
@@ -1978,6 +1985,59 @@ mod tests {
             remedy > fallback,
             "the remedy has to sit in the branch that took the weaker path, \
              not somewhere a reader on that path never sees it:\n{s}"
+        );
+    }
+}
+
+/// The launch script and `chm posture` have to be talking about the *same*
+/// probe, or the report says a guest is fine while the browser fails on the
+/// exact thing that was reported fine.
+///
+/// This needs its own module because a content assertion structurally cannot
+/// see the failure it guards: re-hardcoding the literal here leaves the emitted
+/// script byte-identical *today* and silently uncoupled tomorrow. The same
+/// two-guard shape the welcome-banner copy needed -- neither subsumes the other.
+#[cfg(test)]
+mod userns_coupling_tests {
+    /// Needles assembled from parts so this test cannot match its own text --
+    /// *and* scoped to `launch_script`'s own body, because the sibling test
+    /// below names both constants literally. A needle in more than one place
+    /// cannot detect its removal from the one that matters.
+    #[test]
+    fn the_launch_script_reads_the_probe_from_posture_rather_than_restating_it() {
+        let src = include_str!("browser.rs");
+        let src = src
+            .split_once("fn launch_script(")
+            .expect("launch_script is gone")
+            .1
+            .split_once("\n}\n")
+            .expect("launch_script has no end")
+            .0;
+        for needle in [
+            format!("{}.join(", "USERNS_PROBE_ARGV"),
+            format!("sysctl = {}", "APPARMOR_USERNS_SYSCTL"),
+        ] {
+            assert!(
+                src.contains(&needle),
+                "browser.rs no longer reads `{needle}`, so the browser's probe \
+                 and the posture report can drift without any test noticing"
+            );
+        }
+    }
+
+    /// And the other direction: a reference that survives while the constant it
+    /// names is emitted into a *different* part of the script would pass the
+    /// check above and still uncouple the sentence a user reads.
+    #[test]
+    fn the_remedy_the_browser_prints_is_the_one_posture_names() {
+        let s = super::launch_script();
+        assert!(
+            s.contains(super::APPARMOR_USERNS_SYSCTL),
+            "the browser's remedy no longer names the sysctl posture reports on"
+        );
+        assert!(
+            s.contains(&super::USERNS_PROBE_ARGV.join(" ")),
+            "the browser no longer runs the probe posture reports on"
         );
     }
 }

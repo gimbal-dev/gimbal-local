@@ -698,11 +698,15 @@ struct PostureControl: Codable, Equatable, Hashable, Identifiable {
         case weakened
         /// Off, and off is the documented posture — not a weakening.
         case notApplicable = "not-applicable"
+        /// Nobody established either way. Not an alarm and not a clean bill of
+        /// health — the panel says it does not know, which is the one thing a
+        /// security report is allowed to say when it did not look.
+        case unmeasured
     }
 
     /// An unrecognised state decodes as `weakened`, not as "fine".
     ///
-    /// If a future `chm` adds a fourth state, a UI that fell back to `active`
+    /// If a future `chm` adds a fifth state, a UI that fell back to `active`
     /// would quietly show green for something it does not understand. Failing
     /// towards alarm is the only safe direction for a security panel.
     init(from decoder: Decoder) throws {

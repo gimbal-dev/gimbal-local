@@ -1466,3 +1466,66 @@ final class LocalOnlyDefaultTests: XCTestCase {
         XCTAssertTrue(AppModel.storedLocalOnly(in: d))
     }
 }
+
+/// Guards for the in-guest user-namespace row the daemon can now report (#363).
+///
+/// `PostureControl.State` maps every unrecognised string to `.weakened` on
+/// purpose -- failing towards alarm is the only safe direction for a security
+/// panel. That default is exactly why a new *known* state has to be taught to
+/// the app in the same change that starts emitting it: shipping the Rust half
+/// alone would paint an orange "Weakened" row over a report whose actual
+/// content is "I did not look".
+final class PostureUnmeasuredTests: XCTestCase {
+    private func control(state: String) throws -> PostureControl {
+        let json = """
+        {"invariant":"#363","control":"in-guest user namespaces",
+         "state":"\(state)","detail":"a detail long enough to be real"}
+        """
+        return try JSONDecoder().decode(PostureControl.self, from: Data(json.utf8))
+    }
+
+    func testUnmeasuredDecodesAsItselfRatherThanAsAnAlarm() throws {
+        let c = try control(state: "unmeasured")
+        XCTAssertEqual(c.state, .unmeasured,
+                       "the panel would alarm over a check that was skipped")
+    }
+
+    /// The fallback is load-bearing and must survive the new case being added.
+    func testAnUnknownStateStillFailsTowardsAlarm() throws {
+        let c = try control(state: "something-we-have-never-heard-of")
+        XCTAssertEqual(c.state, .weakened,
+                       "an unrecognised state must never read as fine")
+    }
+
+    /// The exit-code neutrality of the Rust side has to hold here too, or the
+    /// two halves disagree about whether anything is wrong.
+    func testUnmeasuredIsNotCountedAsWeakened() throws {
+        let report = PostureReport(
+            workspace: "/w",
+            weakened: 0,
+            controls: [try control(state: "unmeasured"),
+                       try control(state: "active")])
+        XCTAssertTrue(report.weakenedControls.isEmpty,
+                      "a skipped check was counted as a weakened one")
+    }
+
+    /// Every presentation switch is exhaustive, so a missing case is a compile
+    /// error -- but a case filled in with a copy of its neighbour's values
+    /// compiles fine and renders the row as something it is not.
+    func testUnmeasuredIsDistinguishableOnScreen() {
+        XCTAssertEqual(PostureControl.State.unmeasured.label, "Not measured")
+        XCTAssertNotEqual(PostureControl.State.unmeasured.symbol,
+                          PostureControl.State.weakened.symbol)
+        XCTAssertNotEqual(PostureControl.State.unmeasured.label,
+                          PostureControl.State.notApplicable.label)
+    }
+
+    /// Sorted above the green rows: "we did not look" is not bad news, but it
+    /// is the thing a reader needs to notice.
+    func testUnmeasuredSortsAboveActive() {
+        XCTAssertLessThan(PostureControl.State.unmeasured.sortRank,
+                          PostureControl.State.active.sortRank)
+        XCTAssertLessThan(PostureControl.State.weakened.sortRank,
+                          PostureControl.State.unmeasured.sortRank)
+    }
+}
