@@ -9,6 +9,7 @@
 //! what it would do before you trust it with a credential, and confirm it can
 //! actually reach an origin from this machine.
 
+use crate::imp::require_workspace_dir;
 use crate::oci::entry::EntryKind;
 use crate::oci::initramfs::{Rootfs, write_cpio};
 use std::io::{Read, Write};
@@ -453,6 +454,14 @@ fn show(args: &[String]) -> ExitCode {
         return e;
     }
     let workspace = workspace_arg(args).map(PathBuf::from);
+    // Only when one was supplied: a bare `chm proxy show` legitimately reads
+    // `--rules` or CHM_PROXY_RULES and never needs a workspace at all.
+    if let Some(ws) = workspace.as_deref()
+        && let Err(e) = require_workspace_dir(ws)
+    {
+        eprintln!("chm proxy: {e}");
+        return ExitCode::FAILURE;
+    }
     let over = flag(args, "--rules").map(PathBuf::from);
     let resolved = match resolve_rules(workspace.as_deref(), over.as_deref()) {
         Ok(r) => r,
@@ -2857,6 +2866,49 @@ mod tests {
         assert!(
             src.contains(&call),
             "the CA install no longer uses the digest-verified transfer"
+        );
+    }
+}
+
+/// #421 -- the call site, not the helper, and the one command whose workspace
+/// argument is genuinely optional.
+#[cfg(test)]
+mod workspace_arg_tests {
+    use super::*;
+
+    fn ghost(tag: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("chm-ws421-px-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        assert!(!p.exists(), "precondition: {} must be absent", p.display());
+        p
+    }
+
+    #[test]
+    fn proxy_show_refuses_a_workspace_that_is_not_there() {
+        let d = ghost("px");
+        let got = show(&["--workspace".to_string(), d.display().to_string()]);
+        assert_eq!(
+            format!("{got:?}"),
+            format!("{:?}", ExitCode::FAILURE),
+            "`not configured -- no traffic is intercepted` is a claim about a \
+             workspace, and there is no workspace here to make it about"
+        );
+    }
+
+    /// The asymmetry that makes the guard conditional: `chm proxy show` with no
+    /// workspace at all is a working case -- rules resolve from `--rules` or
+    /// CHM_PROXY_RULES -- and refusing it would break it.
+    #[test]
+    fn proxy_show_without_a_workspace_is_still_answered() {
+        assert!(
+            std::env::var_os("CHM_PROXY_RULES").is_none(),
+            "precondition: this test describes the no-rules-configured case"
+        );
+        let got = show(&[]);
+        assert_eq!(
+            format!("{got:?}"),
+            format!("{:?}", ExitCode::SUCCESS),
+            "the workspace argument is optional and must stay optional"
         );
     }
 }

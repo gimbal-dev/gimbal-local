@@ -52,6 +52,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::imp::require_workspace_dir;
+
 use hypervisor::hvf::virtio::nat::{EgressEvent, POLICY_EVENT_DOMAIN};
 use serde_json::{Map, Value, json};
 
@@ -363,6 +365,7 @@ fn show(raw: &[String]) -> Result<(), String> {
         })
         .map(|(_, a)| PathBuf::from(a))
         .ok_or("usage: chm audit show <WORKSPACE_DIR> [--json] [--tail N]")?;
+    require_workspace_dir(&dir)?;
     let path = dir.join(AUDIT_FILE);
     let text = match fs::read_to_string(&path) {
         Ok(t) => t,
@@ -752,5 +755,38 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&ws);
+    }
+}
+
+/// #421 -- the call site, not the helper: `chm audit show` must consult
+/// `require_workspace_dir` itself, or it keeps reporting on a directory that
+/// is not there while the helper's own tests stay green.
+#[cfg(test)]
+mod workspace_arg_tests {
+    use super::*;
+
+    fn ghost(tag: &str) -> std::path::PathBuf {
+        let p = std::env::temp_dir().join(format!("chm-ws421-aud-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&p);
+        assert!(!p.exists(), "precondition: {} must be absent", p.display());
+        p
+    }
+
+    /// `no audit trail yet` was the defect's exit path: the `NotFound` arm
+    /// cannot tell an absent file from an absent workspace, so it answered for
+    /// both.
+    #[test]
+    fn audit_show_refuses_a_workspace_that_is_not_there() {
+        let d = ghost("aud");
+        let e = show(&[d.display().to_string()]).unwrap_err();
+        assert!(e.contains("no such workspace directory"), "{e}");
+        assert!(e.contains(&d.display().to_string()), "{e}");
+    }
+
+    #[test]
+    fn audit_show_json_refuses_it_too() {
+        let d = ghost("audj");
+        let e = show(&[d.display().to_string(), "--json".to_string()]).unwrap_err();
+        assert!(e.contains("no such workspace directory"), "{e}");
     }
 }

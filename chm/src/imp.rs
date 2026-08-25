@@ -2435,6 +2435,13 @@ fn revisions(raw: &[String]) -> Result<ExitCode, String> {
     }
 
     let dir = PathBuf::from(positionals[0]);
+    // Only the listing path. A real workspace with no revisions yet is a
+    // legitimate empty answer and stays rc=0, like `ls` on an empty directory;
+    // what must not stay rc=0 is a path that was never there, which today gets
+    // the same "run and suspend it first" advice it is in no position to follow.
+    // The verb path above (pin/delete/gc/...) is out of scope: those are not
+    // pure readers and were not measured.
+    require_workspace_dir(&dir)?;
     let summaries = checkpoint::revision_summaries(&dir);
 
     if usage_only {
@@ -2751,6 +2758,43 @@ pub(crate) fn human_bytes(n: u64) -> String {
         format!("{n} B")
     } else {
         format!("{v:.1} {}", UNITS[u])
+    }
+}
+
+/// Refuse a workspace argument that names nothing, or names something that is
+/// not a directory.
+///
+/// Every read-only workspace report -- posture, firewall, limits, audit, proxy,
+/// revisions -- resolves its answer from files *inside* the directory it is
+/// handed. When the directory itself is absent, each of those reads fails in
+/// exactly the way it fails for a workspace that exists and is merely
+/// unconfigured, so "no allow-list", "no proxy rules" and "no control is
+/// weakened" come back as measurements of a workspace nobody looked at.
+///
+/// `chm posture` is what makes this a defect rather than a wart: it is
+/// documented as a gate that exits non-zero when a control is weakened, so
+/// `chm posture "$WS" || exit 1` with a typo'd `$WS` reported a clean posture
+/// and passed. A control that could not be checked is not a control that is
+/// fine -- the same rule the roadmap states for an unreadable registry.
+///
+/// Deliberately **not** a check for `state.json`. `ensureWorkspace` recreates a
+/// workspace from its image when that file is absent, so a legitimate workspace
+/// directory can lack one and refusing it would break a working case. Launch
+/// *heals* a missing workspace; a report must not *invent* one. Refuse only
+/// what is unambiguously not a workspace at all.
+///
+/// Returns a bare message: every caller already prefixes `chm <verb>: `.
+pub(crate) fn require_workspace_dir(dir: &Path) -> Result<(), String> {
+    if dir.is_dir() {
+        return Ok(());
+    }
+    if dir.exists() {
+        Err(format!(
+            "{} is not a directory, so there is no workspace to report on",
+            dir.display()
+        ))
+    } else {
+        Err(format!("no such workspace directory: {}", dir.display()))
     }
 }
 
@@ -7295,4 +7339,83 @@ mod net_service_pass_tests {
         );
     }
 
+}
+
+/// #421 -- the six read-only workspace reports used to answer a question about
+/// a directory that was not there, and exit 0.
+#[cfg(test)]
+mod workspace_arg_tests {
+    use super::*;
+    use std::process::ExitCode;
+
+    fn ghost(tag: &str) -> PathBuf {
+        let p = env::temp_dir().join(format!("chm-ws421-rev-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        let _ = fs::remove_file(&p);
+        assert!(
+            !p.exists(),
+            "the test's own precondition: {} must be absent",
+            p.display()
+        );
+        p
+    }
+
+    fn real(tag: &str) -> PathBuf {
+        let p = env::temp_dir().join(format!("chm-ws421r-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&p);
+        fs::create_dir_all(&p).unwrap();
+        p
+    }
+
+    #[test]
+    fn a_real_directory_is_accepted() {
+        let d = real("ok");
+        require_workspace_dir(&d)
+            .expect("a directory that is there is a workspace we can report on");
+        let _ = fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn a_path_that_is_not_there_is_refused_by_name() {
+        let d = ghost("gone");
+        let e = require_workspace_dir(&d).unwrap_err();
+        // Naming the path is the whole remedy: the overwhelmingly likely cause
+        // is a typo or an unset variable, and neither is visible without it.
+        assert!(e.contains(&d.display().to_string()), "{e}");
+        assert!(e.contains("no such workspace directory"), "{e}");
+    }
+
+    #[test]
+    fn a_file_is_refused_as_not_a_directory() {
+        let f = ghost("file");
+        fs::write(&f, b"not a workspace").unwrap();
+        let e = require_workspace_dir(&f).unwrap_err();
+        assert!(e.contains("is not a directory"), "{e}");
+        let _ = fs::remove_file(&f);
+    }
+
+    // The call site, not the helper. A helper that is perfect and is not called
+    // from `revisions` leaves `revisions` broken with every other test green --
+    // the failure this repo has now banked eight times.
+    #[test]
+    fn revisions_refuses_a_workspace_that_is_not_there() {
+        let d = ghost("rev");
+        let e = revisions(&[d.display().to_string()]).unwrap_err();
+        assert!(e.contains("no such workspace directory"), "{e}");
+    }
+
+    /// The other half, and it is not symmetric: an empty *real* workspace is a
+    /// legitimate empty answer, like `ls` on an empty directory. Refusing it
+    /// would trade one wrong answer for another.
+    #[test]
+    fn revisions_still_succeeds_on_a_real_workspace_with_no_revisions() {
+        let d = real("rev");
+        let got = revisions(&[d.display().to_string()]).expect("a real empty workspace is fine");
+        assert_eq!(
+            format!("{got:?}"),
+            format!("{:?}", ExitCode::SUCCESS),
+            "an empty revision list is a valid answer and must stay rc=0"
+        );
+        let _ = fs::remove_dir_all(&d);
+    }
 }
