@@ -80,12 +80,31 @@ pub trait NetResponder: Send {
         Vec::new()
     }
 
-    /// Take the egress-decision events (allow/deny) accumulated since the last
-    /// drain, for the audit trail. The default responder makes no policy
-    /// decisions, so it has none.
+    /// Attach (or clear) the credential proxy's interception decision. The
+    /// default responder intercepts nothing.
     fn set_intercept(&mut self, _decider: Option<std::sync::Arc<dyn super::nat::InterceptDecider>>) {}
 
-    /// Take the responder's egress decisions accumulated since the last
+    /// Apply a live change to the egress policy this responder enforces, and
+    /// report what it did.
+    ///
+    /// `None` from a responder that enforces no policy, so a caller can tell
+    /// "there was nothing to amend" from "the amendment was applied" rather
+    /// than reporting success at a device that never had a policy (#156).
+    ///
+    /// Called under the device lock from the control socket's thread, not from
+    /// the net service loop: the policy is consulted once per *flow* (at the
+    /// DNS query and at the TCP SYN), never per packet, so this cannot land
+    /// partway through relaying a stream.
+    fn amend_egress(
+        &mut self,
+        _amendment: &super::nat::Amendment,
+    ) -> Option<super::nat::AmendOutcome> {
+        None
+    }
+
+    /// Take the responder's egress decisions accumulated since the last drain,
+    /// for the audit trail. The default responder makes no policy decisions, so
+    /// it has none.
     fn drain_egress_events(&mut self) -> Vec<super::nat::EgressEvent> {
         Vec::new()
     }
@@ -395,6 +414,15 @@ impl NetDevice {
         decider: Option<std::sync::Arc<dyn super::nat::InterceptDecider>>,
     ) {
         self.responder.set_intercept(decider);
+    }
+
+    /// Apply a live egress-policy change to the responder, if it enforces one
+    /// (see [`NetResponder::amend_egress`]).
+    pub fn amend_egress(
+        &mut self,
+        amendment: &super::nat::Amendment,
+    ) -> Option<super::nat::AmendOutcome> {
+        self.responder.amend_egress(amendment)
     }
 
     /// Whether a frame is waiting to be delivered into the guest's receive

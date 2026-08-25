@@ -51,7 +51,7 @@ mod reserved;
 mod relay_test;
 
 use device::{FrameDevice, NAT_MTU};
-pub use policy::{Decision, EgressPolicy};
+pub use policy::{AmendOutcome, Amendment, Decision, EgressPolicy};
 pub use reserved::is_reserved_egress_ip;
 
 use smoltcp::iface::{Config, Interface, SocketHandle, SocketSet};
@@ -333,6 +333,53 @@ impl NatResponder {
     /// Take the egress-decision events accumulated since the last drain.
     pub fn drain_events(&mut self) -> Vec<EgressEvent> {
         std::mem::take(&mut self.events)
+    }
+
+    /// Apply a live change to the egress policy this NAT enforces (#156).
+    ///
+    /// Runs under the device lock, on whichever thread the control socket is
+    /// served from -- not on the net service thread. That is safe because the
+    /// policy is consulted once per *flow* (at [`EgressPolicy::decide_dns`] and
+    /// at [`EgressPolicy::decide_connect`]) and never per packet, so an
+    /// amendment cannot land halfway through relaying a stream.
+    ///
+    /// Established flows are counted, not severed -- see
+    /// [`AmendOutcome::established_retained`].
+    pub fn amend_policy(&mut self, amendment: &Amendment) -> AmendOutcome {
+        let mut outcome = self.policy.amend(amendment);
+        outcome.established_retained = self.flows.len();
+
+        // The amendment goes into the same buffer as the decisions, so it is
+        // drained by the same pass and lands in the audit trail *between* the
+        // flows the old label governed and the flows the new one will. Reading
+        // the trail forward then answers "what was the policy at the time of
+        // this request?" -- which a mutable policy makes a harder question, not
+        // an easier one (V6.3).
+        self.events.push(EgressEvent {
+            domain: POLICY_EVENT_DOMAIN,
+            target: outcome.rule.clone(),
+            allowed: outcome.allowed,
+            rule: describe_amendment(&outcome),
+            policy: outcome.label.clone(),
+        });
+
+        // A denial that leaves connections up is the surprising case, so say it
+        // on the console too rather than only in the trail.
+        eprintln!(
+            "chm: [egress] AMEND {} {} — policy now {}{}",
+            if outcome.allowed { "allow" } else { "deny" },
+            outcome.rule,
+            outcome.label,
+            if outcome.established_retained > 0 {
+                format!(
+                    " ({} established flow(s) continue under the previous decision)",
+                    outcome.established_retained
+                )
+            } else {
+                String::new()
+            }
+        );
+        outcome
     }
 
     /// Log a blocked flow to the console once per unique target — the visible
@@ -997,9 +1044,42 @@ impl NetResponder for NatResponder {
         NatResponder::set_intercept(self, decider);
     }
 
+    fn amend_egress(&mut self, amendment: &Amendment) -> Option<AmendOutcome> {
+        Some(NatResponder::amend_policy(self, amendment))
+    }
+
     fn drain_egress_events(&mut self) -> Vec<EgressEvent> {
         self.drain_events()
     }
+}
+
+/// The [`EgressEvent::domain`] a live policy amendment carries, distinguishing
+/// an administrative change from the `"dns"` and `"tcp"` flow decisions.
+///
+/// Named here, beside the code that emits it, and imported by the audit sink
+/// that has to route it -- a second copy of this string on the consumer side
+/// would drift silently, and the symptom would be amendments quietly folded
+/// into the flow tally (see `chm::audit::record_egress`).
+pub const POLICY_EVENT_DOMAIN: &str = "policy";
+
+/// Render an amendment for the audit trail, naming what it displaced.
+///
+/// The superseded rules are part of the record because an amendment that had to
+/// remove an opposing rule changed the policy in two ways, and a trail that
+/// showed only the addition would under-report it.
+fn describe_amendment(outcome: &AmendOutcome) -> String {
+    let verb = if outcome.allowed { "allow" } else { "deny" };
+    let mut s = format!("amend {verb} {}", outcome.rule);
+    if !outcome.superseded.is_empty() {
+        s.push_str(&format!(" (superseded {})", outcome.superseded.join(", ")));
+    }
+    if outcome.established_retained > 0 {
+        s.push_str(&format!(
+            " ({} established flow(s) retained)",
+            outcome.established_retained
+        ));
+    }
+    s
 }
 
 /// Log a parsed summary of an Ethernet frame for NAT debugging (ethertype, and

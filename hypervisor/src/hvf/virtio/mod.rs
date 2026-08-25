@@ -71,6 +71,14 @@ pub trait NetIo: Send + Sync {
     /// every NIC however it arrived: two renderings of one security posture
     /// drift, and the drift is invisible until a guest reaches a host unsigned.
     fn set_net_intercept(&self, decider: Option<std::sync::Arc<dyn nat::InterceptDecider>>);
+    /// Apply a live change to this NIC's egress policy, reporting what it did,
+    /// or `None` if this device enforces no policy (#156).
+    ///
+    /// On the trait for the same reason `set_net_intercept` is: one caller
+    /// amends every NIC however it arrived, so a sandbox cannot end up with two
+    /// NICs enforcing two different postures because the amendment only reached
+    /// the transport somebody happened to think of.
+    fn amend_net_egress(&self, amendment: &nat::Amendment) -> Option<nat::AmendOutcome>;
 }
 
 impl NetIo for pci::VirtioPciDevice {
@@ -89,6 +97,9 @@ impl NetIo for pci::VirtioPciDevice {
     fn set_net_intercept(&self, decider: Option<std::sync::Arc<dyn nat::InterceptDecider>>) {
         pci::VirtioPciDevice::set_net_intercept(self, decider);
     }
+    fn amend_net_egress(&self, amendment: &nat::Amendment) -> Option<nat::AmendOutcome> {
+        pci::VirtioPciDevice::amend_net_egress(self, amendment)
+    }
 }
 
 impl NetIo for mmio::VirtioMmioDevice {
@@ -106,6 +117,9 @@ impl NetIo for mmio::VirtioMmioDevice {
     }
     fn set_net_intercept(&self, decider: Option<std::sync::Arc<dyn nat::InterceptDecider>>) {
         mmio::VirtioMmioDevice::set_net_intercept(self, decider);
+    }
+    fn amend_net_egress(&self, amendment: &nat::Amendment) -> Option<nat::AmendOutcome> {
+        mmio::VirtioMmioDevice::amend_net_egress(self, amendment)
     }
 }
 
