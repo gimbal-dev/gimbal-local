@@ -2483,7 +2483,10 @@ pub fn exec_main(raw: &[String]) -> ExitCode {
 
 fn exec_client(raw: &[String]) -> Result<u8, String> {
     let (socket, rest) = take_socket(raw)?;
-    let (timeout, json, argv) = parse_exec_args(&rest)?;
+    let Some((timeout, json, argv)) = parse_exec_args(&rest)? else {
+        print!("{EXEC_USAGE}");
+        return Ok(0);
+    };
 
     let reply = exec_once(&socket, timeout, &argv)?;
 
@@ -2571,7 +2574,14 @@ pub(crate) fn ask_json(socket: &Path, command: &str) -> Result<serde_json::Value
 /// Everything after `--` is the command, verbatim: a guest command's own flags
 /// must never be mistaken for ours. Without a `--`, flags are consumed until the
 /// first non-flag word, which then starts the command.
-fn parse_exec_args(rest: &[String]) -> Result<(u64, bool, Vec<String>), String> {
+///
+/// `Ok(None)` means the caller asked `chm exec` itself to explain. That answer
+/// lives in here rather than in [`exec_main`] because the boundary it depends on
+/// lives in here: `chm exec -- mytool --help` is asking *mytool* for help, and
+/// any second copy of "where do our flags stop" would eventually disagree with
+/// this loop. #417 -- the help page used to leave through the `Err` channel,
+/// which printed it to stderr and exited 125.
+fn parse_exec_args(rest: &[String]) -> Result<Option<(u64, bool, Vec<String>)>, String> {
     let mut timeout = EXEC_DEFAULT_TIMEOUT;
     let mut json = false;
     let mut i = 0;
@@ -2590,7 +2600,7 @@ fn parse_exec_args(rest: &[String]) -> Result<(u64, bool, Vec<String>), String> 
                 }
                 i += 1;
             }
-            "-h" | "--help" => return Err(EXEC_USAGE.to_string()),
+            "-h" | "--help" => return Ok(None),
             other if other.starts_with('-') => {
                 return Err(format!("unknown option `{other}`\n\n{EXEC_USAGE}"));
             }
@@ -2602,7 +2612,7 @@ fn parse_exec_args(rest: &[String]) -> Result<(u64, bool, Vec<String>), String> 
     if argv.is_empty() {
         return Err(format!("no command given\n\n{EXEC_USAGE}"));
     }
-    Ok((timeout, json, argv))
+    Ok(Some((timeout, json, argv)))
 }
 
 #[cfg(test)]
@@ -2939,7 +2949,9 @@ mod tests {
 
     #[test]
     fn exec_defaults_to_a_bounded_wait_and_text_output() {
-        let (timeout, json, argv) = parse_exec_args(&s(&["uname", "-a"])).unwrap();
+        let (timeout, json, argv) = parse_exec_args(&s(&["uname", "-a"]))
+            .unwrap()
+            .expect("a command, not a help request");
         assert_eq!(timeout, EXEC_DEFAULT_TIMEOUT);
         assert!(!json);
         assert_eq!(argv, s(&["uname", "-a"]));
@@ -2949,8 +2961,9 @@ mod tests {
     /// and everything past it is data.
     #[test]
     fn exec_does_not_claim_the_guest_commands_flags() {
-        let (_, json, argv) =
-            parse_exec_args(&s(&["--", "ls", "--json", "--timeout", "5"])).unwrap();
+        let (_, json, argv) = parse_exec_args(&s(&["--", "ls", "--json", "--timeout", "5"]))
+            .unwrap()
+            .expect("a command, not a help request");
         assert!(!json, "`--json` after `--` belongs to the guest command");
         assert_eq!(argv, s(&["ls", "--json", "--timeout", "5"]));
     }
@@ -2958,10 +2971,36 @@ mod tests {
     #[test]
     fn exec_reads_its_own_flags_before_the_separator() {
         let (timeout, json, argv) =
-            parse_exec_args(&s(&["--timeout", "5", "--json", "--", "true"])).unwrap();
+            parse_exec_args(&s(&["--timeout", "5", "--json", "--", "true"]))
+                .unwrap()
+                .expect("a command, not a help request");
         assert_eq!(timeout, 5);
         assert!(json);
         assert_eq!(argv, s(&["true"]));
+    }
+
+    /// `chm exec -- mytool --help` is asking *mytool* to explain itself, not
+    /// `chm`. #417 moved seven subcommands to a scan-every-argument rule for
+    /// help; applying that rule here too would have silently eaten a flag meant
+    /// for the guest. So `exec` keeps the question inside this parser, which is
+    /// the only code that knows where our flags stop -- the same care `chm ctl
+    /// input <text>` needed in #416, for the same reason.
+    #[test]
+    fn exec_does_not_answer_a_help_flag_meant_for_the_guest() {
+        let (_, _, argv) = parse_exec_args(&s(&["--", "mytool", "--help"]))
+            .expect("a guest command line is not an error")
+            .expect("`--help` after `--` belongs to the guest, not to chm");
+        assert_eq!(argv, s(&["mytool", "--help"]));
+
+        // The same word before any separator is ours, and it is a question
+        // rather than a failure -- `Ok(None)`, not `Err`.
+        assert!(
+            parse_exec_args(&s(&["--help"]))
+                .expect("asking for help is not an error")
+                .is_none(),
+            "`chm exec --help` must be read as a request for chm's own help"
+        );
+        assert!(parse_exec_args(&s(&["-h"])).expect("nor is `-h`").is_none());
     }
 
     #[test]
