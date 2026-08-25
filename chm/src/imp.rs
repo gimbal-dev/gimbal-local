@@ -2798,6 +2798,53 @@ pub(crate) fn require_workspace_dir(dir: &Path) -> Result<(), String> {
     }
 }
 
+/// The refusal a command group gives when it was handed no subcommand at all.
+///
+/// Split out from [`answer_group_help`] so the sentence a caller reads is
+/// testable: the failing branch writes to stderr, and a test cannot read that
+/// without capturing a process-global stream.
+pub(crate) fn missing_command_message(group: &str, usage: &str) -> String {
+    format!(
+        "chm {group}: missing command\n\n{}",
+        usage.trim_end_matches('\n')
+    )
+}
+
+/// Answer a command group invoked with no subcommand, or with an explicit
+/// request for help.
+///
+/// **These are two different questions with opposite answers**, and collapsing
+/// them into one match arm is what made ten of the eleven groups reply to both
+/// byte-identically (#423):
+///
+/// - `chm <group> --help` is a request that was granted. The usage goes to
+///   **stdout** and the process **succeeds** -- settled in #417.
+/// - `chm <group>` with nothing after it is a usage error. A script that typed
+///   nothing did not get what it asked for, so the usage goes to **stderr**
+///   behind a named reason and the process **fails**.
+///
+/// Both halves matter independently. `kernel` and `spec` already exited
+/// non-zero and still wrote nothing to stderr, so a caller checking stderr for
+/// a reason -- or redirecting stdout to a file -- got a bare failing status and
+/// no explanation anywhere it was looking. The other eight exited *zero*, so a
+/// script that typed nothing was told it had succeeded.
+///
+/// `chm ctl` is the one group that already took the two apart, in #420; this is
+/// that shape, shared, so the remaining ten cannot answer differently.
+///
+/// `usage` is printed **verbatim** on the help path. Not one byte of `--help`
+/// output moves: that half is settled, and this change is about the other
+/// branch.
+pub(crate) fn answer_group_help(group: &str, asked_for_help: bool, usage: &str) -> ExitCode {
+    if asked_for_help {
+        print!("{usage}");
+        ExitCode::SUCCESS
+    } else {
+        eprintln!("{}", missing_command_message(group, usage));
+        ExitCode::FAILURE
+    }
+}
+
 /// `chm rollback <SNAPSHOT_DIR> <REVISION_ID>` — roll a snapshot back to an
 /// archived revision (appended as a fresh HEAD; history is preserved).
 fn rollback_cmd(raw: &[String]) -> Result<ExitCode, String> {
@@ -7417,5 +7464,179 @@ mod workspace_arg_tests {
             "an empty revision list is a valid answer and must stay rc=0"
         );
         let _ = fs::remove_dir_all(&d);
+    }
+}
+
+/// Guards for #423: a command group must not answer "help me" and "I typed
+/// nothing" identically.
+///
+/// Eleven of twelve groups did. The two questions have opposite answers -- one
+/// is a request that was granted, the other is a request that was never made --
+/// and answering both with the same bytes on the same stream at the same exit
+/// code makes them indistinguishable to anything downstream.
+#[cfg(test)]
+mod group_dispatch_guards {
+    use std::process::ExitCode;
+
+    use crate::audit::audit_main;
+    use crate::cloud::cloud_main;
+    use crate::control_plane::{policy_main, runner_main};
+    use crate::credproxy::cli::proxy_main;
+    use crate::firewall::firewall_main;
+    use crate::imp::missing_command_message;
+    use crate::kernelimage::kernel_main;
+    use crate::limits::limits_main;
+    use crate::oci::image::image_main;
+    use crate::serve::ctl_main;
+    use crate::spec::spec_main;
+    use crate::state_cdn::state_cdn_main;
+
+    /// `ExitCode` has no `PartialEq`, so compare through `Debug`.
+    fn shown(c: ExitCode) -> String {
+        format!("{c:?}")
+    }
+
+    fn success() -> String {
+        shown(ExitCode::SUCCESS)
+    }
+
+    fn failure() -> String {
+        shown(ExitCode::FAILURE)
+    }
+
+    type GroupMain = fn(&[String]) -> ExitCode;
+
+    /// Every `chm` command group that dispatches subcommands, paired with the
+    /// function `chm <group>` reaches.
+    ///
+    /// Every one of these returns before it opens a socket, reads a workspace
+    /// or spawns anything, so driving them in-process is safe. `ctl` is the
+    /// interesting case and it is deliberate: `serve.rs::ctl` answers the
+    /// no-subcommand case *above* the connect, so that the person who most
+    /// needs the usage -- the one with no daemon running -- gets it.
+    fn groups() -> Vec<(&'static str, GroupMain)> {
+        vec![
+            ("kernel", kernel_main as GroupMain),
+            ("spec", spec_main as GroupMain),
+            ("image", image_main as GroupMain),
+            ("ctl", ctl_main as GroupMain),
+            ("audit", audit_main as GroupMain),
+            ("limits", limits_main as GroupMain),
+            ("firewall", firewall_main as GroupMain),
+            ("proxy", proxy_main as GroupMain),
+            ("cloud", cloud_main as GroupMain),
+            ("policy", policy_main as GroupMain),
+            ("state-cdn", state_cdn_main as GroupMain),
+            ("runner", runner_main as GroupMain),
+        ]
+    }
+
+    fn argv(words: &[&str]) -> Vec<String> {
+        words.iter().map(|w| String::from(*w)).collect()
+    }
+
+    /// The load-bearing guard. Drives the real dispatcher rather than asserting
+    /// about its source, so it sees the answer a caller actually gets.
+    #[test]
+    fn typing_nothing_is_a_usage_error_and_asking_for_help_is_not() {
+        for (name, dispatch) in groups() {
+            assert_eq!(
+                shown(dispatch(&[])),
+                failure(),
+                "`chm {name}` with no subcommand must fail: a script that typed \
+                 nothing did not get what it asked for"
+            );
+            for flag in ["--help", "-h"] {
+                assert_eq!(
+                    shown(dispatch(&argv(&[flag]))),
+                    success(),
+                    "`chm {name} {flag}` must succeed: it is a request that was granted"
+                );
+            }
+        }
+    }
+
+    /// The refusing branch writes to stderr, and a test cannot read a
+    /// process-global stream -- so the sentence is built by a pure function and
+    /// that is what gets asserted on.
+    #[test]
+    fn the_refusal_names_the_group_and_carries_the_usage() {
+        let msg =
+            missing_command_message("kernel", "chm kernel <COMMAND>\n\nCOMMANDS:\n    probe\n");
+        assert!(
+            msg.starts_with("chm kernel: missing command"),
+            "the refusal must lead with which command group refused, got: {msg:?}"
+        );
+        assert!(
+            msg.contains("chm kernel <COMMAND>"),
+            "a refusal that withholds the usage leaves the reader with no next \
+             step, got: {msg:?}"
+        );
+        assert!(
+            !msg.ends_with('\n'),
+            "`eprintln!` supplies the terminator; ending the message with one \
+             too would print a blank line no `--help` prints, got: {msg:?}"
+        );
+    }
+
+    /// Every command group's source, paired with the group name it dispatches,
+    /// so a dispatcher that quietly stops routing through the shared answer is
+    /// visible even while its behaviour still happens to be right.
+    ///
+    /// Keyed on the **group**, not the file, and that distinction is not
+    /// cosmetic: `control_plane.rs` dispatches two groups, so a needle that
+    /// only asks "does this file mention the shared answer" stays satisfied by
+    /// `policy` while `runner` is unhooked. A needle present in two places
+    /// cannot detect its removal from the one that matters -- proved by
+    /// mutation M5, which this guard was silent on until it was keyed this way.
+    fn dispatched_groups() -> Vec<(&'static str, &'static str, &'static str)> {
+        vec![
+            ("kernel", "kernelimage.rs", include_str!("kernelimage.rs")),
+            ("spec", "spec.rs", include_str!("spec.rs")),
+            ("image", "oci/image.rs", include_str!("oci/image.rs")),
+            ("audit", "audit.rs", include_str!("audit.rs")),
+            ("limits", "limits.rs", include_str!("limits.rs")),
+            ("firewall", "firewall.rs", include_str!("firewall.rs")),
+            (
+                "proxy",
+                "credproxy/cli.rs",
+                include_str!("credproxy/cli.rs"),
+            ),
+            ("cloud", "cloud.rs", include_str!("cloud.rs")),
+            (
+                "runner",
+                "control_plane.rs",
+                include_str!("control_plane.rs"),
+            ),
+            (
+                "policy",
+                "control_plane.rs",
+                include_str!("control_plane.rs"),
+            ),
+            ("state-cdn", "state_cdn.rs", include_str!("state_cdn.rs")),
+        ]
+    }
+
+    /// Mutating a function is not mutating its call site -- this repository has
+    /// banked that seven times. The behavioural guard above sees a dispatcher
+    /// that answers wrongly; this one sees a dispatcher that has stopped asking.
+    #[test]
+    fn every_command_group_routes_its_empty_case_through_the_shared_answer() {
+        for (group, path, src) in dispatched_groups() {
+            // Whitespace is flattened before searching, because a guard that a
+            // line break can defeat reports safety it does not provide -- and
+            // rustfmt is free to wrap any of these call sites at any time.
+            let flat: String = src.chars().filter(|c| !c.is_whitespace()).collect();
+            // Assembled from parts: a literal needle would match this
+            // assertion's own text if this file joined the list above.
+            let needle = format!("{}(\"{group}\"", "answer_group_help");
+            assert!(
+                flat.contains(&needle),
+                "{path} dispatches `chm {group}` but no longer routes its empty \
+                 case through the shared answer, so `chm {group}` and \
+                 `chm {group} --help` can drift back into being the same reply \
+                 (#423)"
+            );
+        }
     }
 }

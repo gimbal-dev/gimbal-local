@@ -34,6 +34,7 @@ use std::process::{Command, ExitCode};
 
 use crate::imp::require_workspace_dir;
 
+use crate::imp::answer_group_help;
 use serde::{Deserialize, Serialize};
 
 /// The per-workspace file `chm` reads to bound a sandbox's resources.
@@ -238,8 +239,7 @@ pub(crate) fn limits_main(raw: &[String]) -> ExitCode {
         Some("clear") => clear(&raw[1..]),
         Some("validate") => validate(&raw[1..]),
         Some("-h") | Some("--help") | None => {
-            print!("{}", usage());
-            return ExitCode::SUCCESS;
+            return answer_group_help("limits", !raw.is_empty(), &usage());
         }
         Some(other) => Err(format!("unknown subcommand `{other}`")),
     };

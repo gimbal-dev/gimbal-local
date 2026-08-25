@@ -55,6 +55,7 @@ use super::reference::{self, Reference};
 use super::registry::{self, ImageConfig, Registry};
 use super::targz;
 use crate::coldboot::VirtioBuiltin;
+use crate::imp::answer_group_help;
 use crate::imp::human_bytes;
 use crate::kernelimage::{self, KernelForm};
 use crate::oci::entry::EntryKind;
@@ -93,8 +94,7 @@ pub fn image_main(args: &[String]) -> ExitCode {
             }
         },
         Some("--help") | Some("-h") | None => {
-            println!("{}", usage());
-            ExitCode::SUCCESS
+            answer_group_help("image", !args.is_empty(), &format!("{}\n", usage()))
         }
         Some(other) => {
             eprintln!("chm image: unknown subcommand `{other}`\n\n{}", usage());

@@ -54,6 +54,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::imp::require_workspace_dir;
 
+use crate::imp::answer_group_help;
 use hypervisor::hvf::virtio::nat::{EgressEvent, POLICY_EVENT_DOMAIN};
 use serde_json::{Map, Value, json};
 
@@ -325,8 +326,7 @@ pub(crate) fn audit_main(raw: &[String]) -> ExitCode {
     let result = match raw.first().map(String::as_str) {
         Some("show") => show(&raw[1..]),
         Some("-h") | Some("--help") | None => {
-            print!("{}", usage());
-            return ExitCode::SUCCESS;
+            return answer_group_help("audit", !raw.is_empty(), &usage());
         }
         Some(other) => Err(format!("unknown subcommand `{other}`")),
     };
