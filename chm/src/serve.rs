@@ -992,7 +992,37 @@ fn status_json(daemon: &Daemon) -> String {
 /// directory, falling back to the library root when idle. Emits the same shape
 /// as `chm posture --json` plus `source` and `assessed` so the caller can say
 /// whose posture it is showing.
+///
+/// # Why `--probe-guest` is opt-in
+///
+/// The in-guest user-namespace row can only be answered by running a command in
+/// the guest, and [`exec_run`] writes **ETX (Ctrl-C)** to the console before its
+/// script so it starts from a known prompt. `EXEC_BUSY` serialises two `chm
+/// exec`s against each other; it knows nothing about a human's foreground
+/// command. So probing on every posture read would interrupt whatever the user
+/// was running, to compute a report that sounds read-only.
+///
+/// Split a `posture-json` request line into "was the guest's consent given?"
+/// and "which directory?".
+///
+/// A pure function rather than two lines inside [`posture_json`] because that
+/// function needs a live [`Daemon`], so a guard written against it can only
+/// re-implement this parsing -- and a test that re-implements the thing it
+/// guards agrees with itself no matter what the product does.
+fn posture_request(arg: &str) -> (bool, &str) {
+    let probe = arg.split_whitespace().any(|a| a == "--probe-guest");
+    let dir = arg
+        .split_whitespace()
+        .find(|a| !a.starts_with('-'))
+        .unwrap_or("");
+    (probe, dir)
+}
+
+/// Reading a posture must not do anything. The flag is how a caller says it is
+/// willing to.
 fn posture_json(daemon: &Daemon, arg: &str) -> String {
+    let (probe_requested, arg) = posture_request(arg);
+
     let (dir, assessed) = if arg.is_empty() {
         match running_vm_dir(daemon) {
             Some(dir) => (dir, "running-vm"),
@@ -1002,7 +1032,12 @@ fn posture_json(daemon: &Daemon, arg: &str) -> String {
         (PathBuf::from(arg), "requested")
     };
 
-    let (body, _weakened) = posture::assess_json(&dir);
+    let userns = match guest_userns_plan(probe_requested, running_vm_dir(daemon).is_some()) {
+        Err(answer) => answer,
+        Ok(secs) => probe_guest_userns(daemon, secs),
+    };
+
+    let (body, _weakened) = posture::assess_json(&dir, &userns);
     // Splice the provenance in after the opening brace rather than nesting, so
     // one decoder handles both this and `chm posture --json`.
     let spliced = body.replacen(
@@ -1011,6 +1046,86 @@ fn posture_json(daemon: &Daemon, arg: &str) -> String {
         1,
     );
     format!("{spliced}\n")
+}
+
+/// How long the guest gets to answer the user-namespace probe.
+///
+/// Two orders of magnitude below `chm exec`'s 300 s default, and deliberately
+/// so: `unshare --user --map-root-user true` either returns immediately or the
+/// console is not in a state to run it. A posture read that can block for five
+/// minutes is a posture read nobody will wait for, and the honest answer to a
+/// console that will not answer in eight seconds is [`GuestUserns::NoAnswer`],
+/// which this report can say.
+const USERNS_PROBE_SECS: u64 = 8;
+
+/// Decide whether to probe, separately from probing.
+///
+/// Split out because the effect needs a live guest and a console, and the
+/// decision does not -- so every cell of the table is unit-testable without
+/// either. Same move as `leak_at` in the GIC model (§54).
+///
+/// `Err` carries the answer to report without asking; `Ok` carries the deadline
+/// to ask within.
+fn guest_userns_plan(probe_requested: bool, vm_running: bool) -> Result<u64, posture::GuestUserns> {
+    match (probe_requested, vm_running) {
+        (false, true) => Err(posture::GuestUserns::NotAsked(
+            "reading a posture does not touch the guest; pass --probe-guest to \
+             run the check in it (it writes to the console, which interrupts a \
+             foreground command)"
+                .into(),
+        )),
+        (false, false) => Err(posture::GuestUserns::NotAsked(
+            "no guest is running, and this control is a property of the guest".into(),
+        )),
+        // Asked, with nothing to ask. Not a failure: an idle daemon is the
+        // normal state, and `NoAnswer` would imply something went wrong.
+        (true, false) => Err(posture::GuestUserns::NotAsked(
+            "--probe-guest was given but no guest is running; start one and ask \
+             again"
+                .into(),
+        )),
+        (true, true) => Ok(USERNS_PROBE_SECS),
+    }
+}
+
+/// Run the probe in the guest and translate what came back.
+///
+/// Every outcome that is not a completed command becomes
+/// [`GuestUserns::NoAnswer`] carrying its own reason. The transport cannot be
+/// allowed to look like an answer in either direction: a timeout is not a
+/// restriction, and a truncated transcript is not a success.
+fn probe_guest_userns(daemon: &Daemon, secs: u64) -> posture::GuestUserns {
+    let argv: Vec<String> = posture::USERNS_PROBE_ARGV
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+    let request = format!("{secs} {}", exec::encode_argv(&argv));
+
+    match exec_run(daemon, &request) {
+        Err(why) => posture::GuestUserns::NoAnswer(why),
+        Ok((exec::ExecOutcome::Completed { code, output }, _)) => {
+            if code == 0 {
+                posture::GuestUserns::Available
+            } else {
+                let said = output.trim();
+                let said = said.lines().next_back().unwrap_or("").trim();
+                if said.is_empty() {
+                    posture::GuestUserns::Restricted(format!("it exited {code} and said nothing"))
+                } else {
+                    posture::GuestUserns::Restricted(format!("exit {code}: {said}"))
+                }
+            }
+        }
+        Ok((exec::ExecOutcome::Pending, _)) => posture::GuestUserns::NoAnswer(format!(
+            "the guest console did not answer within {secs}s"
+        )),
+        Ok((exec::ExecOutcome::Truncated, _)) => posture::GuestUserns::NoAnswer(
+            "the guest console overflowed and the reply was lost".into(),
+        ),
+        Ok((exec::ExecOutcome::Overflowed, _)) => posture::GuestUserns::NoAnswer(
+            "the reply was longer than the console buffer could hold".into(),
+        ),
+    }
 }
 
 /// The credential-proxy rule set **as the daemon resolves it**.
@@ -1935,6 +2050,20 @@ fn ctl_command(rest: &[String]) -> Result<String, String> {
         return Ok(match dir {
             Some(d) => format!("capabilities-json {d}"),
             None => "capabilities-json -".to_string(),
+        });
+    }
+
+    // `posture [<dir>] [--probe-guest]`: the generic tail below matches only
+    // bare `[cmd]`/`[cmd, <dir>]` shapes, so a flag would fall through it and
+    // be reported as an unknown command. Its own block, like `audit`.
+    if rest.first().map(String::as_str) == Some("posture") {
+        let probe = rest.iter().any(|a| a == "--probe-guest");
+        let dir = rest.iter().skip(1).find(|a| !a.starts_with('-')).cloned();
+        return Ok(match (probe, dir) {
+            (true, Some(d)) => format!("posture-json --probe-guest {d}"),
+            (true, None) => "posture-json --probe-guest".to_string(),
+            (false, Some(d)) => format!("posture-json {d}"),
+            (false, None) => "posture-json".to_string(),
         });
     }
 
@@ -2894,5 +3023,141 @@ mod cold_finish_drain_tests {
             began.elapsed() < Duration::from_millis(200),
             "a guest that ended on its own must not pay the drain"
         );
+    }
+}
+
+/// Guards for the in-guest user-namespace probe (#363).
+#[cfg(test)]
+mod guest_userns_probe_tests {
+    use super::*;
+
+    /// All four cells, without a guest or a console.
+    ///
+    /// The two that matter most are the `false` rows: they are the promise that
+    /// reading a posture writes nothing to anyone's console.
+    #[test]
+    fn the_probe_only_runs_when_it_was_asked_for_and_there_is_something_to_ask() {
+        assert!(
+            guest_userns_plan(true, true).is_ok(),
+            "--probe-guest with a running guest must actually probe"
+        );
+        for (requested, running) in [(false, true), (false, false), (true, false)] {
+            let plan = guest_userns_plan(requested, running);
+            assert!(
+                plan.is_err(),
+                "probed with requested={requested} running={running}; a posture \
+                 read wrote to a guest console it was not told it could touch"
+            );
+        }
+    }
+
+    /// Not asking is not the same as asking and getting nothing back, and the
+    /// report has to be able to tell a reader which happened.
+    #[test]
+    fn every_non_probing_cell_says_why_without_claiming_a_failure() {
+        for (requested, running) in [(false, true), (false, false), (true, false)] {
+            match guest_userns_plan(requested, running) {
+                Err(posture::GuestUserns::NotAsked(why)) => {
+                    assert!(
+                        why.len() > 20,
+                        "requested={requested} running={running} gave no reason"
+                    );
+                }
+                other => panic!(
+                    "requested={requested} running={running} reported {other:?}; an \
+                     unasked question must not read as a failed one"
+                ),
+            }
+        }
+    }
+
+    /// A guest that is up but silent must not be reported as either answer.
+    #[test]
+    fn the_deadline_is_short_enough_that_a_posture_read_returns() {
+        assert!(
+            USERNS_PROBE_SECS <= 30,
+            "a posture read that can block for {USERNS_PROBE_SECS}s is one \
+             nobody will wait for"
+        );
+        assert!(USERNS_PROBE_SECS >= 1);
+    }
+
+    /// The call-site class, eight times over in this repo now: a guard that
+    /// asserts an outcome structurally cannot see a path that is no longer
+    /// taken. `guest_userns_plan` could keep returning `Ok` forever while
+    /// `posture_json` stopped consulting it.
+    ///
+    /// Needles assembled from parts so this test cannot match its own text.
+    #[test]
+    fn posture_json_consults_the_plan_and_runs_the_probe() {
+        let src = include_str!("serve.rs");
+        let body = src
+            .split_once("fn posture_json(")
+            .expect("posture_json is gone")
+            .1
+            .split_once("\nfn ")
+            .expect("posture_json has no end")
+            .0;
+        for needle in [
+            // Both halves of the parsed request must be the ones used. Binding
+            // the flag to `_` and hardcoding `false` compiles, passes every
+            // outcome assertion, and silently never probes.
+            format!("let (probe_requested, arg) = {}(arg);", "posture_request"),
+            format!("{}(probe_requested", "guest_userns_plan"),
+            format!("{}(daemon, secs)", "probe_guest_userns"),
+            format!("&{}", "userns"),
+        ] {
+            assert!(
+                body.contains(&needle),
+                "posture_json no longer contains `{needle}`, so the probe it \
+                 reports on may never run"
+            );
+        }
+    }
+
+    /// The flag has to survive `ctl_command`, which is where a new flag on an
+    /// existing verb silently falls off: the generic tail matches only bare
+    /// `[cmd]` and `[cmd, <dir>]`.
+    #[test]
+    fn ctl_carries_probe_guest_through_to_the_daemon() {
+        let wire = |args: &[&str]| {
+            let owned: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            ctl_command(&owned).expect("ctl_command refused a posture form")
+        };
+        let flag = format!("--{}", "probe-guest");
+        assert_eq!(wire(&["posture"]), "posture-json");
+        assert_eq!(wire(&["posture", "/w"]), "posture-json /w");
+        assert_eq!(wire(&["posture", &flag]), format!("posture-json {flag}"));
+        assert_eq!(
+            wire(&["posture", &flag, "/w"]),
+            format!("posture-json {flag} /w")
+        );
+        assert_eq!(
+            wire(&["posture", "/w", &flag]),
+            format!("posture-json {flag} /w"),
+            "flag order changed the request"
+        );
+    }
+
+    /// And the daemon side has to read it back off the wire. Both halves,
+    /// because a flag that arrives and is ignored is the worse failure: it
+    /// reports "not asked" while the user believes they asked.
+    #[test]
+    fn the_daemon_reads_the_flag_and_the_directory_out_of_one_argument() {
+        let flag = format!("--{}", "probe-guest");
+        assert_eq!(
+            posture_request(&format!("{flag} /some/dir")),
+            (true, "/some/dir"),
+            "the flag arrived and was ignored, or the directory was lost"
+        );
+        // Order must not matter: the CLI emits flag-first, a human may not.
+        assert_eq!(
+            posture_request(&format!("/some/dir {flag}")),
+            (true, "/some/dir")
+        );
+        assert_eq!(posture_request("/some/dir"), (false, "/some/dir"));
+        assert_eq!(posture_request(""), (false, ""));
+        // A near-miss must not be read as consent to write to the console.
+        assert!(!posture_request("--probe-guests").0);
     }
 }

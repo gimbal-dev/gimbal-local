@@ -284,6 +284,7 @@ extension PostureControl.State {
         case .active: return "Active"
         case .weakened: return "Weakened"
         case .notApplicable: return "N/A"
+        case .unmeasured: return "Not measured"
         }
     }
 
@@ -292,6 +293,7 @@ extension PostureControl.State {
         case .active: return "checkmark.shield.fill"
         case .weakened: return "exclamationmark.shield.fill"
         case .notApplicable: return "minus.circle"
+        case .unmeasured: return "questionmark.circle"
         }
     }
 
@@ -300,6 +302,7 @@ extension PostureControl.State {
         case .active: return Theme.green
         case .weakened: return Theme.orange
         case .notApplicable: return .gray
+        case .unmeasured: return .gray
         }
     }
 
@@ -307,8 +310,12 @@ extension PostureControl.State {
     var sortRank: Int {
         switch self {
         case .weakened: return 0
-        case .active: return 1
-        case .notApplicable: return 2
+        // Above `active`: "we did not look" is not bad news, but it is the
+        // thing you want to notice, and burying it under the green rows is how
+        // a gap stays invisible.
+        case .unmeasured: return 1
+        case .active: return 2
+        case .notApplicable: return 3
         }
     }
 }

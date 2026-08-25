@@ -45,6 +45,24 @@ use crate::runs;
 use crate::signing;
 use hypervisor::hvf::virtio::nat::INGRESS_BIND_ADDR;
 
+/// The runtime probe for an unprivileged user namespace, as argv.
+///
+/// Shared with [`crate::oci::browser::launch_script`], which runs the same
+/// command to decide whether Chromium keeps its own sandbox. Two copies would
+/// eventually ask two different questions, and a posture row describing a
+/// different question than the browser asks is worse than no row: it would
+/// report on a capability nothing actually depends on.
+///
+/// It is a **probe, not a sysctl read**. `kernel.apparmor_restrict_unprivileged_userns`
+/// is one distro's route to withholding the capability; seccomp, a different
+/// LSM, or a kernel built without `CONFIG_USER_NS` all withhold it too, and a
+/// report that read only the sysctl would call those guests capable.
+pub(crate) const USERNS_PROBE_ARGV: [&str; 4] = ["unshare", "--user", "--map-root-user", "true"];
+
+/// The sysctl that withholds it on Ubuntu 23.10 and later, and therefore in
+/// every rehydrated Ubuntu 24.04 capture.
+pub(crate) const APPARMOR_USERNS_SYSCTL: &str = "kernel.apparmor_restrict_unprivileged_userns";
+
 /// Whether a control is on, and how strongly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -54,6 +72,19 @@ enum State {
     Weakened,
     /// Off, and off is the documented posture (not a weakening).
     NotApplicable,
+    /// Nobody established either way, and this report says so.
+    ///
+    /// The first state that admits ignorance, and it exists because the
+    /// alternatives all lie. `NotApplicable` would claim the posture is a
+    /// documented off; `Active` would claim a capability nothing checked;
+    /// `Weakened` would exit non-zero over an absence of looking. This repo has
+    /// banked the same failure seven times — a mechanism reporting safety it
+    /// never established — and an unasked question is exactly that shape.
+    ///
+    /// Deliberately **not** counted in the weakened total, so it cannot change
+    /// an exit status. `chm posture && deploy` must not start refusing because
+    /// a check was skipped.
+    Unmeasured,
 }
 
 impl State {
@@ -62,6 +93,7 @@ impl State {
             State::Active => "on ",
             State::Weakened => "OFF",
             State::NotApplicable => "n/a",
+            State::Unmeasured => " ? ",
         }
     }
 
@@ -70,8 +102,32 @@ impl State {
             State::Active => "active",
             State::Weakened => "weakened",
             State::NotApplicable => "not-applicable",
+            State::Unmeasured => "unmeasured",
         }
     }
+}
+
+/// What a running guest answered when asked whether an unprivileged process
+/// inside it can obtain a user namespace.
+///
+/// This is an **injected input**, never something [`assess`] reaches for. Every
+/// other row in this report resolves from the host — an env var, a file, a
+/// registry — and can be computed by any process. This one can only be answered
+/// by a guest, over a console, by writing to it; so the decision to ask belongs
+/// to the caller that owns the guest, and `assess` stays pure over it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum GuestUserns {
+    /// Nobody asked, and why. The ordinary case: `chm posture` has no guest,
+    /// and `chm ctl posture` does not interrupt one without being told to.
+    NotAsked(String),
+    /// Asked, and the guest did not answer — a timeout, a busy console, a
+    /// transport failure. Distinct from [`Self::NotAsked`] because a question
+    /// that went unanswered is a different fact from one never put.
+    NoAnswer(String),
+    /// The probe succeeded: an unprivileged process here gets a user namespace.
+    Available,
+    /// The probe failed, carrying the guest's own words for why.
+    Restricted(String),
 }
 
 /// One row of the posture report.
@@ -86,7 +142,9 @@ struct Control {
 
 /// Build the report for `dir`. Pure over its inputs apart from the environment
 /// and filesystem it deliberately inspects, so the shape is easy to test.
-fn assess(dir: &Path) -> Vec<Control> {
+///
+/// `guest_userns` is injected rather than measured here: see [`GuestUserns`].
+fn assess(dir: &Path, guest_userns: &GuestUserns) -> Vec<Control> {
     let mut out = Vec::new();
 
     // I10 — the reserved-address boundary. Default-on; opting out is the
@@ -199,6 +257,8 @@ fn assess(dir: &Path) -> Vec<Control> {
     // posture report that stayed silent about it because a different directory
     // opened it would be reporting the boundary it did not check.
     out.push(ingress_control(&runs::registry_dir()));
+
+    out.push(guest_userns_control(guest_userns));
 
     // Resource ceilings (M30.6) — default-on since V4.2.
     let (doc, source) = limits::resolve_limits(dir, None);
@@ -443,6 +503,82 @@ fn ingress_control(registry: &Path) -> Control {
     }
 }
 
+/// The in-guest user-namespace row, over an injected answer so it is testable.
+///
+/// **This is the first row in this report that the host cannot answer.**
+/// Everything else describes what chm does *to* a guest; this describes what
+/// the guest can do. Two guests on the same hypervisor, the same binary and the
+/// same flags differ here: a container rootfs built by `chm image build`
+/// carries no AppArmor policy, while a rehydrated Ubuntu 24.04 capture carries
+/// `kernel.apparmor_restrict_unprivileged_userns=1` in from the cloud host.
+///
+/// It escapes the "whose posture is it?" trap the same way [`ingress_control`]
+/// does, and for the opposite reason: ingress is a property of a live run on
+/// this machine, and this is a property of the guest image. Neither is read
+/// from the environment of whoever happens to be computing the report, so
+/// `chm posture` and `chm ctl posture` cannot disagree about it — the CLI
+/// simply has no guest to ask.
+///
+/// Four inputs, three states. The mapping is the whole design:
+///
+/// * [`GuestUserns::Available`] → **active**. Defence in depth: the guest can
+///   contain a browser, podman or bubblewrap *inside* the VM boundary.
+/// * [`GuestUserns::Restricted`] → **not applicable**, never weakened. A stock
+///   Ubuntu default is not a misconfiguration, and grading it as a weakening
+///   would make `chm posture && deploy` refuse over every capture we hold.
+/// * [`GuestUserns::NotAsked`] / [`GuestUserns::NoAnswer`] → **unmeasured**,
+///   each naming its own reason. Reporting an unasked question as "n/a" would
+///   claim a measured off; reporting it as "active" would claim a capability.
+fn guest_userns_control(answer: &GuestUserns) -> Control {
+    let probe = USERNS_PROBE_ARGV.join(" ");
+    let (state, detail) = match answer {
+        GuestUserns::Available => (
+            State::Active,
+            format!(
+                "`{probe}` succeeded in the running guest, so an unprivileged \
+                 process there can contain itself: Chromium keeps its own \
+                 sandbox, and podman and bubblewrap work. The VM boundary is \
+                 not the only isolation in this guest."
+            ),
+        ),
+        GuestUserns::Restricted(why) => (
+            State::NotApplicable,
+            format!(
+                "`{probe}` was refused in the running guest ({}). The VM \
+                 boundary still holds and is the premise of this sandbox, but \
+                 it is the only isolation here -- Chromium falls back to \
+                 --no-sandbox and podman and bubblewrap will not start. This is \
+                 the stock Ubuntu 23.10+ default, not a misconfiguration: \
+                 `sudo sysctl -w {APPARMOR_USERNS_SYSCTL}=0` in the guest \
+                 restores it (docs/first-resume.md).",
+                why.trim()
+            ),
+        ),
+        GuestUserns::NoAnswer(why) => (
+            State::Unmeasured,
+            format!(
+                "the running guest was asked and did not answer ({why}), so \
+                 this report cannot say whether an unprivileged process there \
+                 gets a user namespace. Do not read that as either answer."
+            ),
+        ),
+        GuestUserns::NotAsked(why) => (
+            State::Unmeasured,
+            format!(
+                "not measured: {why}. This is the one control only the guest \
+                 can answer -- `chm ctl posture --probe-guest` runs `{probe}` \
+                 in a running guest and reports what it said."
+            ),
+        ),
+    };
+    Control {
+        invariant: "#363",
+        name: "in-guest user namespaces",
+        state,
+        detail,
+    }
+}
+
 pub(crate) fn posture_main(raw: &[String]) -> ExitCode {
     if raw.iter().any(|a| a == "-h" || a == "--help") {
         print!("{}", usage());
@@ -454,7 +590,15 @@ pub(crate) fn posture_main(raw: &[String]) -> ExitCode {
         return ExitCode::FAILURE;
     };
 
-    let controls = assess(&dir);
+    // Never probes. This process has no guest -- `chm posture` reads a
+    // directory -- and reaching for one would mean opening a control socket
+    // from a command documented as describing a workspace.
+    let controls = assess(
+        &dir,
+        &GuestUserns::NotAsked(
+            "`chm posture` reads a workspace directory and has no guest to ask".into(),
+        ),
+    );
     let weakened = controls.iter().filter(|c| c.state == State::Weakened).count();
 
     if json {
@@ -492,8 +636,14 @@ pub(crate) fn posture_main(raw: &[String]) -> ExitCode {
 /// This is the daemon's entry point: `chm serve` is the process that actually
 /// runs the guest, so it is the only process whose environment describes the
 /// sandbox. See the module docs.
-pub(crate) fn assess_json(dir: &Path) -> (String, usize) {
-    let controls = assess(dir);
+///
+/// `guest_userns` has **no default**, deliberately. The daemon is the only
+/// caller that can ask a guest anything, so if this parameter could be omitted
+/// the one code path capable of measuring the row would be able to silently
+/// stop doing so and every test would stay green. Requiring it makes that a
+/// compile error instead of a guard.
+pub(crate) fn assess_json(dir: &Path, guest_userns: &GuestUserns) -> (String, usize) {
+    let controls = assess(dir, guest_userns);
     let weakened = controls.iter().filter(|c| c.state == State::Weakened).count();
     (render_json(dir, &controls, weakened), weakened)
 }
@@ -571,12 +721,17 @@ fn usage() -> String {
 mod tests {
     use super::*;
 
+    /// The answer every test that does not care about the guest row passes.
+    fn unasked() -> GuestUserns {
+        GuestUserns::NotAsked("a test".into())
+    }
+
     #[test]
     fn baseline_workspace_has_no_weakened_controls() {
         // A workspace with no configuration at all must still come up safe:
         // that is the whole point of V4.2. Guard against the env of whoever
         // runs the tests by only asserting on controls that do not read env.
-        let controls = assess(Path::new("/nonexistent-workspace"));
+        let controls = assess(Path::new("/nonexistent-workspace"), &unasked());
         let limits = controls.iter().find(|c| c.name == "resource ceilings").unwrap();
         assert_eq!(
             limits.state,
@@ -588,7 +743,7 @@ mod tests {
 
     #[test]
     fn every_control_names_an_invariant_and_a_source() {
-        for c in assess(Path::new("/nonexistent-workspace")) {
+        for c in assess(Path::new("/nonexistent-workspace"), &unasked()) {
             assert!(!c.invariant.is_empty(), "{} has no invariant", c.name);
             assert!(
                 c.detail.len() > 10,
@@ -647,7 +802,7 @@ mod tests {
             "found only {vars:?} -- the extraction is broken, not the report"
         );
 
-        let controls = assess(Path::new("/nonexistent-workspace"));
+        let controls = assess(Path::new("/nonexistent-workspace"), &unasked());
         for var in vars {
             assert!(
                 controls.iter().any(|c| c.detail.contains(var)),
@@ -766,6 +921,164 @@ mod tests {
             include_str!("posture.rs").contains(&needle),
             "chm posture no longer reports ingress, so a sandbox can be \
              reachable from this host with nothing saying so"
+        );
+    }
+}
+
+/// Guards for the in-guest user-namespace row (#363).
+///
+/// The coupling guard in the module's other test block cannot see this row: it
+/// requires every `CHM_STRICT_*` behind an `env::var_os` in `imp.rs` to appear
+/// in some row, and this control has no env var at all -- like
+/// [`ingress_control`], it is a property of a guest rather than of the calling
+/// process. So it needs its own.
+#[cfg(test)]
+mod guest_userns_tests {
+    use super::*;
+
+    fn row(answer: &GuestUserns) -> Control {
+        guest_userns_control(answer)
+    }
+
+    /// The mapping is the design, so it is the thing to pin.
+    #[test]
+    fn each_answer_maps_to_the_state_that_does_not_overclaim() {
+        assert_eq!(
+            row(&GuestUserns::Available).state,
+            State::Active,
+            "a guest that can contain its own processes has the control on"
+        );
+        assert_eq!(
+            row(&GuestUserns::NotAsked("x".into())).state,
+            State::Unmeasured,
+            "a question never put must not read as an answer"
+        );
+        assert_eq!(
+            row(&GuestUserns::NoAnswer("x".into())).state,
+            State::Unmeasured,
+            "a question that went unanswered must not read as an answer"
+        );
+    }
+
+    /// The load-bearing one, and the reason this row exists at all.
+    ///
+    /// `Restricted` is the *stock* Ubuntu 23.10+ posture and every rehydrated
+    /// capture we hold is in it. Grading it `Weakened` would exit 1, so
+    /// `chm posture && deploy` would refuse on every one of them -- a check
+    /// that always fails is a check people delete.
+    #[test]
+    fn a_restricted_guest_is_not_a_weakened_one() {
+        let c = row(&GuestUserns::Restricted("denied".into()));
+        assert_eq!(
+            c.state,
+            State::NotApplicable,
+            "the stock distro default was graded as a misconfiguration"
+        );
+        assert_ne!(c.state, State::Weakened);
+    }
+
+    /// An unmeasured control must not be able to change an exit status.
+    ///
+    /// Asserted through the same counting expression `posture_main` and
+    /// `assess_json` use, rather than over the enum, because the exit code is
+    /// what a caller actually gates on.
+    #[test]
+    fn unmeasured_does_not_count_towards_weakened() {
+        for answer in [
+            GuestUserns::NotAsked("x".into()),
+            GuestUserns::NoAnswer("x".into()),
+        ] {
+            let controls = [row(&answer)];
+            let weakened = controls
+                .iter()
+                .filter(|c| c.state == State::Weakened)
+                .count();
+            assert_eq!(weakened, 0, "an unasked question changed the exit code");
+        }
+    }
+
+    /// A refusal that does not name its cure sends the reader to a search
+    /// engine. Needle assembled from parts so it cannot match itself.
+    #[test]
+    fn a_restricted_guest_is_told_the_one_command_that_fixes_it() {
+        let c = row(&GuestUserns::Restricted("Operation not permitted".into()));
+        let sysctl = format!("sysctl -w {APPARMOR_USERNS_SYSCTL}=0");
+        assert!(
+            c.detail.contains(&sysctl),
+            "the remedy is not in the detail: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("Operation not permitted"),
+            "the guest's own words were dropped: {}",
+            c.detail
+        );
+        assert!(
+            c.detail.contains("--no-sandbox"),
+            "the consequence is not named: {}",
+            c.detail
+        );
+    }
+
+    /// A report that says "not measured" and stops has told the reader nothing
+    /// they can act on -- the #304/#305/#306 defect class.
+    #[test]
+    fn an_unmeasured_row_names_the_command_that_would_measure_it() {
+        let c = row(&GuestUserns::NotAsked("no guest".into()));
+        let cmd = format!("chm ctl posture --{}", "probe-guest");
+        assert!(
+            c.detail.contains(&cmd),
+            "nothing tells the reader how to get an answer: {}",
+            c.detail
+        );
+    }
+
+    /// `chm posture` has no guest, so it must never claim one answered.
+    #[test]
+    fn the_cli_reports_this_row_as_unmeasured() {
+        let controls = assess(
+            Path::new("/nonexistent-workspace"),
+            &GuestUserns::NotAsked("no guest".into()),
+        );
+        let c = controls
+            .iter()
+            .find(|c| c.invariant == "#363")
+            .expect("the row is missing from assess()");
+        assert_eq!(c.state, State::Unmeasured);
+    }
+
+    /// The wire value the app decodes on. Changing it silently would make the
+    /// panel fall back to `weakened` and alarm over a skipped check.
+    #[test]
+    fn unmeasured_has_a_stable_wire_name_and_a_mark_of_its_own() {
+        assert_eq!(State::Unmeasured.as_str(), "unmeasured");
+        for other in [State::Active, State::Weakened, State::NotApplicable] {
+            assert_ne!(
+                State::Unmeasured.mark(),
+                other.mark(),
+                "unmeasured is indistinguishable from {} in the rendered report",
+                other.as_str()
+            );
+        }
+    }
+
+    /// The browser must probe the same thing the report describes.
+    ///
+    /// If these diverge, `chm posture` answers a question nothing depends on
+    /// while the browser silently takes the other branch. Reads both out of the
+    /// machine rather than restating either.
+    #[test]
+    fn the_browser_runs_the_probe_this_row_reports_on() {
+        let script = crate::oci::browser::launch_script();
+        let probe = USERNS_PROBE_ARGV.join(" ");
+        assert!(
+            script.contains(&probe),
+            "the browser no longer runs `{probe}`, so this row describes a \
+             different question than the one it depends on"
+        );
+        assert!(
+            script.contains(APPARMOR_USERNS_SYSCTL),
+            "the browser's remedy no longer names {APPARMOR_USERNS_SYSCTL}"
         );
     }
 }
