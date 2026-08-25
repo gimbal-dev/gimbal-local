@@ -179,6 +179,50 @@ A guest that skips DNS and dials a raw IP is judged by the same rules: under
 default-deny, an IP the guest never resolved through us matches no allow rule and
 is refused.
 
+## Changing the policy without restarting (`chm ctl egress`)
+
+The denial above is the moment the policy is usually wrong. An agent discovers
+mid-session that it needs one more host, and until #156 the only way to grant it
+was to stop the sandbox that discovered it -- destroying the session, and the
+state that produced the requirement, in order to act on it.
+
+A guest running under `chm serve` (or `chm create --socket`) can be amended in
+place:
+
+```
+usage: chm ctl egress allow|deny <host[:port]>
+
+$ chm ctl egress allow ports.ubuntu.com:80
+net0: allow ports.ubuntu.com:80 -- policy now sha256:147f…+live1; 3 established flow(s) kept
+```
+
+Three properties are worth stating plainly, because each is a decision rather
+than a detail:
+
+- **An allow supersedes the deny it would otherwise have lost to.** The NAT
+  checks deny rules before allow rules, so appending `allow foo.com` beside an
+  existing `deny foo.com` would report success and change nothing. An amendment
+  removes the opposing rules that name the same host *and* port, and says which
+  ones it removed. Different ports do not collide: allowing `:443` leaves a
+  `deny host:22` standing.
+- **Established flows continue under the decision that admitted them.** An
+  amendment governs admission. A `deny` does not sever the connection you are
+  watching, and the reply says so with a count rather than leaving you to infer
+  it from a transfer that does not stop.
+- **The policy label moves, and moves to something that cannot be mistaken for a
+  cloud-issued digest.** Every audit record names the exact policy that made that
+  call (see `EgressEvent.policy`), which is what proves a digest bound by the
+  control plane is the one enforcing the flow on your Mac. A policy that has been
+  amended locally is no longer that digest, so it is labelled `<base>+liveN` --
+  the base it started from, plus how many times it has moved.
+
+`chm ctl posture-json` grows an `egress_live` key naming the label each NIC is
+enforcing *now*. **The human-readable `chm posture` cannot carry it**, and that
+is structural rather than an omission: `posture::report()` is a pure function of
+a directory and the environment, so it can describe the sources a sandbox was
+*configured* from and has no way to see a running guest. Only the daemon knows,
+so only the daemon's report can say.
+
 ## Enabling the live path (capture requirement)
 
 Enforcement is exercised end-to-end by an in-tree test that drives a guest TCP/IP

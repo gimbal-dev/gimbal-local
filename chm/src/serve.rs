@@ -84,6 +84,16 @@ const CONSOLE_CAP: usize = 256 * 1024;
 // of the same scaffolding constant is how it stayed wrong in both places.
 use crate::imp::DEFAULT_IDLE_EXIT_SECS;
 
+/// Applies one live egress amendment to every NIC a guest has, returning what
+/// each device did, paired with the name it reported it under.
+///
+/// Named rather than written inline because it appears at both the field and
+/// the publication site, and the two must not drift: a mismatch there is a
+/// compile error only by luck, since both are `Arc<dyn Fn…>` and coercion is
+/// what connects them.
+pub(crate) type EgressAmender =
+    Arc<dyn Fn(&Amendment) -> Vec<(String, AmendOutcome)> + Send + Sync>;
+
 /// Where the running guest's state lives, shared between the worker thread that
 /// drives the vCPU and the connection handlers that read console / status.
 ///
@@ -115,7 +125,7 @@ pub(crate) struct VmInner {
     /// is reported as such rather than as a silent success, because "your
     /// change did nothing" is the one answer an operator must never have to
     /// infer (#156).
-    pub(crate) egress: Option<Arc<dyn Fn(&Amendment) -> Vec<(String, AmendOutcome)> + Send + Sync>>,
+    pub(crate) egress: Option<EgressAmender>,
     /// Per NIC, the effective policy label the *device* reported after the last
     /// amendment, so `posture` can say the policy in force is no longer the one
     /// the workspace configures.
@@ -1743,7 +1753,12 @@ fn parse_amendment(arg: &str) -> Result<Amendment, String> {
 
 /// The shape `chm ctl egress` accepts, quoted verbatim in every refusal so a
 /// user who typed it wrong is told the form rather than the category.
-const EGRESS_USAGE: &str = "usage: chm ctl egress allow|deny <host[:port]>";
+///
+/// `pub(crate)` for the guard in `hygiene.rs` that holds `docs/networking.md`
+/// to this exact string. A doc teaching a form the parser rejects sends a
+/// reader to the one place that cannot help them, and a constant retyped in
+/// the test would pass happily through exactly that bug.
+pub(crate) const EGRESS_USAGE: &str = "usage: chm ctl egress allow|deny <host[:port]>";
 
 /// Serialises exec requests: two commands typed into one console interleave
 /// their characters and both come back wrong. A second caller is refused rather
@@ -2046,7 +2061,7 @@ fn supervise_daemon(
                 nics.iter()
                     .filter_map(|n| n.amend_net_egress(a).map(|o| (n.name().to_string(), o)))
                     .collect::<Vec<_>>()
-            }) as Arc<dyn Fn(&Amendment) -> Vec<(String, AmendOutcome)> + Send + Sync>
+            }) as EgressAmender
         });
     }
 
