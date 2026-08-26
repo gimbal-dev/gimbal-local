@@ -215,6 +215,35 @@ def classify(words, addr, guard_word, op_word):
             return "PRESENT", i, o
     if not ops:
         return "NO-OP-IN-ROUTINE", None, None
+
+    # A shape none of the above can express: there is no alternative at this
+    # site at all, and the op is unconditional. `user_cache_maint_handler` is
+    # the real case -- it does the maintenance on userspace's behalf when EL0
+    # traps, and is not guarded by ARM64_HAS_CACHE_DIC. UNKNOWN was the correct
+    # answer while we could not tell, but it leaves a standing REVIEW REQUIRED
+    # on a routine that needs no repair, and a repair pass would relitigate it
+    # every run.
+    #
+    # Proving that negative needs both halves, because an alternative leaves
+    # one of exactly two marks and the point is that *neither* is here:
+    #     applied   -> the guard word is in the text (that is what applied means)
+    #     unapplied -> an adjacent (nop, nop) pair is in the text
+    # Neither anywhere in the routine means no alternative of this shape was
+    # ever placed at this site, so the op cannot have been elided from it.
+    #
+    # The lone-nop test is the belt. A hypothetical single-word alternative
+    # (`nop` -> guard, no branch) would leave neither mark, and the two tests
+    # above would happily call it unconditional. It costs nothing on the real
+    # kernel -- measured nops at 1/31/111/123 against an op at 74 -- and it is
+    # the only shape those two cannot see.
+    #
+    # This is strictly narrower than UNKNOWN, never a relaxation of it: a
+    # routine carrying an `isb` anywhere still declines.
+    has_pair = any(words[i] == NOP and words[i + 1] == NOP for i in range(len(words) - 1))
+    lone_nop_before_op = any(NOP in words[max(0, o - 2) : o] for o in ops)
+    if guard_word not in words and not has_pair and not lone_nop_before_op:
+        return "UNCONDITIONAL", ops[0], None
+
     return "UNKNOWN", None, None
 
 
@@ -326,6 +355,46 @@ def _synth_early_return(dic_patched):
     return w
 
 
+FILLER = 0xAA0003E1  # `mov x1, x0`; any word that is none of the recognised ones
+
+
+def _synth_unconditional(stray_guard=False, nop_before_op=False, trailing_pair=False):
+    """`user_cache_maint_handler`'s shape: an `ic ivau` with no alternative.
+
+    Transcribed from this kernel's own bytes, read out of /proc/kcore and then
+    re-measured predicate by predicate rather than eyeballed off an annotated
+    dump:
+
+        words=126     (routine_extent said 126, MAX_WORDS=128 -- not truncated)
+        isb anywhere?        []
+        (nop, nop) pair?     []
+        ic ivau at           [74]
+        lone nops at         [1, 31, 111, 123]
+
+    Neither mark an alternative leaves is anywhere in the routine, so none was
+    ever placed here and the op is unconditional. Each flag reintroduces
+    exactly one of the three marks that must make the classifier decline again.
+    """
+    w = [FILLER] * 126
+    for i in (1, 31, 111, 123):
+        w[i] = NOP
+    w[74] = IC_IVAU | 21  # measured d50b7535, i.e. x21
+    w[61] = RET
+    w[107] = RET
+    w[36] = B_OPC | ((50 - 36) & 0x03FFFFFF)
+    w[90] = B_OPC | ((36 - 90) & 0x03FFFFFF)
+
+    if stray_guard:
+        w[5] = ISB  # applied-form mark, so no negative can be proved
+    if nop_before_op:
+        w[73] = NOP  # a single-word alternative would look like this
+    if trailing_pair:
+        # An unapplied pair *after* the op: PRESENT scans backwards from the op
+        # and structurally cannot see it, so only the pair test catches this.
+        w[100], w[101] = NOP, NOP
+    return w
+
+
 def selftest():
     """Positive and negative controls for the classifier.
 
@@ -371,6 +440,30 @@ def selftest():
             _synth_far_branch(),
             "UNKNOWN",
             "PRESENT",
+        ),
+        (
+            "unconditional op (user_cache_maint_handler)",
+            _synth_unconditional(),
+            "UNCONDITIONAL",
+            "NO-OP-IN-ROUTINE",
+        ),
+        (
+            "negative control: a stray guard word is an applied mark",
+            _synth_unconditional(stray_guard=True),
+            "UNKNOWN",
+            "NO-OP-IN-ROUTINE",
+        ),
+        (
+            "negative control: a lone nop right before the op",
+            _synth_unconditional(nop_before_op=True),
+            "UNKNOWN",
+            "NO-OP-IN-ROUTINE",
+        ),
+        (
+            "negative control: an unapplied pair after the op",
+            _synth_unconditional(trailing_pair=True),
+            "UNKNOWN",
+            "NO-OP-IN-ROUTINE",
         ),
     )
     bad = 0

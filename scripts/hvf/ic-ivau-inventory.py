@@ -24,6 +24,11 @@ Positive control:       ./ic-ivau-inventory.py selftest   (needs no guest)
 
 Exit status: 0 clean, 1 every site classified and at least one PATCHED,
 2 at least one site could not be classified (see REVIEW REQUIRED).
+
+A site classified UNCONDITIONAL is *classified*: the op was never guarded by an
+alternative, so it is reported and annotated but counts towards neither. It is
+the shape of the EL0 trap emulation path, which holds an `ic ivau` because that
+is its whole job.
 """
 
 import importlib.util
@@ -179,11 +184,17 @@ def report(probe, kc, syms, sites, skipped=0, out=sys.stdout):
         note = ""
         if verdict == "PATCHED" and nvhe:
             note = "  (nVHE hyp text -- not reached under HVF)"
+        elif verdict == "UNCONDITIONAL":
+            # Neither mark an alternative leaves is anywhere in the routine, so
+            # the op was never guarded and there is nothing here to repair.
+            # Reported rather than dropped: a routine holding an `ic ivau` is a
+            # site a repair pass will walk past, and it should be able to see
+            # why this one was left alone.
+            note = "  (no alternative here -- the op is unconditional)"
         elif verdict == "UNKNOWN":
-            # An `ic ivau` with no DIC alternative around it is the ordinary
-            # shape of the EL0 trap emulation path. It is also the shape of a
-            # guard this tool does not understand. Those must not be conflated,
-            # so it is reported loudly either way and the caller decides.
+            # A shape this tool does not understand. Louder than it looks: an
+            # unrecognised guard could be an elision we cannot see, and calling
+            # that sound is the one direction that hides a defect.
             note = "  <-- REVIEW REQUIRED: no DIC alternative recognised here"
 
         print(
@@ -318,11 +329,17 @@ def selftest():
     #    Fully mapped on purpose: an under-served fake makes `skipped` non-zero,
     #    and that rule returns 2 as well -- so the case would pass with the
     #    unknown rule deleted, which is the failure this check exists to catch.
-    words = [probe.BTI_C, probe.IC_IVAU | 21, probe.RET]
+    #    The guard word is present but forms no shape we can prove: not a branch
+    #    (the next word is the op), not an early return, and no unapplied pair
+    #    to find. Note it is deliberately *not* a bare `ic ivau` with nothing
+    #    around it -- that is the unconditional shape checked in 10 below, and
+    #    using it here would test the wrong rule.
+    words = [probe.BTI_C, probe.ISB, probe.IC_IVAU | 21, probe.RET]
     buf = _mapped(probe, words)
-    syms = [(base, "unguarded"), (base + 12, "next")]
+    syms = [(base, "unrecognised"), (base + len(words) * 4, "next")]
     kc = _FakeKcore(base, buf)
     _, _, sites, skipped = find_sites(probe, kc, syms)
+    check("unknown case reads cleanly", skipped, 0)
     sink = io.StringIO()
     check("unknown exits 2", report(probe, kc, syms, sites, skipped, out=sink), 2)
     check("unknown is loud", "REVIEW REQUIRED" in sink.getvalue(), True)
@@ -358,6 +375,26 @@ def selftest():
     check("nvhe alone is not a defect", report(probe, kc, syms, sites, skipped, sink), 0)
     check("nvhe is still reported", "PATCHED" in sink.getvalue(), True)
     check("nvhe is annotated", "not reached under HVF" in sink.getvalue(), True)
+
+    # 10. an unconditional `ic ivau` is reported and annotated, and must count
+    #     as neither a defect nor an unknown. It is the EL0 trap emulation path:
+    #     the op was never guarded, so there is nothing to repair and nothing
+    #     left to review. Counting it as unknown would leave a real kernel
+    #     permanently at REVIEW REQUIRED over a routine already understood,
+    #     which is how a tool that can never say "clean" stops being read.
+    #     Fully mapped, and with no PATCHED routine present, so exit 0 can only
+    #     have come from this routine falling through both counted branches.
+    words = [probe.BTI_C, probe.IC_IVAU | 21, probe.RET]
+    buf = _mapped(probe, words)
+    syms = [(base, "user_cache_maint_handler"), (base + len(words) * 4, "next")]
+    kc = _FakeKcore(base, buf)
+    _, _, sites, skipped = find_sites(probe, kc, syms)
+    check("unconditional case reads cleanly", skipped, 0)
+    sink = io.StringIO()
+    check("unconditional is not counted", report(probe, kc, syms, sites, skipped, sink), 0)
+    check("unconditional is reported", "UNCONDITIONAL" in sink.getvalue(), True)
+    check("unconditional is annotated", "the op is unconditional" in sink.getvalue(), True)
+    check("unconditional is not review", "REVIEW REQUIRED" not in sink.getvalue(), True)
 
     for f in fails:
         print("FAIL %s" % f)
