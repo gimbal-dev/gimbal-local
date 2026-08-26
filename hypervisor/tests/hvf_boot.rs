@@ -394,6 +394,23 @@ fn hvf_host_cache_identity_registers() {
          non-zero. See docs/cpu-feature-deltas.md."
     );
 
+    // `IDC = 1` says the data cache is coherent to the point of unification, so
+    // Linux alternative-patches `dc cvau` out of the same routines it patches
+    // `ic ivau` out of. That elision travels in a capture's kernel text exactly
+    // as the `ic ivau` one does — and it is *sound* here only because this Mac
+    // is coherent too. The #287 repair therefore reverts the DIC alternative and
+    // must leave the IDC one alone; on a part that reported `IDC = 0` that
+    // asymmetry would be wrong, and a doc comment is not where a safety
+    // precondition should live. `imp::idc_elision_is_sound_here` takes this as a
+    // parameter so it can be reasoned about; this is where reality enters.
+    assert_ne!(
+        ctr & (1 << 28),
+        0,
+        "CTR_EL0.IDC is clear on this Mac, so a capture's elided `dc cvau` is \
+         unsound here as well as its elided `ic ivau`. The #287 repair assumes \
+         the opposite — see idc_elision_is_sound_here and docs/cpu-feature-deltas.md."
+    );
+
     // Recorded rather than asserted: CLIDR_EL1 is refused by HVF too, but no
     // guest safety property depends on its exact value, and pinning Apple's
     // cache hierarchy would be a test that breaks on every new part for no
