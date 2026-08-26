@@ -604,6 +604,60 @@ pub(crate) fn icache_detail() -> &'static str {
          docs/cpu-feature-deltas.md."
 }
 
+/// What a capture says about one system register, read across every vCPU.
+///
+/// `.iter().any()` collapses three genuinely different situations into one
+/// bool: a register no vCPU recorded, vCPUs that recorded *different* values,
+/// and a real agreed reading. The first two both mean "this capture cannot
+/// answer", and answering them `false` is the one direction that fails
+/// silently -- it is indistinguishable from a confident "no hazard here".
+///
+/// A warning may reasonably treat an unanswerable capture as quiet. A *repair*
+/// may not: rewriting kernel text on the strength of a register nobody
+/// recorded is acting on a verdict that was never produced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Captured {
+    /// No vCPU recorded this register.
+    Absent,
+    /// Two vCPUs recorded different values, so the capture describes no single
+    /// machine. Cache identity registers are uniform on real hardware, so a
+    /// disagreement means the capture is malformed rather than exotic.
+    Disagreed,
+    /// Every vCPU that recorded it agrees on this value.
+    Agreed(u64),
+}
+
+/// Read one system register out of a capture, across all of its vCPUs.
+///
+/// Deliberately keeps scanning after the first hit: stopping early is what
+/// turns a disagreement into whichever vCPU happened to be enumerated first.
+pub(crate) fn captured_sysreg(snap: &Snapshot, want: u16) -> Captured {
+    let mut seen: Option<u64> = None;
+    for vcpu in &snap.vcpus {
+        for &(reg, val) in &vcpu.sysregs {
+            if reg != want {
+                continue;
+            }
+            match seen {
+                None => seen = Some(val),
+                Some(prev) if prev != val => return Captured::Disagreed,
+                Some(_) => {}
+            }
+        }
+    }
+    seen.map_or(Captured::Absent, Captured::Agreed)
+}
+
+/// `CTR_EL0` is `S3_3_C0_C0_1`, packed as
+/// `(op0<<14)|(op1<<11)|(CRn<<7)|(CRm<<3)|op2`.
+pub(crate) const CTR_EL0: u16 = 0xd801;
+/// `CTR_EL0.DIC` -- instruction cache snoops the data side, so `ic ivau` may
+/// be skipped.
+pub(crate) const CTR_DIC: u64 = 1 << 29;
+/// `CTR_EL0.IDC` -- the data cache is coherent to the point of unification, so
+/// `dc cvau` may be skipped. The sibling alternative at the same call sites.
+pub(crate) const CTR_IDC: u64 = 1 << 28;
+
 /// Did this capture's kernel boot on a host that let it skip `ic ivau`?
 ///
 /// `CTR_EL0.DIC = 1` promises the instruction cache snoops the data side, so
@@ -617,18 +671,62 @@ pub(crate) fn icache_detail() -> &'static str {
 /// host-side. Two copies of this test would eventually disagree, and the
 /// disagreement would be a guest that is warned about but not repaired, or
 /// repaired without being told.
+///
+/// An unreadable capture answers `false` **here and only here**, because both
+/// consumers are best-effort mitigations whose absence leaves the guest no
+/// worse off than before they existed. Anything that rewrites guest memory
+/// must read [`captured_sysreg`] directly and refuse instead -- see
+/// [`idc_elision_is_sound_here`] for the shape.
 pub(crate) fn snapshot_elides_ic_ivau(snap: &Snapshot) -> bool {
-    /// `CTR_EL0` is `S3_3_C0_C0_1`, packed as
-    /// `(op0<<14)|(op1<<11)|(CRn<<7)|(CRm<<3)|op2`.
-    const CTR_EL0: u16 = 0xd801;
-    /// `CTR_EL0.DIC`.
-    const DIC: u64 = 1 << 29;
+    matches!(captured_sysreg(snap, CTR_EL0), Captured::Agreed(v) if v & CTR_DIC != 0)
+}
 
-    snap.vcpus.iter().any(|v| {
-        v.sysregs
-            .iter()
-            .any(|&(reg, val)| reg == CTR_EL0 && (val & DIC) != 0)
-    })
+/// Why a repair must not touch the `dc cvau` sitting next to every elided
+/// `ic ivau`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IdcVerdict {
+    /// This host is coherent to the point of unification, so the elided
+    /// `dc cvau` is sound here for the same reason it was sound on the capture
+    /// host. Repair the DIC half and leave the IDC half alone.
+    LeaveAlone,
+    /// This host is *not* coherent, so the capture's elided `dc cvau` is as
+    /// unsound as its elided `ic ivau`. Repairing only the DIC half would
+    /// produce a guest that is half-correct and reported as fixed.
+    AlsoElidedUnsoundly,
+    /// The capture could not be read, so no conclusion is available.
+    Unreadable(Captured),
+}
+
+/// Decide the IDC half of the repair against the **live host**, not a constant.
+///
+/// The two alternatives are one word apart -- `bti c; isb; ret` is the DIC
+/// early return and `bti c; dsb ishst; ret` is the IDC one -- so a repair that
+/// pattern-matches loosely will revert both. Apple silicon reports `IDC = 1`,
+/// which means reverting the IDC elision is a *regression*: it reintroduces
+/// cache maintenance the hardware does not need.
+///
+/// That is a fact about this machine, so it is a parameter rather than a
+/// constant. `CTR_EL0` cannot be read from the host at all -- macOS traps
+/// `mrs ctr_el0` at EL0 and `hv_vcpu_get_sys_reg` refuses it -- so the only
+/// way to obtain it is a guest that reads it and hands it back. Keeping this a
+/// pure function is what lets all four combinations be tested without one,
+/// exactly as [`hypervisor::hvf::ctr_trap_fixup`] does; the measurement itself
+/// is pinned by `hvf_host_cache_identity_registers`.
+pub(crate) fn idc_elision_is_sound_here(snap: &Snapshot, host_ctr: u64) -> IdcVerdict {
+    let captured = captured_sysreg(snap, CTR_EL0);
+    let Captured::Agreed(val) = captured else {
+        return IdcVerdict::Unreadable(captured);
+    };
+    // A capture whose own host said `IDC = 0` never elided `dc cvau` in the
+    // first place, so there is nothing here to leave alone or to repair.
+    if val & CTR_IDC == 0 {
+        return IdcVerdict::LeaveAlone;
+    }
+    if host_ctr & CTR_IDC != 0 {
+        IdcVerdict::LeaveAlone
+    } else {
+        IdcVerdict::AlsoElidedUnsoundly
+    }
 }
 
 /// The ASID-width hazard, in the words an operator needs.
@@ -722,7 +820,10 @@ pub(crate) fn icache_dic_guard(snap: &Snapshot) -> Result<(), String> {
         return Ok(());
     }
 
-    let detail = icache_detail();
+    let mut detail = icache_detail().to_string();
+    if let IdcVerdict::AlsoElidedUnsoundly = idc_elision_is_sound_here(snap, HOST_CTR_EL0) {
+        detail.push_str(IDC_ALSO_ELIDED);
+    }
 
     if env::var_os("CHM_STRICT_ICACHE").is_some() {
         return Err(format!(
@@ -732,6 +833,27 @@ pub(crate) fn icache_dic_guard(snap: &Snapshot) -> Result<(), String> {
     eprintln!("chm: warning: {detail}");
     Ok(())
 }
+
+/// This host's `CTR_EL0`, measured rather than assumed.
+///
+/// It cannot be read at runtime: macOS traps `mrs ctr_el0` at EL0 with SIGILL
+/// and `hv_vcpu_get_sys_reg` refuses the register outright, so the only reader
+/// is a guest. `hvf_host_cache_identity_registers` runs exactly that guest and
+/// pins the bits this constant is consulted for, so a future part that reports
+/// something else fails a test rather than passing this guard silently -- the
+/// same arrangement as `HOST_ASID_BITS` and `hvf_host_mmu_feature_register`.
+pub(crate) const HOST_CTR_EL0: u64 = 0x9444_c004;
+
+/// Appended when the capture elided its `dc cvau` as well as its `ic ivau`.
+///
+/// Kept apart from [`icache_detail`] because it is a *different* hazard with a
+/// different cure, and because the guard must not claim it on a host where the
+/// elision is sound. On Apple silicon `IDC = 1`, so this is unreachable today
+/// and the test drives the predicate directly rather than through the guard.
+pub(crate) const IDC_ALSO_ELIDED: &str = "\n\n\
+     This capture also elided its data-cache clean (`dc cvau`), and this host \
+     does not snoop for it either, so freshly written code can be stale in the \
+     unified cache before the instruction side is ever consulted.";
 
 /// Take instruction-cache maintenance over from a guest kernel that cannot do
 /// it, once guest RAM holds its restored contents.
@@ -5609,7 +5731,7 @@ mod tests {
     #[test]
     fn the_guard_prints_the_text_the_test_above_checks() {
         let src = include_str!("imp.rs");
-        let needle = format!("let detail = icache_{}();", "detail");
+        let needle = format!("icache_{}().to_string();", "detail");
         assert!(
             src.contains(&needle),
             "icache_dic_guard must emit icache_detail(), not its own literal"
@@ -5618,17 +5740,192 @@ mod tests {
 
     /// The bit position is the whole guard, so pin it against the two measured
     /// values rather than trusting the shift to stay right under edits.
+    ///
+    /// This used to reimplement the predicate locally, which meant it guarded a
+    /// copy of the rule and could not see the production one change underneath
+    /// it -- the same call-site class the test above exists to catch. It now
+    /// drives the real function through a real capture.
     #[test]
     fn icache_guard_reads_bit_29_and_not_a_neighbour() {
-        fn elides(ctr: u64) -> bool {
-            (ctr & (1 << 29)) != 0
-        }
+        let elides = |ctr: u64| snapshot_elides_ic_ivau(&snap_with_ctrs(&[ctr]));
         assert!(elides(0xb444_c004), "Graviton2 capture");
         assert!(!elides(0x9444_c004), "Apple silicon");
         // IDC (bit 28) is 1 on both, so a one-off shift would pass everything.
         assert!(elides(0x9444_c004 | (1 << 29)));
         assert!(!elides(0x9444_c004 & !(1 << 28)));
-        assert!(!elides(0), "absent register");
+        assert!(!elides(0), "register captured as zero");
+    }
+
+    /// Build a capture with one vCPU per supplied `CTR_EL0` value.
+    ///
+    /// Takes a slice rather than a scalar because the whole point of
+    /// [`captured_sysreg`] is what happens when two vCPUs disagree, and a
+    /// single-vCPU helper structurally cannot express that case.
+    fn snap_with_ctrs(ctrs: &[u64]) -> Snapshot {
+        let mut snap = snap_with_no_sysregs();
+        snap.vcpus = ctrs
+            .iter()
+            .map(|&ctr| hypervisor::hvf::VcpuHvfState {
+                gpr: [0; 31],
+                pc: 0,
+                cpsr: 0,
+                sp_el1: 0,
+                sysregs: vec![(CTR_EL0, ctr)],
+                gic_icc: Vec::new(),
+                fp: None,
+                mp_state_running: true,
+            })
+            .collect();
+        snap
+    }
+
+    /// The three readings `.iter().any()` used to collapse into one bool.
+    ///
+    /// `Absent` and `Disagreed` are both "this capture cannot answer", and
+    /// telling them apart from a genuine `DIC = 0` is the whole of the gate:
+    /// only the last one is a capture that says there is nothing to repair.
+    #[test]
+    fn a_capture_that_cannot_answer_is_not_a_capture_that_says_no() {
+        assert_eq!(
+            captured_sysreg(&snap_with_no_sysregs(), CTR_EL0),
+            Captured::Absent
+        );
+        assert_eq!(
+            captured_sysreg(&snap_with_ctrs(&[]), CTR_EL0),
+            Captured::Absent,
+            "a capture with no vCPUs at all records nothing"
+        );
+        assert_eq!(
+            captured_sysreg(&snap_with_ctrs(&[0xb444_c004, 0xb444_c004]), CTR_EL0),
+            Captured::Agreed(0xb444_c004),
+            "two vCPUs reporting the same value is one reading, not a conflict"
+        );
+        assert_eq!(
+            captured_sysreg(&snap_with_ctrs(&[0xb444_c004, 0x9444_c004]), CTR_EL0),
+            Captured::Disagreed,
+            "cache identity is uniform on real hardware, so this capture is malformed"
+        );
+        // The disagreement must be found whichever vCPU is enumerated first,
+        // or the verdict depends on capture order.
+        assert_eq!(
+            captured_sysreg(&snap_with_ctrs(&[0x9444_c004, 0xb444_c004]), CTR_EL0),
+            Captured::Disagreed
+        );
+        // A register that is simply not the one being asked for.
+        assert_eq!(
+            captured_sysreg(&snap_with_ctrs(&[0xb444_c004]), 0xc038),
+            Captured::Absent
+        );
+    }
+
+    /// A malformed capture must not read as a clean one.
+    ///
+    /// The warning still answers `false` for both unreadable shapes -- it is a
+    /// best-effort mitigation and silence leaves the guest no worse off. The
+    /// property that matters is that the *reading* is available to tell them
+    /// apart, because a repair cannot afford to guess.
+    #[test]
+    fn the_warning_stays_quiet_but_the_reading_stays_honest() {
+        assert!(snapshot_elides_ic_ivau(&snap_with_ctrs(&[0xb444_c004])));
+        assert!(!snapshot_elides_ic_ivau(&snap_with_ctrs(&[0x9444_c004])));
+
+        for unreadable in [
+            snap_with_no_sysregs(),
+            snap_with_ctrs(&[0xb444_c004, 0x9444_c004]),
+        ] {
+            assert!(
+                !snapshot_elides_ic_ivau(&unreadable),
+                "an unanswerable capture must not trigger a mitigation"
+            );
+            assert!(
+                !matches!(captured_sysreg(&unreadable, CTR_EL0), Captured::Agreed(_)),
+                "...but it must still be distinguishable from a real DIC = 0"
+            );
+        }
+    }
+
+    /// The IDC half, against all four host/capture combinations.
+    ///
+    /// `0xb444c004` is the real Graviton2 capture and `0x9444c004` is this
+    /// Mac, both measured. They agree on `IDC = 1` and differ only in `DIC`,
+    /// which is exactly why the repair must be able to tell the two
+    /// alternatives apart: reverting the IDC one on this host reintroduces
+    /// maintenance the hardware does not need.
+    #[test]
+    fn the_idc_alternative_is_judged_against_the_live_host() {
+        const GRAVITON: u64 = 0xb444_c004;
+        // Read out of production, not retyped: a drift between the guard's idea
+        // of this host and the test's would leave both perfectly self-consistent.
+        const APPLE: u64 = HOST_CTR_EL0;
+        assert_eq!(GRAVITON & CTR_IDC, CTR_IDC, "capture host is IDC coherent");
+        assert_eq!(APPLE & CTR_IDC, CTR_IDC, "so is this Mac");
+        assert_ne!(GRAVITON & CTR_DIC, APPLE & CTR_DIC, "DIC is the delta");
+
+        // The shipping case: both coherent, so the elided `dc cvau` is sound
+        // here for the same reason it was sound there.
+        assert_eq!(
+            idc_elision_is_sound_here(&snap_with_ctrs(&[GRAVITON]), APPLE),
+            IdcVerdict::LeaveAlone
+        );
+        // A host that is not coherent makes the IDC elision as unsound as the
+        // DIC one, and repairing only half would report a fixed guest.
+        assert_eq!(
+            idc_elision_is_sound_here(&snap_with_ctrs(&[GRAVITON]), APPLE & !CTR_IDC),
+            IdcVerdict::AlsoElidedUnsoundly
+        );
+        // A capture whose own host said IDC = 0 never elided `dc cvau`, so
+        // there is nothing there to be unsound -- even on an incoherent host.
+        assert_eq!(
+            idc_elision_is_sound_here(&snap_with_ctrs(&[GRAVITON & !CTR_IDC]), APPLE & !CTR_IDC),
+            IdcVerdict::LeaveAlone
+        );
+        // Unreadable in both directions, and the reason is carried rather than
+        // flattened: a repair that logs "cannot read" should say which.
+        assert_eq!(
+            idc_elision_is_sound_here(&snap_with_no_sysregs(), APPLE),
+            IdcVerdict::Unreadable(Captured::Absent)
+        );
+        assert_eq!(
+            idc_elision_is_sound_here(&snap_with_ctrs(&[GRAVITON, APPLE]), APPLE),
+            IdcVerdict::Unreadable(Captured::Disagreed)
+        );
+    }
+
+    /// The host constant is only as good as the measurement behind it, and the
+    /// measurement lives in another crate's hardware test. Pin the two bits this
+    /// guard actually consults: if a future Mac disagrees,
+    /// `hvf_host_cache_identity_registers` fails on hardware and this fails in
+    /// the unit suite, rather than the guard quietly judging against fiction.
+    #[test]
+    fn the_host_constant_carries_the_bits_the_hardware_test_pins() {
+        assert_eq!(
+            HOST_CTR_EL0 & CTR_DIC,
+            0,
+            "this host does not snoop instruction fetches, which is the whole hazard"
+        );
+        assert_eq!(
+            HOST_CTR_EL0 & CTR_IDC,
+            CTR_IDC,
+            "this host is data-coherent, which is why the IDC elision is left alone"
+        );
+    }
+
+    /// `AlsoElidedUnsoundly` is unreachable through the guard on Apple silicon,
+    /// so no assertion about the printed output can protect the call site --
+    /// deleting the `push_str` would leave every test green. Read the source
+    /// instead, with the needle assembled from parts so it cannot match itself.
+    #[test]
+    fn the_guard_consults_the_idc_verdict_at_all() {
+        let src = include_str!("imp.rs");
+        let needle = format!("idc_elision_is_sound_here(snap, {})", "HOST_CTR_EL0");
+        assert!(
+            src.contains(&needle),
+            "icache_dic_guard must judge the IDC alternative against this host"
+        );
+        assert!(
+            src.contains(&format!("detail.push_str({})", "IDC_ALSO_ELIDED")),
+            "and must say so when that verdict is AlsoElidedUnsoundly"
+        );
     }
 
     fn snap_with_no_sysregs() -> Snapshot {
