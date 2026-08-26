@@ -106,6 +106,49 @@ pub enum RehydrateError {
     /// A hypervisor/VM operation failed.
     #[error("hypervisor operation failed: {0}")]
     Hv(#[from] anyhow::Error),
+    /// The DIC repair began rewriting guest kernel text and could not finish.
+    #[error("{0}")]
+    TornIcacheRepair(#[from] crate::hvf::dic::TornRepair),
+}
+
+/// Undo the guest kernel's boot-time elision of `ic ivau`, if this capture has
+/// one, before any vCPU can execute.
+///
+/// Shared by both restore paths so there is exactly one definition of what a
+/// refusal costs. A refusal is **warn and continue**: the elision is a hazard
+/// this host already reports through `chm`'s `icache_dic_guard`, and refusing
+/// to start here would quietly convert that warning into a hard failure at a
+/// layer that has no way to say so. `CHM_STRICT_ICACHE` is where a caller opts
+/// into refusing, and it lives in `chm`.
+///
+/// A *torn* repair is the opposite and propagates: the text has already been
+/// partly rewritten, so a half-reverted routine would look repaired while
+/// behaving as neither.
+fn repair_dic_elision(
+    guest_mem: &crate::hvf::virtio::GuestMemory,
+    snap: &Snapshot,
+) -> Result<(), RehydrateError> {
+    use crate::hvf::dic::{HOST_CTR_EL0, Repair, revert_dic_elision};
+    match revert_dic_elision(guest_mem, snap, HOST_CTR_EL0)? {
+        Repair::NotElided => {}
+        Repair::Reverted {
+            sites,
+            unconditional,
+        } => {
+            eprintln!(
+                "[icache] reverted the guest kernel's DIC elision at {sites} site(s); \
+                 {unconditional} unconditional `ic ivau` site(s) needed no repair"
+            );
+        }
+        Repair::Declined(why) => {
+            eprintln!(
+                "[icache] this capture elides `ic ivau` and the repair was declined \
+                 (nothing was written): {why}. Code the guest kernel makes \
+                 executable on userspace's behalf may execute stale."
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Format an error together with its full `source()` chain. Our backends stash
@@ -964,6 +1007,10 @@ pub fn prepare_usgic_vm(
         eprintln!("[timing] RAM map total {:?}", t_ram.elapsed());
     }
 
+    // Guest RAM is mapped and no vCPU exists yet, which is the only window in
+    // which kernel text can be rewritten with nothing able to be executing it.
+    repair_dic_elision(&guest_mem, snap)?;
+
     // The guest's original GIC MMIO bases (arch::aarch64::layout): distributor
     // just below the mapped-IO window, per-vCPU redistributors stacked below it.
     let gicd_base = MAPPED_IO_START - GIC_V3_DIST_SIZE;
@@ -1468,6 +1515,10 @@ pub fn prepare_vm(
         }
         ram.push(backing);
     }
+
+    // Guest RAM is mapped and no vCPU exists yet, which is the only window in
+    // which kernel text can be rewritten with nothing able to be executing it.
+    repair_dic_elision(&guest_mem, snap)?;
 
     // --- GIC ---------------------------------------------------------------
     let gic = vm.create_vgic(&snap.vgic_config()).map_err(|e| {

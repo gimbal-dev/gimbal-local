@@ -470,12 +470,27 @@ Shipped as `hypervisor::hvf::ctr_trap_fixup`; `CHM_KEEP_CTR_TRAP=1` opts out.
 > warning does not transfer: the value EL0 then reads is the hardware's, with
 > `DIC = 0`, so userspace does more maintenance rather than skipping it.
 
-**What this does not fix.** The kernel's own `ic ivau`, alternative-patched to a
-NOP at boot because the capture host advertised `DIC = 1`, lives in kernel text
-and no register reaches it. Measured *after* this fix, `mmap(RW)` → write →
+**What this does not fix — and what since does.** The kernel's own `ic ivau`,
+alternative-patched to a branch at boot because the capture host advertised
+`DIC = 1`, lives in kernel text and no register reaches it. Measured *after*
+this fix and *before* any repair of that text, `mmap(RW)` → write →
 `mprotect(RX)` → call was stale **998 times in 1000**. That is #287, and this
 finding shows it is genuinely independent rather than a second symptom of the
 stride — the opposite of what was recorded when the two were first linked.
+
+Because no register reaches it, the repair rewrites the text instead: restore
+walks the kernel's executable pages, finds the branch Linux patched in front of
+each `ic ivau`, and writes two NOPs over it so control flow reaches the
+maintenance again. Shipped in `hypervisor/src/hvf/dic.rs`; the site inventory
+below is what it re-derives at runtime, from the capture's own registers rather
+than from this table. It can decline — a capture whose `CTR_EL0` disagrees
+across vCPUs, a text layout it does not recognise — and it warns and continues
+when it does, so the guest console is where you find out which happened.
+
+An A/B across the single commit that added it, same probe and same capture,
+measured **293 and 265 stale of 300** at two offsets within a page without the
+repair and **0 of 300 at both** with it. The two offsets matter: every probe
+before #290 wrote at offset 0, the one offset a 4096-byte stride covers.
 
 ### The elision is structural, and it has been inventoried
 

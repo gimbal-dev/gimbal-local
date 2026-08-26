@@ -487,10 +487,16 @@ pub(crate) fn aarch32_guard(snap: &Snapshot) -> Result<(), String> {
 /// lets EL0 read this Mac's own `CTR_EL0`. Measured after the fix, all eight
 /// offsets return 0/200 and `npm --version` is 20/20.
 ///
-/// What this warning still covers is the kernel's own elided copy (#287),
-/// which lives in kernel text and no register can reach. Measured *after* the
-/// stride fix, `mmap(RW)` → write → `mprotect(RX)` → call is stale 998 times
-/// in 1,000.
+/// The other half is the kernel's own elided copy (#287), which lives in
+/// kernel text and no register can reach. Measured *after* the stride fix,
+/// `mmap(RW)` → write → `mprotect(RX)` → call was stale 998 times in 1,000.
+///
+/// **That half is now fixed too**, in [`hypervisor::hvf::dic`]: restore walks
+/// the kernel's executable text and writes back over the branches Linux
+/// patched in front of its `ic ivau`. An A/B across the single commit that
+/// added it, same probe and same capture, measured 293/300 and 265/300 stale
+/// at two offsets within a page without the repair and **0/300 at both** with
+/// it.
 ///
 /// How bad this is in practice was understated for a long time. The figure used
 /// to be "roughly one run in seven"; measured on a rehydrated Graviton guest
@@ -522,10 +528,13 @@ pub(crate) fn aarch32_guard(snap: &Snapshot) -> Result<(), String> {
 /// warning no longer claims non-JIT workloads are safe: they are not, and no
 /// in-guest environment variable reaches this case.
 ///
-/// The kernel side cannot be fixed at rehydrate time: the NOPs are baked into
-/// the kernel text inside the snapshot, and we have no way to write into the
-/// guest filesystem from here either, so the mitigation has to be something the
-/// user applies. This warns rather than refuses, matching [`aarch32_guard`], and
+/// The kernel side *is* fixed at rehydrate time, by [`hypervisor::hvf::dic`],
+/// which rewrites that text before any vCPU exists. It can decline — a capture
+/// whose registers disagree, a text layout it does not recognise — and it warns
+/// and continues when it does, so this guard fires on the DIC delta itself
+/// rather than on the repair's outcome: the delta is what makes the capture
+/// unlike this host, and it is true whether or not the repair landed.
+/// This warns rather than refuses, matching [`aarch32_guard`], and
 /// the warning carries the workaround so it is read at the moment the problem
 /// is. A cold-booted guest is unaffected: its kernel reads this Mac's real
 /// `CTR_EL0` and patches correctly. `CHM_STRICT_ICACHE=1` refuses.
@@ -558,13 +567,17 @@ pub(crate) fn icache_detail() -> &'static str {
          succeeded 20 times out of 20 where it had failed 15 of 20 before. Setting \
          CHM_KEEP_CTR_TRAP=1 restores the captured value and the failure with it.\n\
          \n\
-         What remains is the kernel's own elided maintenance (#287), which no \
-         register can reach because it is patched into the kernel text inside the \
-         snapshot. \
-         Measured after the UCT fix, mmap RW -> write -> mprotect RX -> call was \
-         stale 998 times in 1000. Node and npm do not take that path and now work; \
-         a runtime that relies on the kernel to synchronise the caches for it will \
-         still fetch stale code.\n\
+         The kernel's own elided maintenance (#287) is repaired at restore. No \
+         register reaches it -- it is patched into the kernel text inside the \
+         snapshot -- so restore walks that text and writes two NOPs over the \
+         branch Linux put in front of each `ic ivau`, and control flow reaches \
+         the maintenance again. Left alone it was measured stale 998 times in \
+         1000 on the mmap RW -> write -> mprotect RX -> call path; across the \
+         one commit that added the repair, the same probe at two offsets in a \
+         page over 300 rounds each went from 293 and 265 stale to 0 and 0. The \
+         engine prints on this console what it repaired; if it prints a refusal \
+         instead, that staleness still stands and the workaround below is what \
+         is left.\n\
          \n\
          If a JIT workload does still die with `Illegal instruction (core dumped)`, \
          turn the JIT off:\n\
@@ -5516,9 +5529,40 @@ mod tests {
             !d.contains("only the kernel's copy is wrong"),
             "the retracted #290 conclusion must not come back: {d}"
         );
+    }
+
+    /// #287 is repaired at restore now, so the message must not still present
+    /// the kernel's elision as something only the user can work around.
+    ///
+    /// The needles are the A/B numbers and the phrase naming the cure, both of
+    /// which appear nowhere else in the message. That is deliberate: #290's M5
+    /// mutation did not fire because its needle (`SCTLR_EL1.UCT`) also matched
+    /// the paragraph describing the *problem*, so removing it from the sentence
+    /// describing the *cure* left the guard green. A needle that matches in two
+    /// places cannot detect its removal from the one that matters.
+    #[test]
+    fn the_icache_warning_says_the_kernel_side_is_repaired_at_restore() {
+        let d = icache_detail();
         assert!(
-            !d.contains("failed 15 times out of 20"),
-            "the stride failure is fixed; the warning must not present it as live: {d}"
+            d.contains("repaired at restore"),
+            "the warning must say the kernel's elision is cured rather than \
+             merely diagnosed: {d}"
+        );
+        assert!(
+            d.contains("293 and 265"),
+            "the warning must carry the measured staleness without the repair; \
+             without the control arm the 0/300 is an observation rather than \
+             evidence about the repair: {d}"
+        );
+        // The repair warns and continues when it declines, so a message that
+        // promised success would be wrong on exactly the runs that matter.
+        assert!(
+            d.contains("prints a refusal"),
+            "the warning must say what a declined repair looks like: {d}"
+        );
+        assert!(
+            !d.contains("still fetch stale code"),
+            "the pre-repair residual must not come back as a live claim: {d}"
         );
     }
 
@@ -5541,7 +5585,8 @@ mod tests {
         );
         assert!(
             d.contains("998 times in 1000"),
-            "the measured residual, which is what still justifies the workaround"
+            "what the kernel's elision cost before the repair -- the number the \
+             A/B in the same paragraph is measured against, not a live residual"
         );
         // #261: the workaround's limit is part of the workaround. A reader who
         // sets NODE_OPTIONS and then watches a native binary SIGILL -- while
