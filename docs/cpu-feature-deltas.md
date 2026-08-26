@@ -488,12 +488,21 @@ Read out of the live guest's own text via `/proc/kcore` by
 | `caches_clean_inval_user_pou` | `+0x94` | PATCHED |
 | `icache_inval_pou` | `+0x28` | PATCHED |
 | `__kvm_nvhe_icache_inval_pou` | `+0x34` | PATCHED, **not reached under HVF** |
-| `user_cache_maint_handler` | `+0x128` | UNKNOWN, review required |
+| `user_cache_maint_handler` | `+0x128` | UNCONDITIONAL — no alternative here, nothing to repair |
 
 Five sites in five routines; **exactly three reachable routines need repair.**
 The nVHE copy is patched by the same alternatives pass and must be *reported*,
 but the guest never runs at EL2 here, so counting it would send a repair pass
 writing to text nothing executes, on the strength of a routine name.
+
+`user_cache_maint_handler` is reported for the same reason and is **benign**: it
+is the EL0 cache-maintenance trap emulation path, so it holds an `ic ivau`
+because issuing one is its entire job. Nothing ever guarded that op, so there is
+no elision to undo. Measured — 126 words, no `isb` anywhere, no adjacent `nop`
+pair anywhere, and the lone `nop`s it does carry sit at words 1/31/111/123
+against the op at 74. It was originally reported as *unclassified*, which left
+the whole inventory unable to say "complete"; the probe now recognises the shape
+and the kernel reports **0 unclassified**.
 
 This settles what a register cannot: `ctr_trap_fixup` rewrites a restored
 `SCTLR_EL1` and **cannot alter kernel text bytes**. The instruction is still
@@ -513,12 +522,57 @@ physically present in every case; what changed is a `b` jumping over it.
 > regression**. Both pairs sit in the same routine and are applied by the same
 > pass, so a repair triggered on "an alternative was applied" gets this wrong.
 
-Two further constraints, neither visible from the text alone.
-`ARM64_HAS_CACHE_DIC` stays set in the guest's capability state, so
-`module_finalize()` reproduces the elision in **every module loaded afterwards**
-unless that state is repaired too, or the fix is explicitly scoped to say so. And
-a unique RAM pattern does not identify *active* kernel text: the write has to be
-anchored through the captured `TTBR1_EL1`/`VBAR_EL1`, with all vCPUs agreeing.
+Two further constraints, neither visible from the text alone. A unique RAM
+pattern does not identify *active* kernel text: the write has to be anchored
+through the captured `TTBR1_EL1`/`VBAR_EL1`, with all vCPUs agreeing. And the
+alternatives machinery can re-apply itself after we repair — measured below.
+
+### A repair to built-in text is stable; modules and the vDSO are not, in theory
+
+Read out of Linux v6.8 `arch/arm64/kernel/alternative.c` rather than assumed:
+
+| entry point | `__init`? | capability mask |
+| --- | --- | --- |
+| `apply_boot_alternatives` | yes | boot-scope caps |
+| `apply_alternatives_all` | yes | live `cpus_have_cap()` |
+| `apply_alternatives_vdso` | yes (called from `_all`) | `bitmap_fill` — **all** caps |
+| `apply_alternatives_module` | **no** | `bitmap_fill` — **all** caps |
+
+Three consequences follow, and only the first is comfortable.
+
+**A repair to built-in kernel text is permanent.** Every pass that could rewrite
+it is `__init`, so once the guest is up nothing will undo two `nop`s we write
+there. That is what makes the Phase 3 repair worth building at all.
+
+**`apply_alternatives_module` is not `__init`**, fills the capability mask, and
+gates only on live `cpus_have_cap()`. `ARM64_HAS_CACHE_DIC` stays set in the
+guest's restored capability state (`system_cpucaps` in v6.8 — renamed from
+`cpu_hwcaps`), so a module loaded *after* a repair would re-elide **its own**
+`ic ivau` sites. Repairing built-in text does not repair the capability bit.
+
+**Measured on the live guest: no loaded module carries the instruction at all.**
+Scanning all 40 loaded modules' text — 12,438,552 bytes, `unreadable=0` —
+found **0** `ic ivau` sites, so there is nothing for that pass to re-elide here.
+This is consistent with the source: the elided sites live in the out-of-line
+routines of `arch/arm64/mm/cache.S`, and a module calling `flush_icache_range()`
+calls the *kernel's* (repaired) copy rather than carrying its own.
+
+**The vDSO is likewise zero.** `apply_alternatives_vdso` also `bitmap_fill`s, and
+the inventory scans `stext..etext` only — `vdso_start`/`vdso_end` are `D`
+symbols, so a text-restricted scan structurally cannot reach them. Scanned
+directly: **0** sites in its 4096-byte span.
+
+> **Both zeros are only evidence because the same instrument was shown to
+> speak.** Each scan ran the *identical* body — same `NEEDLE`, same 4-byte
+> alignment test, same `RT_MASK` decode — against built-in text in the same
+> process, where it returned all five known sites at their byte-exact addresses.
+> A re-implemented scanner would have tested a different thing. Reporting a zero
+> from an instrument that has never returned non-zero is not a measurement.
+
+The residual risk is nameable rather than eliminated: this is *this* guest's 40
+modules. A capture whose workload loads a module carrying its own cache
+maintenance would reopen it, which is why the capability bit stays on the record
+as a known gap rather than a closed one.
 
 ---
 

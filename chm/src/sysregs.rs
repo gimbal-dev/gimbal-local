@@ -398,6 +398,45 @@ mod tests {
         }
     }
 
+    /// The inventory's completeness claim must not silently regress.
+    ///
+    /// `user_cache_maint_handler` was originally reported as *unclassified*,
+    /// which left the whole inventory unable to say "this kernel is completely
+    /// inventoried" over a routine that is in fact benign -- it is the EL0
+    /// trap emulation path, so it holds an `ic ivau` because issuing one is
+    /// its job, and nothing ever guarded that op.
+    ///
+    /// The risk this guards is narrow and real: the table is copied out of the
+    /// tool's own output, so regenerating it with an older build of the probe
+    /// would quietly restore the withdrawn verdict while the shipped tool
+    /// disagrees. The doc and the tool would then contradict each other with
+    /// nothing reporting it.
+    #[test]
+    fn the_delta_doc_does_not_reopen_the_unconditional_site() {
+        let doc = include_str!("../../docs/cpu-feature-deltas.md");
+        let flat = doc.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // Assembled from parts for the same reason as the guard above: a
+        // literal here would match this test's own source if the doc ever
+        // quoted it back.
+        let withdrawn = format!("{}, review required", "UNKNOWN");
+        assert!(
+            !flat.contains(&withdrawn),
+            "the delta doc reports a site as needing review that the probe now \
+             classifies -- one of the two is stale"
+        );
+
+        // A zero is only evidence when the instrument has been shown to speak,
+        // so the page must carry the control alongside each negative result.
+        // Dropping the control leaves two bare zeros that look like coverage.
+        for needle in ["UNCONDITIONAL", "0 unclassified", "vdso_start", "40 loaded"] {
+            assert!(
+                flat.contains(needle),
+                "the delta doc must record the inventory result: missing {needle:?}"
+            );
+        }
+    }
+
     /// A capture that trapped EL0's `CTR_EL0` read must be corrected.
     ///
     /// The measured Graviton2 value is `0x3454599d`, whose bit 15 (`UCT`) is
