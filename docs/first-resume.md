@@ -254,17 +254,38 @@ That form matters: `sudo` strips `NODE_OPTIONS` from the environment, so
 `chm` warns about the remaining hazard on every affected resume, and the full
 measurement is in `docs/cpu-feature-deltas.md`.
 
-### What is still genuinely exposed
+### The other half, and how you know it landed
 
-The fix corrects the stride userspace uses for its own cache maintenance. It does
-not restore the maintenance the guest kernel elided at boot on the assumption
-that its i-cache snooped. On the path where a program maps a page writable, writes
-code into it, then flips it executable with `mprotect(PROT_READ|PROT_EXEC)`, a
-rehydrated guest still reads stale instructions **998 times out of 1000**. See
-[#287](https://github.com/gimbal-dev/gimbal-local/issues/287).
+The stride fix corrects the stride userspace uses for its own cache maintenance.
+It does not restore the maintenance the guest kernel elided at boot on the
+assumption that its i-cache snooped — that elision is patched into kernel text
+inside the snapshot, so no register reaches it. Left alone, a program that maps
+a page writable, writes code into it, then flips it executable with
+`mprotect(PROT_READ|PROT_EXEC)` read stale instructions **998 times out of
+1000**.
 
-Node and npm do not take that path. A package that ships its own compiled binary
-and execs it may.
+Restore now repairs that text: it walks the kernel's executable pages, finds the
+branch Linux patched in front of each `ic ivau`, and writes two NOPs over it so
+control flow reaches the maintenance again
+([#287](https://github.com/gimbal-dev/gimbal-local/issues/287)). An A/B across
+the single commit that added it, same probe and same capture, measured **293 and
+265 stale of 300** at two offsets within a page without the repair and **0 of
+300 at both** with it.
+
+**It can decline, and it says so on the console.** A capture whose `CTR_EL0`
+disagrees across vCPUs, or a kernel text layout it does not recognise, gets a
+refusal rather than a guessed rewrite — the repair warns and continues rather
+than aborting the resume. So read the line it prints:
+
+```
+[icache] reverted the guest kernel's DIC elision at 4 site(s); 1 unconditional `ic ivau` site(s) needed no repair
+```
+
+That is the success shape. If you get a refusal instead, the 998 above is what
+you are running on, and `NODE_OPTIONS=--jitless` is the workaround that is left.
+
+Node and npm do not take that path either way. A package that ships its own
+compiled binary and execs it does.
 
 **A cold-booted guest is immune to all of this by construction** — it reads this
 Mac's own `CTR_EL0` and keeps the maintenance its kernel would otherwise have

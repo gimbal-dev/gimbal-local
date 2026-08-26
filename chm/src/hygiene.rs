@@ -337,6 +337,12 @@ mod tests {
                  the whole answer",
             ),
             (
+                "293 and 265 stale of 300",
+                "#287's kernel-text repair is measured by its control arm; \
+                 without the without-the-repair numbers the 0 of 300 is an \
+                 observation rather than evidence that the repair did it",
+            ),
+            (
                 "overwrite `/etc/resolv.conf`",
                 "the page has to actively warn against its own former advice, \
                  because that advice replaces a working resolver configuration",
@@ -459,6 +465,45 @@ mod tests {
         ] {
             assert!(doc.contains(&needle), "docs/first-resume.md: {why}");
         }
+    }
+
+    /// The success line #287's repair prints is read out of the hypervisor, not
+    /// retyped in the page.
+    ///
+    /// The repair can decline, and it warns and continues when it does rather
+    /// than refusing the resume -- so the console is the *only* place a user
+    /// learns which happened, and the page is where they find out what to look
+    /// for. That holds only while the page and the code agree, and they live in
+    /// different crates. Restating a constant across a crate boundary is
+    /// exactly how the app came to refuse kernels the engine accepts (#242).
+    #[test]
+    fn the_first_resume_guide_quotes_the_repair_line_the_hypervisor_prints() {
+        let src = include_str!("../../hypervisor/src/hvf/rehydrate.rs");
+        let doc = flattened(include_str!("../../docs/first-resume.md"));
+
+        // Assembled from parts so this cannot match its own source, and cut at
+        // the first `{` because the rest of the literal is format arguments.
+        let opening = format!("\"[{}] reverted ", "icache");
+        let Some(line) = src
+            .split_once(&opening)
+            .map(|(_, rest)| rest)
+            .and_then(|rest| rest.split_once('{'))
+            .map(|(head, _)| head)
+        else {
+            panic!(
+                "the hypervisor no longer prints a `reverted` line for the \
+                 #287 repair, so this guard can no longer read what a repaired \
+                 capture will actually say on the console"
+            )
+        };
+        let needle = format!("reverted {}", line.trim());
+        assert!(
+            doc.contains(&needle),
+            "the hypervisor prints `{needle}` when it repairs the kernel's DIC \
+             elision, but docs/first-resume.md does not quote it -- so a user \
+             cannot tell a repaired capture from one whose repair declined, \
+             and the two differ by 998 stale executions in 1000"
+        );
     }
 
     /// Blank out whole-line comments, preserving line numbering.
