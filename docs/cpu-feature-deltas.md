@@ -477,6 +477,49 @@ and no register reaches it. Measured *after* this fix, `mmap(RW)` → write →
 finding shows it is genuinely independent rather than a second symptom of the
 stride — the opposite of what was recorded when the two were first linked.
 
+### The elision is structural, and it has been inventoried
+
+Read out of the live guest's own text via `/proc/kcore` by
+`scripts/hvf/ic-ivau-inventory.py`, twice, byte-identically:
+
+| routine | site | verdict |
+| --- | --- | --- |
+| `caches_clean_inval_pou` | `+0x68` | PATCHED |
+| `caches_clean_inval_user_pou` | `+0x94` | PATCHED |
+| `icache_inval_pou` | `+0x28` | PATCHED |
+| `__kvm_nvhe_icache_inval_pou` | `+0x34` | PATCHED, **not reached under HVF** |
+| `user_cache_maint_handler` | `+0x128` | UNKNOWN, review required |
+
+Five sites in five routines; **exactly three reachable routines need repair.**
+The nVHE copy is patched by the same alternatives pass and must be *reported*,
+but the guest never runs at EL2 here, so counting it would send a repair pass
+writing to text nothing executes, on the strength of a routine name.
+
+This settles what a register cannot: `ctr_trap_fixup` rewrites a restored
+`SCTLR_EL1` and **cannot alter kernel text bytes**. The instruction is still
+physically present in every case; what changed is a `b` jumping over it.
+
+```
++0x044  d5033fdf  isb            <- the DIC alternative (originally nop, nop)
++0x048  1400000e  b ->+0x80      <- skips the ic ivau loop
++0x068  d50b7523  ic ivau        <- still in kernel text, branched over
++0x080  d65f03c0  ret
+```
+
+**So the repair is two `nop`s at `+0x044`, not a synthesised `ic ivau`.**
+
+> **Only the DIC pair is the defect.** Apple also reports `IDC = 1`, so eliding
+> `dc cvau` remains correct here and **reverting the IDC pair would be a
+> regression**. Both pairs sit in the same routine and are applied by the same
+> pass, so a repair triggered on "an alternative was applied" gets this wrong.
+
+Two further constraints, neither visible from the text alone.
+`ARM64_HAS_CACHE_DIC` stays set in the guest's capability state, so
+`module_finalize()` reproduces the elision in **every module loaded afterwards**
+unless that state is repaired too, or the fix is explicitly scoped to say so. And
+a unique RAM pattern does not identify *active* kernel text: the write has to be
+anchored through the captured `TTBR1_EL1`/`VBAR_EL1`, with all vCPUs agreeing.
+
 ---
 
 ## Finding 6 — ASID width: unrelated processes share TLB contexts 🔴
