@@ -323,7 +323,12 @@ fn host_page_size() -> usize {
 }
 
 /// Invalidate the instruction cache for a host range.
-fn invalidate(host_va: usize, len: usize) {
+///
+/// Crate-visible because the DIC repair in [`super::dic`] rewrites guest
+/// kernel text before any vCPU exists and must maintain the caches over what
+/// it wrote. It deliberately does not go through `GuestMemory::write`'s hook,
+/// which is a no-op until this module is armed.
+pub(crate) fn invalidate(host_va: usize, len: usize) {
     // SAFETY: the caller has established that `host_va..host_va+len` lies
     // inside a live guest-RAM mapping, which we own for the VM's lifetime.
     unsafe { sys_icache_invalidate(host_va as *mut c_void, len) };
