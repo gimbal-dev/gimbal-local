@@ -71,6 +71,10 @@ pub mod virtio;
 /// `ic ivau` alternative-patched out on a `CTR_EL0.DIC = 1` capture host.
 pub mod icache_wx;
 
+/// Reading a capture's cache-identity registers, and deciding what the
+/// `CTR_EL0.DIC = 1` elision they describe means on this host.
+pub mod dic;
+
 type CpuResult<T> = std::result::Result<T, HypervisorCpuError>;
 type VmResult<T> = std::result::Result<T, HypervisorVmError>;
 
