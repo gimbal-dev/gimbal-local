@@ -204,6 +204,11 @@ def classify(words, addr, guard_word, op_word):
                 continue
             between = words[i + 2 : o]
             if any(w == guard_word for w in between):
+                # `break` rather than `continue` is an optimisation, not a rule:
+                # `between` only grows as `i` falls, so a guard word here is in
+                # every earlier window too. What matters is not returning
+                # PRESENT -- reporting a shape we cannot explain as sound is
+                # the one direction that hides a defect.
                 break
             if any(decode_b(w, 0) is not None for w in between):
                 break
@@ -250,6 +255,30 @@ def _synth_stray(filler):
     w = [NOP] * 17
     w[2:6] = [DC_CVAU | 3, DSB_ISH, NOP, NOP]
     w[8] = filler
+    w[10:16] = [IC_IVAU | 3, DSB_ISH, ISB, NOP, NOP, NOP]
+    w[16] = RET
+    return w
+
+
+def _synth_far_branch():
+    """Unpatched, with an `isb` followed by a branch that leaves the routine.
+
+    The pair at 8..9 looks exactly like a patched DIC alternative until you ask
+    where the branch goes: past the end of the routine, as a tail call or a jump
+    to a shared epilogue does. Nothing about `isb; b` alone distinguishes the
+    two, so the in-range check is the whole of the distinction.
+
+    Wrong in the expensive direction: a repair pass acting on a false PATCHED
+    writes two `nop`s over a guard that was never an alternative, corrupting
+    kernel text in a routine it had no business touching.
+    """
+
+    def b(frm, to):
+        return B_OPC | ((to - frm) & 0x03FFFFFF)
+
+    w = [NOP] * 17
+    w[2:8] = [DC_CVAU | 3, DSB_ISH, NOP, NOP, NOP, NOP]
+    w[8], w[9] = ISB, b(9, 40)  # 40 is well past word 16, the `ret`
     w[10:16] = [IC_IVAU | 3, DSB_ISH, ISB, NOP, NOP, NOP]
     w[16] = RET
     return w
@@ -336,6 +365,12 @@ def selftest():
             _synth_early_return(False),
             "PRESENT",
             "NO-OP-IN-ROUTINE",
+        ),
+        (
+            "negative control: isb+b that leaves the routine",
+            _synth_far_branch(),
+            "UNKNOWN",
+            "PRESENT",
         ),
     )
     bad = 0
