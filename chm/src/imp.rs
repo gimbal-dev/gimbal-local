@@ -4076,9 +4076,19 @@ fn retire_or_clear_head(dir: &Path, live_taken: &Arc<AtomicU64>, quiet: bool) {
         return;
     }
     match checkpoint::retire_checkpoint(dir) {
-        Some(id) if !quiet => eprintln!(
+        checkpoint::Retired::Filed(id) if !quiet => eprintln!(
             "chm: kept the last live snapshot as {id}; \
              recover it with `chm rollback {} {id}`",
+            dir.display()
+        ),
+        // Say this even when quiet. The snapshot survived but is sitting at HEAD
+        // instead of in the archive, so the next start resumes it rather than
+        // the caller's next capture -- and silence is what let the same failure
+        // destroy it unnoticed before (#437).
+        checkpoint::Retired::Kept { id, why } => eprintln!(
+            "chm: could not file the last live snapshot {id} into {}: {why}. \
+             It is still at HEAD, so nothing was lost, but the next start will \
+             resume it.",
             dir.display()
         ),
         _ => {}

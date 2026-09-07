@@ -53,7 +53,7 @@
 //! incrementally and inspected without unpacking. `tar`ing one is a single
 //! command and loses nothing, because the deduplication has already happened.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::env::{self, current_dir};
 use std::ffi::CString;
 use std::fs::{self, File};
@@ -354,8 +354,30 @@ fn is_inside(child: &Path, parent: &Path) -> bool {
     true
 }
 
+/// Enumerate the base snapshot files a bundle carries under `--with-base`.
+///
+/// Stats through symlinks rather than at them. `chm workspace` shares its base
+/// by symlinking `state.json`, `snapshot/` and `disks/` at the image, so every
+/// base file a workspace has is reached through a link. `DirEntry::metadata` is
+/// an `lstat` and reports those links as neither a file nor a directory, so the
+/// walk skipped all of them and `--with-base` refused a workspace for holding
+/// "no base snapshot files" while it was reading them fine for every other
+/// command (#438).
+///
+/// Following links means a cycle is now reachable, so the walk remembers the
+/// canonical directories it has entered and refuses to enter one twice.
 fn carried_base_files(snapshot_dir: &Path) -> Result<Vec<PathBuf>, String> {
-    fn walk(root: &Path, at: &Path, out: &mut Vec<PathBuf>) -> Result<(), String> {
+    fn walk(
+        root: &Path,
+        at: &Path,
+        out: &mut Vec<PathBuf>,
+        seen: &mut HashSet<PathBuf>,
+    ) -> Result<(), String> {
+        if let Ok(real) = at.canonicalize()
+            && !seen.insert(real)
+        {
+            return Ok(());
+        }
         let entries = fs::read_dir(at).map_err(|e| format!("read {}: {e}", at.display()))?;
         for entry in entries.flatten() {
             let path = entry.path();
@@ -363,12 +385,14 @@ fn carried_base_files(snapshot_dir: &Path) -> Result<Vec<PathBuf>, String> {
             if name.starts_with(".chm-") {
                 continue;
             }
-            let md = match entry.metadata() {
+            // `fs::metadata`, not `entry.metadata()`: the first follows a link to
+            // what it points at, the second describes the link itself.
+            let md = match fs::metadata(&path) {
                 Ok(md) => md,
                 Err(e) => return Err(format!("stat {}: {e}", path.display())),
             };
             if md.is_dir() {
-                walk(root, &path, out)?;
+                walk(root, &path, out, seen)?;
             } else if md.is_file() {
                 if name.ends_with(".tmp") {
                     continue;
@@ -382,7 +406,8 @@ fn carried_base_files(snapshot_dir: &Path) -> Result<Vec<PathBuf>, String> {
         Ok(())
     }
     let mut out = Vec::new();
-    walk(snapshot_dir, snapshot_dir, &mut out)?;
+    let mut seen = HashSet::new();
+    walk(snapshot_dir, snapshot_dir, &mut out, &mut seen)?;
     out.sort();
     Ok(out)
 }
@@ -1834,10 +1859,79 @@ mod tests {
         assert!(names.contains(&"something-new".to_string()), "{names:?}");
     }
 
-    /// A base is the vanilla Cloud Hypervisor snapshot. Our own lineage lives
-    /// beside it in `.chm-*` directories, and carrying those would double the
-    /// bundle, hand over somebody's working directory as if it were a snapshot,
-    /// and make "the base arrives vanilla" untrue in the one place it matters.
+    /// #438: `--with-base` refused a workspace for holding no base files while
+    /// every other command was reading them fine.
+    ///
+    /// `chm workspace` shares its base by symlinking `state.json`, `snapshot/`
+    /// and `disks/` at the image. The walk used `DirEntry::metadata`, an `lstat`,
+    /// which describes the *link* -- neither a file nor a directory -- so every
+    /// base file a workspace has was skipped in silence and the export refused.
+    ///
+    /// The links come from `workspace_from_image`, not from this test, because a
+    /// hand-built symlink proves this walk handles symlinks in general and says
+    /// nothing about the ones the product actually creates.
+    #[test]
+    fn the_carried_base_follows_the_links_a_workspace_is_made_of() {
+        let root = tmp("basesymlink");
+        let image = root.join("image");
+        let ws = root.join("ws");
+        fs::create_dir_all(image.join("snapshot")).unwrap();
+        fs::create_dir_all(image.join("disks")).unwrap();
+        fs::write(image.join("state.json"), b"{}").unwrap();
+        fs::write(image.join("snapshot/memory-ranges"), b"m").unwrap();
+        fs::write(image.join("disks/disk0.raw"), b"d").unwrap();
+
+        checkpoint::workspace_from_image(&image, &ws).expect("the image is usable as a base");
+        assert!(
+            fs::symlink_metadata(ws.join("state.json"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the premise of this test is that a workspace shares its base by link"
+        );
+
+        let got: Vec<String> = carried_base_files(&ws)
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                "disks/disk0.raw".to_string(),
+                "snapshot/memory-ranges".to_string(),
+                "state.json".to_string()
+            ],
+            "a workspace's base is reached through links, and a bundle that \
+             silently leaves it out is not the self-contained thing --with-base \
+             promises"
+        );
+    }
+
+    /// The loop guard that following links made necessary. A directory that
+    /// contains a link back to itself is a cycle, and the walk must end.
+    #[test]
+    fn the_base_walk_does_not_follow_a_link_into_a_cycle() {
+        let root = tmp("baseloop");
+        let snap = root.join("snap");
+        fs::create_dir_all(snap.join("nested")).unwrap();
+        fs::write(snap.join("state.json"), b"{}").unwrap();
+        fs::write(snap.join("nested/disk.raw"), b"d").unwrap();
+        std::os::unix::fs::symlink(&snap, snap.join("nested/back")).unwrap();
+
+        let got: Vec<String> = carried_base_files(&snap)
+            .unwrap()
+            .iter()
+            .map(|p| p.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            got,
+            vec!["nested/disk.raw".to_string(), "state.json".to_string()],
+            "each file is listed once and the walk terminates"
+        );
+    }
+
+
     #[test]
     fn the_carried_base_is_the_snapshot_and_not_our_lineage() {
         let root = tmp("basefiles");
