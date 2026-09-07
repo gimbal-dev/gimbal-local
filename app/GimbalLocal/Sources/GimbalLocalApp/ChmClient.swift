@@ -465,6 +465,14 @@ struct ChmClient {
     /// stdout+stderr. Used for one-shot commands (`fork`, `runner`) that talk to
     /// the plane or filesystem rather than the local daemon. Never throws on a
     /// non-zero exit — the status is returned so callers can report it honestly.
+    ///
+    /// Reads the pipe to EOF *before* waiting for exit. The other order looks
+    /// equivalent and is not: a pipe holds 64 KiB, and past that the child
+    /// blocks in `write` waiting for a reader while this thread blocks in
+    /// `waitUntilExit` waiting for the child. Neither ever moves, and because
+    /// the deadlock is inside a continuation the `await` simply never returns
+    /// and the app hangs with no error (#440). `chm revisions`, `chm ps` on a
+    /// busy machine and any console dump clear 64 KiB easily.
     func runRaw(settings: AppSettings, args: [String]) async -> CommandResult {
         await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -476,8 +484,8 @@ struct ChmClient {
                 process.standardError = pipe
                 do {
                     try process.run()
-                    process.waitUntilExit()
                     let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                    process.waitUntilExit()
                     let output = String(decoding: data, as: UTF8.self)
                     continuation.resume(
                         returning: CommandResult(output: output, status: process.terminationStatus)
@@ -513,6 +521,10 @@ struct ChmClient {
         return args + ["--socket", socketPath]
     }
 
+    /// Reads the pipe to EOF before waiting, for the reason spelled out on
+    /// `runRaw`: the reverse order deadlocks once a command's output passes the
+    /// 64 KiB pipe buffer (#440). This is the path the whole UI uses, so the
+    /// hang it produced was the app freezing on an ordinary command.
     func run(settings: AppSettings, args: [String]) async throws -> CommandResult {
         try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -526,9 +538,9 @@ struct ChmClient {
                     process.standardError = pipe
 
                     try process.run()
+                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
                     process.waitUntilExit()
 
-                    let data = pipe.fileHandleForReading.readDataToEndOfFile()
                     let output = String(decoding: data, as: UTF8.self)
                     continuation.resume(returning: CommandResult(output: output, status: process.terminationStatus))
                 } catch {
