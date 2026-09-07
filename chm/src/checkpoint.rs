@@ -189,6 +189,22 @@ pub(crate) fn clear_checkpoint(snapshot_dir: &Path) {
     let _ = fs::remove_dir_all(checkpoint_dir(snapshot_dir));
 }
 
+/// What became of HEAD when a run tried to retire it.
+///
+/// Three outcomes, named separately because the caller has to say something
+/// different about each and `Option<String>` could only tell two of them apart.
+/// Collapsing "there was nothing to retire" into "retiring it failed" is how
+/// #437 stayed quiet: the run ended, the archive was empty, and nothing was
+/// printed either way.
+pub(crate) enum Retired {
+    /// HEAD is now in the revision store under this id.
+    Filed(String),
+    /// There was no HEAD to retire.
+    Nothing,
+    /// HEAD could not be filed and is still in place, with the reason why.
+    Kept { id: String, why: String },
+}
+
 /// Retire the current checkpoint into the revision store rather than deleting
 /// it, and report the id it was filed under.
 ///
@@ -205,18 +221,45 @@ pub(crate) fn clear_checkpoint(snapshot_dir: &Path) {
 /// That pairing is the only consistent way back — the live overlays have moved
 /// on since, so resuming this RAM against them is exactly the torn RAM/disk pair
 /// the #139 drift guard refuses.
-pub(crate) fn retire_checkpoint(snapshot_dir: &Path) -> Option<String> {
-    let id = read_revision(snapshot_dir).ok()?.id;
-    archive_head(snapshot_dir, &id);
+pub(crate) fn retire_checkpoint(snapshot_dir: &Path) -> Retired {
+    let Ok(id) = read_revision(snapshot_dir).map(|r| r.id) else {
+        return Retired::Nothing;
+    };
+    if let Err(why) = archive_head(snapshot_dir, &id) {
+        return Retired::Kept { id, why };
+    }
     // Keep the store bounded on the way out. Safe for the revision just filed:
     // pruning keeps the newest, and nothing is newer than this.
     prune_revisions(snapshot_dir);
-    Some(id)
+    Retired::Filed(id)
 }
 
 /// Read a revision's full manifest (lineage header + hardware state).
 pub(crate) fn read_revision(snapshot_dir: &Path) -> Result<Revision, String> {
     read_revision_manifest(&checkpoint_dir(snapshot_dir))
+}
+
+/// Whether this directory holds a manifest that parses but names a *newer*
+/// format than this build understands.
+///
+/// `read_revision_manifest` refuses such a manifest on purpose, and the refusal
+/// means the opposite of garbage: the bytes are a valid revision carrying more
+/// meaning than this build can honour. Everything downstream of that reader sees
+/// only `Err`, so anything that acts on the *absence* of a successful read has
+/// to ask this separately or it will treat "too new to read" and "not a revision
+/// at all" as the same thing -- which is exactly what deleted a pinned revision
+/// in #439.
+fn manifest_is_from_a_newer_chm(rev_dir: &Path) -> bool {
+    /// Just the envelope field, so a newer format's unknown *body* cannot make
+    /// this parse fail and send the directory back to being called garbage.
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        manifest_version: u32,
+    }
+    fs::read_to_string(rev_dir.join(MANIFEST))
+        .ok()
+        .and_then(|body| serde_json::from_str::<Envelope>(&body).ok())
+        .is_some_and(|e| e.manifest_version > REVISION_MANIFEST_VERSION)
 }
 
 /// Read a revision manifest from an arbitrary revision directory (the current
@@ -397,8 +440,15 @@ fn commit_checkpoint(
     // Archive the current HEAD into the revision store (preserving history),
     // then swap the staged revision into place as the new HEAD. The new
     // revision's `parent` is exactly the current HEAD's id.
+    //
+    // A failed archive fails the whole write, because the swap below needs the
+    // checkpoint dir free and the only other way to free it is to delete the
+    // HEAD that could not be filed (#437). Refusing costs this one capture from
+    // a guest that is still live and can be captured again; deleting costs a
+    // point that no longer exists anywhere.
     match revision.parent.as_deref() {
-        Some(head_id) => archive_head(snapshot_dir, head_id),
+        Some(head_id) => archive_head(snapshot_dir, head_id)
+            .map_err(|e| format!("archive the current HEAD before replacing it: {e}"))?,
         None => {
             let _ = fs::remove_dir_all(&dir);
         }
@@ -497,18 +547,28 @@ pub(crate) fn max_resumable_revisions() -> usize {
 
 /// Move the current HEAD checkpoint into the revision store under its id, so it
 /// is preserved as a past revision instead of being overwritten.
-fn archive_head(snapshot_dir: &Path, head_id: &str) {
+///
+/// Reports the failure rather than papering over it, and on failure leaves HEAD
+/// exactly where it was. Both halves matter, and this used to get both wrong:
+/// it returned nothing, and on either error it deleted `.chm-checkpoint`. The
+/// stated reason was "don't leave a stale HEAD behind" — but the store it was
+/// moving *into* is the only other copy, so when the move failed that delete
+/// destroyed the one that was left, pin marker and all (#437). A caller cannot
+/// preserve state on the strength of a result it is never given, so `rollback`
+/// went on to report "could not be archived" over an empty directory.
+///
+/// Keeping a stale HEAD is recoverable: the next start resumes a point that is
+/// older than the caller wanted. Deleting it is not recoverable at all. When
+/// the two duties conflict, #148 already decided which way to fall — a session
+/// that ends badly must not be a session whose work is gone.
+fn archive_head(snapshot_dir: &Path, head_id: &str) -> Result<(), String> {
     let store = revisions_dir(snapshot_dir);
-    if fs::create_dir_all(&store).is_err() {
-        let _ = fs::remove_dir_all(checkpoint_dir(snapshot_dir));
-        return;
-    }
+    fs::create_dir_all(&store).map_err(|e| format!("create {}: {e}", store.display()))?;
     let dest = store.join(head_id);
     let _ = fs::remove_dir_all(&dest);
-    if fs::rename(checkpoint_dir(snapshot_dir), &dest).is_err() {
-        // If the move failed, don't leave a stale HEAD behind.
-        let _ = fs::remove_dir_all(checkpoint_dir(snapshot_dir));
-    }
+    let head = checkpoint_dir(snapshot_dir);
+    fs::rename(&head, &dest)
+        .map_err(|e| format!("move {} -> {}: {e}", head.display(), dest.display()))
 }
 
 /// A revision in a snapshot's lineage, with whether it can still be resumed /
@@ -1022,16 +1082,29 @@ pub(crate) fn plan_gc(snapshot_dir: &Path) -> Vec<GcItem> {
     // A revision directory whose manifest will not parse is skipped by
     // `list_revisions`, so it is invisible to every reader while still holding
     // its RAM dump. Nothing can ever resume or roll back to it.
+    //
+    // Two things are *not* that, and both used to be swept up with it (#439).
+    // A pin is the user's standing instruction that this revision outlives
+    // retention, and `plan_delete` already refuses a pinned revision by name
+    // rather than behind a `--force`; GC reached the same directory through a
+    // different door and deleted it without asking. And a manifest refused only
+    // for being from a newer chm is refused *because* it means more than this
+    // build can read, so an old binary would delete the very data it was too old
+    // to understand -- a downgrade that silently eats the newer format's work.
     if let Ok(entries) = fs::read_dir(revisions_dir(snapshot_dir)) {
         for entry in entries.flatten() {
             let dir = entry.path();
-            if dir.is_dir() && read_revision_manifest(&dir).is_err() {
-                items.push(GcItem {
-                    frees: revision_frees(&dir),
-                    path: dir,
-                    reason: "unreadable manifest",
-                });
+            if !dir.is_dir() || read_revision_manifest(&dir).is_ok() {
+                continue;
             }
+            if is_pinned_dir(&dir) || manifest_is_from_a_newer_chm(&dir) {
+                continue;
+            }
+            items.push(GcItem {
+                frees: revision_frees(&dir),
+                path: dir,
+                reason: "unreadable manifest",
+            });
         }
     }
     items.sort_by(|a, b| a.path.cmp(&b.path));
@@ -1088,7 +1161,8 @@ pub(crate) fn rollback(snapshot_dir: &Path, rev_id: &str) -> Result<(), String> 
         // first, then take the ordinary path.
         match read_revision(snapshot_dir) {
             Ok(head) if head.id == rev_id => {
-                archive_head(snapshot_dir, rev_id);
+                archive_head(snapshot_dir, rev_id)
+                    .map_err(|e| format!("revision {rev_id} could not be archived: {e}"))?;
                 target = revisions_dir(snapshot_dir).join(rev_id);
                 if !target.join(MANIFEST).is_file() {
                     return Err(format!("revision {rev_id} could not be archived"));
@@ -1103,9 +1177,18 @@ pub(crate) fn rollback(snapshot_dir: &Path, rev_id: &str) -> Result<(), String> 
         ));
     }
 
-    // Archive the current HEAD so the rollback is non-destructive.
+    // Archive the current HEAD so the rollback is non-destructive. If it cannot
+    // be archived, stop here: `copy_tree` below writes the target *over* the
+    // checkpoint dir, so continuing would overwrite the HEAD that just failed to
+    // be preserved — the same loss #437 reported, one step further along.
     if let Ok(head) = read_revision(snapshot_dir) {
-        archive_head(snapshot_dir, &head.id);
+        archive_head(snapshot_dir, &head.id).map_err(|e| {
+            format!(
+                "the current HEAD {} could not be archived, so the rollback was \
+                 not started (it is still in place): {e}",
+                head.id
+            )
+        })?;
     } else {
         clear_checkpoint(snapshot_dir);
     }
@@ -1726,6 +1809,7 @@ fn copy_tree(from: &Path, to: &Path) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
     use std::process;
     use std::thread;
     use std::time::Duration;
@@ -1958,7 +2042,9 @@ mod tests {
         write_test_checkpoint(&root, b"second!", "connect-auto");
         let head = read_revision(&root).unwrap().id;
 
-        let retired = retire_checkpoint(&root).expect("HEAD exists, so it is filed");
+        let Retired::Filed(retired) = retire_checkpoint(&root) else {
+            panic!("HEAD exists, so it is filed");
+        };
         assert_eq!(retired, head, "reports the id a reader can roll back to");
         assert!(
             read_revision(&root).is_err(),
@@ -1980,13 +2066,252 @@ mod tests {
         );
 
         // With nothing to retire the call is a no-op rather than an error, so a
-        // caller need not know whether a checkpoint was ever written.
-        assert_eq!(retire_checkpoint(&root), None);
+        // caller need not know whether a checkpoint was ever written. It says
+        // `Nothing`, which is a different answer from `Kept` -- a run that could
+        // not file its snapshot must not look like a run that had none (#437).
+        assert!(matches!(retire_checkpoint(&root), Retired::Nothing));
 
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Write a checkpoint with a given RAM marker + origin into `snapshot_dir`.
+    /// #437: a failed archive deleted the only copy of HEAD.
+    ///
+    /// `archive_head` removed `.chm-checkpoint` whenever it could not create the
+    /// revision store or rename into it, on the reasoning that a stale HEAD is
+    /// worse than none. The store it was moving into *is* the other copy, so on
+    /// failure that delete took the last one, pin marker included, and `rollback`
+    /// then reported "could not be archived" over an empty directory.
+    ///
+    /// Driven through `rollback` rather than `archive_head` directly, because the
+    /// loss needed a caller that could not see the failure: the helper returned
+    /// nothing, so no caller could preserve state on the strength of its result.
+    ///
+    /// Both ways in are exercised. There were two deletes, one per failure arm,
+    /// and an unwritable store only reaches the second: `create_dir_all` succeeds
+    /// on a directory that already exists no matter what its mode is. Covering
+    /// only the rename left the `create_dir_all` arm free to delete HEAD with
+    /// every test still green.
+    #[test]
+    fn a_failed_archive_leaves_head_where_it_was() {
+        for arm in ["rename", "create"] {
+            let root = std::env::temp_dir().join(format!("chm-a437-{arm}-{}", process::id()));
+            let _ = fs::remove_dir_all(&root);
+            fs::create_dir_all(&root).unwrap();
+            write_test_checkpoint(&root, b"only-copy", "connect-auto");
+            let head = read_revision(&root).unwrap().id;
+            fs::write(checkpoint_dir(&root).join(PIN_MARKER), b"").unwrap();
+
+            let store = revisions_dir(&root);
+            if arm == "rename" {
+                // The store exists and cannot be written into, so the move fails.
+                fs::create_dir_all(&store).unwrap();
+                let mut perms = fs::metadata(&store).unwrap().permissions();
+                perms.set_mode(0o500);
+                fs::set_permissions(&store, perms).unwrap();
+            } else {
+                // The store cannot be created at all: its path is taken by a file.
+                fs::write(&store, b"not a directory").unwrap();
+            }
+
+            let err = rollback(&root, &head).expect_err("the archive cannot be written");
+
+            if arm == "rename" {
+                let mut perms = fs::metadata(&store).unwrap().permissions();
+                perms.set_mode(0o700);
+                fs::set_permissions(&store, perms).unwrap();
+            }
+
+            assert!(
+                read_revision(&root).is_ok_and(|r| r.id == head),
+                "HEAD must survive an archive that failed at the {arm} step: \
+                 it was the only copy"
+            );
+            assert!(
+                is_pinned_dir(&checkpoint_dir(&root)),
+                "the pin is part of the checkpoint, so losing it is losing the \
+                 user's instruction ({arm})"
+            );
+            assert!(
+                !err.is_empty(),
+                "the caller is told why, or it cannot report the outcome honestly"
+            );
+            let _ = fs::remove_dir_all(&root);
+        }
+    }
+
+    /// #437 at `rollback`'s *other* archive site.
+    ///
+    /// Rolling back to an already-archived revision still has to file the current
+    /// HEAD first, and the line right after it copies the target over the
+    /// checkpoint directory. So an archive failure that is not checked here does
+    /// not merely leave HEAD unfiled: the next statement overwrites it. The
+    /// earlier site is reached only when the rollback target *is* HEAD, so a test
+    /// that rolls back to HEAD cannot see this one at all.
+    #[test]
+    fn a_rollback_that_cannot_file_head_does_not_overwrite_it() {
+        let root = std::env::temp_dir().join(format!("chm-r437b-{}", process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        // Two revisions, so the older one is in the store and the newer is HEAD.
+        write_test_checkpoint(&root, b"older", "connect-auto");
+        let older = read_revision(&root).unwrap().id;
+        write_test_checkpoint(&root, b"newer!!", "connect-auto");
+        let head = read_revision(&root).unwrap().id;
+        assert_ne!(older, head);
+        assert!(
+            revisions_dir(&root).join(&older).join(MANIFEST).is_file(),
+            "the target must already be archived, or the other code path is taken"
+        );
+
+        // Now the store is sealed, so filing the current HEAD must fail.
+        let store = revisions_dir(&root);
+        let mut perms = fs::metadata(&store).unwrap().permissions();
+        perms.set_mode(0o500);
+        fs::set_permissions(&store, perms).unwrap();
+
+        let err = rollback(&root, &older).expect_err("HEAD cannot be filed, so nothing starts");
+
+        let mut perms = fs::metadata(&store).unwrap().permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&store, perms).unwrap();
+
+        assert!(
+            err.contains(&head),
+            "the error names the snapshot that is still in place: {err}"
+        );
+        let now = read_revision(&root).expect("HEAD is still readable");
+        assert_eq!(
+            now.id, head,
+            "HEAD must still be the snapshot that could not be filed, not the \
+             rollback target copied over it"
+        );
+        assert_eq!(
+            fs::read(checkpoint_dir(&root).join(MEMORY_RANGES)).unwrap(),
+            b"newer!!",
+            "and its RAM is its own: a half-done rollback is the torn pair #139 refuses"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+
+    ///
+    /// `retire_checkpoint` returned `Option<String>`, so "there was no HEAD" and
+    /// "HEAD could not be filed" were both `None` and the run said nothing in
+    /// either case. The distinction is the whole difference between a clean exit
+    /// and a snapshot sitting somewhere the next start will resume it.
+    #[test]
+    fn retiring_says_whether_it_failed_or_had_nothing_to_do() {
+        let root = std::env::temp_dir().join(format!("chm-r437-{}", process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        assert!(
+            matches!(retire_checkpoint(&root), Retired::Nothing),
+            "no checkpoint at all"
+        );
+
+        write_test_checkpoint(&root, b"live", "connect-auto");
+        let head = read_revision(&root).unwrap().id;
+        let store = revisions_dir(&root);
+        fs::create_dir_all(&store).unwrap();
+        let mut perms = fs::metadata(&store).unwrap().permissions();
+        perms.set_mode(0o500);
+        fs::set_permissions(&store, perms).unwrap();
+
+        let outcome = retire_checkpoint(&root);
+
+        let mut perms = fs::metadata(&store).unwrap().permissions();
+        perms.set_mode(0o700);
+        fs::set_permissions(&store, perms).unwrap();
+
+        match outcome {
+            Retired::Kept { id, why } => {
+                assert_eq!(id, head, "names the snapshot that is still at HEAD");
+                assert!(!why.is_empty(), "and why it could not be filed");
+            }
+            Retired::Nothing => panic!(
+                "a failed archive reported as `Nothing` -- indistinguishable \
+                 from a run that never took a snapshot, which is #437"
+            ),
+            Retired::Filed(_) => panic!("it cannot have been filed: the store is unwritable"),
+        }
+        assert!(
+            read_revision(&root).is_ok_and(|r| r.id == head),
+            "and the snapshot itself is still there"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// #439: GC deleted a pinned revision because it could not read its manifest.
+    ///
+    /// `plan_gc` collected every directory `read_revision_manifest` refused. That
+    /// reader refuses a *newer* manifest version on purpose -- because the data
+    /// means more than this build can honour -- so an older chm treated the newer
+    /// format as garbage and freed it. The pin marker, which `plan_delete`
+    /// already refuses to override by name, was never consulted on this path.
+    #[test]
+    fn gc_keeps_what_it_cannot_read_rather_than_freeing_it() {
+        let root = std::env::temp_dir().join(format!("chm-gc439-{}", process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let store = revisions_dir(&root);
+
+        // Too new to read, and pinned. Either alone must be enough to save it.
+        let newer = store.join("rev-1785771527264-newer");
+        fs::create_dir_all(&newer).unwrap();
+        write_manifest_with_version(&newer, REVISION_MANIFEST_VERSION + 1);
+        fs::write(newer.join(MEMORY_RANGES), b"ram").unwrap();
+
+        let pinned = store.join("rev-1785771527264-pinned");
+        fs::create_dir_all(&pinned).unwrap();
+        fs::write(pinned.join(MANIFEST), b"{ this is not json").unwrap();
+        fs::write(pinned.join(MEMORY_RANGES), b"ram").unwrap();
+        fs::write(pinned.join(PIN_MARKER), b"").unwrap();
+
+        // Genuinely unreachable: not pinned, not a format, just rubble. GC still
+        // has to free this or the guard proves nothing but timidity.
+        let rubble = store.join("rev-1785771527264-junk");
+        fs::create_dir_all(&rubble).unwrap();
+        fs::write(rubble.join(MANIFEST), b"{ also not json").unwrap();
+        fs::write(rubble.join(MEMORY_RANGES), b"ram").unwrap();
+
+        let planned: Vec<_> = plan_gc(&root).into_iter().map(|i| i.path).collect();
+        assert!(
+            !planned.contains(&newer),
+            "a manifest this build is too old to read is not garbage: {planned:?}"
+        );
+        assert!(
+            !planned.contains(&pinned),
+            "a pin is a retention root and GC is not a way around it: {planned:?}"
+        );
+        assert!(
+            planned.contains(&rubble),
+            "GC must still free what no reader can reach: {planned:?}"
+        );
+
+        run_gc(&root);
+        assert!(newer.is_dir(), "the newer-format revision survives GC");
+        assert!(pinned.is_dir(), "the pinned revision survives GC");
+        assert!(!rubble.is_dir(), "the unreachable one is freed");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Write a manifest whose envelope names `version`, leaving everything else
+    /// valid. Built by editing the shipped fixture rather than by hand, so this
+    /// stays a version difference and does not quietly become a parse failure --
+    /// which would pass the test for the wrong reason.
+    fn write_manifest_with_version(dir: &Path, version: u32) {
+        let fixture = include_str!("../testdata/manifest-v1-pre-smp.json");
+        let mut doc: serde_json::Value = serde_json::from_str(fixture).unwrap();
+        doc["manifest_version"] = serde_json::json!(version);
+        fs::write(dir.join(MANIFEST), doc.to_string()).unwrap();
+        assert!(
+            read_revision_manifest(dir).is_err(),
+            "the fixture must actually be refused, or the test proves nothing"
+        );
+    }
+
+
     /// Write a checkpoint the way the product does, with a caller-supplied RAM
     /// image standing in for a live guest.
     ///
