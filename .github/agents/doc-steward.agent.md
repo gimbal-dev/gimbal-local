@@ -54,7 +54,7 @@ what had actually been booted.
 | Doc | Role | Rule |
 | --- | --- | --- |
 | [`project-state.md`](../../docs/project-state.md) | The honest "where are we" snapshot | Update its **Last verified** line whenever you touch it, and re-measure the gate numbers rather than copying them |
-| [`roadmap.md`](../../docs/roadmap.md) | Canonical durable tracker — goal ledger (§0), milestone ladder (§0a), "What is outstanding" (§ ~186) | Update after every merged milestone. Keep the ★ markers meaningful |
+| [`roadmap.md`](../../docs/roadmap.md) | Canonical durable tracker — goal ledger (§0), milestone ladder (§0a), "What is outstanding" (§ ~194) | Update after every merged milestone. Keep the ★ markers meaningful |
 | [`engineering-discipline.md`](../../docs/engineering-discipline.md) | How we work | Add a rule only when a real incident earned it, and cite the incident |
 | [`agents.md`](../../docs/agents.md) | Index of the specialist agents | Keep in sync with `.github/agents/` |
 | [`container-images.md`](../../docs/container-images.md) | The user-facing image page | The most-read page by new users. Front-load the things that bite in the first ten minutes |

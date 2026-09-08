@@ -52,7 +52,7 @@ to account for, at minimum:
 | `~/gimbal-snapshots/`, `snapshots/` | Snapshot fixtures, tens of GiB |
 | `.chm-workspaces/`, workspace dirs | Per-sandbox state |
 | `~/Library/Application Support/` | App data |
-| UserDefaults plists | And note **the Swift suite leaks one per run** ([#223](https://github.com/gimbal-dev/gimbal-local/issues/223)) |
+| UserDefaults plists | The Swift suite **used to leak one per run** ([#223](https://github.com/gimbal-dev/gimbal-local/issues/223), now fixed) — older leaked plists may still litter a dev machine |
 | Daemon sockets, running `chm` processes | `kill <PID>` — never `killall`/`pkill` |
 | `/tmp` scratch kernels and images | |
 
@@ -115,9 +115,9 @@ without shortcuts.
 | --- | --- | --- |
 | Every guest opened with `can't access tty; job control turned off`, and **Ctrl-C did not interrupt** | [#226](https://github.com/gimbal-dev/gimbal-local/issues/226) | Fixed (PR #229) |
 | A container-derived guest had **no network and no disk**, because the kernel used at the time built virtio as modules and a container rootfs ships no `/lib/modules` | [#222](https://github.com/gimbal-dev/gimbal-local/issues/222) | **Closed.** #228 warns when a kernel cannot give the guest devices; #230 configures the NIC; `chm image build --modules <DIR>` bundles the virtio closure and the generated init loads it, on rootfs with and without `insmod`. **Note:** the original claim that *every* downloadable arm64 distro kernel is modular was **disproven** — Ubuntu `generic` has virtio built in and needs no module tree |
-| The app says **"No sandboxes yet" while a guest it launched is running** | [#225](https://github.com/gimbal-dev/gimbal-local/issues/225) | Open |
-| `*-alpine` images cannot run the Copilot CLI — its prebuilt musl runtime fails to load | [#224](https://github.com/gimbal-dev/gimbal-local/issues/224) | Open |
-| `node:22` and `node:22-slim` ship **neither `ip` nor `ifconfig`** | part of #222 | Open — the honest refusal fires on the mainstream case |
+| The app says **"No sandboxes yet" while a guest it launched is running** | [#225](https://github.com/gimbal-dev/gimbal-local/issues/225) | **Closed (fixed).** The engine now reports every running guest via `chm ps`, and the app reads it (`RunningGuests.swift`), so a cold boot it launched is no longer invisible |
+| `*-alpine` images cannot run the Copilot CLI — its prebuilt musl runtime fails to load | [#224](https://github.com/gimbal-dev/gimbal-local/issues/224) | **Closed** (documented: agent workloads need a glibc rootfs) |
+| `node:22` and `node:22-slim` ship **neither `ip` nor `ifconfig`** | part of #222 | Still true as a measured fact; #222 is **closed** — the generated init prints a named refusal and still boots to a shell |
 
 ---
 

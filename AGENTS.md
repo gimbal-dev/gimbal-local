@@ -72,9 +72,34 @@ The five rules that matter most, if you read nothing else:
 
 ### Build and Test Notes
 
+- **Build and sign in one step.** `cd chm && cargo build`, then re-sign from the
+  repo root. Every `cargo build` strips the hypervisor entitlement, and an
+  unsigned binary fails with `HV_DENIED`, which reads like a broken backend:
+  ```
+  cd chm && cargo build && cd .. && codesign --sign - \
+    --entitlements hypervisor/tests/data/hv.entitlements --force target/debug/chm
+  ```
+  Root-level `cargo build --bin chm` fails inside `kvm-ioctls` *and looks like
+  it worked*, leaving a stale binary in use. Always `cd chm` first.
+- **The gates**, all run from the repo root unless shown otherwise:
+  `cd chm && cargo test` · `cargo test -p hypervisor --no-default-features
+  --features hvf,kvm-snapshot --lib` · `cd app/GimbalLocal && swift test` ·
+  `make clippy` · `make test-hvf` · `make check-docs`.
+- **Expected counts live in exactly one place**, the gate table in
+  [`docs/project-state.md`](docs/project-state.md). Do not copy them into
+  another document — `hygiene.rs::only_the_state_page_states_a_gate_count`
+  fails if you do. If your run disagrees with that table, find out which is
+  wrong before changing code.
+- **`make check-docs` is the one gate that leaves the repo.** It compares the
+  open-issue list in `project-state.md` against GitHub. Exit 1 means drift,
+  exit 2 means it could not check at all.
+- **CI is billing-blocked, so every gate runs locally.** This is known and
+  accepted — do not raise it as a finding, and do not try to start a CI run.
 - Some workspace members require the `kvm` feature to build or test correctly.
   When a default build failure looks feature-related, retry the narrow command
-  with `--features kvm` before widening the diagnosis.
+  with `--features kvm` before widening the diagnosis. On macOS, `cargo test -p
+  hypervisor` with default features cannot compile at all; use the
+  `--no-default-features --features hvf,kvm-snapshot` form above.
 - Prefer narrow crate/test commands while iterating, then broaden verification
   when the touched surface justifies it.
 - Formatting currently needs nightly-only rustfmt features; use

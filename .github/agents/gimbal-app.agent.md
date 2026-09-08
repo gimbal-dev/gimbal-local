@@ -10,7 +10,8 @@ tools: [bash, view, edit, create, grep, glob, todo]
 
 # Gimbal Local app specialist
 
-You own the macOS app: 42 Swift files under `app/GimbalLocal/`. This is what
+You own the macOS app: the Swift sources under
+`app/GimbalLocal/Sources/GimbalLocalApp/`. This is what
 most users see first, and it is judged as a shipped Mac app, not as a debug
 tool.
 
@@ -30,23 +31,23 @@ do in Rust.
 ```
 app/GimbalLocal/
   Package.swift
-  Sources/GimbalLocal/
+  Sources/GimbalLocalApp/
     GimbalLocalApp.swift, ContentView.swift, AppModel.swift
     ChmClient.swift, DaemonRunOwner.swift, CloudControlClient.swift
-    SandboxesView.swift, SnapshotsView.swift, CloudSnapshotsView.swift
+    SandboxesView.swift, SnapshotsView.swift, CloudSnapshotsView.swift, RunningGuests.swift
     ProxyView.swift, SecurityView.swift, SettingsView.swift, SettingsStore.swift
     FirstRun.swift, LibraryAgreement.swift, DesignSystem.swift
     ColdBootTerminalCommand.swift, InteractiveTerminalCommand.swift, TerminalLaunch.swift
     LocalImage.swift, Models.swift, SandboxSpecDocument.swift
     CredentialRuleBuilder.swift, ProxyRuleDraft.swift, SlotContention.swift
     WorkspaceLocation.swift, MenuBarView.swift, ActivityView.swift
-  Tests/GimbalLocalTests/
+  Tests/GimbalLocalAppTests/
 ```
 
 Build and test:
 
 ```bash
-cd app/GimbalLocal && swift test        # 216 passing, 3 skipped
+cd app/GimbalLocal && swift test        # current pass/skip counts live in docs/project-state.md
 ```
 
 There is also `scripts/build-gimbal-local-app.sh` for the app bundle.
@@ -78,10 +79,13 @@ happened. The rule that came out of it:
 > If the app cannot answer a question honestly, it must say it cannot — never
 > display a plausible-looking value it did not verify.
 
-The live example is [#225](https://github.com/gimbal-dev/gimbal-local/issues/225):
-the app says **"No sandboxes yet" while a cold-booted guest it launched is
-running**, because cold boot is a subprocess and `refreshLocal()` lists only
-what the daemon knows. That is exactly the class of bug V6 was about.
+The scar that taught this is [#225](https://github.com/gimbal-dev/gimbal-local/issues/225):
+the app said **"No sandboxes yet" while a cold-booted guest it launched was
+running**, because cold boot is a subprocess and `refreshLocal()` listed only
+what the daemon knew. It is now **closed (fixed)** — the engine reports every
+running guest via `chm ps` and the app reads it (`RunningGuests.swift`) instead
+of inferring. That is exactly the class of bug V6 was about, and the fix is the
+template: surface the truth from the engine, never guess it.
 
 ### 4. Think like a first-run user
 
@@ -91,14 +95,17 @@ the codebase, **that is a defect**. File an issue or warn in the docs. See
 
 ---
 
-## Known issues in your area
+## Recently closed in your area — the scars behind current behaviour
+
+All four are **closed (fixed)**. They are kept here because the behaviour they
+produced is now load-bearing, not because there is open work.
 
 | Issue | Detail |
 | --- | --- |
-| [#225](https://github.com/gimbal-dev/gimbal-local/issues/225) | "No sandboxes yet" while a cold-booted guest is running. Cold boot is a subprocess; `refreshLocal()` only knows daemon-managed sandboxes. |
-| [#223](https://github.com/gimbal-dev/gimbal-local/issues/223) | **The Swift suite leaks a UserDefaults plist per run** — 136 were found on this machine. Your test run is making a mess of the developer's home directory. |
-| [#174](https://github.com/gimbal-dev/gimbal-local/issues/174) | The app cannot turn continuous snapshots on, so its timeline only fills from manual suspends. |
-| [#170](https://github.com/gimbal-dev/gimbal-local/issues/170) | A resumed snapshot inherits an egress posture its author may not have chosen, and nothing in the UI makes that visible. **Explicitly not** a request to flip the resume default — that was considered and rejected. |
+| [#225](https://github.com/gimbal-dev/gimbal-local/issues/225) | Fixed. "No sandboxes yet" while a cold-booted guest was running. Cold boot is a subprocess; `refreshLocal()` only knew daemon-managed sandboxes. The engine now lists every running guest via `chm ps` and the app reads it (`RunningGuests.swift`). |
+| [#223](https://github.com/gimbal-dev/gimbal-local/issues/223) | Fixed. The Swift suite used to leak a UserDefaults plist per run — 136 were found on this machine. `ThrowawayDefaults` now isolates test defaults. |
+| [#174](https://github.com/gimbal-dev/gimbal-local/issues/174) | Fixed. The app could not turn continuous snapshots on, so its timeline only filled from manual suspends. See `SnapshotCadence.swift`. |
+| [#170](https://github.com/gimbal-dev/gimbal-local/issues/170) | Fixed. A resumed snapshot inherited an egress posture its author may not have chosen, with nothing in the UI making it visible. **Explicitly not** a request to flip the resume default — that was considered and rejected. |
 
 ---
 
@@ -109,9 +116,10 @@ know:
 
 - **The daemon is `chm serve`** (`chm/src/serve.rs`). If you change the
   protocol, both sides change together and the Rust tests are part of your gate.
-- **Cold boot is launched as a subprocess**, not through the daemon — which is
-  the root of #225. Any fix needs the app to learn about processes it spawned
-  directly.
+- **Cold boot is launched as a subprocess**, not through the daemon — which was
+  the root of #225. The fix landed: the engine records running guests and the
+  app reads them via `chm ps` (`RunningGuests.swift`) rather than inferring from
+  daemon state. Keep that property when you touch the launch paths.
 
 The app also emits terminal commands the user can copy
 (`ColdBootTerminalCommand.swift`). Those strings are a user-facing surface:

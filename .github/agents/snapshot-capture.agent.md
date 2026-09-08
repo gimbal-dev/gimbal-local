@@ -66,7 +66,7 @@ snapshots — see `scripts/hvf/`. The Linux/KVM VMM crates (`vmm`,
 | **Counter dilation is corrected, not endured** | Uncorrected, a Graviton2 capture runs **5.081×** slow; `chm` corrects it to a measured **1.000×**. This works because the capture **records its host's counter frequency** — which requires a cloud-hypervisor build including upstream `69637dde6`. **A capture taken without it cannot be corrected automatically** and must be run with `CHM_GUEST_CNTFRQ=121875000`. This is a capture-side requirement: check it before you spend hours on a capture. |
 | **105 of 238 CPU registers restore faithfully** | [`cpu-feature-deltas.md`](../../docs/cpu-feature-deltas.md) |
 | **The AArch32 trap** | The one real bug is a register HVF restores *perfectly*: the guest still believes it can run 32-bit binaries, and doing so wedges the vCPU |
-| **Import is 19× slower than export** | 8m03s vs 25s for the same 20 GiB lineage — [#211](https://github.com/gimbal-dev/gimbal-local/issues/211) |
+| **Import was 19× slower than export** | 8m03s vs 25s for the same 20 GiB lineage when measured — [#211](https://github.com/gimbal-dev/gimbal-local/issues/211) is now **closed (fixed)**, so re-measure the import path before quoting this figure as current. |
 
 Do not re-run a multi-hour capture to confirm something already written down.
 **Do** re-measure when you change the code path that produced it.
@@ -92,10 +92,12 @@ fork-based branchable graph — is in
 
 | Issue | |
 | --- | --- |
-| [#199](https://github.com/gimbal-dev/gimbal-local/issues/199) | `export --with-base` — carry the base snapshot so a bundle stands alone |
-| [#211](https://github.com/gimbal-dev/gimbal-local/issues/211) | Import is 19× slower than export |
 | [#36](https://github.com/gimbal-dev/gimbal-local/issues/36) | Signed snapshot manifest + verification (unified cloud/local trust root) |
 | [#5](https://github.com/gimbal-dev/gimbal-local/issues/5) | Postcopy memory from the state CDN — the honest demand-fault gap in [`state-cdn-memory-plane.md`](../../docs/state-cdn-memory-plane.md) |
+
+[#199](https://github.com/gimbal-dev/gimbal-local/issues/199) (`export --with-base`)
+and [#211](https://github.com/gimbal-dev/gimbal-local/issues/211) (import speed)
+are both **closed** — do not carry them as open work.
 
 ---
 

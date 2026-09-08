@@ -11,7 +11,7 @@ tools: [bash, view, edit, create, grep, glob, todo]
 # Release engineer
 
 You own the step where this stops being a development tree and becomes
-something a stranger can download and run. Current release: **v0.2.1**, signed,
+something a stranger can download and run. Current release: **v0.2.2**, signed,
 notarized, stapled, and verified the way a stranger receives it.
 
 **Before you start:** read [`docs/engineering-discipline.md`](../../docs/engineering-discipline.md) — **§0 first.**
@@ -26,7 +26,7 @@ notarized, stapled, and verified the way a stranger receives it.
 ## The two phases
 
 ```bash
-version=0.2.2
+version=0.2.3
 GIMBAL_VERSION="$version" scripts/release-macos.sh
 # Install and review target/GimbalLocal-$version.zip as a stranger would.
 scripts/release-macos.sh \
@@ -104,10 +104,11 @@ release-configuration gate now exists and the release script runs it itself.
 
 ## Release checklist
 
-1. `main` is green on **all** gates: `cd chm && cargo test` (629, 3 ignored),
-   `cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib`
-   (216), `cd app/GimbalLocal && swift test` (244 XCTest, 3 skipped, plus 35
-   swift-testing), `make clippy` (0), `make security-check`.
+1. `main` is green on **all** gates: `cd chm && cargo test`,
+   `cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib`,
+   `cd app/GimbalLocal && swift test`, `make clippy`, `make security-check`.
+   The expected pass/ignore/skip counts for each live in `docs/project-state.md`
+   — check against that, do not hard-code a number here.
 2. Version bumped in `chm/Cargo.toml` and `GIMBAL_VERSION` matching; worktree
    clean; EULA present and its draft-review marker removed by legal review.
 3. Run `scripts/release-macos.sh` with the explicit version. Read the

@@ -84,7 +84,7 @@ again" because a second shell is harmless while init exiting is a kernel panic.
 > sets one deadline covering the whole wait. Do not repeat the "no deadline"
 > claim as fact — I did, from memory, and it was wrong; that is why this note
 > exists rather than the issue link alone.
-| `chm proxy ca --for-guest` | **Advertised but does not exist** ([#210](https://github.com/gimbal-dev/gimbal-local/issues/210)) |
+| `chm proxy ca --for-guest` | Real and implemented. [#210](https://github.com/gimbal-dev/gimbal-local/issues/210) is **closed**: the flag was fully built but the parser's allow-list omitted it, so `chm proxy ca` advertised a flag it then refused as unknown. `usage_promises_only_flags_the_parser_accepts` now pins the help text to the parser |
 
 macOS has no `timeout`. Use the tool's own flag. `killall`/`pkill` are
 forbidden on this shared machine — `kill <PID>` only.
@@ -147,7 +147,7 @@ first keystroke for a container initramfs, `grep -a` on the log.
 ## Gates
 
 ```bash
-cd chm && cargo test        # 537 passing, 3 ignored
+cd chm && cargo test        # current pass/ignore counts live in docs/project-state.md
 make clippy                 # 0
 make security-check
 cargo +nightly fmt --all    # measure drift against the HEAD baseline, not zero
