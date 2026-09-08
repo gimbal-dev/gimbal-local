@@ -1931,7 +1931,6 @@ mod tests {
         );
     }
 
-
     #[test]
     fn the_carried_base_is_the_snapshot_and_not_our_lineage() {
         let root = tmp("basefiles");

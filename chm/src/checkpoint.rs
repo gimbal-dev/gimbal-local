@@ -2194,7 +2194,6 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-
     ///
     /// `retire_checkpoint` returned `Option<String>`, so "there was no HEAD" and
     /// "HEAD could not be filed" were both `None` and the run said nothing in
@@ -2310,7 +2309,6 @@ mod tests {
             "the fixture must actually be refused, or the test proves nothing"
         );
     }
-
 
     /// Write a checkpoint the way the product does, with a caller-supplied RAM
     /// image standing in for a live guest.
