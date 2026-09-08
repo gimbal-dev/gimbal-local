@@ -22,6 +22,16 @@ Three documents carry the context you need, in this order:
    `release-engineer`, `acceptance-tester`, `doc-steward`) and read its file; it
    carries the traps and verification loops for that surface.
 
+Two of those rules are no longer only advice.
+[`.github/hooks/`](.github/hooks/) enforces them: it refuses the commands that
+have destroyed work here, asks for a rubber-duck pass after a compaction, and
+refuses one stop if you changed source files and never ran a gate.
+[`.github/skills/`](.github/skills/) carries the procedures that go with them —
+`mutation-proof`, `measure-formatting-drift`, and `ship-a-change`. Read
+[`.github/hooks/README.md`](.github/hooks/README.md) when a refusal surprises
+you, and never work around one: a refusal you routed around is a defect report
+you threw away.
+
 The five rules that matter most, if you read nothing else:
 
 - **Measure, don't assert.** Be able to name the command that produced any claim
