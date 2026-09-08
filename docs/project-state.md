@@ -89,7 +89,7 @@ three ways:
 
 | Suite | Command | Measured result |
 | --- | --- | --- |
-| chm | `cd chm && cargo test` | **1113** passed / 4 ignored (lib), plus **2** passed / 7 ignored (integration) |
+| chm | `cd chm && cargo test` | **1114** passed / 4 ignored (lib), plus **2** passed / 7 ignored (integration) |
 | hypervisor | `cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib` | **343** passed — also run by `make test-hvf` |
 | Swift app | `cd app/GimbalLocal && swift test` | **273** XCTest (3 skipped), plus **34** Swift Testing cases in 5 suites |
 | Lints | `make clippy` | **0** |
