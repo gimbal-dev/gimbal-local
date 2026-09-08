@@ -7,7 +7,7 @@
 CHM_BIN := target/debug/chm
 SOCKET  ?= $${TMPDIR:-/tmp}/gimbal-local/chm.sock
 
-.PHONY: help chm chm-run chm-serve clippy fmt test-hvf test-release security-check
+.PHONY: help chm chm-run chm-serve clippy fmt test-hvf test-release security-check check-docs
 
 help:
 	@echo "Cloud Hypervisor for macOS — make targets:"
@@ -16,6 +16,7 @@ help:
 	@echo "  make chm-serve DIR=<library>  Run the daemon over a snapshot library"
 	@echo "  make clippy                   Lint chm + hvf + arch configs"
 	@echo "  make security-check           Enforce the no-host-FS-passthrough guard"
+	@echo "  make check-docs               Check the open-issue list against GitHub"
 	@echo "  make fmt                      Format (nightly rustfmt)"
 	@echo "  make test-hvf                 Run the HVF gate (signed hvf_boot + lib tests)"
 	@echo "  make test-release             Run every suite in RELEASE configuration"
@@ -55,6 +56,26 @@ clippy:
 # passthrough (virtiofs/9p/shared-folder) appears in the device model.
 security-check:
 	@./scripts/security/no-host-fs-passthrough.sh
+
+# The one gate that has to leave the repo.
+#
+# docs/project-state.md carries a grouped list of every open issue. That is an
+# assertion about the outside world, so no `cargo test` can check it, and it
+# has rotted twice: #368 was filed when every issue on a hand-built list had
+# closed, and the refresh that closed #368 was measured 42% wrong on 2026-09-08
+# -- 12 of the 31 issues it named were closed and one open issue was missing.
+#
+# Both times the page was internally consistent. It claimed 31 and listed 31.
+# Any check that stayed inside the repo would have passed it, which is why this
+# one calls GitHub and why it is a make target rather than a note telling
+# somebody to remember. It exits 1 on drift and 2 when it cannot check at all,
+# because a checker that cannot reach GitHub must not report success.
+#
+# `chm/src/hygiene.rs::the_state_page_still_matches_the_checker_that_sweeps_it`
+# holds the other half: the script finds the list by literal headings, so that
+# test fails if the page is reformatted out from under it.
+check-docs:
+	@./scripts/check-docs.sh
 
 fmt:
 	cargo +nightly fmt --all

@@ -119,6 +119,77 @@ Cheap habits that catch it:
   but did not check" is useful. "X" is a liability.
 - Dates on measured claims, so a reader can tell how stale a number is.
 
+### 1c. A fact about the outside world cannot be guarded from inside the repo
+
+The rule above says to date a measured claim. This is what to do when dating it
+is not enough, because the claim is about something that changes without anyone
+touching the repo.
+
+`docs/project-state.md` carries a grouped list of every open issue. That is an
+assertion about GitHub, so no `cargo test` can check it. It rotted twice:
+
+- [#368](https://github.com/gimbal-dev/gimbal-local/issues/368) was filed when a
+  hand-built list had gone **completely** stale — every issue on it had closed.
+- The refresh that closed #368 rotted in turn. Measured 2026-09-08: of the 31
+  issues it named, **12 were closed and one open issue was missing**. 42% wrong,
+  in 19 days.
+
+The second rot is the instructive one. **The page was internally consistent the
+whole time** — it claimed 31 and listed 31, every link well-formed, every group
+sensible. Any checker that stayed inside the repo would have passed it, on every
+run, while it decayed.
+
+> **Generalisation:** *internal consistency is not truth. A document that
+> asserts something only an external system knows needs a checker that leaves
+> the repo and asks, and it needs to be a gate rather than a habit — because the
+> first refresh was done carefully by someone who knew all this, and it rotted
+> anyway.*
+
+The shape that works here is a pair, and both halves are needed:
+
+| Half | Where | Catches |
+| --- | --- | --- |
+| Ask the outside world | `scripts/check-docs.sh`, wired to `make check-docs` | The list disagreeing with GitHub |
+| Keep the asker aimed | `hygiene.rs::the_state_page_still_matches_the_checker_that_sweeps_it` | The page being reformatted so the checker silently sweeps the wrong region |
+
+The second half is easy to skip and is the one that fails quietly. A checker
+that navigates a document by literal headings stops checking the moment those
+headings move, and it keeps exiting 0 while it does. So the guard reads the
+checker's own needles out of the script rather than restating them, which makes
+editing either file alone a failure.
+
+Note also what the checker does when it **cannot** reach GitHub: it exits `2`,
+distinct from `1` for real drift. A checker that reports success because it
+could not run is the silent failure of §5 wearing a green tick.
+
+**The same rot lives in `.github/agents/*.md`, in a different shape.** Those
+files carry per-issue status rows — a table naming an issue and marking it
+`Open`. An audit on 2026-09-08 found **ten wrong across six of the eight
+files**, and the damage is worse than a stale list: the agent file told a
+reader to plan around defects that had already been fixed, so the reader
+designs a workaround for a bug that no longer exists. `check-docs.sh` now
+checks those rows against GitHub too, and refuses (exit 2) if the agents
+directory ever moves out from under it.
+
+**Aim an external checker with a narrow needle, and measure the false
+positives before you keep it.** The first version of that status check matched
+any line pairing an issue number with the word `Open`. It immediately produced
+**eight false positives** in `docs/roadmap.md`, where `Open` belongs to the
+**Open terminal** button name and is not a status at all. Tightened to a table
+*cell* — `| Open` — it matched exactly the three genuinely stale rows and
+nothing else.
+
+> **Generalisation:** *a guard that cries wolf on correct prose gets switched
+> off, so a needle's false-positive count is part of whether it works, not a
+> detail. Measure it against both a known-bad tree and the known-good one.*
+
+The same reasoning splits the gate-count guard in two. `docs/` keeps narrative
+history — "827 tests stayed green", "all 514 tests pass" — which is a record of
+a past measurement and must not be flagged, so there the needle is a **bolded**
+count. The agent files keep no such history and restate counts as comments on
+commands (`swift test # 216 passing`), so there the needle is looser. One
+needle across both trees cannot be right.
+
 ## 2. Mutation testing: a guard that has never failed is worth nothing
 
 Every new test must be proven to fail when the thing it guards is broken. No
@@ -200,6 +271,39 @@ and know that it covers something different from the outcome tests. That is what
 a mutation pair proves: break the function and the outcome tests fire; break the
 call site and only the source guard does.
 
+#### One of N call sites can be unreachable from your fixture
+
+The refinement that cost a real hole in a real guard. `checkpoint::rollback`
+calls `archive_head` **twice**: site 1 runs only when the rollback target *is*
+HEAD, site 2 on the ordinary path. The guard rolled back to HEAD, so it
+exercised site 1 and could never reach site 2 — and site 2 is the one that
+matters more, because its very next statement is `copy_tree(&target, &dir)`,
+which overwrites the HEAD that just failed to be preserved.
+
+Mutation reported it: ignoring the failure at site 2 left the suite green.
+
+> **Generalisation:** *"the guard drives the function" is not the same claim as
+> "the guard drives this call to the function". Count the call sites, then ask
+> which one your fixture can actually reach.* The cure was a second guard whose
+> fixture writes two checkpoints, so the older is archived and the newer is
+> HEAD, which reaches site 2 exclusively.
+
+#### A fixture that does not create the failure it names
+
+Sibling failure, same investigation. `archive_head` had two error arms, one for
+`fs::rename` and one for `fs::create_dir_all`, each with its own delete. The
+guard failed the rename by setting the store to mode `0500`, and reported the
+`create_dir_all` delete as covered. It was not:
+
+**`fs::create_dir_all` succeeds on a directory that already exists, whatever its
+mode.** The second arm was never entered, so mutating it was silent.
+
+> **Generalisation:** *a fixture is a claim that a specific failure happens. If
+> you have not seen the error, you have not established the arm is reachable —
+> you have established that the test passes.* The cure was to loop the guard
+> over both arms, the second making the store path a **regular file** so
+> `create_dir_all` genuinely fails.
+
 ### A guard whose body recomputes the answer cannot fail
 
 The strongest lesson on the vanilla-export stream, and the hardest to see by
@@ -267,6 +371,93 @@ silently.
 > mid-table mutation fires whether the bound is right or wrong; only a mutation
 > against the **last** entry can tell you the region reaches the end.
 
+### Reading a mutation result: SILENT has three causes, not one
+
+A mutation that does not fire is a finding. But it is not automatically a hole
+in the guard, and treating it as one sends you rewriting a test that was fine.
+Ask these in order, because the first two are cheaper and more common:
+
+1. **Did the mutation apply?** `str.replace` no-ops on an absent needle. Worse,
+   `replace(old, new, 1)` applies to the *first* occurrence only. A guard here
+   reported SILENT because its needle appeared **five** times in the file and
+   only one was mutated; the assertion under test still saw an intact copy.
+   Make the harness print the occurrence count and assert it changed.
+2. **Did the guard run?** A `cargo test` filter list that does not name the test
+   reports a clean run and a green suite. That happened here: the cycle-guard
+   mutation looked fire-proof for a whole cycle because the filter never
+   selected it. Print the test count, and check the mutation run selected what
+   you think it selected.
+3. **Only then: is the guard weak?** If the mutation truly applied and the guard
+   truly ran, now you have a finding worth acting on.
+
+> **Generalisation:** *SILENT is a claim about your harness before it is a claim
+> about your test.* Two of the three causes are in the tooling.
+
+**And FIRES has causes too — check the failure is the one you provoked.** A
+mutation of `scripts/check-docs.sh` was run by copying the script to `/tmp` and
+editing the copy. It exited `2`, which is what the guard under test should
+produce, so it looked proven. It was not: the script derives `ROOT` from its own
+location, so from `/tmp` it had failed much earlier, on `cannot read
+//docs/project-state.md`, and never reached the new code at all. **Read the
+failure message, not just the exit status**, and mutate in place with a backup
+rather than in a copy that changes the program's idea of where it lives.
+
+### A hang is the fire, and it has to be timed out to be seen
+
+Not every broken guard fails an assertion. `ChmClient.runRaw` waited on the
+child process before draining its pipe; a reply larger than the ~64 KiB pipe
+buffer blocks the child on write and the parent on wait, and neither moves
+again. Reverting the fix does not turn the suite red. The suite **never
+returns** — the first such run held the tool for 500 s and had to be killed.
+
+A harness with no timeout cannot distinguish "the guard did not fire" from "the
+guard is still running", so it will eventually record the wrong one:
+
+```python
+try:
+    r = subprocess.run(CMD, cwd=..., capture_output=True, text=True, timeout=180)
+except subprocess.TimeoutExpired:
+    restore()
+    print(f"{mid}: TIMED OUT after 180s -- FIRES (deadlock: the test never returned)")
+```
+
+> **Generalisation:** *for anything with a pipe, a lock, or a wait in it, the
+> expected fire is a timeout, so the harness needs a deadline before it can
+> observe one.*
+
+Stranded children clean themselves up here, which is worth knowing before you
+go hunting: when the killed test process drops the read end of the pipe, the
+blocked writer takes `SIGPIPE` and dies. Measured `0` leftovers afterwards.
+
+### An assertion implied by a stronger one cannot fail
+
+Found by mutating this repo's own doc guard.
+`the_state_page_still_matches_the_checker_that_sweeps_it` opened with
+`doc.contains("scripts/check-docs.sh")` and closed with
+`doc.contains("`./scripts/check-docs.sh`")`. The second needle *contains* the
+first, so the first could never fail while the second passed. It read like two
+checks and was one, and the mutation that should have caught it was silent.
+
+> **Generalisation:** *when two assertions in the same test check needles where
+> one is a substring of the other, the looser one is decoration.* Delete it, or
+> make it check something the stricter one does not. Leave a comment saying
+> which, or it will be added back as an "obvious" safety net.
+
+### A test producer whose own length surprises you
+
+The megabyte guard for the pipe deadlock first failed at `1048577 != 1048576`.
+The product was correct — a full megabyte arrived where 65536 used to. The
+**test's own data generator** was wrong: `printf 'x%.0s' $(seq 1 1048576)` emits
+one byte more than its argument count at that size, though it is exact at 10.
+
+Replaced with `head -c 1048576 /dev/zero | tr '\0' x`, which is exactly the
+requested length.
+
+> **Generalisation:** *a producer whose own length is a surprise is no way to
+> measure somebody else's read.* When a test that measures a size is off by a
+> small amount, suspect the fixture before the product, and measure the fixture
+> on its own.
+
 ### A mutation harness with hardcoded backup paths goes stale
 
 A helper script that restores from fixed paths (`/tmp/create.rs.good`) is
@@ -277,9 +468,6 @@ is worse than mutating by hand.
 
 Two more one-liners that have each cost a run here:
 
-- A Python mutation helper **must assert the text actually changed.**
-  `str.replace` no-ops silently on an absent needle, and a mutation that never
-  landed is indistinguishable from a fire-proof guard.
 - Prose **wraps.** A guard reading a `.md` file must flatten whitespace before
   searching, or a reinstated claim that happens to break across a newline sails
   straight past the substring search.
@@ -405,13 +593,27 @@ Redirect each to a log file and grep the log — see §0.
 
 The Swift numbers are two suites: XCTest and swift-testing report separately.
 
-| Gate | Command | Current baseline |
-| --- | --- | --- |
-| chm suite | `cd chm && cargo test` | **629** passed, 3 ignored |
-| hypervisor suite | `cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib` | **216** passed |
-| Swift suite | `cd app/GimbalLocal && swift test` | **244** XCTest (3 skipped) + **35** swift-testing |
-| Lints | `make clippy` | **0** |
-| Format | `cargo +nightly fmt --all` | see below |
+| Gate | Command |
+| --- | --- |
+| chm suite | `cd chm && cargo test` |
+| hypervisor suite | `cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib` |
+| Swift suite | `cd app/GimbalLocal && swift test` |
+| Lints | `make clippy` |
+| Docs | `make check-docs` |
+| Format | `cargo +nightly fmt --all` |
+
+**The expected counts are deliberately not written here.** They live in one
+place, the gate table in
+[`project-state.md`](project-state.md#the-gates-and-their-current-numbers), for
+the reason given in §4: a number restated in a second file goes stale in the
+second file. This table used to carry its own baseline and it did exactly that
+— it still read `629` / `216` / `244` when the suites were at `1111` / `343` /
+`273`, which is not a harmless slip. A newcomer comparing a real run against a
+stale baseline concludes they have broken something, or "fixes" a regression
+that never happened.
+
+Compare your run against `project-state.md`, and if it disagrees, work out which
+of the two is wrong before you change any code.
 
 ### Debug is not evidence about release
 
@@ -454,6 +656,15 @@ yours, save both diffs and compare their sorted `^[+-]` lines.
 **Do not measure this per file with a bare `rustfmt <path>`.** Two traps, and
 the second is silent:
 
+- **`cargo fmt -- --check <path>` does not check `<path>`.** `cargo fmt`
+  formats the package's own targets and passes the trailing arguments to
+  rustfmt, so the path you named is simply not what gets examined. It exits 0
+  and prints nothing, which reads exactly like "no drift". Measured: a file
+  deliberately mangled to `fn f(){let _x=1;` scored **0** through
+  `cargo +nightly fmt -- --edition 2024 --check <path>` and **10** through
+  `rustfmt` invoked directly on the same file. A whole drift measurement was
+  taken and believed on the strength of that zero. If you want one file, invoke
+  `rustfmt` itself.
 - `--edition 2024` is required. Under an older edition the parse differs and so
   does the verdict.
 - **rustfmt formats submodules too.** Point it at a file with `mod foo;`
@@ -489,6 +700,20 @@ the second is silent:
 When a drift number moves by much more than your diff could explain, the
 measurement is wrong before the code is. Formatting needs nightly:
 `cargo +nightly fmt --all`.
+
+**Control-test the measurement before you trust its verdict.** Every trap in
+this section produces a *confident wrong number* rather than an error, so the
+only way to tell a working method from a blind one is to feed it something you
+know is broken and check it complains:
+
+```bash
+# deliberately mangle a copy, then measure it. A blind method scores this 0.
+sed 's/fn some_test() {/fn some_test(){let _x=1;/' file.rs > ctl.rs
+```
+
+This costs one command and has caught two blind methods here — the `cargo fmt`
+path-forwarding above, and the `/tmp` baseline ruleset below. Both reported
+zero drift on code that drifts.
 
 > **CI is billing-blocked.** Every gate above runs locally. This is known and
 > accepted — do not raise it as a finding.

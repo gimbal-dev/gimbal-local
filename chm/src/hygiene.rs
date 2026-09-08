@@ -1339,4 +1339,229 @@ mod tests {
             );
         }
     }
+
+    /// No page but `project-state.md` states a gate's pass count.
+    ///
+    /// §4 of `docs/engineering-discipline.md` says never restate a constant.
+    /// Gate counts are the constant that restates itself most eagerly, because
+    /// every page describing how to verify something wants to say what "good"
+    /// looks like -- and a second copy is a second thing to update, which means
+    /// it is the copy that goes stale.
+    ///
+    /// This is not hypothetical. `engineering-discipline.md` §8 carried its own
+    /// baseline table and it read **629** / **216** / **244** while the suites
+    /// were actually at 1111 / 343 / 273. The document that contains the rule
+    /// was breaking the rule, for months, in the section a newcomer reads
+    /// immediately before running the gates for the first time. The failure
+    /// mode is worse than a stale number looks: someone compares a real run
+    /// against it, concludes they have broken 482 tests, and starts
+    /// "fixing" a regression that never happened.
+    ///
+    /// The needle is deliberately narrow -- a **bolded** number immediately
+    /// followed by `passed` or `XCTest` -- because that is the shape a gate
+    /// table uses and ordinary prose does not. Measured at the time of writing:
+    /// it matches four lines, all of them in `project-state.md`.
+    ///
+    /// `.github/agents/*.md` and the root `AGENTS.md` need a *second*, looser
+    /// needle, because they restate counts in running commands rather than in
+    /// tables: `swift test # 216 passing`, `# 262 tests`, `(629, 3 ignored)`.
+    /// Six such restatements were found across the eight agent files, every one
+    /// of them wrong. That looser needle cannot be used on `docs/`, which keeps
+    /// narrative history: "827 tests stayed green", "all 514 tests pass" and
+    /// "10 tests in `coldboot.rs`" are records of a past measurement, not
+    /// claims about what a gate prints today, and flagging them would teach the
+    /// next reader to disable the guard. Measured: the loose needle matches
+    /// three lines in `docs/` (all history) and zero in the agent tree.
+    #[test]
+    fn only_the_state_page_states_a_gate_count() {
+        let docs = repo_root().join("docs");
+        let home = "project-state.md";
+
+        let pages: Vec<PathBuf> = fs::read_dir(&docs)
+            .expect("read docs/")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "md"))
+            .filter(|p| p.file_name().is_some_and(|n| n != home))
+            .collect();
+        assert!(
+            !pages.is_empty(),
+            "found no docs pages to check; the walk is broken"
+        );
+
+        // `**123** passed` / `**123** XCTest`, and nothing looser.
+        let states_a_count = |line: &str| {
+            line.match_indices("**").any(|(i, _)| {
+                let rest = &line[i + 2..];
+                let Some(close) = rest.find("**") else {
+                    return false;
+                };
+                let (num, after) = (&rest[..close], rest[close + 2..].trim_start());
+                !num.is_empty()
+                    && num.chars().all(|c| c.is_ascii_digit())
+                    && (after.starts_with("passed") || after.starts_with("XCTest"))
+            })
+        };
+
+        let mut offenders = Vec::new();
+        for page in &pages {
+            let text = fs::read_to_string(page).expect("read a docs page");
+            for (n, line) in text.lines().enumerate() {
+                if states_a_count(line) {
+                    let name = page.file_name().unwrap().to_string_lossy().into_owned();
+                    offenders.push(format!("{name}:{}", n + 1));
+                }
+            }
+        }
+
+        // The agent tree, where the same rot took the shape of a comment on the
+        // command rather than a row in a table.
+        let root = repo_root();
+        let mut agent_pages: Vec<PathBuf> = fs::read_dir(root.join(".github/agents"))
+            .expect("read .github/agents/")
+            .flatten()
+            .map(|e| e.path())
+            .filter(|p| p.extension().is_some_and(|e| e == "md"))
+            .collect();
+        assert!(
+            !agent_pages.is_empty(),
+            "found no agent files to check; the walk is broken"
+        );
+        agent_pages.push(root.join("AGENTS.md"));
+
+        // A two-or-more digit number followed by a suite word: `216 passing`,
+        // `262 tests`, `3 ignored` is too short to trip it.
+        let states_a_loose_count = |line: &str| {
+            let b = line.as_bytes();
+            b.iter().enumerate().any(|(i, c)| {
+                if !c.is_ascii_digit() || (i > 0 && b[i - 1].is_ascii_digit()) {
+                    return false;
+                }
+                let rest = &line[i..];
+                let digits = rest.chars().take_while(|c| c.is_ascii_digit()).count();
+                if digits < 2 {
+                    return false;
+                }
+                let after = rest[digits..].trim_start();
+                ["passing", "passed", "tests", "XCTest", "ignored", "skipped"]
+                    .iter()
+                    .any(|w| after.starts_with(w))
+            })
+        };
+
+        for page in &agent_pages {
+            let text = fs::read_to_string(page).expect("read an agent file");
+            for (n, line) in text.lines().enumerate() {
+                if states_a_loose_count(line) {
+                    let name = page.file_name().unwrap().to_string_lossy().into_owned();
+                    offenders.push(format!("{name}:{}", n + 1));
+                }
+            }
+        }
+
+        assert!(
+            offenders.is_empty(),
+            "these pages state a gate's pass count, which belongs only in \
+             docs/{home}: {offenders:?}. A second copy is the one that goes \
+             stale -- engineering-discipline.md §8 sat at 629/216/244 while the \
+             suites were at 1111/343/273. Link to the gate table instead."
+        );
+
+        // And the home page must still carry them, or the rule above has
+        // quietly deleted the numbers instead of centralising them.
+        let home_text = fs::read_to_string(docs.join(home)).expect("read the state page");
+        assert!(
+            home_text.lines().any(states_a_count),
+            "docs/{home} no longer states any gate count, so the numbers have \
+             been removed from the one page that is supposed to hold them"
+        );
+    }
+
+    /// `docs/project-state.md` and `scripts/check-docs.sh` still fit together.
+    ///
+    /// The grouped issue list on that page asserts a fact about the outside
+    /// world -- which issues are open -- so nothing in this suite can tell
+    /// whether it is true. `scripts/check-docs.sh` leaves the repo and asks.
+    /// That division is deliberate, but it creates a failure this test exists
+    /// to catch: the checker locates the list by three literal needles, and if
+    /// the page is reformatted the checker stops examining what it thinks it is
+    /// examining. Nothing would report that. The page would drift, the script
+    /// would keep being run, and it would keep exiting 0.
+    ///
+    /// This is the "a source-reading needle can silently relocate" failure, one
+    /// file removed: the needle is fine, the *document it points into* moved.
+    ///
+    /// The needles are read out of the script rather than retyped here, so the
+    /// binding is checked in both directions. Editing either file alone fails
+    /// this test; editing both together passes it, which is the point -- the
+    /// cost is paid by whoever breaks the coupling, not by the next reader.
+    ///
+    /// The list rotted twice before the checker existed. #368 was filed when
+    /// every issue on a hand-built list had closed, and the refresh that closed
+    /// #368 was itself measured 42% wrong on 2026-09-08 (12 of 31 closed, one
+    /// open issue missing) while remaining internally consistent throughout.
+    #[test]
+    fn the_state_page_still_matches_the_checker_that_sweeps_it() {
+        let doc = include_str!("../../docs/project-state.md");
+        let script = include_str!("../../scripts/check-docs.sh");
+
+        // There is deliberately no separate "the page mentions the script at
+        // all" assertion here. There was one, and mutation proved it dead: the
+        // gate-table assertion at the bottom of this test looks for
+        // "`./scripts/check-docs.sh`", which *contains* the looser needle, so
+        // the looser one could never fail while the stricter one passed. It
+        // read like two checks and was one.
+
+        // Read the needles the script actually greps for. Retyping them here
+        // would let the two files disagree without either one failing, which
+        // is the whole failure being guarded against.
+        let section = script
+            .lines()
+            .find_map(|l| l.strip_prefix("SECTION_START='^"))
+            .and_then(|l| l.strip_suffix('\''))
+            .expect(
+                "scripts/check-docs.sh no longer defines SECTION_START, so this \
+                 guard cannot learn which heading the checker looks for",
+            );
+
+        assert!(
+            doc.contains(section),
+            "scripts/check-docs.sh looks for the heading `{section}`, which is \
+             no longer in docs/project-state.md. The checker would find no \
+             issue links and refuse, or worse, sweep the wrong section"
+        );
+
+        for (needle, why) in [
+            (
+                "## Where to read next",
+                "the checker reads the issue list as the range from the grouped \
+                 heading to this one. Without the closing heading the range \
+                 runs to the end of the file and swallows every issue number \
+                 cited below it, inventing drift that is not there",
+            ),
+            (
+                " remain open**",
+                "the checker requires the page to state its own count, and \
+                 refuses when it cannot find it. Reformatting this phrase turns \
+                 a passing check into a hard error rather than a silent skip, \
+                 which is deliberate -- but it should fail here first, where the \
+                 message can say why",
+            ),
+        ] {
+            assert!(
+                doc.contains(needle),
+                "docs/project-state.md no longer contains `{needle}`: {why}"
+            );
+        }
+
+        // The gate table should list the checker, or it becomes a script
+        // nobody runs. That is how the list rotted the second time: the sweep
+        // was a one-off command in a session, not a gate.
+        assert!(
+            doc.contains("`./scripts/check-docs.sh`"),
+            "docs/project-state.md no longer lists ./scripts/check-docs.sh \
+             among the gates, so nothing routine re-runs it and the issue list \
+             is back to being checked only when somebody remembers"
+        );
+    }
 }

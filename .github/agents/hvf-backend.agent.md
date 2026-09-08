@@ -73,7 +73,7 @@ codesign --sign - --entitlements hypervisor/tests/data/hv.entitlements --force .
 vmm_sys_util::ioctl` — the KVM path is Linux-only. Always:
 
 ```bash
-cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib   # 262 tests
+cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib   # counts in docs/project-state.md
 cargo clippy -p hypervisor --no-default-features --features hvf,kvm-snapshot
 ```
 
@@ -87,7 +87,7 @@ and concluding HVF is broken.
 It then runs the hypervisor **lib** suite, because the two cover different code.
 A mutation inside `hvf/mod.rs` guarded by a `#[cfg(test)]` module in that same
 file is invisible to the integration binary: swap `CNTV_CVAL`/`CNTV_CTL` in
-`SNAPSHOT_SYS_REGS` and all 36 integration tests stay green while the lib suite
+`SNAPSHOT_SYS_REGS` and every integration test stays green while the lib suite
 fails. Run the gate, not one half of it.
 
 ---
@@ -156,9 +156,9 @@ policy is enforced on the data path.
 ## Gates
 
 ```bash
-cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib   # 262
+cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib   # counts in docs/project-state.md
 make clippy                                                                        # 0
-make test-hvf                                                                      # signed hvf_boot (36) THEN the lib suite (262)
+make test-hvf                                                                      # signed hvf_boot THEN the lib suite; counts in docs/project-state.md
 make security-check                                                                # invariant I1
 cargo +nightly fmt --all
 ```

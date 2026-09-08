@@ -175,8 +175,8 @@ guest.
 | **busybox TLS fails against real chains** | A bare `alpine` has no `openssl`, so busybox `wget` uses its minimal built-in TLS and fails `Connection reset by peer` — measured identically against `example.com`, `github.com`, `registry.npmjs.org`, while `--no-check-certificate` returns rc=0. **Not a chm defect.** `apk add curl` or use a fuller base. |
 | **Node ignores the system trust store** | Set `NODE_EXTRA_CA_CERTS` as well as installing the CA. |
 | **Max RAM is 3008 MiB** | Guest RAM starts `0x40000000`, one region must end by `0xfc000000`. |
-| **The rootfs unpacks into guest RAM** | Big images need big `--memory`, and are capped by the above. #205 tracks a disk-backed variant. |
-| **zboot kernels are refused as if x86** | [#220](https://github.com/gimbal-dev/gimbal-local/issues/220), in `check_kernel` (`image.rs`). |
+| **The rootfs unpacks into guest RAM** | Big images need big `--memory`, and are capped by the above. `chm image build --disk` (closed [#205](https://github.com/gimbal-dev/gimbal-local/issues/205)) writes an ext2 `rootfs.img` the kernel mounts instead of unpacking, for images too large for RAM. |
+| **zboot / gzip kernels are unwrapped, not refused** | `kernelimage::decode` unwraps EFI zboot and gzip, and `image build` writes the *decoded* bytes into `Image`. This was not always so: [#220](https://github.com/gimbal-dev/gimbal-local/issues/220) (zboot refused as if x86) and [#242](https://github.com/gimbal-dev/gimbal-local/issues/242) (the app rejecting gzip kernels chm accepts) are both **closed**. `the_image_directory_holds_the_decoded_kernel_not_the_file_named` pins it. |
 
 ---
 
@@ -233,6 +233,7 @@ for Ctrl-C, `grep -a` because the log has binary bytes, and **`chm create` takes
 
 ## Gates
 
-`cd chm && cargo test` (537) · `make clippy` (0) · rustfmt drift measured
-**against the HEAD baseline**, not zero. Mutate every new guard and put the
+`cd chm && cargo test` · `make clippy` · rustfmt drift measured
+**against the HEAD baseline**, not zero. Current gate counts live in
+`docs/project-state.md`. Mutate every new guard and put the
 table in the PR body.

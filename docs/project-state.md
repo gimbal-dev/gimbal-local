@@ -5,14 +5,18 @@ you are an agent starting a task — read this, then
 [`engineering-discipline.md`](engineering-discipline.md), then the domain guide
 for the area you are touching.
 
-**Last measured sweep:** 2026-08-20, on the branch that becomes
-[#371](https://github.com/gimbal-dev/gimbal-local/pull/371). The gate numbers
-below include the changes merging with it, so they are true at the commit that
-introduces this line and not before.
-**Issue-state refresh:** 2026-08-20, swept from `gh issue list --state open`
-rather than transcribed by hand — the previous list was assembled by hand and
-every issue on it had closed
-([#368](https://github.com/gimbal-dev/gimbal-local/issues/368)).
+**Last measured sweep:** 2026-09-08, at commit `ded833183`. Every gate number
+below was produced by running the command in its own row on that commit, not
+carried forward from a previous sweep.
+**Issue-state refresh:** 2026-09-08, swept with
+[`../scripts/check-docs.sh`](../scripts/check-docs.sh) rather than transcribed
+by hand. Run that script before trusting the grouped list at the bottom of this
+page; it compares the page against GitHub and exits non-zero on drift. It
+exists because this list has now rotted twice — once as
+[#368](https://github.com/gimbal-dev/gimbal-local/issues/368), and again in the
+refresh that closed #368, which was measured 42% wrong (12 of the 31 issues it
+named had closed, and one open issue was missing). Both times the page was
+internally consistent, so only leaving the repo and asking could catch it.
 
 Everything in this document was measured on this machine. Where something is
 believed but not measured, it says so.
@@ -85,11 +89,12 @@ three ways:
 
 | Suite | Command | Measured result |
 | --- | --- | --- |
-| chm | `cd chm && cargo test` | **915** passed / 4 ignored (lib), plus **2** passed / 7 ignored (integration) |
-| hypervisor | `cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib` | **276** passed — also run by `make test-hvf` |
-| Swift app | `cd app/GimbalLocal && swift test` | **263** XCTest (3 skipped), plus **34** Swift Testing cases in 5 suites |
+| chm | `cd chm && cargo test` | **1113** passed / 4 ignored (lib), plus **2** passed / 7 ignored (integration) |
+| hypervisor | `cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib` | **343** passed — also run by `make test-hvf` |
+| Swift app | `cd app/GimbalLocal && swift test` | **273** XCTest (3 skipped), plus **34** Swift Testing cases in 5 suites |
 | Lints | `make clippy` | **0** |
-| HVF gate | `make test-hvf` | **41** passed / 3 ignored (signed `hvf_boot`), then **276** passed (hypervisor lib). [#334](https://github.com/gimbal-dev/gimbal-local/issues/334) is fixed and merged |
+| HVF gate | `make test-hvf` | **41** passed / 3 ignored (signed `hvf_boot`), then **343** passed (hypervisor lib) |
+| Docs | `./scripts/check-docs.sh` | **0** drift — the grouped issue list below matches GitHub |
 
 `cargo test` and `swift test` each print **more than one** result line. Quote all
 of them, or say which you are quoting — a single number invites a false
@@ -160,10 +165,18 @@ cannot be measured on this hardware at all
 recorded as unmeasured rather than believed. Until the return leg is
 demonstrated, "cloud to Mac" is proved and "Mac back to cloud" is not.
 
-Two rehydration warts remain visible to a user:
-[#310](https://github.com/gimbal-dev/gimbal-local/issues/310) (a resumed guest
-reports an RCU stall the detector classifies as benign, and the presentation
-still does not explain the difference) and
+**This is now the only substantial engineering problem left in the local
+product.** The defect backlog is empty: the last four defects
+([#437](https://github.com/gimbal-dev/gimbal-local/issues/437),
+[#438](https://github.com/gimbal-dev/gimbal-local/issues/438),
+[#439](https://github.com/gimbal-dev/gimbal-local/issues/439),
+[#440](https://github.com/gimbal-dev/gimbal-local/issues/440)) closed on
+2026-09-08. What remains open is vision work, the parked sandbox-spec family,
+two security umbrellas, one packaging gap
+([#410](https://github.com/gimbal-dev/gimbal-local/issues/410)), and four
+limitations that need hardware this machine does not have.
+
+One rehydration wart remains visible to a user:
 [#366](https://github.com/gimbal-dev/gimbal-local/issues/366)
 (`update-initramfs` segfaults about half the time in a rehydrated capture).
 
@@ -171,66 +184,56 @@ still does not explain the difference) and
 
 ## The open issue list, grouped
 
-Swept from `gh issue list --state open` on 2026-08-20. Six issues close with the
-PR introducing this section — #317, #341, #365, #369, #374 and #368 itself — so
-**31 remain open**, and every one of them is named below. Issue numbers are
-written individually rather than as ranges, so a checker can verify the list
-against `gh` without expanding anything.
+Swept with [`../scripts/check-docs.sh`](../scripts/check-docs.sh) on 2026-09-08,
+so **20 remain open** and every one of them is named below. Issue numbers are
+written individually rather than as ranges, so the checker can compare this
+list against `gh` without expanding anything. If you change this list, re-run
+that script before you commit — it is the only thing standing between this page
+and its third rot.
 
-**Credential-proxy first contact:** [#315](https://github.com/gimbal-dev/gimbal-local/issues/315)
-(a workspace mints a CA the guest does not trust),
-[#316](https://github.com/gimbal-dev/gimbal-local/issues/316) (the CA install
-script is too large for `chm exec`, and there is no `chm cp`),
-[#318](https://github.com/gimbal-dev/gimbal-local/issues/318) (a client that
-gates on local auth never lets the proxy inject)
+**Nothing below is a defect.** The defect backlog closed out on 2026-09-08.
+Every item here is vision work, parked spec work, a security umbrella, a
+packaging gap, or a limitation that needs hardware this machine does not have.
 
 **Rehydration fidelity:** [#279](https://github.com/gimbal-dev/gimbal-local/issues/279)
-(cure the ASID-width delta at capture time),
-[#287](https://github.com/gimbal-dev/gimbal-local/issues/287) (re-patch the
-guest kernel's elided `ic ivau` instead of working around DIC=0),
-[#310](https://github.com/gimbal-dev/gimbal-local/issues/310),
+(cure the ASID-width delta at capture time, or refuse the capture),
 [#366](https://github.com/gimbal-dev/gimbal-local/issues/366)
+(`update-initramfs` segfaults about half the time in a rehydrated capture)
 
-**The return leg, unmeasured:** [#372](https://github.com/gimbal-dev/gimbal-local/issues/372),
-[#373](https://github.com/gimbal-dev/gimbal-local/issues/373)
+**The return leg, unmeasured:** [#372](https://github.com/gimbal-dev/gimbal-local/issues/372)
+(nothing has shown upstream cloud-hypervisor accepting a chm-originated
+snapshot), [#373](https://github.com/gimbal-dev/gimbal-local/issues/373) (an
+Apple-originated snapshot will hard-fail on a non-PAC host, and that is
+unmeasurable here)
 
-**Sandbox / browser defects:** [#360](https://github.com/gimbal-dev/gimbal-local/issues/360)
-(the app never stops the daemon it started),
-[#361](https://github.com/gimbal-dev/gimbal-local/issues/361) (a browser guest
-can be warm-resumable or keep its own sandbox, but not both),
-[#363](https://github.com/gimbal-dev/gimbal-local/issues/363) (`chm posture`
-reports only what chm does to a guest, never what the guest can do)
+**Sandbox spec alignment** — parked as a family, not being worked:
+[#182](https://github.com/gimbal-dev/gimbal-local/issues/182) (umbrella),
+[#183](https://github.com/gimbal-dev/gimbal-local/issues/183) (extensions),
+[#184](https://github.com/gimbal-dev/gimbal-local/issues/184) (securityModules),
+[#185](https://github.com/gimbal-dev/gimbal-local/issues/185) (dataPolicy),
+[#186](https://github.com/gimbal-dev/gimbal-local/issues/186) (toolPolicy),
+[#187](https://github.com/gimbal-dev/gimbal-local/issues/187) (identity),
+[#188](https://github.com/gimbal-dev/gimbal-local/issues/188) (observability),
+[#189](https://github.com/gimbal-dev/gimbal-local/issues/189) (lifecycle hooks)
 
-**Sandbox spec alignment:** [#182](https://github.com/gimbal-dev/gimbal-local/issues/182)
-(umbrella), [#183](https://github.com/gimbal-dev/gimbal-local/issues/183)
-(extensions), [#184](https://github.com/gimbal-dev/gimbal-local/issues/184)
-(securityModules), [#185](https://github.com/gimbal-dev/gimbal-local/issues/185)
-(dataPolicy), [#186](https://github.com/gimbal-dev/gimbal-local/issues/186)
-(toolPolicy), [#187](https://github.com/gimbal-dev/gimbal-local/issues/187)
-(identity), [#188](https://github.com/gimbal-dev/gimbal-local/issues/188)
-(observability), [#189](https://github.com/gimbal-dev/gimbal-local/issues/189)
-(lifecycle hooks)
+**Packaging:** [#410](https://github.com/gimbal-dev/gimbal-local/issues/410)
+(the app has no update channel, and the gap lost its tracker when #391 closed)
 
-**Product tracks:**
-[#156](https://github.com/gimbal-dev/gimbal-local/issues/156)
-(change egress policy without restarting),
-[#157](https://github.com/gimbal-dev/gimbal-local/issues/157) (drive a sandbox
-as an MCP server), [#159](https://github.com/gimbal-dev/gimbal-local/issues/159)
-(V10 Living Workspaces),
-[#171](https://github.com/gimbal-dev/gimbal-local/issues/171) (measure vCPU WFI
-residency instead of console silence)
+**Product vision:** [#159](https://github.com/gimbal-dev/gimbal-local/issues/159)
+(V10 Living Workspaces — the workspace becomes part of the session)
 
 **Security:** [#36](https://github.com/gimbal-dev/gimbal-local/issues/36)
-(signed snapshot manifest), [#39](https://github.com/gimbal-dev/gimbal-local/issues/39)
-(threat model + hardening checklist)
+(signed snapshot manifest + verification),
+[#39](https://github.com/gimbal-dev/gimbal-local/issues/39) (threat model +
+hardening checklist, umbrella)
 
-**Docs:** [#368](https://github.com/gimbal-dev/gimbal-local/issues/368) — this
-section's own defect, closed by the change that introduced this list
-
-**Control plane / cross-repo:** [#5](https://github.com/gimbal-dev/gimbal-local/issues/5),
-[#6](https://github.com/gimbal-dev/gimbal-local/issues/6),
-[#20](https://github.com/gimbal-dev/gimbal-local/issues/20),
-[#21](https://github.com/gimbal-dev/gimbal-local/issues/21)
+**Control plane / cross-repo:** [#5](https://github.com/gimbal-dev/gimbal-local/issues/5)
+(postcopy memory from the state CDN),
+[#6](https://github.com/gimbal-dev/gimbal-local/issues/6) (fork + CoW overlays +
+wake-on-traffic), [#20](https://github.com/gimbal-dev/gimbal-local/issues/20)
+(consistent filesystem + network policy enforced on the Mac),
+[#21](https://github.com/gimbal-dev/gimbal-local/issues/21) (V0 vision: the four
+capability pillars)
 
 ---
 
