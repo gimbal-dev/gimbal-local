@@ -1564,4 +1564,71 @@ mod tests {
              is back to being checked only when somebody remembers"
         );
     }
+
+    /// Every agent file is on the roster, and the roster's count is true.
+    ///
+    /// A new session's whole route into this repo is `AGENTS.md` ->
+    /// `docs/agents.md` -> the specialist file for its area. An agent file that
+    /// nothing links to is invisible: the work it exists to guide gets done
+    /// without it, which is the same as it not existing, except that somebody
+    /// maintains it.
+    ///
+    /// Both pages also spell the roster size in words, which is a restated
+    /// constant of exactly the kind section 4 warns about. It is kept because
+    /// the number genuinely orients a reader, and made safe by checking it here
+    /// rather than by trusting whoever adds the ninth agent to remember two
+    /// prose sentences in two files.
+    #[test]
+    fn every_agent_file_is_named_in_the_roster() {
+        let root = repo_root();
+        let mut names: Vec<String> = fs::read_dir(root.join(".github/agents"))
+            .expect("read .github/agents/")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".agent.md"))
+            .map(|n| n.trim_end_matches(".agent.md").to_string())
+            .collect();
+        names.sort();
+        assert!(
+            !names.is_empty(),
+            "found no agent files; the walk is broken"
+        );
+
+        let roster = fs::read_to_string(root.join("docs/agents.md")).expect("read docs/agents.md");
+        let home = fs::read_to_string(root.join("AGENTS.md")).expect("read AGENTS.md");
+
+        let mut unlisted = Vec::new();
+        for name in &names {
+            if !roster.contains(name.as_str()) {
+                unlisted.push(format!("docs/agents.md is missing {name}"));
+            }
+            if !home.contains(name.as_str()) {
+                unlisted.push(format!("AGENTS.md is missing {name}"));
+            }
+        }
+        assert!(
+            unlisted.is_empty(),
+            "an agent file exists that the entry path never mentions, so a new \
+             session will not find it: {unlisted:?}"
+        );
+
+        // The spelled-out size, in the two places that state it.
+        let word = match names.len() {
+            6 => "six",
+            7 => "seven",
+            8 => "eight",
+            9 => "nine",
+            10 => "ten",
+            n => panic!("the roster reached {n} agents; add the number word here"),
+        };
+        for (page, text) in [("docs/agents.md", &roster), ("AGENTS.md", &home)] {
+            assert!(
+                text.contains(word),
+                "{page} does not say \"{word}\", but {} agent files exist. \
+                 Either the roster gained a member and the prose still states \
+                 the old size, or the prose was reworded; fix whichever it is.",
+                names.len()
+            );
+        }
+    }
 }
