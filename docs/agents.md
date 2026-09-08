@@ -45,6 +45,27 @@ and every one of them tells you to read it first. The short version:
    `md5 -q` to verify.
 7. **Every `cargo build` strips the hypervisor entitlement.** Re-sign.
 
+Rules 2, 6 and 7 are not left to memory. The harness in
+[`.github/hooks/`](../.github/hooks/) refuses the destructive commands, asks for
+a rubber-duck pass after a compaction, and refuses one stop when source files
+changed and no gate ran. [`.github/hooks/README.md`](../.github/hooks/README.md)
+explains each refusal and how to switch any of it off.
+
+---
+
+## The skills
+
+An agent file says what to care about in an area. A skill says how to carry out
+a procedure, and the runtime loads it only when it is needed, which is why the
+long recipes live in [`.github/skills/`](../.github/skills/) rather than in
+every agent file:
+
+| Skill | Use it when |
+| --- | --- |
+| `mutation-proof` | You added or changed a test, a guard, or a check script. |
+| `measure-formatting-drift` | You touched Rust, or a formatting check reported no problems. |
+| `ship-a-change` | You are ready to run the gates, commit, open a PR, or merge. |
+
 ---
 
 ## Keeping them true

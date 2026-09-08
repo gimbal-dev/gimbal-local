@@ -487,6 +487,69 @@ own backup, then `cmp -s` to prove the restore landed.
 
 ---
 
+## 2b. Enforce the rule, don't only write it down
+
+The rule about `git checkout` was already in this document, in bold, with the
+count of times it had destroyed work. It went on destroying work. A rule an
+agent has to remember is a rule an agent can forget, and a document that is
+read once at session start competes with everything that arrives afterwards.
+
+So the rules that have actually cost time here now live in `.github/hooks/`,
+where the runtime enforces them. `.github/hooks/README.md` describes each one.
+The short version: the harness refuses `git checkout` of a path, `git restore`,
+`git reset --hard`, `git clean -f`, `pkill`, `killall`, and
+`cargo fmt --check <path>`; it asks before a mutating AWS command; it asks for a
+rubber-duck pass after a compaction; and it refuses one stop when source files
+changed and no gate command ran.
+
+### The contract, measured rather than read
+
+Every claim below came from running a real session against Copilot CLI 1.0.74
+on macOS and reading what happened, not from documentation:
+
+- Repo hooks load from `.github/hooks/*.json`, and only after folder trust. In
+  prompt mode they additionally need `GITHUB_COPILOT_PROMPT_MODE_REPO_HOOKS`.
+- `preToolUse` receives `toolArgs.command`. Returning
+  `{"permissionDecision": "deny", "permissionDecisionReason": "..."}` blocks the
+  command and hands the reason to the agent word for word.
+- `agentStop` returning `{"decision": "block", "reason": "..."}` refuses the
+  stop and makes the agent continue.
+- `sessionStart` and `postToolUse` returning `{"additionalContext": "..."}`
+  reach the model.
+- Hook commands run in the session directory, so scripts must be located with
+  `git rev-parse --show-toplevel`, not a relative path.
+
+To test a hook change without touching your own configuration, point
+`COPILOT_HOME` at a throwaway directory whose `config.json` trusts this repo.
+
+### What makes an enforced rule survive contact
+
+- **Fail open.** A `preToolUse` hook that errors denies the tool call, so a
+  crash in a guard script blocks every command the agent tries. Every script
+  here prints `{}` and exits 0 on any failure path. The completion gate does the
+  same: a malformed payload lets the agent stop. A gate that can trap the agent
+  is worse than no gate.
+- **Block once.** The stop gate refuses a single stop per session and never
+  fights a forced continuation. The runtime gives up after eight consecutive
+  blocks anyway; a gate that has to be overridden is a gate that gets deleted.
+- **Count the false positives, in a table.** Each script carries a case list of
+  inputs it must act on *and* inputs it must ignore, run by `make check-harness`.
+  The `git clean` rule matched `git clean --dry-run` on its first run, because
+  `--dry-run` contains a `-d`. Only the quiet cases could have found that.
+- **Say where the instruction comes from.** Context injected through
+  `additionalContext` arrives inside a tool result, which is exactly where a
+  prompt injection would arrive. A test notice that told the agent to repeat a
+  passphrase was correctly refused as an injection attempt. Notices must name
+  the file they come from and the reason they exist, or a careful agent will
+  ignore them and an incautious one will obey anything.
+
+The same principle covers the procedures rather than the prohibitions:
+`.github/skills/` holds `mutation-proof`, `measure-formatting-drift`, and
+`ship-a-change`, so the recipe is loaded when it is needed instead of being
+remembered from a document read an hour earlier.
+
+---
+
 ## 3. Tests that earn their keep
 
 Prefer a test that runs the real thing over one that inspects a string.

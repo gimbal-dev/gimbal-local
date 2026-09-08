@@ -1429,6 +1429,19 @@ mod tests {
         );
         agent_pages.push(root.join("AGENTS.md"));
 
+        // The harness tree is the newest place a session reads prose, so it is
+        // the newest place a count can rot. Sweep it with the same needle.
+        agent_pages.push(root.join(".github/hooks/README.md"));
+        for entry in fs::read_dir(root.join(".github/skills")).expect("read .github/skills/") {
+            let skill = entry
+                .expect("a skill directory entry")
+                .path()
+                .join("SKILL.md");
+            if skill.is_file() {
+                agent_pages.push(skill);
+            }
+        }
+
         // A two-or-more digit number followed by a suite word: `216 passing`,
         // `262 tests`, `3 ignored` is too short to trip it.
         let states_a_loose_count = |line: &str| {
@@ -1630,5 +1643,85 @@ mod tests {
                 names.len()
             );
         }
+    }
+
+    /// The agent harness stays wired to itself.
+    ///
+    /// `.github/hooks/` is the one place in this repo where a rule is enforced
+    /// rather than written down, which makes it the one place where silent rot
+    /// is worst: a hook that stopped being loaded, or a rule table that stopped
+    /// being tested, looks exactly like a harness that is working. Nothing
+    /// fails, and that is the problem.
+    ///
+    /// So this checks the three joints that can come apart on their own. Every
+    /// script is wired into the config, every script the config names exists,
+    /// and every script that carries a rule table is actually run by
+    /// `make check-harness`.
+    #[test]
+    fn the_agent_harness_stays_wired_to_itself() {
+        let root = repo_root();
+        let hooks = root.join(".github/hooks");
+        let config = fs::read_to_string(hooks.join("gimbal-harness.json"))
+            .expect("read gimbal-harness.json");
+        let readme = fs::read_to_string(hooks.join("README.md")).expect("read hooks README.md");
+        let makefile = fs::read_to_string(root.join("Makefile")).expect("read Makefile");
+
+        let mut scripts: Vec<String> = fs::read_dir(hooks.join("bin"))
+            .expect("read .github/hooks/bin/")
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".py"))
+            .collect();
+        scripts.sort();
+        assert!(
+            !scripts.is_empty(),
+            "found no hook scripts; the walk is broken"
+        );
+
+        let mut broken = Vec::new();
+        for name in &scripts {
+            if !config.contains(name.as_str()) {
+                broken.push(format!(
+                    "{name} exists but gimbal-harness.json never runs it, so it does nothing"
+                ));
+            }
+            if !readme.contains(name.as_str()) {
+                broken.push(format!(
+                    "{name} is not described in .github/hooks/README.md"
+                ));
+            }
+            // A script with a case table has to be run by the target that runs
+            // case tables, or the table is decoration. The needle is the
+            // definition, not the word: session_brief.py only quotes
+            // `--selftest` in the text it hands the agent, and matching that
+            // made this guard demand a case table from a script that has none.
+            let body = fs::read_to_string(hooks.join("bin").join(name)).expect("read hook script");
+            if body.contains("def selftest(") && !makefile.contains(name.as_str()) {
+                broken.push(format!(
+                    "{name} has a --selftest that `make check-harness` never runs"
+                ));
+            }
+        }
+
+        // Every event the config wires up is explained to the reader, because
+        // an unexplained refusal is one an agent works around.
+        for event in [
+            "sessionStart",
+            "preToolUse",
+            "postToolUse",
+            "preCompact",
+            "agentStop",
+        ] {
+            if config.contains(event) && !readme.contains(event) {
+                broken.push(format!(
+                    "gimbal-harness.json hooks {event} but the README never says so"
+                ));
+            }
+        }
+
+        assert!(
+            broken.is_empty(),
+            "the harness and the page describing it have come apart: {broken:?}"
+        );
     }
 }

@@ -1,0 +1,42 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "bash": "python3 \"$(git rev-parse --show-toplevel)/.github/hooks/bin/session_brief.py\"",
+        "timeoutSec": 20
+      }
+    ],
+    "preToolUse": [
+      {
+        "type": "command",
+        "matcher": "bash",
+        "bash": "python3 \"$(git rev-parse --show-toplevel)/.github/hooks/bin/guard_command.py\"",
+        "timeoutSec": 15
+      }
+    ],
+    "postToolUse": [
+      {
+        "type": "command",
+        "matcher": "bash",
+        "bash": "python3 \"$(git rev-parse --show-toplevel)/.github/hooks/bin/relay.py\"",
+        "timeoutSec": 15
+      }
+    ],
+    "preCompact": [
+      {
+        "type": "command",
+        "bash": "python3 \"$(git rev-parse --show-toplevel)/.github/hooks/bin/pre_compact.py\"",
+        "timeoutSec": 15
+      }
+    ],
+    "agentStop": [
+      {
+        "type": "command",
+        "bash": "python3 \"$(git rev-parse --show-toplevel)/.github/hooks/bin/stop_gate.py\"",
+        "timeoutSec": 25
+      }
+    ]
+  }
+}

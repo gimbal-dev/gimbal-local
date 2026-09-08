@@ -7,7 +7,7 @@
 CHM_BIN := target/debug/chm
 SOCKET  ?= $${TMPDIR:-/tmp}/gimbal-local/chm.sock
 
-.PHONY: help chm chm-run chm-serve clippy fmt test-hvf test-release security-check check-docs
+.PHONY: help chm chm-run chm-serve clippy fmt test-hvf test-release security-check check-docs check-harness
 
 help:
 	@echo "Cloud Hypervisor for macOS — make targets:"
@@ -17,6 +17,7 @@ help:
 	@echo "  make clippy                   Lint chm + hvf + arch configs"
 	@echo "  make security-check           Enforce the no-host-FS-passthrough guard"
 	@echo "  make check-docs               Check the open-issue list against GitHub"
+	@echo "  make check-harness            Self-test the agent hooks in .github/hooks"
 	@echo "  make fmt                      Format (nightly rustfmt)"
 	@echo "  make test-hvf                 Run the HVF gate (signed hvf_boot + lib tests)"
 	@echo "  make test-release             Run every suite in RELEASE configuration"
@@ -76,6 +77,14 @@ security-check:
 # test fails if the page is reformatted out from under it.
 check-docs:
 	@./scripts/check-docs.sh
+
+# Self-test the agent harness. Each hook script carries a case table of inputs
+# it must act on and inputs it must ignore, because a guard that has never
+# stayed quiet is as untrustworthy as one that has never fired.
+check-harness:
+	@python3 .github/hooks/bin/guard_command.py --selftest
+	@python3 .github/hooks/bin/relay.py --selftest
+	@python3 .github/hooks/bin/stop_gate.py --selftest
 
 fmt:
 	cargo +nightly fmt --all

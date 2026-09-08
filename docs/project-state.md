@@ -89,11 +89,12 @@ three ways:
 
 | Suite | Command | Measured result |
 | --- | --- | --- |
-| chm | `cd chm && cargo test` | **1114** passed / 4 ignored (lib), plus **2** passed / 7 ignored (integration) |
+| chm | `cd chm && cargo test` | **1115** passed / 4 ignored (lib), plus **2** passed / 7 ignored (integration) |
 | hypervisor | `cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot --lib` | **343** passed — also run by `make test-hvf` |
 | Swift app | `cd app/GimbalLocal && swift test` | **273** XCTest (3 skipped), plus **34** Swift Testing cases in 5 suites |
 | Lints | `make clippy` | **0** |
 | HVF gate | `make test-hvf` | **41** passed / 3 ignored (signed `hvf_boot`), then **343** passed (hypervisor lib) |
+| Harness | `make check-harness` | **62** cases pass across the three hook rule tables |
 | Docs | `./scripts/check-docs.sh` | **0** drift — the grouped issue list below matches GitHub |
 
 `cargo test` and `swift test` each print **more than one** result line. Quote all
@@ -185,15 +186,24 @@ One rehydration wart remains visible to a user:
 ## The open issue list, grouped
 
 Swept with [`../scripts/check-docs.sh`](../scripts/check-docs.sh) on 2026-09-08,
-so **20 remain open** and every one of them is named below. Issue numbers are
+so **23 remain open** and every one of them is named below. Issue numbers are
 written individually rather than as ranges, so the checker can compare this
 list against `gh` without expanding anything. If you change this list, re-run
 that script before you commit — it is the only thing standing between this page
 and its third rot.
 
-**Nothing below is a defect.** The defect backlog closed out on 2026-09-08.
-Every item here is vision work, parked spec work, a security umbrella, a
-packaging gap, or a limitation that needs hardware this machine does not have.
+**Three of the items below are defects**, all filed on 2026-09-08 after the
+backlog had closed out; they are grouped first. Everything after them is vision
+work, parked spec work, a security umbrella, a packaging gap, or a limitation
+that needs hardware this machine does not have.
+
+**Filed after the backlog closed:**
+[#445](https://github.com/gimbal-dev/gimbal-local/issues/445) (CA install
+reports rejected trust when the guest only lacks openssl),
+[#446](https://github.com/gimbal-dev/gimbal-local/issues/446) (the agent
+quickstart lacks account-specific Copilot endpoint setup),
+[#447](https://github.com/gimbal-dev/gimbal-local/issues/447) (no bounded stop
+wait, so stop/start automation is unreliable)
 
 **Rehydration fidelity:** [#279](https://github.com/gimbal-dev/gimbal-local/issues/279)
 (cure the ASID-width delta at capture time, or refuse the capture),
