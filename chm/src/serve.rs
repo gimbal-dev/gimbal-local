@@ -16,26 +16,23 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{ExitCode, exit};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use std::{env, fs, mem, ptr, thread};
 
-use crate::audit;
-use crate::capability;
-use crate::checkpoint;
-use crate::console::ConsoleInput;
 use hypervisor::hvf::virtio::NetIo;
 use hypervisor::hvf::virtio::nat::{AmendOutcome, Amendment};
-use crate::disktail;
-use crate::credproxy::cli;
+
+use crate::console::ConsoleInput;
 use crate::console_filter::ConsoleFilter;
-use crate::exec;
+use crate::credproxy::cli;
 use crate::imp::{
     IDLE_RESIDENCY_PERCENT, IdleResidency, Loaded, Outcome, UsgicConfig, UsgicSession,
     aarch32_guard, cntfrq_guard, icache_dic_guard, load_snapshot, run_usgic_engine,
     superseded_note,
 };
-use crate::posture;
+use crate::{audit, capability, checkpoint, disktail, exec, posture};
 
 /// Set by the daemon's termination-signal handlers so the accept loop exits and
 /// tears the running VM down gracefully (checkpoint + `hv_vm_destroy`) instead
@@ -108,6 +105,8 @@ pub(crate) struct VmInner {
     /// cursor is an absolute byte offset into the whole stream).
     pub(crate) dropped: usize,
     pub(crate) status: RunStatus,
+    /// Typed worker failure, separate from the legacy human-readable status.
+    stop_error: Option<String>,
     pub(crate) stop_requested: bool,
     /// Cross-thread handle that forces the vCPU out of `run()` (HVF
     /// `hv_vcpus_exit`). Published by the worker once the VM is built, so a
@@ -144,6 +143,7 @@ impl VmInner {
             console: Vec::new(),
             dropped: 0,
             status: RunStatus::Running,
+            stop_error: None,
             stop_requested: false,
             kick: None,
             input: None,
@@ -167,6 +167,22 @@ struct Vm {
     /// assess the library root instead and report it as such.
     dir: Option<PathBuf>,
     inner: Arc<Mutex<VmInner>>,
+    worker: Option<thread::JoinHandle<()>>,
+}
+
+impl Vm {
+    /// Never join a live worker: callers hold the daemon lock.
+    fn reap(&mut self) {
+        if self.worker.as_ref().is_some_and(|h| h.is_finished()) {
+            let result = self.worker.take().unwrap().join();
+            if result.is_err() {
+                let mut inner = self.inner.lock().unwrap();
+                let error = "guest worker panicked; check the daemon log before restarting";
+                inner.stop_error = Some(error.to_string());
+                inner.status = RunStatus::Stopped(format!("error: {error}"));
+            }
+        }
+    }
 }
 
 struct Entry {
@@ -532,8 +548,9 @@ fn serve(raw: &[String]) -> Result<(), String> {
     // Graceful shutdown path: stop any running VM (capturing its checkpoint and
     // destroying it) before the process exits, so no HVF slot is leaked.
     eprintln!("chm serve: shutting down — stopping any running sandbox…");
-    let _ = stop_vm_blocking(&daemon, SHUTDOWN_DRAIN);
+    let stopped = stop_vm_blocking(&daemon, SHUTDOWN_DRAIN);
     let _ = fs::remove_file(&daemon.socket_path);
+    stopped?;
     Ok(())
 }
 
@@ -641,6 +658,7 @@ impl ColdControl {
                 started: Instant::now(),
                 dir: Some(dir),
                 inner: Arc::clone(&inner),
+                worker: None,
             })),
         });
 
@@ -761,36 +779,15 @@ impl ColdControl {
 }
 
 /// Request the running VM to stop and wait up to `timeout` for the worker to
-/// finish (its checkpoint capture + `hv_vm_destroy` complete when the worker
-/// records `Stopped`). Used by the shutdown paths, which need to wait longer
-/// than `ctl stop`'s responsiveness window for a full RAM checkpoint to flush.
+/// finish (including checkpoint capture and VM teardown). Shutdown paths need
+/// longer than `ctl stop`'s responsiveness window for a full RAM checkpoint.
 fn stop_vm_blocking(daemon: &Daemon, timeout: Duration) -> Result<String, String> {
-    let (inner, name) = {
-        let guard = daemon.current.lock().unwrap();
-        match guard.as_ref() {
-            Some(vm) => (Arc::clone(&vm.inner), vm.name.clone()),
-            None => return Ok("no VM running".to_string()),
-        }
-    };
-    let kick = {
-        let mut g = inner.lock().unwrap();
-        if matches!(g.status, RunStatus::Stopped(_)) {
-            return Ok(format!("`{name}` already stopped"));
-        }
-        g.stop_requested = true;
-        g.kick.clone()
-    };
-    if let Some(kick) = kick {
-        kick();
+    let reply = wait_for_stop(daemon, timeout);
+    if reply.status == "completed" {
+        Ok(reply.message)
+    } else {
+        Err(reply.message)
     }
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if matches!(inner.lock().unwrap().status, RunStatus::Stopped(_)) {
-            return Ok(format!("stopped `{name}`"));
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    Ok(format!("stop requested for `{name}` (still draining)"))
 }
 
 /// Why a verb does not apply to a cold-boot control socket, or `None` if it does.
@@ -865,6 +862,9 @@ fn handle_conn(stream: UnixStream, daemon: &Daemon) {
     let mut parts = line.trim().splitn(2, ' ');
     let cmd = parts.next().unwrap_or("");
     let arg = parts.next().unwrap_or("").trim();
+    if let Some(vm) = daemon.current.lock().unwrap().as_mut() {
+        vm.reap();
+    }
 
     // Four verbs are about a *library*, and a cold-booted guest has none: this
     // process was handed a kernel, it did not pick a snapshot out of a
@@ -953,16 +953,31 @@ fn handle_conn(stream: UnixStream, daemon: &Daemon) {
             let _ = writer.write_all(resp.as_bytes());
         }
         "stop" => {
-            let resp = match stop_vm(daemon) {
+            let result = if arg.is_empty() {
+                stop_vm(daemon)
+            } else {
+                Err("stop takes no wire arguments; use stop-wait-json SECS for bounded completion".into())
+            };
+            let resp = match result {
                 Ok(msg) => format!("ok\t{msg}\n"),
                 Err(e) => format!("{REPLY_ERROR_PREFIX}{e}\n"),
             };
             let _ = writer.write_all(resp.as_bytes());
         }
+        "stop-wait-json" => {
+            let reply = match stop_timeout(arg) {
+                Ok(timeout) => wait_for_stop(daemon, timeout),
+                Err(e) => StopReply::failed(e),
+            };
+            let _ = writeln!(writer, "{}", serde_json::to_string(&reply).unwrap());
+        }
         "shutdown" => {
             // Wait longer than `ctl stop` so a full RAM checkpoint finishes
             // flushing (and the VM is destroyed) before the process exits.
-            let _ = stop_vm_blocking(daemon, SHUTDOWN_DRAIN);
+            if let Err(e) = stop_vm_blocking(daemon, SHUTDOWN_DRAIN) {
+                let _ = writeln!(writer, "{REPLY_ERROR_PREFIX}{e}");
+                return;
+            }
             let _ = writer.write_all(b"ok\tdaemon exiting\n");
             let _ = writer.flush();
             let _ = fs::remove_file(&daemon.socket_path);
@@ -1541,13 +1556,14 @@ fn start_vm(daemon: &Daemon, name: &str) -> Result<String, String> {
     };
 
     let mut guard = daemon.current.lock().unwrap();
-    if let Some(vm) = guard.as_ref()
-        && matches!(vm.inner.lock().unwrap().status, RunStatus::Running)
-    {
-        return Err(format!(
-            "`{}` is already running — stop it first (HVF is one VM per process)",
-            vm.name
-        ));
+    if let Some(vm) = guard.as_mut() {
+        vm.reap();
+        if vm.worker.is_some() || matches!(vm.inner.lock().unwrap().status, RunStatus::Running) {
+            return Err(format!(
+                "`{}` is already running — stop it first (HVF is one VM per process)",
+                vm.name
+            ));
+        }
     }
 
     let inner = Arc::new(Mutex::new(VmInner::new()));
@@ -1557,12 +1573,8 @@ fn start_vm(daemon: &Daemon, name: &str) -> Result<String, String> {
         max_seconds: daemon.max_seconds,
     };
     let worker_inner = Arc::clone(&inner);
-    thread::spawn(move || {
-        let reason = match run_guest(&dir, &opts, &worker_inner) {
-            Ok(reason) => reason,
-            Err(e) => format!("error: {e}"),
-        };
-        worker_inner.lock().unwrap().status = RunStatus::Stopped(reason);
+    let worker = spawn_guest_worker(Arc::clone(&worker_inner), move || {
+        run_guest(&dir, &opts, &worker_inner)
     });
 
     *guard = Some(Vm {
@@ -1572,17 +1584,43 @@ fn start_vm(daemon: &Daemon, name: &str) -> Result<String, String> {
         // `running_vm_dir` looks it up there.
         dir: None,
         inner,
+        worker: Some(worker),
     });
     Ok(format!("started `{display_name}`"))
+}
+
+fn spawn_guest_worker(
+    inner: Arc<Mutex<VmInner>>,
+    run: impl FnOnce() -> Result<String, String> + Send + 'static,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let result = run();
+        let mut inner = inner.lock().unwrap();
+        // Release the published device handles before reporting completion.
+        inner.kick = None;
+        inner.input = None;
+        inner.egress = None;
+        let reason = match result {
+            Ok(reason) => reason,
+            Err(e) => {
+                inner.stop_error = Some(e.clone());
+                format!("error: {e}")
+            }
+        };
+        inner.status = RunStatus::Stopped(reason);
+    })
 }
 
 fn stop_vm(daemon: &Daemon) -> Result<String, String> {
     let guard = daemon.current.lock().unwrap();
     let vm = guard.as_ref().ok_or("no VM running")?;
+    let name = vm.name.clone();
+    let state = Arc::clone(&vm.inner);
+    drop(guard);
     let kick = {
-        let mut inner = vm.inner.lock().unwrap();
+        let mut inner = state.lock().unwrap();
         if matches!(inner.status, RunStatus::Stopped(_)) {
-            return Ok(format!("`{}` already stopped", vm.name));
+            return Ok(format!("`{name}` already stopped"));
         }
         inner.stop_requested = true;
         inner.kick.clone()
@@ -1593,7 +1631,8 @@ fn stop_vm(daemon: &Daemon) -> Result<String, String> {
         kick();
     }
     // Wait briefly for the worker to observe the flag and halt, so `ctl stop`
-    // returns only once the guest has actually stopped.
+    // can report completion if it is quick. Otherwise success means accepted,
+    // not completed; automation must use the explicit bounded wait.
     //
     // Report the worker's own reason rather than a bare "stopped": on this path
     // the teardown has just written a checkpoint over the resume point, and that
@@ -1602,12 +1641,108 @@ fn stop_vm(daemon: &Daemon) -> Result<String, String> {
     // about `chm rollback` to find out their last good state still exists.
     let deadline = Instant::now() + Duration::from_secs(3);
     while Instant::now() < deadline {
-        if let RunStatus::Stopped(reason) = &vm.inner.lock().unwrap().status {
-            return Ok(format!("stopped `{}` — {reason}", vm.name));
+        if let RunStatus::Stopped(reason) = &state.lock().unwrap().status {
+            return Ok(format!("stopped `{name}` — {reason}"));
         }
         thread::sleep(Duration::from_millis(50));
     }
-    Ok(format!("stop requested for `{}`", vm.name))
+    Ok(format!("stop requested for `{name}`"))
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct StopReply {
+    status: String,
+    message: String,
+}
+
+impl StopReply {
+    fn failed(message: String) -> Self {
+        Self {
+            status: "failed".into(),
+            message,
+        }
+    }
+
+    fn exit_code(&self) -> Result<u8, String> {
+        match self.status.as_str() {
+            "completed" => Ok(0),
+            "timeout" => Ok(EXEC_TIMEOUT_EXIT),
+            "failed" => Ok(1),
+            other => Err(format!("invalid stop outcome `{other}` from daemon")),
+        }
+    }
+}
+
+fn stop_timeout(value: &str) -> Result<Duration, String> {
+    // A finite cap also prevents overflow when adding to Instant.
+    match value.parse::<u64>() {
+        Ok(secs @ 1..=86400) => Ok(Duration::from_secs(secs)),
+        _ => Err("stop --wait needs --timeout SECS (an integer from 1 to 86400)".into()),
+    }
+}
+
+fn wait_for_stop(daemon: &Daemon, timeout: Duration) -> StopReply {
+    let deadline = Instant::now() + timeout;
+    if daemon.role == Role::ColdBoot {
+        return StopReply::failed(
+            "stop --wait needs `chm serve`: this cold-boot socket reports stop before \
+             --originate completes; use `stop` and wait for the `chm create` process to exit"
+                .into(),
+        );
+    }
+    let (inner, name) = {
+        let mut guard = daemon.current.lock().unwrap();
+        let Some(vm) = guard.as_mut() else {
+            return StopReply {
+                status: "completed".into(),
+                message: "no VM running".into(),
+            };
+        };
+        vm.reap();
+        let mut inner = vm.inner.lock().unwrap();
+        inner.stop_requested = true;
+        // The worker's supervisor observes this flag even if no kick exists yet.
+        // Do not retain device handles across teardown.
+        if let Some(kick) = &inner.kick {
+            kick();
+        }
+        (Arc::clone(&vm.inner), vm.name.clone())
+    };
+    loop {
+        let mut guard = daemon.current.lock().unwrap();
+        let worker_pending = if let Some(vm) = guard.as_mut() {
+            vm.reap();
+            Arc::ptr_eq(&vm.inner, &inner) && vm.worker.is_some()
+        } else {
+            false
+        };
+        let state = inner.lock().unwrap();
+        if !worker_pending && let RunStatus::Stopped(reason) = &state.status {
+            return match &state.stop_error {
+                Some(e) => StopReply::failed(format!(
+                    "stop failed for `{name}`: {e}; check the daemon log and saved revisions before restarting"
+                )),
+                None => StopReply {
+                    status: "completed".into(),
+                    message: format!("stopped `{name}` - {reason}"),
+                },
+            };
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return StopReply {
+                status: "timeout".into(),
+                message: format!(
+                    "stop requested for `{name}`, but completion was not observed within {}s; \
+                     teardown continues, retry `stop --wait --timeout SECS` before starting",
+                    timeout.as_secs()
+                ),
+            };
+        }
+        drop(state);
+        drop(guard);
+        thread::sleep(remaining.min(Duration::from_millis(10)));
+    }
 }
 
 fn stream_console(writer: &mut UnixStream, daemon: &Daemon) {
@@ -2199,7 +2334,7 @@ pub(crate) fn append_console(inner: &Arc<Mutex<VmInner>>, bytes: &[u8]) {
 
 pub fn ctl_main(raw: &[String]) -> ExitCode {
     match ctl(raw) {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code),
         Err(e) => {
             eprintln!("chm ctl: {e}");
             ExitCode::FAILURE
@@ -2216,7 +2351,7 @@ THE LIBRARY AND ITS GUESTS
   list [--json]                     snapshots this daemon can start
   status [--json]                   what it is running now
   start <NAME>                      start a snapshot from the library
-  stop                              stop the guest, saving a checkpoint
+  stop [--wait --timeout SECS] [--json]  request stop; optionally wait for teardown
   shutdown                          stop the guest and exit the daemon
 
 THE RUNNING GUEST
@@ -2238,6 +2373,15 @@ WHAT THE DAEMON'S OWN ENVIRONMENT REPORTS (JSON)
 
 OPTIONS
   --socket PATH   the daemon's socket (default: <tmpdir>/gimbal-local/chm.sock)
+
+Bare stop keeps its 3-second responsiveness window: exit 0 can mean only
+`stop requested`, not completion. For stop/start automation use:
+  chm ctl stop --wait --timeout 60 && chm ctl start NAME
+Wait requires an integer timeout from 1 to 86400 seconds. It returns exit 0
+only after the worker and checkpoint teardown complete, 124 on timeout, and
+1 on failure. Timeout does not cancel teardown. Retry the wait before start.
+--json requires --wait and reports status completed, timeout, or failed.
+Wait needs a library daemon; it refuses cold-boot sockets and older daemons.
 
 A cold-booted guest (`chm create --socket`) serves the same socket but has no
 library, so the four library verbs are refused by name rather than answered
@@ -2333,7 +2477,7 @@ fn relay_reply<R: Read, W: Write>(
     Ok(())
 }
 
-fn ctl(raw: &[String]) -> Result<(), String> {
+fn ctl(raw: &[String]) -> Result<u8, String> {
     let (socket, rest) = take_socket(raw)?;
     // Answered before the connect, because the person who needs this most is
     // the one with no daemon running: replying "cannot connect to daemon" to
@@ -2341,7 +2485,7 @@ fn ctl(raw: &[String]) -> Result<(), String> {
     // nowhere to go. `chm --help` promises every command takes its own.
     if wants_help(&rest) {
         println!("{CTL_USAGE}");
-        return Ok(());
+        return Ok(0);
     }
     if rest.is_empty() {
         return Err(format!("missing command\n\n{CTL_USAGE}"));
@@ -2355,9 +2499,25 @@ fn ctl(raw: &[String]) -> Result<(), String> {
     // that swallowed it would be a silent data loss dressed as a kindness.
     if rest[0] == "egress" && wants_help(&rest[1..]) {
         println!("{EGRESS_USAGE}");
-        return Ok(());
+        return Ok(0);
+    }
+    if rest[0] == "stop" && wants_help(&rest[1..]) {
+        println!("{CTL_USAGE}");
+        return Ok(0);
     }
     let command = ctl_command(&rest)?;
+    if let Some(value) = command.strip_prefix("stop-wait-json ") {
+        let reply = ctl_stop_wait(socket, stop_timeout(value)?);
+        let code = reply.exit_code()?;
+        if rest.iter().any(|a| a == "--json") {
+            println!("{}", serde_json::to_string(&reply).unwrap());
+        } else if code == 0 {
+            println!("ok\t{}", reply.message);
+        } else {
+            eprintln!("chm ctl: {}: {}", reply.status, reply.message);
+        }
+        return Ok(code);
+    }
 
     let mut stream = UnixStream::connect(&socket).map_err(|e| {
         format!(
@@ -2377,7 +2537,66 @@ fn ctl(raw: &[String]) -> Result<(), String> {
         &mut stream,
         &mut io::stdout(),
         !reply_is_guest_bytes(&command),
-    )
+    )?;
+    Ok(0)
+}
+
+/// Bound the entire transport, including connect and a peer that never closes
+/// its reply. Only this thread prints; a late reply can never become success.
+/// `ctl_main` exits the CLI after a timeout, so no blocked transport thread
+/// survives the command. The daemon still owns its independent teardown.
+fn ctl_stop_wait(socket: PathBuf, timeout: Duration) -> StopReply {
+    let deadline = Instant::now() + timeout;
+    let (tx, rx) = mpsc::sync_channel(1);
+    let spawned = thread::Builder::new()
+        .name("stop-wait".into())
+        .spawn(move || {
+            let result = (|| {
+                let mut stream = UnixStream::connect(&socket).map_err(|e| {
+                    format!("connect {}: {e}; is `chm serve` running?", socket.display())
+                })?;
+                if Instant::now() >= deadline {
+                    return Err("deadline expired before the stop request could be sent".into());
+                }
+                writeln!(stream, "stop-wait-json {}", timeout.as_secs())
+                    .map_err(|e| format!("send stop request: {e}"))?;
+                let mut body = String::new();
+                stream
+                    .take(64 * 1024)
+                    .read_to_string(&mut body)
+                    .map_err(|e| format!("read stop reply: {e}"))?;
+                if let Some(error) = body.strip_prefix(REPLY_ERROR_PREFIX) {
+                    return Err(format!(
+                        "{}; stop --wait needs a daemon that supports stop-wait-json",
+                        error.trim()
+                    ));
+                }
+                serde_json::from_str::<StopReply>(&body)
+                    .map_err(|e| format!("invalid stop reply: {e}; completion is not confirmed"))
+            })();
+            let _ = tx.send(result);
+        });
+    if let Err(e) = spawned {
+        return StopReply::failed(format!("start stop-wait client: {e}"));
+    }
+    match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+        Ok(Ok(reply)) => match reply.exit_code() {
+            Ok(_) => reply,
+            Err(e) => StopReply::failed(e),
+        },
+        Ok(Err(e)) => StopReply::failed(e),
+        Err(RecvTimeoutError::Timeout) => StopReply {
+            status: "timeout".into(),
+            message: format!(
+                "no stop completion reply within {}s; request acceptance is unknown, and \
+                 teardown may continue; retry `stop --wait --timeout SECS` before starting",
+                timeout.as_secs()
+            ),
+        },
+        Err(RecvTimeoutError::Disconnected) => {
+            StopReply::failed("stop-wait transport thread failed; check the daemon status".into())
+        }
+    }
 }
 
 /// Map `chm ctl <args>` onto the one-line daemon protocol.
@@ -2389,6 +2608,36 @@ fn ctl(raw: &[String]) -> Result<(), String> {
 /// environment answered, not its formatting — both read the environment of the
 /// process they run in, and only the daemon's environment describes the guest.
 fn ctl_command(rest: &[String]) -> Result<String, String> {
+    if rest.first().map(String::as_str) == Some("stop") {
+        if rest.len() == 1 {
+            return Ok("stop".into());
+        }
+        let mut wait = false;
+        let mut json = false;
+        let mut timeout = None;
+        let mut args = rest[1..].iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--wait" if !wait => wait = true,
+                "--json" if !json => json = true,
+                "--timeout" if timeout.is_none() => {
+                    let value = args.next().ok_or("stop --wait needs --timeout SECS")?;
+                    timeout = Some(stop_timeout(value)?);
+                }
+                _ => {
+                    return Err(format!(
+                        "unexpected stop argument `{arg}`; use stop --wait --timeout SECS [--json]"
+                    ));
+                }
+            }
+        }
+        if !wait || timeout.is_none() {
+            return Err(
+                "stop: --wait and --timeout SECS must be used together; --json needs --wait".into(),
+            );
+        }
+        return Ok(format!("stop-wait-json {}", timeout.unwrap().as_secs()));
+    }
     /// Commands whose answer depends on the answering process's environment.
     fn provenanced(cmd: &str) -> Option<&'static str> {
         match cmd {
@@ -3158,12 +3407,340 @@ mod tests {
             "run_guest_usgic must consult superseded_note, or the daemon's stop \
              message loses the displaced revision"
         );
-        let reports = format!("stopped `{{}}` {} {{reason}}", "\u{2014}");
+        let reports = format!("stopped `{{name}}` {} {{reason}}", "\u{2014}");
         assert!(
             src.contains(&reports),
             "stop_vm must report the worker's own reason: a bare `stopped` is \
              what #288 printed over a wedged guest"
         );
+    }
+}
+
+#[cfg(test)]
+mod stop_wait_tests {
+    use std::sync::mpsc;
+
+    use super::*;
+
+    struct Harness {
+        daemon: Arc<Daemon>,
+        listener: UnixListener,
+        dir: PathBuf,
+    }
+
+    impl Harness {
+        fn new() -> Self {
+            let dir = env::temp_dir().join(format!(
+                "stop447-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&dir).unwrap();
+            let socket_path = dir.join("s");
+            let listener = UnixListener::bind(&socket_path).unwrap();
+            let daemon = Arc::new(Daemon {
+                role: Role::Library,
+                library: vec![Entry {
+                    name: "toy".into(),
+                    dir: dir.clone(),
+                    num_vcpus: 1,
+                    total_ram: 0,
+                }],
+                library_dir: dir.clone(),
+                idle_exit_secs: 0,
+                max_seconds: 0,
+                socket_path,
+                current: Mutex::new(None),
+            });
+            Self {
+                daemon,
+                listener,
+                dir,
+            }
+        }
+
+        fn worker(
+            &self,
+        ) -> (
+            mpsc::SyncSender<Result<String, String>>,
+            Arc<Mutex<VmInner>>,
+        ) {
+            let inner = Arc::new(Mutex::new(VmInner::new()));
+            let (tx, rx) = mpsc::sync_channel(1);
+            let worker = spawn_guest_worker(Arc::clone(&inner), move || {
+                rx.recv_timeout(Duration::from_secs(15))
+                    .expect("test must release worker")
+            });
+            *self.daemon.current.lock().unwrap() = Some(Vm {
+                name: "toy".into(),
+                started: Instant::now(),
+                dir: None,
+                inner: Arc::clone(&inner),
+                worker: Some(worker),
+            });
+            (tx, inner)
+        }
+
+        fn accept(&self) -> thread::JoinHandle<()> {
+            let listener = self.listener.try_clone().unwrap();
+            let daemon = Arc::clone(&self.daemon);
+            thread::spawn(move || {
+                let (stream, _) = listener.accept().unwrap();
+                handle_conn(stream, &daemon);
+            })
+        }
+
+        fn ctl(&self, args: &[&str]) -> u8 {
+            let server = self.accept();
+            let mut raw = vec![
+                "--socket".into(),
+                self.daemon.socket_path.display().to_string(),
+            ];
+            raw.extend(args.iter().map(|s| s.to_string()));
+            let code = ctl(&raw).unwrap();
+            server.join().unwrap();
+            code
+        }
+
+        fn wire(&self, command: &str) -> String {
+            let server = self.accept();
+            let mut stream = UnixStream::connect(&self.daemon.socket_path).unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(6)))
+                .unwrap();
+            writeln!(stream, "{command}").unwrap();
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).unwrap();
+            server.join().unwrap();
+            reply
+        }
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            let worker = self
+                .daemon
+                .current
+                .lock()
+                .unwrap()
+                .as_mut()
+                .and_then(|v| v.worker.take());
+            if let Some(worker) = worker {
+                let _ = worker.join();
+            }
+            fs::remove_file(&self.daemon.socket_path).unwrap();
+            fs::remove_dir(&self.dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn stop_wait_parser_and_help_preserve_bare_stop() {
+        let s = |args: &[&str]| args.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(ctl_command(&s(&["stop"])).unwrap(), "stop");
+        for args in [
+            vec!["stop", "--wait", "--timeout", "4"],
+            vec!["stop", "--json", "--timeout", "4", "--wait"],
+        ] {
+            assert_eq!(ctl_command(&s(&args)).unwrap(), "stop-wait-json 4");
+        }
+        for args in [
+            vec!["stop", "--wait"],
+            vec!["stop", "--timeout", "4"],
+            vec!["stop", "--json"],
+            vec!["stop", "--wait", "--timeout"],
+            vec!["stop", "--wait", "--timeout", "0"],
+            vec!["stop", "--wait", "--timeout", "-1"],
+            vec!["stop", "--wait", "--timeout", "1.5"],
+            vec!["stop", "--wait", "--timeout", "86401"],
+            vec!["stop", "--wait", "--timeout", "18446744073709551616"],
+            vec!["stop", "--wait", "--wait", "--timeout", "1"],
+            vec!["stop", "--wait", "--timeout", "1", "--timeout", "2"],
+            vec!["stop", "--wait", "--timeout", "1", "extra"],
+        ] {
+            assert!(
+                ctl_command(&s(&args)).is_err(),
+                "invalid stop form must fail: {args:?}"
+            );
+        }
+        stop_timeout("86400").unwrap();
+        assert_eq!(
+            ctl(&s(&["--socket", "/nonexistent/447", "stop", "--help"])).unwrap(),
+            0
+        );
+        for text in [
+            "--wait",
+            "--timeout",
+            "124",
+            "request",
+            "checkpoint",
+            "older daemons",
+        ] {
+            assert!(CTL_USAGE.contains(text), "help omits {text}");
+        }
+    }
+
+    #[test]
+    fn stop_wait_public_dispatch_exceeds_old_window_then_allows_start() {
+        let h = Harness::new();
+        let (release, inner) = h.worker();
+        let began = Instant::now();
+        assert_eq!(h.ctl(&["stop"]), 0);
+        assert!(began.elapsed() >= Duration::from_secs(3));
+        assert!(inner.lock().unwrap().stop_requested);
+        assert!(matches!(inner.lock().unwrap().status, RunStatus::Running));
+        assert!(h.wire("start toy").contains("already running"));
+
+        let done = Arc::new(AtomicBool::new(false));
+        let mark = Arc::clone(&done);
+        let completer = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(250));
+            mark.store(true, Ordering::Release);
+            release
+                .send(Ok("checkpoint saved; revision previous".into()))
+                .unwrap();
+        });
+        assert_eq!(h.ctl(&["stop", "--wait", "--timeout", "4", "--json"]), 0);
+        assert!(
+            done.load(Ordering::Acquire),
+            "wait returned before teardown finished"
+        );
+        assert!(
+            h.daemon
+                .current
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .worker
+                .is_none(),
+            "completed means the actual worker was joined"
+        );
+        completer.join().unwrap();
+        let reply: serde_json::Value = serde_json::from_str(&h.wire("stop-wait-json 1")).unwrap();
+        assert_eq!(reply["status"], "completed");
+        assert!(
+            reply["message"]
+                .as_str()
+                .unwrap()
+                .contains("revision previous")
+        );
+        assert!(
+            h.wire("start toy").starts_with("ok\tstarted"),
+            "a completed stop must release the public start path"
+        );
+    }
+
+    #[test]
+    fn stop_wait_timeout_does_not_complete_or_cancel_teardown() {
+        let h = Harness::new();
+        let (release, inner) = h.worker();
+        let began = Instant::now();
+        assert_eq!(h.ctl(&["stop", "--wait", "--timeout", "1"]), 124);
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "deadline was not bounded"
+        );
+        assert!(
+            inner.lock().unwrap().stop_requested,
+            "public wait did not request stop"
+        );
+        assert!(h.wire("start toy").contains("already running"));
+        // A status publication alone cannot substitute for joining the worker.
+        inner.lock().unwrap().status = RunStatus::Stopped("early status".into());
+        let reply: serde_json::Value = serde_json::from_str(&h.wire("stop-wait-json 1")).unwrap();
+        assert_eq!(reply["status"], "timeout", "a live worker is not complete");
+        release.send(Ok("saved after deadline".into())).unwrap();
+        assert_eq!(h.ctl(&["stop", "--wait", "--timeout", "2"]), 0);
+    }
+
+    #[test]
+    fn stop_wait_propagates_worker_failure_and_retains_it_for_retry() {
+        let h = Harness::new();
+        let (release, _) = h.worker();
+        release
+            .send(Err("checkpoint write: no space left".into()))
+            .unwrap();
+        assert_eq!(h.ctl(&["stop", "--wait", "--timeout", "2", "--json"]), 1);
+        let reply: serde_json::Value = serde_json::from_str(&h.wire("stop-wait-json 1")).unwrap();
+        assert_eq!(reply["status"], "failed");
+        assert!(reply["message"].as_str().unwrap().contains("no space left"));
+        assert!(stop_vm_blocking(&h.daemon, Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn stop_wait_propagates_worker_panic() {
+        let h = Harness::new();
+        let (_, inner) = h.worker();
+        // Dropping the sender makes the real worker wrapper panic in this fixture.
+        assert_eq!(h.ctl(&["stop", "--wait", "--timeout", "2"]), 1);
+        assert!(
+            inner
+                .lock()
+                .unwrap()
+                .stop_error
+                .as_ref()
+                .unwrap()
+                .contains("panicked")
+        );
+    }
+
+    #[test]
+    fn stop_wait_idle_malformed_and_cold_requests_use_public_dispatch() {
+        let mut h = Harness::new();
+        assert_eq!(h.ctl(&["stop", "--wait", "--timeout", "1"]), 0);
+        for command in [
+            "stop-wait-json",
+            "stop-wait-json 0",
+            "stop-wait-json 1 extra",
+        ] {
+            let reply: serde_json::Value = serde_json::from_str(&h.wire(command)).unwrap();
+            assert_eq!(reply["status"], "failed");
+        }
+        assert!(h.wire("stop --wait").starts_with(REPLY_ERROR_PREFIX));
+        Arc::get_mut(&mut h.daemon).unwrap().role = Role::ColdBoot;
+        let reply: serde_json::Value = serde_json::from_str(&h.wire("stop-wait-json 1")).unwrap();
+        assert_eq!(reply["status"], "failed");
+        assert!(reply["message"].as_str().unwrap().contains("--originate"));
+    }
+
+    #[test]
+    fn stop_wait_transport_rejects_old_empty_invalid_and_silent_peers() {
+        for reply in [
+            format!("{REPLY_ERROR_PREFIX}unknown command `stop-wait-json`\n"),
+            String::new(),
+            "{\"status\":\"accepted\",\"message\":\"not complete\"}".into(),
+        ] {
+            let h = Harness::new();
+            let listener = h.listener.try_clone().unwrap();
+            let peer = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut request = String::new();
+                BufReader::new(stream.try_clone().unwrap())
+                    .read_line(&mut request)
+                    .unwrap();
+                assert_eq!(request, "stop-wait-json 1\n");
+                stream.write_all(reply.as_bytes()).unwrap();
+            });
+            let result = ctl_stop_wait(h.daemon.socket_path.clone(), Duration::from_secs(1));
+            assert_eq!(result.status, "failed");
+            peer.join().unwrap();
+        }
+        let h = Harness::new();
+        let listener = h.listener.try_clone().unwrap();
+        let (release, rx) = mpsc::channel();
+        let peer = thread::spawn(move || {
+            let (_stream, _) = listener.accept().unwrap();
+            rx.recv_timeout(Duration::from_secs(4)).unwrap();
+        });
+        let began = Instant::now();
+        let result = ctl_stop_wait(h.daemon.socket_path.clone(), Duration::from_secs(1));
+        assert_eq!(result.status, "timeout");
+        assert!(began.elapsed() < Duration::from_secs(2));
+        release.send(()).unwrap();
+        peer.join().unwrap();
     }
 }
 
