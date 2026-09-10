@@ -542,6 +542,15 @@ To test a hook change without touching your own configuration, point
   passphrase was correctly refused as an injection attempt. Notices must name
   the file they come from and the reason they exist, or a careful agent will
   ignore them and an incautious one will obey anything.
+- **Check the mechanism with something only the mechanism does.** The obvious
+  way to ask whether the harness is live is to try a `git checkout` of a path
+  and see it refused. That check passes with the harness switched off, because
+  the rule is in this document too and the agent refuses on its own judgement.
+  Measured: a worktree with no `.github/hooks` at all still refused it. Use
+  `cargo fmt -- --check <path>` instead, which an agent has no reason to
+  refuse, and look for the literal words `Denied by preToolUse hook`. When a
+  rule is written down *and* enforced, an observed refusal does not tell you
+  which one acted. Pick a probe the prose does not cover.
 
 The same principle covers the procedures rather than the prohibitions:
 `.github/skills/` holds `mutation-proof`, `measure-formatting-drift`, and

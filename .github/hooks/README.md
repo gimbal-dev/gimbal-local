@@ -32,9 +32,10 @@ first time it starts in a directory. That writes the path into
 `trustedFolders` in `~/.copilot/config.json`.
 
 Trust cascades to child directories. Measured: with only the worktree parent
-in `trustedFolders`, a session inside a child worktree still loaded these
-hooks and refused a `git checkout` of a path. So trust the directory that
-holds the worktrees, once, and every worktree made later is covered:
+in `trustedFolders`, a session inside a child worktree loaded these hooks and
+denied `cargo fmt -- --check <path>`, which is a command an agent has no
+reason to refuse by itself. So trust the directory that holds the worktrees,
+once, and every worktree made later is covered:
 
 ```jsonc
 // ~/.copilot/config.json
@@ -44,8 +45,17 @@ holds the worktrees, once, and every worktree made later is covered:
 That file is JSONC and holds other settings. Edit it, do not overwrite it.
 
 To check whether the harness is live, ask the session to run
-`git checkout -- some/file`. A live harness refuses it and quotes the reason.
-Nothing happening means the folder is not trusted.
+`cargo fmt -- --check chm/src/hygiene.rs`, and look for the literal words
+`Denied by preToolUse hook` in what comes back. Anything else means the
+folder is not trusted and none of this is running.
+
+Do not use `git checkout -- some/file` as that check. It passes for the
+wrong reason: the rule is also written in `docs/engineering-discipline.md`,
+so an agent refuses it on its own judgement whether or not the hook exists.
+Measured, in a worktree with no `.github/hooks` at all, an agent still
+refused it. The blind `cargo fmt --check` command discriminates because an
+agent has no reason to refuse it: the same worktree ran it without comment.
+A check that cannot fail is not a check.
 
 ## What it refuses
 
