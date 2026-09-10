@@ -84,6 +84,7 @@ check-docs:
 check-harness:
 	@python3 .github/hooks/bin/guard_command.py --selftest
 	@python3 .github/hooks/bin/relay.py --selftest
+	@python3 .github/hooks/bin/session_brief.py --selftest
 	@python3 .github/hooks/bin/stop_gate.py --selftest
 
 fmt:

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""sessionStart hook: open the session with facts, not with a summary.
+"""userPromptSubmitted hook: open the session with facts, not with a summary.
 
 Two things go wrong at the start of a session here.  The agent works in the
 wrong tree, because the environment block it is handed can name a worktree that
@@ -15,6 +15,14 @@ rule docs/engineering-discipline.md sets and the hygiene tests enforce.
 It also says what the harness will refuse, because an agent that meets an
 unexplained refusal mid-task tends to work around it.
 
+This runs on `userPromptSubmitted`, not on `sessionStart`, and the difference
+was measured rather than assumed.  With both events wired in one session and
+each returning a distinct codename, the agent could see only the one from
+`userPromptSubmitted`: `sessionStart` fires, and its `additionalContext` is
+dropped, in Copilot CLI 1.0.74.  A brief nobody receives is worse than none,
+because it reads like the trap is covered.  `userPromptSubmitted` fires on
+every prompt, so the brief is delivered once per session and then goes quiet.
+
 This script must never raise: it prints `{}` on any failure path and exits 0.
 """
 
@@ -22,6 +30,9 @@ import json
 import os
 import subprocess
 import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from relay import state_dir  # noqa: E402  (same directory, shared state path)
 
 
 def git(cwd, *args):
@@ -67,10 +78,56 @@ def brief(cwd):
     return "\n".join(lines)
 
 
+def is_first_prompt(base):
+    """True once per session.  The brief is a greeting, not a nag."""
+    stamp = os.path.join(base, "brief-sent")
+    if os.path.exists(stamp):
+        return False
+    open(stamp, "w").close()
+    return True
+
+
+SELFTEST_CASES = [
+    ("first prompt of the session", True),
+    ("second prompt, same session", False),
+    ("third prompt, same session", False),
+]
+
+
+def selftest():
+    """The quiet cases are the point: a brief on every prompt is noise."""
+    import tempfile
+
+    failures = []
+    with tempfile.TemporaryDirectory() as base:
+        for label, expected in SELFTEST_CASES:
+            actual = is_first_prompt(base)
+            if actual != expected:
+                failures.append((label, expected, actual))
+    text = brief(os.path.dirname(os.path.abspath(__file__)))
+    for needed in ("working tree", "branch", "docs/project-state.md"):
+        if needed not in text:
+            failures.append(("brief text", "contains %r" % needed, "missing"))
+    for command, expected, actual in failures:
+        sys.stderr.write("FAIL: %s expected %s, got %s\n" % (command, expected, actual))
+    total = len(SELFTEST_CASES) + 3
+    if failures:
+        sys.stderr.write("%d of %d brief cases failed\n" % (len(failures), total))
+        return 1
+    sys.stdout.write(
+        "session_brief: %d cases pass (1 delivers, %d quiet, 3 content)\n"
+        % (total, len(SELFTEST_CASES) - 1)
+    )
+    return 0
+
+
 def main():
+    if "--selftest" in sys.argv:
+        return selftest()
     try:
         payload = json.load(sys.stdin)
-        text = brief(payload.get("cwd") or os.getcwd())
+        base = state_dir(payload.get("sessionId", ""))
+        text = brief(payload.get("cwd") or os.getcwd()) if is_first_prompt(base) else None
     except Exception:
         text = None
     sys.stdout.write(json.dumps({"additionalContext": text}) if text else "{}")
