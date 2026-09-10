@@ -109,6 +109,53 @@ The hardware measurements behind that are kept as tests in
 `hypervisor/tests/hvf_boot.rs`, which still drives Apple's GIC directly. The
 evidence survives; the footgun does not.
 
+## Pointer authentication: retain the restore refusal
+
+**Support policy: retain option 1 from
+[#373](https://github.com/gimbal-dev/gimbal-local/issues/373).** A destination
+must restore the captured pointer-authentication (PAC) state. Gimbal Local does
+not skip a refused PAC key write or resume with fresh keys. Signed pointers
+travel in guest RAM; changing their keys can turn a restore into a later guest
+authentication fault.
+
+HVF capture requires all ten key registers: the Lo/Hi halves of APIA, APIB,
+APDA, APDB and APGA. HVF restore attempts every key that the snapshot carries,
+including zero-valued keys. Any failed key write aborts restore, as does a
+failed `MPIDR_EL1` write. The PAC error names the register encoding, retains
+the backend error and explains the refusal. Both HVF rehydration paths retain
+that detail.
+
+This does not add a destination feature mask, change the vanilla snapshot
+format, or patch stock upstream Cloud Hypervisor. A non-PAC capture that
+carries no keys still follows the existing restore path. Key absence alone
+does not establish whether the guest used PAC: this change does not detect or
+repair an old or incomplete snapshot that already lost its keys.
+
+### What the local evidence does and does not prove
+
+| Evidence | Scope |
+| --- | --- |
+| `hvf::restore_tests` in the hypervisor lib suite | Injected HVF write failures prove local refusal, error propagation and no key skipping. Register translation tests prove a KVM-shaped round trip, not a KVM import. |
+| `every_captured_register_survives_a_write_back` in the signed `hvf_boot` suite | Real Apple-silicon register writes and reads cover the captured PAC bank. This is not a non-PAC host. |
+| Stock upstream [AArch64 `set_state`](https://github.com/cloud-hypervisor/cloud-hypervisor/blob/5b54e29fa75d0cd894532e4568745e89a84a2ae4/hypervisor/src/kvm/mod.rs#L3513-L3547) | Source read on 2026-09-10: KVM restore propagates `set_one_reg` errors. It does not call the HVF policy. |
+
+Run the local refusal tests with:
+
+```sh
+cargo test -p hypervisor --no-default-features --features hvf,kvm-snapshot \
+  --lib hvf::restore_tests
+```
+
+`make test-hvf` signs and runs the hardware suite, then runs the lib suite.
+
+**The first stock upstream restore outcome on a non-PAC arm64 KVM host remains
+unmeasured.** A PAC-related refusal is a prediction, not an observed first
+failure; format, vCPU initialization or timer checks can fail earlier. That
+experiment remains part of
+[#372](https://github.com/gimbal-dev/gimbal-local/issues/372). Neither local
+error injection nor successful Apple-silicon writes settle it. These local
+changes do not by themselves satisfy #373's original hardware measurement.
+
 ## Counter frequency: a capture-host property you cannot fix on restore
 
 Interrupt routing is not the only thing a snapshot inherits from its capture
