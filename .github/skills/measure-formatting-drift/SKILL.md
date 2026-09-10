@@ -61,12 +61,25 @@ Every flag earns its place:
 
 Every trap here produces a confident wrong number rather than an error, so the
 only way to tell a working method from a blind one is to feed it something you
-know is broken:
+know is broken. Build the control with python, not `sed`:
 
 ```bash
-sed 's/fn \([a-z_]*\)() {/fn \1(){let _x=1;/' chm/src/<file>.rs > chm/src/.fmtbase/ctl.rs
-$RF chm/src/.fmtbase/ctl.rs 2>/dev/null | grep -c '^Diff in'   # must be well above zero
+python3 -c "
+s = open('chm/src/<file>.rs').read()
+old, new = 'let x: Vec<&str> = y', 'let  x:Vec<&str>   =  y'
+assert s.count(old) == 1, s.count(old)
+open('chm/src/.fmtbase/ctl.rs', 'w').write(s.replace(old, new))"
+$RF chm/src/.fmtbase/ctl.rs 2>/dev/null | grep -c '^Diff in'   # must beat the live score
 ```
+
+A control can be wrong in two ways, and both have happened here. Its needle
+may not match, so the control is a copy of the file and scores the same. Or
+the edit may not compile, so rustfmt refuses the file and scores zero, which
+reads exactly like the blind method you are testing for. An `&` in a `sed`
+replacement means the whole match, so `sed 's/a: Vec<&str>/a:Vec<&str>/'`
+splices the pattern into the file and produces a syntax error. That is why
+this uses python with an assert on the match count: it fails loudly when the
+needle is wrong, and it changes only whitespace, so the result still parses.
 
 If the control scores zero, the method is blind. Fix the method before you
 report anything about the code.

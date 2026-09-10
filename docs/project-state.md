@@ -94,7 +94,7 @@ three ways:
 | Swift app | `cd app/GimbalLocal && swift test` | **273** XCTest (3 skipped), plus **34** Swift Testing cases in 5 suites |
 | Lints | `make clippy` | **0** |
 | HVF gate | `make test-hvf` | **41** passed / 3 ignored (signed `hvf_boot`), then **343** passed (hypervisor lib) |
-| Harness | `make check-harness` | **62** cases pass across the three hook rule tables |
+| Harness | `make check-harness` | **68** cases pass across the four hook rule tables |
 | Docs | `./scripts/check-docs.sh` | **0** drift — the grouped issue list below matches GitHub |
 
 `cargo test` and `swift test` each print **more than one** result line. Quote all

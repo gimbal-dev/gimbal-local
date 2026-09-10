@@ -514,8 +514,10 @@ on macOS and reading what happened, not from documentation:
   command and hands the reason to the agent word for word.
 - `agentStop` returning `{"decision": "block", "reason": "..."}` refuses the
   stop and makes the agent continue.
-- `sessionStart` and `postToolUse` returning `{"additionalContext": "..."}`
-  reach the model.
+- `postToolUse` and `userPromptSubmitted` returning
+  `{"additionalContext": "..."}` reach the model. `sessionStart` does not: it
+  runs its command and its context is dropped, so the session brief is wired
+  to `userPromptSubmitted` and delivered on the first prompt only.
 - Hook commands run in the session directory, so scripts must be located with
   `git rev-parse --show-toplevel`, not a relative path.
 

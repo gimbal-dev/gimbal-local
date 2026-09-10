@@ -1,7 +1,7 @@
 {
   "version": 1,
   "hooks": {
-    "sessionStart": [
+    "userPromptSubmitted": [
       {
         "type": "command",
         "bash": "python3 \"$(git rev-parse --show-toplevel)/.github/hooks/bin/session_brief.py\"",

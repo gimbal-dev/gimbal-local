@@ -12,7 +12,7 @@ Nothing here is speculative hardening.
 
 | Event | Script | What it does |
 | --- | --- | --- |
-| `sessionStart` | `bin/session_brief.py` | States the working tree, branch, commit, and whether anything is uncommitted, all measured at that moment. Points at the three documents a new session should read. States what the harness will refuse, so a refusal mid-task is not a surprise. |
+| `userPromptSubmitted` | `bin/session_brief.py` | States the working tree, branch, commit, and whether anything is uncommitted, all measured at that moment. Points at the three documents a new session should read. States what the harness will refuse, so a refusal mid-task is not a surprise. Delivered on the first prompt of a session only. |
 | `preToolUse` (bash) | `bin/guard_command.py` | Refuses the shell commands that have destroyed work here, and asks before a mutating AWS command. Each refusal explains the safe way round. |
 | `postToolUse` (bash) | `bin/relay.py` | Reminds about the traps that cannot be blocked, only remembered. Delivers the rubber-duck request after a compaction or after an interval. Records that a gate command ran. |
 | `preCompact` | `bin/pre_compact.py` | Leaves a stamp that `relay.py` turns into a rubber-duck request on the next tool call. |
@@ -20,6 +20,16 @@ Nothing here is speculative hardening.
 
 Wiring is in `gimbal-harness.json`. The Copilot CLI loads every `*.json` in
 this directory once the folder is trusted.
+
+The brief runs on `userPromptSubmitted` rather than the obvious
+`sessionStart`, and the choice was measured. With both events wired in one
+session, each returning a different codename, the agent could repeat only the
+codename from `userPromptSubmitted`. `sessionStart` runs its command, and
+proves it by leaving a file, but its `additionalContext` never reaches the
+model in Copilot CLI 1.0.74. A brief nobody receives is worse than no brief,
+because the trap it covers looks covered. Check any new event this way before
+trusting it: fire it, and have the agent repeat something only that event
+could have told it.
 
 ## Turning it on
 
@@ -150,7 +160,10 @@ real sessions, not read from documentation:
 - `postToolUse` `{"additionalContext": "..."}` reaches the model.
 - `agentStop` `{"decision": "block", "reason": "..."}` refuses the stop and
   makes the agent continue.
-- `sessionStart` `{"additionalContext": "..."}` is injected into the
-  conversation.
+- `userPromptSubmitted` `{"additionalContext": "..."}` reaches the model, on
+  every prompt.
+- `sessionStart` runs its command but its `additionalContext` does **not**
+  reach the model. Measured side by side with `userPromptSubmitted` in one
+  session; only the latter arrived.
 - Hook commands run in the session directory, so the scripts are located with
   `git rev-parse --show-toplevel` rather than a relative path.

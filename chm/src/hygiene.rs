@@ -1704,14 +1704,23 @@ mod tests {
         }
 
         // Every event the config wires up is explained to the reader, because
-        // an unexplained refusal is one an agent works around.
-        for event in [
-            "sessionStart",
-            "preToolUse",
-            "postToolUse",
-            "preCompact",
-            "agentStop",
-        ] {
+        // an unexplained refusal is one an agent works around.  The list comes
+        // out of the config so that wiring a new event cannot quietly escape
+        // this check.
+        let events: Vec<&str> = config
+            .lines()
+            .map(str::trim)
+            .filter(|line| line.ends_with("\": ["))
+            .filter_map(|line| line.split('"').nth(1))
+            .filter(|key| *key != "hooks")
+            .collect();
+        assert!(
+            events.len() >= 5,
+            "found {} wired events in gimbal-harness.json, expected the whole set; \
+             the scan that reads them has probably drifted from the file",
+            events.len()
+        );
+        for event in events {
             if config.contains(event) && !readme.contains(event) {
                 broken.push(format!(
                     "gimbal-harness.json hooks {event} but the README never says so"
