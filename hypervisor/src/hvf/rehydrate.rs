@@ -167,6 +167,13 @@ fn full_chain(e: &dyn std::error::Error) -> String {
     s
 }
 
+pub(super) fn restore_state_error(
+    id: usize,
+    error: &crate::cpu::HypervisorCpuError,
+) -> RehydrateError {
+    RehydrateError::Hv(anyhow!("restore vCPU {id} state: {}", full_chain(error)))
+}
+
 /// One guest-RAM region: where it maps in guest-physical space and where its
 /// bytes live inside the `memory-ranges` file.
 ///
@@ -1117,7 +1124,7 @@ pub fn restore_usgic_vcpu(
         None => &snap.vcpus[id],
     };
     vcpu.set_state(&CpuState::Hvf(vcpu_state.clone()))
-        .map_err(|e| RehydrateError::Hv(anyhow!("restore vCPU {id} state: {e}")))?;
+        .map_err(|e| restore_state_error(id, &e))?;
 
     // Bind this vCPU to the VM's ONE counter clock. Every vCPU programming the
     // same virtual-timer offset is what makes `CNTVCT_EL0` coherent across
@@ -1592,7 +1599,7 @@ pub fn restore_vcpu_state(
     id: usize,
 ) -> Result<(), RehydrateError> {
     vcpu.set_state(&CpuState::Hvf(snap.vcpus[id].clone()))
-        .map_err(|e| RehydrateError::Hv(anyhow!("restore vCPU {id} state: {e}")))?;
+        .map_err(|e| restore_state_error(id, &e))?;
 
     let redist_pairs = redist_to_hvf(&snap.rdist_slice(id)).ok_or_else(|| {
         RehydrateError::Translate(format!("vCPU {id} redistributor did not translate"))
