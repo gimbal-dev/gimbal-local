@@ -21,6 +21,32 @@ Nothing here is speculative hardening.
 Wiring is in `gimbal-harness.json`. The Copilot CLI loads every `*.json` in
 this directory once the folder is trusted.
 
+## Turning it on
+
+The harness is off until the folder is trusted, and it is silent when it is
+off. A new session in a fresh worktree gets no hooks and no warning that it
+has none.
+
+In an interactive session, answer yes to the trust prompt the CLI shows the
+first time it starts in a directory. That writes the path into
+`trustedFolders` in `~/.copilot/config.json`.
+
+Trust cascades to child directories. Measured: with only the worktree parent
+in `trustedFolders`, a session inside a child worktree still loaded these
+hooks and refused a `git checkout` of a path. So trust the directory that
+holds the worktrees, once, and every worktree made later is covered:
+
+```jsonc
+// ~/.copilot/config.json
+{ "trustedFolders": ["/path/that/holds/your/worktrees"] }
+```
+
+That file is JSONC and holds other settings. Edit it, do not overwrite it.
+
+To check whether the harness is live, ask the session to run
+`git checkout -- some/file`. A live harness refuses it and quotes the reason.
+Nothing happening means the folder is not trusted.
+
 ## What it refuses
 
 `bin/guard_command.py --selftest` prints the whole rule table. In summary it
