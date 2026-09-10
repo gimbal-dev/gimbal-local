@@ -808,7 +808,7 @@ fn ca_from_daemon(reply: &serde_json::Value) -> Result<(String, String), String>
     Ok((script.to_string(), fingerprint.to_string()))
 }
 
-/// Decide whether the guest's own trust store accepted the CA.
+/// Report what the guest demonstrated about system-store trust.
 ///
 /// Pure, because this is the only thing standing between "the script ran" and
 /// "the guest trusts the proxy", and the install path needs a live daemon so no
@@ -833,10 +833,43 @@ fn install_verdict(output: &str, want_fingerprint: &str) -> Result<String, Strin
                 .to_string(),
         );
     };
-    if system != "trusted" {
-        return Err(format!(
-            "the guest's trust store did not accept the CA (system store: {system})"
-        ));
+    match system.as_str() {
+        "trusted" => {}
+        "NOT TRUSTED" => {
+            return Err(format!(
+                "the guest's trust store did not accept the CA (system store: {system}) -- \
+                 in the guest, run `openssl verify -CApath /etc/ssl/certs {CA_PATH}` \
+                 to see the rejection; repair the trust store and rerun \
+                 `chm proxy ca --install` with the same --socket"
+            ));
+        }
+        "installed, unverified (no openssl here)" => {
+            return Err(format!(
+                "system-store trust is unknown, not rejected (system store: {system}): \
+                 the guest has no openssl to check trust or read back the CA fingerprint. \
+                 Install openssl and ca-certificates in the guest image \
+                 (Debian/Node, as root: `apt-get update && apt-get install -y openssl ca-certificates`), \
+                 then rerun `chm proxy ca --install` with the same --socket. \
+                 Node configuration or a successful Node request does not prove system-store trust"
+            ));
+        }
+        "skipped" => {
+            return Err(format!(
+                "system-store installation was skipped (system store: {system}); trust is unknown -- \
+                 check write access to /usr/local/share/ca-certificates in the guest and run \
+                 the installer as root or with sudo; then rerun `chm proxy ca --install` \
+                 with the same --socket"
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "system-store trust is unknown (system store: {system}) -- \
+                 the installer did not report a supported trust verdict; check its output above. \
+                 In the guest, use openssl to check \
+                 `openssl verify -CApath /etc/ssl/certs {CA_PATH}`; \
+                 rerun `chm proxy ca --install` with the same --socket after repair"
+            ));
+        }
     }
     // A `trusted` verdict is about the file on disk. If that file is not the CA
     // the running proxy signs with, the guest trusts a certificate nothing
@@ -2785,12 +2818,54 @@ mod tests {
     /// the console path that could only ever say "CA script sent".
     #[test]
     fn an_unverifiable_install_is_not_reported_as_success() {
-        let out =
-            good_output("beefcafe").replace("trusted", "installed, unverified (no openssl here)");
+        let out = good_output("<no openssl here to read it back>")
+            .replace("trusted", "installed, unverified (no openssl here)");
+        let e = install_verdict(&out, "beefcafe").unwrap_err();
         assert!(
-            install_verdict(&out, "beefcafe").is_err(),
-            "an install nobody could check must not exit 0"
+            e.contains("trust is unknown, not rejected"),
+            "missing evidence is not rejection, even with Node configured: {e}"
         );
+        assert!(
+            e.contains("apt-get install -y openssl ca-certificates")
+                && e.contains("chm proxy ca --install")
+                && e.contains("same --socket"),
+            "name the supported guest tools and how to retry: {e}"
+        );
+        assert!(
+            e.contains("Node request does not prove system-store trust"),
+            "do not offer Node as a system-store check: {e}"
+        );
+    }
+
+    #[test]
+    fn a_skipped_system_install_is_not_a_rejection() {
+        let out = good_output("beefcafe").replace("trusted", "skipped");
+        let e = install_verdict(&out, "beefcafe").unwrap_err();
+        assert!(
+            e.contains("installation was skipped") && e.contains("trust is unknown"),
+            "no store check ran: {e}"
+        );
+        assert!(
+            e.contains("/usr/local/share/ca-certificates") && e.contains("root or with sudo"),
+            "name the directory and authority needed by the installer: {e}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_system_verdict_is_not_a_rejection_or_success() {
+        for system in ["", "installed, unverified", "unsupported checker"] {
+            let out = good_output("beefcafe")
+                .replace("system store: trusted", &format!("system store: {system}"));
+            let e = install_verdict(&out, "beefcafe").unwrap_err();
+            assert!(
+                e.contains("trust is unknown") && e.contains(&format!("system store: {system}")),
+                "retain the unknown verdict without inventing a rejection: {e}"
+            );
+            assert!(
+                e.contains(&format!("openssl verify -CApath /etc/ssl/certs {CA_PATH}")),
+                "name the supported system-store check: {e}"
+            );
+        }
     }
 
     #[test]
