@@ -110,9 +110,30 @@ Measured on `node:22-slim`: no `sudo`, no `openssl`, no
 `/usr/share/ca-certificates` or `/etc/ssl/certs`. An earlier installer opened
 with `sudo tee`, so **every line of it failed** — on exactly the kind of image
 these docs recommend for running an agent. It now uses `sudo` only if it is
-both needed and present, creates what it needs, and degrades to a named
-outcome (`installed, unverified (no openssl here)`) rather than either failing
-or claiming a trust it did not verify.
+both needed and present and creates what it needs. Without `openssl`, the
+generated script reports `installed, unverified (no openssl here)`. This means
+the certificate was copied, but system-store trust and the installed fingerprint
+remain unknown. It does not mean the trust store rejected the CA.
+
+**`chm proxy ca --install` is strict:** it exits nonzero for an unverified,
+skipped, unknown, untrusted or mismatched result. The generated script can finish
+without proving trust; that is not a successful one-command install. Node
+configuration or a successful Node HTTPS request proves nothing about
+system-store trust and does not change this exit status.
+
+For a Debian-based Node image, prepare the image with `openssl` and
+`ca-certificates`. As root in the image or guest, with package-network access:
+
+```sh
+apt-get update && apt-get install -y openssl ca-certificates
+```
+
+Then run `chm proxy ca --install --socket "$SOCKET"` again from the host.
+Keep the socket that selects the running guest. The installer uses
+`openssl verify -CApath /etc/ssl/certs /etc/gimbal/proxy-ca.crt` to check the
+system store and reads back the CA fingerprint. If the store reports
+`NOT TRUSTED`, run that OpenSSL command in the guest to see the rejection.
+Do not disable TLS checks or treat a Node-only check as the remedy.
 
 Two things the trust-store check has to be, learned by getting both wrong:
 
