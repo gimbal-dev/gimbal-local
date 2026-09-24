@@ -8,7 +8,7 @@ for the area you are touching.
 **Last measured sweep:** 2026-09-08, at commit `ded833183`. Every gate number
 below was produced by running the command in its own row on that commit, not
 carried forward from a previous sweep.
-**Issue-state refresh:** 2026-09-08, swept with
+**Issue-state refresh:** 2026-09-24, swept with
 [`../scripts/check-docs.sh`](../scripts/check-docs.sh) rather than transcribed
 by hand. Run that script before trusting the grouped list at the bottom of this
 page; it compares the page against GitHub and exits non-zero on drift. It
@@ -166,14 +166,18 @@ cannot be measured on this hardware at all
 recorded as unmeasured rather than believed. Until the return leg is
 demonstrated, "cloud to Mac" is proved and "Mac back to cloud" is not.
 
-**This is now the only substantial engineering problem left in the local
-product.** The defect backlog is empty: the last four defects
+**This is now the only substantial unproven capability in the local
+product.** The last four defects from the previous backlog
 ([#437](https://github.com/gimbal-dev/gimbal-local/issues/437),
 [#438](https://github.com/gimbal-dev/gimbal-local/issues/438),
 [#439](https://github.com/gimbal-dev/gimbal-local/issues/439),
 [#440](https://github.com/gimbal-dev/gimbal-local/issues/440)) closed on
-2026-09-08. What remains open is vision work, the parked sandbox-spec family,
-two security umbrellas, one packaging gap
+2026-09-08. Two defects filed after that closure, #445 and #446, closed on
+2026-09-24. One operational defect remains:
+[#447](https://github.com/gimbal-dev/gimbal-local/issues/447), which needs a
+bounded stop wait for reliable stop/start automation. The other open work is
+vision work, the parked sandbox-spec family, two security umbrellas, one
+packaging gap
 ([#410](https://github.com/gimbal-dev/gimbal-local/issues/410)), and four
 limitations that need hardware this machine does not have.
 
@@ -185,23 +189,19 @@ One rehydration wart remains visible to a user:
 
 ## The open issue list, grouped
 
-Swept with [`../scripts/check-docs.sh`](../scripts/check-docs.sh) on 2026-09-08,
-so **23 remain open** and every one of them is named below. Issue numbers are
+Swept with [`../scripts/check-docs.sh`](../scripts/check-docs.sh) on 2026-09-24,
+so **21 remain open** and every one of them is named below. Issue numbers are
 written individually rather than as ranges, so the checker can compare this
 list against `gh` without expanding anything. If you change this list, re-run
 that script before you commit — it is the only thing standing between this page
 and its third rot.
 
-**Three of the items below are defects**, all filed on 2026-09-08 after the
-backlog had closed out; they are grouped first. Everything after them is vision
-work, parked spec work, a security umbrella, a packaging gap, or a limitation
-that needs hardware this machine does not have.
+**One item below is a defect**, filed on 2026-09-08 after the previous backlog
+closed; it is grouped first. Everything after it is vision work, parked spec
+work, a security umbrella, a packaging gap, or a limitation that needs hardware
+this machine does not have.
 
 **Filed after the backlog closed:**
-[#445](https://github.com/gimbal-dev/gimbal-local/issues/445) (CA install
-reports rejected trust when the guest only lacks openssl),
-[#446](https://github.com/gimbal-dev/gimbal-local/issues/446) (the agent
-quickstart lacks account-specific Copilot endpoint setup),
 [#447](https://github.com/gimbal-dev/gimbal-local/issues/447) (no bounded stop
 wait, so stop/start automation is unreliable)
 
