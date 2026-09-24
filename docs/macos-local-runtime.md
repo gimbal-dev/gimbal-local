@@ -154,6 +154,47 @@ carrier asserted or the reopened getty hangs before printing its login prompt.
   uploads return artifacts, and `cleanup` wraps the tag-scoped destructive
   cleanup script.
 
+### Bounded stop completion
+
+Bare `chm ctl stop` keeps its request-only contract. It waits up to three
+seconds, then can return exit 0 with `stop requested` while the worker still
+writes its checkpoint. Existing app clients can continue to use this form.
+
+Use an explicit wait before a dependent start:
+
+```sh
+chm ctl --socket "$SOCKET" stop --wait --timeout 60 &&
+  chm ctl --socket "$SOCKET" start toy
+```
+
+`--wait` needs `--timeout SECS`, an integer from 1 to 86400. The client uses
+one monotonic deadline for the whole request, including the transport. The
+daemon also bounds its wait. Neither deadline cancels or kills the worker.
+The wait follows the guest selected when the daemon accepts the request, even
+if another client later starts a different guest.
+
+| Result | Exit | Meaning |
+| --- | --- | --- |
+| `completed` | 0 | The worker finished, the daemon joined it, and checkpoint/teardown reported no error. A following start cannot race that worker. An idle daemon also returns this result. |
+| `timeout` | 124 | The deadline expired without observed completion. Teardown can still run. Retry the wait before a start. If the client received no reply, request acceptance is unknown. |
+| `failed` | 1 | The worker, checkpoint, or transport failed. The message names the error. Check the daemon log and saved revisions before a restart. |
+
+Add `--json` to the wait form for `{"status":"completed","message":"..."}`.
+Timeout and failure use the same JSON fields with their own status values.
+Invalid arguments exit 1 before a connection.
+
+The one-line wire request is `stop-wait-json SECS`; its response is the JSON
+object above. A separate verb makes older daemons refuse the operation rather
+than ignore a wait flag. The existing `stop` wire request and status schemas
+do not change. Stop requests do not reserve the next start against other
+clients; the daemon still serializes starts into its one VM slot.
+
+This wait form needs `chm serve`. It refuses `chm create --socket`: that
+endpoint reports stopped before its optional `--originate` capture finishes.
+For cold boot, use bare `stop` and wait for the `chm create` process to exit.
+`shutdown` uses the same completion check and refuses to exit successfully
+if the wait times out or teardown fails.
+
 ## chm runner: driving snapshots through the control plane
 
 `chm runner` makes `chm` a *runner* for a `gimbal-cloud-control` (`gctl`)
