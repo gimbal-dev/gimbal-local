@@ -49,7 +49,7 @@ flate2 = "1.1"
 # zstd-compressed layers (#206). Already a direct dependency of the in-tree
 # `block` crate at the same pin, so this is a use of what the workspace already
 # vendors and builds, not a new crate in the tree.
-zstd = "0.13"
+zstd = "0.14"
 
 [lints]
 workspace = true
