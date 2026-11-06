@@ -8,7 +8,7 @@ for the area you are touching.
 **Last measured sweep:** 2026-09-08, at commit `ded833183`. Every gate number
 below was produced by running the command in its own row on that commit, not
 carried forward from a previous sweep.
-**Issue-state refresh:** 2026-09-24, swept with
+**Issue-state refresh:** 2026-11-06, swept with
 [`../scripts/check-docs.sh`](../scripts/check-docs.sh) rather than transcribed
 by hand. Run that script before trusting the grouped list at the bottom of this
 page; it compares the page against GitHub and exits non-zero on drift. It
@@ -176,10 +176,24 @@ product.** The last four defects from the previous backlog
 2026-09-24. One operational defect remains:
 [#447](https://github.com/gimbal-dev/gimbal-local/issues/447), which needs a
 bounded stop wait for reliable stop/start automation. The other open work is
-vision work, the parked sandbox-spec family, two security umbrellas, one
-packaging gap
-([#410](https://github.com/gimbal-dev/gimbal-local/issues/410)), and four
-limitations that need hardware this machine does not have.
+two security umbrellas, one packaging gap
+([#410](https://github.com/gimbal-dev/gimbal-local/issues/410)), the upstream
+conformance review, cross-repo control-plane work, and four limitations that
+need hardware this machine does not have.
+
+**Priority: isolation, security, and upstream conformance.** On 2026-11-06 the
+sandbox-spec family (#182 to #189), V10 Living Workspaces (#159) and the V0
+vision record (#21) closed as not planned, so that work does not compete with
+this priority. Reopen them when that changes.
+
+### Upstream conformance is stale
+
+The upstream baseline in [`../UPSTREAM-CHANGES.md`](../UPSTREAM-CHANGES.md) is
+`1db8858fa`, from 2026-06-21. Upstream has since released v53.0 and v54.0, and
+v54.0 persists the GICv3 distributor address in arm64 snapshots. Nothing has
+shown that `chm` rehydrates a stock v54.0 snapshot, so the "vanilla" claim above
+is proved only for captures from the baseline era. The review is
+[#472](https://github.com/gimbal-dev/gimbal-local/issues/472).
 
 One rehydration wart remains visible to a user:
 [#366](https://github.com/gimbal-dev/gimbal-local/issues/366)
@@ -189,17 +203,17 @@ One rehydration wart remains visible to a user:
 
 ## The open issue list, grouped
 
-Swept with [`../scripts/check-docs.sh`](../scripts/check-docs.sh) on 2026-09-24,
-so **21 remain open** and every one of them is named below. Issue numbers are
+Swept with [`../scripts/check-docs.sh`](../scripts/check-docs.sh) on 2026-11-06,
+so **12 remain open** and every one of them is named below. Issue numbers are
 written individually rather than as ranges, so the checker can compare this
 list against `gh` without expanding anything. If you change this list, re-run
 that script before you commit — it is the only thing standing between this page
 and its third rot.
 
 **One item below is a defect**, filed on 2026-09-08 after the previous backlog
-closed; it is grouped first. Everything after it is vision work, parked spec
-work, a security umbrella, a packaging gap, or a limitation that needs hardware
-this machine does not have.
+closed; it is grouped first. Everything after it is upstream conformance, a
+security umbrella, a packaging gap, cross-repo control-plane work, or a
+limitation that needs hardware this machine does not have.
 
 **Filed after the backlog closed:**
 [#447](https://github.com/gimbal-dev/gimbal-local/issues/447) (no bounded stop
@@ -216,21 +230,11 @@ snapshot), [#373](https://github.com/gimbal-dev/gimbal-local/issues/373) (an
 Apple-originated snapshot will hard-fail on a non-PAC host, and that is
 unmeasurable here)
 
-**Sandbox spec alignment** — parked as a family, not being worked:
-[#182](https://github.com/gimbal-dev/gimbal-local/issues/182) (umbrella),
-[#183](https://github.com/gimbal-dev/gimbal-local/issues/183) (extensions),
-[#184](https://github.com/gimbal-dev/gimbal-local/issues/184) (securityModules),
-[#185](https://github.com/gimbal-dev/gimbal-local/issues/185) (dataPolicy),
-[#186](https://github.com/gimbal-dev/gimbal-local/issues/186) (toolPolicy),
-[#187](https://github.com/gimbal-dev/gimbal-local/issues/187) (identity),
-[#188](https://github.com/gimbal-dev/gimbal-local/issues/188) (observability),
-[#189](https://github.com/gimbal-dev/gimbal-local/issues/189) (lifecycle hooks)
+**Upstream conformance:** [#472](https://github.com/gimbal-dev/gimbal-local/issues/472)
+(review against upstream v53.0 and v54.0; refresh the modification notice)
 
 **Packaging:** [#410](https://github.com/gimbal-dev/gimbal-local/issues/410)
 (the app has no update channel, and the gap lost its tracker when #391 closed)
-
-**Product vision:** [#159](https://github.com/gimbal-dev/gimbal-local/issues/159)
-(V10 Living Workspaces — the workspace becomes part of the session)
 
 **Security:** [#36](https://github.com/gimbal-dev/gimbal-local/issues/36)
 (signed snapshot manifest + verification),
@@ -241,9 +245,7 @@ hardening checklist, umbrella)
 (postcopy memory from the state CDN),
 [#6](https://github.com/gimbal-dev/gimbal-local/issues/6) (fork + CoW overlays +
 wake-on-traffic), [#20](https://github.com/gimbal-dev/gimbal-local/issues/20)
-(consistent filesystem + network policy enforced on the Mac),
-[#21](https://github.com/gimbal-dev/gimbal-local/issues/21) (V0 vision: the four
-capability pillars)
+(consistent filesystem + network policy enforced on the Mac)
 
 ---
 
