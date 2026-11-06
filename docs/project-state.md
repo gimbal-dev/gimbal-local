@@ -189,11 +189,16 @@ this priority. Reopen them when that changes.
 ### Upstream conformance is stale
 
 The upstream baseline in [`../UPSTREAM-CHANGES.md`](../UPSTREAM-CHANGES.md) is
-`1db8858fa`, from 2026-06-21. Upstream has since released v53.0 and v54.0, and
-v54.0 persists the GICv3 distributor address in arm64 snapshots. Nothing has
-shown that `chm` rehydrates a stock v54.0 snapshot, so the "vanilla" claim above
-is proved only for captures from the baseline era. The review is
-[#472](https://github.com/gimbal-dev/gimbal-local/issues/472).
+`1db8858fa`, from 2026-06-21. Upstream has since tagged v53.0 and v54.0, and
+v54.0 is 1028 commits past the baseline. The last stock build that `chm` is
+known to rehydrate is upstream `9ea9019d29af` (2026-07-29), which made the
+Graviton round-2 captures, and v54.0 is 736 commits past it. Nothing has shown
+that `chm` rehydrates a stock v54.0 snapshot, so the "vanilla" claim above is
+proved only up to that build. Two v54.0 changes are guest-visible and not
+modelled by `chm`: a VM Generation ID device and an ACPI Time and Alarm Device.
+The upstream change that moves the GICv3 layout, which `rehydrate.rs`
+hard-codes, is on upstream `main` only and lands in the next release. The review
+is [#472](https://github.com/gimbal-dev/gimbal-local/issues/472).
 
 One rehydration wart remains visible to a user:
 [#366](https://github.com/gimbal-dev/gimbal-local/issues/366)
