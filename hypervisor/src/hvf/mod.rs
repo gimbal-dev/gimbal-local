@@ -52,6 +52,8 @@ pub mod checkpoint;
 pub mod devices;
 #[cfg(feature = "kvm-snapshot")]
 pub mod rehydrate;
+#[cfg(test)]
+mod restore_tests;
 pub mod translate;
 
 /// Which of a capture's system registers this host can actually reproduce.
@@ -1597,6 +1599,52 @@ fn vtimer_needs_arming(sysregs: &[(u16, u64)]) -> bool {
         Some(ctl) if ctl & CNTV_CTL_ENABLE != 0 => false,
         Some(_) => reg(SYSREG_CNTV_CVAL_EL0).unwrap_or(0) == 0,
     }
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RestoredSysregs {
+    mpidr: bool,
+    cntvct: Option<u64>,
+}
+
+/// Restore policy with an injectable writer, so a backend refusal can be tested
+/// locally without claiming this models a non-PAC KVM host.
+fn restore_sysregs(
+    sysregs: &[(u16, u64)],
+    mut write: impl FnMut(u16, u64) -> CpuResult<()>,
+) -> CpuResult<RestoredSysregs> {
+    let mut restored = RestoredSysregs::default();
+    for &(id, v) in sysregs {
+        if id == SYSREG_MPIDR_EL1 {
+            // Affinity is load-bearing for GIC interrupt delivery.
+            write(id, v)?;
+            restored.mpidr = true;
+        } else if id == SYSREG_CNTVCT_EL0 {
+            // Read-only: seed the virtual-timer offset, not a sysreg write.
+            restored.cntvct = Some(v);
+        } else if SYSREG_PAC_KEYS.contains(&id) {
+            // Signed pointers travel in RAM. Skipping a failed key write
+            // turns a clean restore refusal into a later authentication fault.
+            write(id, v).map_err(|error| {
+                HypervisorCpuError::SetSysRegister(anyhow!(error).context(format!(
+                    "cannot restore PAC key register {id:#06x}; \
+                     refusing to resume with different pointer-authentication keys; \
+                     use a destination that can restore the captured PAC state"
+                )))
+            })?;
+        } else if id == SYSREG_SCTLR_EL1 {
+            // See `ctr_trap_fixup`: retain the captured guest's cache repair.
+            let want = if std::env::var_os("CHM_KEEP_CTR_TRAP").is_some() {
+                v
+            } else {
+                ctr_trap_fixup(v).unwrap_or(v)
+            };
+            let _ = write(id, want);
+        } else {
+            let _ = write(id, v);
+        }
+    }
+    Ok(restored)
 }
 
 #[cfg(test)]
@@ -5106,52 +5154,15 @@ impl Vcpu for HvfVcpu {
         // Some EL1 system registers may be read-only on a given core; restoring
         // them is best-effort and must not abort the whole restore.
         let _ = self.set_sysreg(SYSREG_SP_EL1, s.sp_el1);
-        let mut restored_mpidr = false;
-        let mut snapshot_cntvct = None;
-        for &(id, v) in &s.sysregs {
-            if id == SYSREG_MPIDR_EL1 {
-                // MPIDR affinity is load-bearing for GIC interrupt delivery, so
-                // it is restored with a hard failure rather than best-effort.
-                self.set_sysreg(SYSREG_MPIDR_EL1, v)?;
-                restored_mpidr = true;
-            } else if id == SYSREG_CNTVCT_EL0 {
-                // Read-only: not written as a sysreg. Its value seeds the vtimer
-                // offset below so the virtual counter resumes continuously.
-                snapshot_cntvct = Some(v);
-            } else if crate::hvf::ffi::SYSREG_PAC_KEYS.contains(&id) {
-                // Restored with a hard failure rather than best-effort, for the
-                // same reason as MPIDR above. A pointer-authentication key that
-                // silently fails to restore does not leave the guest degraded —
-                // it leaves every already-signed return address on every stack
-                // unauthenticatable, so the guest dies with an FPAC oops at some
-                // arbitrary later instruction with nothing pointing back here.
-                // A capture only carries these if it was taken on hardware that
-                // implements FEAT_PAuth, so a host that refuses them cannot run
-                // this guest at all, and failing by name is cheaper than an
-                // unexplained oops.
-                self.set_sysreg(id, v)?;
-            } else if id == SYSREG_SCTLR_EL1 {
-                // See `ctr_trap_fixup`: a capture from Neoverse-N1 arrives with
-                // EL0 reads of CTR_EL0 trapped to a handler that reports a
-                // 4096-byte i-cache stride, which is 64x too coarse here.
-                let want = if std::env::var_os("CHM_KEEP_CTR_TRAP").is_some() {
-                    v
-                } else {
-                    ctr_trap_fixup(v).unwrap_or(v)
-                };
-                let _ = self.set_sysreg(id, want);
-            } else {
-                let _ = self.set_sysreg(id, v);
-            }
-        }
-        if !restored_mpidr {
+        let restored = restore_sysregs(&s.sysregs, |id, v| self.set_sysreg(id, v))?;
+        if !restored.mpidr {
             // Older snapshots predate capturing MPIDR; synthesize it from this
             // vCPU's index so a restored guest can still take interrupts.
             self.set_mpidr_affinity(self.index)?;
         }
         // Restore virtual-counter continuity if the snapshot carried CNTVCT, so
         // the guest's armed timer fires promptly and time advances on resume.
-        if let Some(cntvct) = snapshot_cntvct {
+        if let Some(cntvct) = restored.cntvct {
             if std::env::var("CHM_TRACE_VTIMER").is_ok() {
                 let cval = self.get_sysreg(0xDF1A).unwrap_or(0);
                 let ctl = self.get_sysreg(0xDF19).unwrap_or(0);
