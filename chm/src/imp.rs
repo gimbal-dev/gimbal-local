@@ -3840,6 +3840,7 @@ pub(crate) fn run_usgic_engine(
     });
 
     // Stop: clear the flag, force every vCPU out of any in-flight run(), join.
+    let mut teardown_error = None;
     running.store(false, Ordering::Release);
     // Release any vCPU waiting on an in-flight counter step first, so teardown
     // cannot block behind the stepper.
@@ -3848,30 +3849,30 @@ pub(crate) fn run_usgic_engine(
         exit();
     }
     if let Some(h) = vtimer_stepper {
-        let _ = h.join();
+        join_for_teardown(h, "virtual timer", &mut teardown_error);
     }
     // The watchdog observes `running`, cleared above.
     if let Some(h) = run_watchdog {
-        let _ = h.join();
+        join_for_teardown(h, "run watchdog", &mut teardown_error);
     }
     // Stop accepting new proxied flows; in-flight connections finish on their own.
     if let Some(p) = running_proxy.take() {
         p.stop();
     }
-    let _ = serial_reassert.join();
+    join_for_teardown(serial_reassert, "serial interrupt", &mut teardown_error);
     // Stop the live snapshotter before the writers it holds still: it closes the
     // gate and the latch on its way out, so a vCPU or the net service parked for
     // a checkpoint in progress is released rather than joined-on forever.
     if let Some(h) = live_snapshotter {
-        let _ = h.join();
+        join_for_teardown(h, "live snapshot", &mut teardown_error);
     }
     gate.close();
     quiesce.close();
     if let Some((h, _)) = net_service {
-        let _ = h.join();
+        join_for_teardown(h, "network service", &mut teardown_error);
     }
     for t in threads {
-        let _ = t.join();
+        join_for_teardown(t, "vCPU", &mut teardown_error);
     }
     drop(raw_console);
 
@@ -3922,6 +3923,7 @@ pub(crate) fn run_usgic_engine(
                 }
                 Err(e) => {
                     eprintln!("chm: warning: could not write checkpoint: {e}");
+                    teardown_error = Some(format!("could not write checkpoint: {e}"));
                     retire_or_clear_head(dir, &live_taken, cfg.quiet);
                 }
             }
@@ -3936,11 +3938,7 @@ pub(crate) fn run_usgic_engine(
         retire_or_clear_head(dir, &live_taken, cfg.quiet);
     }
 
-    let resolved = match vcpu_outcome {
-        Some(Ok(o)) => Ok(o),
-        Some(Err(e)) => Err(e),
-        None => Ok(coordinator.unwrap_or(Outcome::Interrupted)),
-    };
+    let resolved = resolve_teardown(vcpu_outcome, coordinator, teardown_error);
 
     // Close the audit trail before returning, on the error path too: a session
     // that ended because a vCPU failed is precisely the one an operator needs a
@@ -3966,7 +3964,105 @@ pub(crate) fn run_usgic_engine(
     Ok(final_outcome)
 }
 
+fn join_for_teardown<T>(handle: thread::JoinHandle<T>, name: &str, failure: &mut Option<String>) {
+    if handle.join().is_err() {
+        let error = format!("{name} thread panicked during guest teardown");
+        eprintln!("chm: {error}");
+        failure.get_or_insert(error);
+    }
+}
 
+fn resolve_teardown(
+    vcpu: Option<Result<Outcome, String>>,
+    coordinator: Result<Outcome, String>,
+    failure: Option<String>,
+) -> Result<Outcome, String> {
+    if let Some(error) = failure {
+        return Err(error);
+    }
+    // A supervisor error must not become an ordinary requested stop.
+    let coordinator = coordinator?;
+    vcpu.unwrap_or(Ok(coordinator))
+}
+
+#[cfg(test)]
+mod stop_teardown_tests {
+    use super::*;
+
+    #[test]
+    fn stop_teardown_failures_are_not_clean_outcomes() {
+        resolve_teardown(None, Ok(Outcome::Interrupted), None).unwrap();
+        assert_eq!(
+            resolve_teardown(
+                None,
+                Ok(Outcome::Interrupted),
+                Some("checkpoint failed".into())
+            )
+            .err(),
+            Some("checkpoint failed".into())
+        );
+        assert_eq!(
+            resolve_teardown(None, Err("supervisor failed".into()), None).err(),
+            Some("supervisor failed".into())
+        );
+        assert_eq!(
+            resolve_teardown(
+                Some(Err("vcpu failed".into())),
+                Ok(Outcome::Interrupted),
+                None
+            )
+            .err(),
+            Some("vcpu failed".into())
+        );
+        let mut failure = None;
+        join_for_teardown(thread::spawn(|| ()), "vCPU", &mut failure);
+        assert_eq!(failure, None, "a clean join is not a teardown failure");
+        join_for_teardown(thread::spawn(|| panic!("injected")), "vCPU", &mut failure);
+        assert_eq!(
+            failure.as_deref(),
+            Some("vCPU thread panicked during guest teardown")
+        );
+    }
+
+    #[test]
+    fn stop_teardown_engine_wires_checkpoint_and_thread_errors_to_outcome() {
+        let source = include_str!("imp.rs");
+        let engine = source
+            .split_once(&format!("pub(crate) fn {}(", "run_usgic_engine"))
+            .unwrap()
+            .1
+            .split_once(&format!("\nfn {}<", "join_for_teardown"))
+            .unwrap()
+            .0;
+        assert!(
+            engine.contains(&format!(
+                "{} = Some(format!(\"could not write checkpoint:",
+                "teardown_error"
+            )),
+            "the actual checkpoint error arm must retain the failure"
+        );
+        assert!(
+            engine.contains(&format!(
+                "{}(vcpu_outcome, coordinator, teardown_error)",
+                "resolve_teardown"
+            )),
+            "the actual engine must return the resolved teardown outcome"
+        );
+        for name in [
+            "virtual timer",
+            "run watchdog",
+            "serial interrupt",
+            "live snapshot",
+            "network service",
+            "vCPU",
+        ] {
+            assert!(
+                engine.contains(&format!("\"{name}\", &mut teardown_error)")),
+                "{name} join must report its failure"
+            );
+        }
+    }
+}
 
 /// RAII guard for the interactive session-liveness lock file. Writes this
 /// process's PID on creation and removes the file on drop. Because every
